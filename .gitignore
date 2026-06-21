@@ -1,0 +1,24 @@
+# Dependencies (the committed package-lock.json pins them; node_modules is not tracked)
+node_modules/
+
+# Build / pack artifacts
+*.tgz
+
+# Test + tooling caches
+coverage/
+.vitest/
+.cache/
+
+# Editor / OS cruft
+.DS_Store
+*.log
+.idea/
+.vscode/
+
+# Local env
+.env
+.env.local
+.env.*.local
+
+# NOTE: package-lock.json IS committed (npm is the chosen package manager;
+# `npm ci` in CI requires it). Do NOT add it here.
