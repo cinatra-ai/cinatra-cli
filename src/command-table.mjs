@@ -93,6 +93,12 @@ export const COMMAND_DESCRIPTORS = [
     summary: "Submit a built extension tarball to the Cinatra Marketplace for review.",
   },
   {
+    id: "create-extension",
+    path: ["create-extension"],
+    match: "command",
+    summary: "Scaffold a new Cinatra extension package on disk (agent|connector|artifact|skill|workflow).",
+  },
+  {
     id: "mcp.tunnel",
     path: ["mcp", "tunnel"],
     match: "command+mode",

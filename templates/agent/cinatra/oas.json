@@ -1,0 +1,118 @@
+{
+  "agentspec_version": "26.1.0",
+  "component_type": "Flow",
+  "id": "{{flowId}}",
+  "name": "{{displayName}}",
+  "description": "{{description}}",
+  "metadata": {
+    "cinatra": {
+      "type": "flow",
+      "packageName": "{{packageName}}",
+      "packageVersion": "0.1.0",
+      "hitlScreens": [],
+      "llm": {
+        "preferredProvider": "anthropic",
+        "preferredModel": "claude-sonnet-4-6"
+      },
+      "toolboxes": []
+    }
+  },
+  "inputs": [
+    { "title": "input", "type": "string" }
+  ],
+  "outputs": [
+    { "title": "result", "type": "string" }
+  ],
+  "start_node": { "$component_ref": "start" },
+  "nodes": [
+    { "$component_ref": "start" },
+    { "$component_ref": "run" },
+    { "$component_ref": "end" }
+  ],
+  "control_flow_connections": [
+    {
+      "component_type": "ControlFlowEdge",
+      "name": "start_to_run",
+      "from_node": { "$component_ref": "start" },
+      "to_node": { "$component_ref": "run" }
+    },
+    {
+      "component_type": "ControlFlowEdge",
+      "name": "run_to_end",
+      "from_node": { "$component_ref": "run" },
+      "to_node": { "$component_ref": "end" }
+    }
+  ],
+  "data_flow_connections": [
+    {
+      "component_type": "DataFlowEdge",
+      "name": "start_input_to_run_input",
+      "source_node": { "$component_ref": "start" },
+      "source_output": "input",
+      "destination_node": { "$component_ref": "run" },
+      "destination_input": "input"
+    },
+    {
+      "component_type": "DataFlowEdge",
+      "name": "run_result_to_end_result",
+      "source_node": { "$component_ref": "run" },
+      "source_output": "result",
+      "destination_node": { "$component_ref": "end" },
+      "destination_input": "result"
+    }
+  ],
+  "$referenced_components": {
+    "start": {
+      "component_type": "StartNode",
+      "id": "start",
+      "name": "Inputs",
+      "metadata": {
+        "cinatra": {
+          "required": ["input"]
+        }
+      },
+      "inputs": [
+        { "title": "input", "type": "string" }
+      ]
+    },
+    "run": {
+      "component_type": "ApiNode",
+      "id": "run",
+      "name": "Run via /api/llm-bridge",
+      "url": "{{CINATRA_BASE_URL}}/api/llm-bridge",
+      "http_method": "POST",
+      "data": {
+        "agent_id": "{{slug}}",
+        "system": "You are the {{displayName}} agent. Follow the SKILL.md step-by-step and return a single JSON object as specified there — nothing else.",
+        "user": "Process the following input per the SKILL.md recipe and return the result JSON.\n\nInput: {{ input }}",
+        "cinatra_llm": {
+          "preferredProvider": "anthropic",
+          "preferredModel": "claude-sonnet-4-6"
+        },
+        "toolbox_ids": []
+      },
+      "inputs": [
+        { "title": "input", "type": "string" }
+      ],
+      "outputs": [
+        { "title": "result", "type": "string" }
+      ],
+      "metadata": {
+        "cinatra": {
+          "riskClass": "read_only",
+          "requiresApproval": false,
+          "packageName": "{{packageName}}",
+          "description": "Single ApiNode to /api/llm-bridge. The bridge auto-discovers SKILL.md by agent_id and runs the prompt. Replace this stub with the real node graph for your agent."
+        }
+      }
+    },
+    "end": {
+      "component_type": "EndNode",
+      "id": "end",
+      "name": "End",
+      "outputs": [
+        { "title": "result", "type": "string", "default": "" }
+      ]
+    }
+  }
+}

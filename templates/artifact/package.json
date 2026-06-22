@@ -1,0 +1,44 @@
+{
+  "name": "{{packageName}}",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "description": "{{description}}",
+  "type": "module",
+  "files": [
+    "src",
+    "skills"
+  ],
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "peerDependencies": {
+    "@cinatra-ai/sdk-extensions": "{{sdkPin}}"
+  },
+  "peerDependenciesMeta": {
+    "@cinatra-ai/sdk-extensions": {
+      "optional": true
+    }
+  },
+  "cinatra": {
+    "apiVersion": "cinatra.ai/v1",
+    "kind": "artifact",
+    "roles": [
+      "artifact-{{base}}"
+    ],
+    "dependencies": [],
+    "artifact": {
+      "accepts": {
+        "file": {
+          "mimeTypes": [
+            "text/markdown"
+          ]
+        }
+      },
+      "skills": {
+        "matchers": [
+          "{{packageName}}:{{base}}-matcher"
+        ]
+      },
+      "matcherConfidenceThreshold": 0.7
+    }
+  }
+}

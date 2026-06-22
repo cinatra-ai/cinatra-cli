@@ -14,8 +14,4 @@ jobs:
     with:
       profile: default
       ratchet_mode: line
-      # Per-repo config: the gate STILL scans every file (incl. templates/); this
-      # only exempts one unavoidable, FULL-LINE-ANCHORED schema-version literal
-      # ("apiVersion": "vN.N") a scaffold dashboard.json carries. cinatra#402.
-      config: .source-leak-gate.json
       ref: 4c903fe9ca71ad47752a2bc92b72893e5f7c9814

@@ -90,6 +90,12 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode",
         },
         {
+          "command": "create-extension",
+          "hidden": false,
+          "id": "create-extension",
+          "match": "command",
+        },
+        {
           "command": "mcp tunnel",
           "hidden": true,
           "id": "mcp.tunnel",

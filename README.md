@@ -24,15 +24,31 @@ Requires Node.js >= 20.
 
 ## What you can do
 
-    cinatra install                # set up a new Cinatra instance from scratch
-    cinatra setup dev              # provision a local development instance
-    cinatra setup prod             # provision a production instance
-    cinatra db migrate             # apply schema updates to an instance
-    cinatra status                 # check an instance's status
-    cinatra doctor                 # diagnose your local setup
-    cinatra agents install <name>  # add an agent to your instance
+    cinatra install                  # set up a new Cinatra instance from scratch
+    cinatra setup dev                # provision a local development instance
+    cinatra setup prod               # provision a production instance
+    cinatra db migrate               # apply schema updates to an instance
+    cinatra status                   # check an instance's status
+    cinatra doctor                   # diagnose your local setup
+    cinatra agents install <name>    # add an agent to your instance
+    cinatra create-extension <kind>  # scaffold a new extension to author
 
 Run `cinatra --help` for the full command list.
+
+## Author an extension
+
+Scaffold a ready-to-author, ready-to-publish extension package — one of five
+kinds (`agent`, `connector`, `artifact`, `skill`, `workflow`):
+
+    cinatra create-extension agent invoice-extractor
+
+It generates a complete, standalone repo (manifest, README, CI, kind gate, and
+kind-specific payload). The generated package pins `@cinatra-ai/sdk-extensions`
+as an optional peer; nothing is installed for you. Run `cinatra create-extension
+--help` for the kinds and options.
+
+> This replaces the standalone `npx create-cinatra-extension` scaffolder, which
+> is retired.
 
 ## License
 
