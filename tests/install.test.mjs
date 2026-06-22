@@ -32,6 +32,7 @@ import {
   assertAmbientModeMatches,
   assertSafeRepoUrl,
   detectPortConflicts,
+  emitDegradedBandWarning,
   ensureEnvLocal,
   normalizeRemote,
   ownedPortsFromInspect,
@@ -455,7 +456,7 @@ describe("ownedPortsFromInspect", () => {
     NetworkSettings: { Ports: ports },
   });
 
-  it("returns only host ports whose container is rooted at OUR working_dir", () => {
+  it("returns interface-aware host:port keys for containers rooted at OUR working_dir", () => {
     const rows = [
       containerInDir(DIR, { "5432/tcp": [{ HostIp: "127.0.0.1", HostPort: "5434" }] }),
       containerInDir(DIR, { "4873/tcp": [{ HostIp: "0.0.0.0", HostPort: "4873" }] }),
@@ -464,9 +465,24 @@ describe("ownedPortsFromInspect", () => {
       containerInDir("/elsewhere/cinatra-out", { "6379/tcp": [{ HostPort: "6379" }] }),
     ];
     const owned = ownedPortsFromInspect(rows, DIR);
-    expect(owned.has(5434)).toBe(true);
-    expect(owned.has(4873)).toBe(true);
-    expect(owned.has(6379)).toBe(false); // stranger's port — never exempted.
+    // host:port KEYS now (finding #2) — the exemption granularity matches the
+    // interface-aware probe, so a loopback-owned port can't mask an all-interface
+    // stranger's port (or vice-versa).
+    expect(owned.has("127.0.0.1:5434")).toBe(true);
+    expect(owned.has("0.0.0.0:4873")).toBe(true);
+    // The owned set is interface-SPECIFIC: a loopback binding does NOT claim the
+    // all-interfaces key for the same port.
+    expect(owned.has("0.0.0.0:5434")).toBe(false);
+    // The stranger (different working_dir) contributes NOTHING on any interface.
+    expect(owned.has("0.0.0.0:6379")).toBe(false);
+    expect(owned.has("127.0.0.1:6379")).toBe(false);
+  });
+
+  it("folds an absent HostIp to the all-interfaces (0.0.0.0) key", () => {
+    const rows = [containerInDir(DIR, { "8000/tcp": [{ HostPort: "8000" }] })];
+    const owned = ownedPortsFromInspect(rows, DIR);
+    // No HostIp ⇒ all-interfaces publish ⇒ the 0.0.0.0 key.
+    expect(owned.has("0.0.0.0:8000")).toBe(true);
   });
 
   it("ignores non-TCP published ports (the probe only checks TCP)", () => {
@@ -477,8 +493,8 @@ describe("ownedPortsFromInspect", () => {
       }),
     ];
     const owned = ownedPortsFromInspect(rows, DIR);
-    expect(owned.has(8000)).toBe(true);
-    expect(owned.has(5353)).toBe(false);
+    expect(owned.has("0.0.0.0:8000")).toBe(true);
+    expect(owned.has("0.0.0.0:5353")).toBe(false);
   });
 
   it("fails safe to an empty set on missing label / bad input", () => {
@@ -565,6 +581,48 @@ describe("detectPortConflicts", () => {
     expect(probed).toContain(5434);
   });
 
+  // ---- finding #2: the exemption is interface-aware (host:port keys) ----
+  it("EXEMPTS an owned host:port key but NOT the same port on a DIFFERENT interface", async () => {
+    // The band declares loopback postgres (127.0.0.1:5434). The owned set proves
+    // we hold 127.0.0.1:5434 → exempt. But it does NOT hold 0.0.0.0:5434, so a
+    // band entry on a DIFFERENT interface for the same port is still probed.
+    const ifaceBand = [
+      { service: "postgres", host: "127.0.0.1", port: 5434 },
+      { service: "evil", host: "0.0.0.0", port: 5434 }, // a stranger on all-interfaces.
+    ];
+    const occupied = new Set(["0.0.0.0:5434"]); // the stranger is bound here.
+    const conflicts = await detectPortConflicts(ifaceBand, {
+      probe: (host, port) => !occupied.has(`${host}:${port}`),
+      ownedPorts: new Set(["127.0.0.1:5434"]), // we own ONLY the loopback one.
+      describeHolder: () => null,
+    });
+    // The all-interfaces stranger is a REAL conflict; our loopback port is exempt.
+    expect(conflicts.map((c) => `${c.host}:${c.port}`)).toEqual(["0.0.0.0:5434"]);
+  });
+
+  it("an owned ALL-INTERFACES binding (0.0.0.0:p) covers a same-port loopback band entry", async () => {
+    // Binding 0.0.0.0:5434 also holds 127.0.0.1:5434 at the OS level, so an owned
+    // 0.0.0.0 key exempts a band entry declared on a narrower interface.
+    const conflicts = await detectPortConflicts(
+      [{ service: "postgres", host: "127.0.0.1", port: 5434 }],
+      {
+        probe: () => false, // pretend it's busy
+        ownedPorts: new Set(["0.0.0.0:5434"]),
+        describeHolder: () => null,
+      },
+    );
+    expect(conflicts).toEqual([]); // exempted — it's us on all interfaces.
+  });
+
+  it("still accepts a legacy bare-NUMBER owned set (back-compat) exempting every interface", async () => {
+    const conflicts = await detectPortConflicts(band, {
+      probe: () => false, // everything busy
+      ownedPorts: new Set([4873, 5434, 6379]), // bare numbers (legacy)
+      describeHolder: () => null,
+    });
+    expect(conflicts).toEqual([]);
+  });
+
   it("de-dupes identical host:port entries (probed once)", async () => {
     let probes = 0;
     const dup = [
@@ -604,5 +662,211 @@ describe("detectPortConflicts", () => {
       { describeHolder: () => null },
     );
     expect(after).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. Finding #1 — the post-clone authoritative gate must FAIL LOUD (not silent)
+//    when the authoritative band cannot be derived from the checkout's compose
+//    config. emitDegradedBandWarning is the surfacing helper.
+// ---------------------------------------------------------------------------
+describe("emitDegradedBandWarning (finding #1 — degraded-mode surfacing)", () => {
+  it("emits a prominent DEGRADED warning that the authoritative check did not run", () => {
+    const logs = [];
+    emitDegradedBandWarning({ usesDefaultBand: true, ref: "main", log: (m) => logs.push(String(m)) });
+    const blob = logs.join("\n");
+    expect(blob).toMatch(/DEGRADED PORT CHECK/);
+    expect(blob).toMatch(/authoritative host-port conflict/i);
+    expect(blob).toMatch(/falling back to probing the STATIC default band/i);
+    // Every line carries the loud ⚠ prefix so it can't be skimmed past.
+    expect(logs.every((l) => l.startsWith("⚠"))).toBe(true);
+  });
+
+  it("is EXTRA prominent for a non-default ref (static band may be inapplicable)", () => {
+    const logs = [];
+    emitDegradedBandWarning({ usesDefaultBand: false, ref: "my-fork-branch", log: (m) => logs.push(String(m)) });
+    const blob = logs.join("\n");
+    // Names the dangerous ref and warns the fallback may not match its real ports.
+    expect(blob).toMatch(/NON-DEFAULT ref "my-fork-branch"/);
+    expect(blob).toMatch(/may NOT match this/i);
+    expect(blob).toMatch(/could slip past THIS check/i);
+  });
+
+  it("names the non-default repo-url when that is what diverges from the default band", () => {
+    const logs = [];
+    emitDegradedBandWarning({
+      usesDefaultBand: false,
+      ref: "main",
+      repoUrl: "file:///tmp/fork.git",
+      log: (m) => logs.push(String(m)),
+    });
+    expect(logs.join("\n")).toMatch(/NON-DEFAULT repo-url "file:\/\/\/tmp\/fork\.git"/);
+  });
+
+  it("does NOT emit the non-default escalation for the default band", () => {
+    const logs = [];
+    emitDegradedBandWarning({ usesDefaultBand: true, ref: "main", log: (m) => logs.push(String(m)) });
+    expect(logs.join("\n")).not.toMatch(/NON-DEFAULT ref/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. Finding #3 — REAL runInstall sequencing (NOT --no-infra, which skips BOTH
+//    gates). Proves: (a) a PRE-CLONE conflict throws BEFORE any clone/.env.local
+//    side-effect, (b) the POST-CLONE authoritative gate fires BEFORE infra, and
+//    (c) finding #1's degraded path warns loudly then proceeds to the static
+//    backstop. Docker is fully stubbed via the injectable `deps` seam so no live
+//    daemon is needed — but, crucially, infra is NOT skipped, so the gates run.
+// ---------------------------------------------------------------------------
+describe("runInstall — real gate sequencing (finding #3, infra NOT skipped)", () => {
+  let sandbox;
+  let originRepo;
+
+  // A docker/compose-present env that lets BOTH gates run; tests override the
+  // individual port-probe / band / infra seams as needed.
+  const dockerPresentDeps = () => ({
+    runPreflight: () => ({ ok: true, failures: [], warnings: [], mode: "dev", infraWillStart: true }),
+    commandExists: () => true, // docker present
+    composeAvailable: () => true, // compose v2 present
+  });
+
+  beforeAll(() => {
+    sandbox = mkdtempSync(path.join(os.tmpdir(), "cinatra-install-seq-"));
+    const src = path.join(sandbox, "src");
+    mkdirSync(path.join(src, "packages", "migrations"), { recursive: true });
+    writeFileSync(path.join(src, "pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n");
+    writeFileSync(
+      path.join(src, "packages", "migrations", "package.json"),
+      JSON.stringify({ name: "@cinatra-ai/migrations", version: "0.0.0" }),
+    );
+    writeFileSync(
+      path.join(src, "package.json"),
+      JSON.stringify({ name: "cinatra-host", cinatra: { devExtensions: {} } }),
+    );
+    writeFileSync(
+      path.join(src, ".env.example"),
+      "BETTER_AUTH_SECRET=\nCINATRA_RUNTIME_MODE=development\n",
+    );
+    writeFileSync(path.join(src, ".gitignore"), ".env.local\nextensions/\n");
+    const G = (args, cwd) =>
+      execFileSync("git", args, {
+        cwd,
+        env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" },
+        stdio: "ignore",
+      });
+    G(["init", "-b", "main"], src);
+    G(["add", "-A"], src);
+    G(["commit", "-m", "init"], src);
+    originRepo = path.join(sandbox, "origin.git");
+    G(["clone", "--bare", src, originRepo], sandbox);
+  });
+
+  afterAll(() => rmSync(sandbox, { recursive: true, force: true }));
+
+  it("(a) a PRE-CLONE port conflict throws BEFORE any clone / .env.local side-effect", async () => {
+    const installDir = path.join(sandbox, "out-preclone");
+    let cloned = false;
+    // DEFAULT repo+ref ⇒ the pre-clone static guard runs. The injected probe
+    // reports a conflict, so it must throw BEFORE the clone (the dir is never
+    // created and the band-derive seam is never reached).
+    await expect(
+      runInstall(
+        ["--dir", installDir, "--ref", "main", "--yes"], // default repo-url+ref, infra NOT skipped
+        {
+          log: () => {},
+          deps: {
+            ...dockerPresentDeps(),
+            // pre-clone gate sees a conflict on the static default band.
+            detectPortConflicts: async () => [
+              { service: "verdaccio", host: "0.0.0.0", port: 4873, holder: "verdaccio (pid 1)" },
+            ],
+            // If the clone were reached these would flip — they must NOT be.
+            composePublishedPortsForTarget: () => {
+              cloned = true;
+              return DEFAULT_DEV_HOST_PORTS;
+            },
+            targetComposeOwnedPorts: () => new Set(),
+            bringUpInfra: () => {
+              cloned = true;
+            },
+          },
+        },
+      ),
+    ).rejects.toThrow(/Host port conflict.*preflight, before clone/s);
+    // Hard proof no side-effect happened: the target dir was never created.
+    expect(existsSync(installDir)).toBe(false);
+    expect(existsSync(path.join(installDir, ".env.local"))).toBe(false);
+    expect(cloned).toBe(false); // post-clone seams never ran.
+  });
+
+  it("(b) the POST-CLONE authoritative gate fires BEFORE infra (clone done, infra NOT started)", async () => {
+    const installDir = path.join(sandbox, "out-postclone");
+    const order = [];
+    // Non-default repo-url ⇒ pre-clone static guard is SKIPPED; only the
+    // authoritative post-clone gate runs. It reports a conflict → throws before
+    // infra. The clone DID happen (.env.local is written AFTER the gate, so it
+    // must be absent), and bringUpInfra must NEVER run.
+    await expect(
+      runInstall(
+        ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes"],
+        {
+          log: () => {},
+          deps: {
+            ...dockerPresentDeps(),
+            composePublishedPortsForTarget: () => {
+              order.push("derive-band");
+              return [{ service: "postgres", host: "127.0.0.1", port: 5434 }];
+            },
+            targetComposeOwnedPorts: () => new Set(),
+            detectPortConflicts: async (band) => {
+              order.push("probe");
+              return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+            },
+            bringUpInfra: () => {
+              order.push("infra"); // must NEVER be reached.
+            },
+          },
+        },
+      ),
+    ).rejects.toThrow(/Host port conflict.*before bringing up infra/s);
+    // The clone HAPPENED (the post-clone gate requires a real checkout)…
+    expect(existsSync(path.join(installDir, "pnpm-workspace.yaml"))).toBe(true);
+    // …but the gate threw BEFORE .env.local and BEFORE infra.
+    expect(existsSync(path.join(installDir, ".env.local"))).toBe(false);
+    expect(order).toEqual(["derive-band", "probe"]); // infra never appended.
+  });
+
+  it("(c) a degraded authoritative band (null) warns LOUDLY then proceeds to the static backstop", async () => {
+    const installDir = path.join(sandbox, "out-degraded");
+    const logs = [];
+    let probedBand = null;
+    await runInstall(
+      // Non-default ref ⇒ the extra-prominent escalation should appear.
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      {
+        log: (m) => logs.push(String(m)),
+        deps: {
+          ...dockerPresentDeps(),
+          composePublishedPortsForTarget: () => null, // config-modeling FAILED ⇒ degraded
+          targetComposeOwnedPorts: () => new Set(),
+          detectPortConflicts: async (band) => {
+            probedBand = band; // capture what got probed
+            return []; // no conflict ⇒ install proceeds
+          },
+          bringUpInfra: () => logs.push("INFRA-STARTED"),
+        },
+      },
+    );
+    const blob = logs.join("\n");
+    // The degraded warning surfaced (NOT silent) …
+    expect(blob).toMatch(/DEGRADED PORT CHECK/);
+    // repo-url is the non-default file:// one ⇒ usesDefaultBand false ⇒ escalation
+    // names the repo-url (the thing that actually diverges from the static band).
+    expect(blob).toMatch(/NON-DEFAULT repo-url "file:\/\//);
+    // … the static default band was probed as the best-effort backstop …
+    expect(probedBand).toBe(DEFAULT_DEV_HOST_PORTS);
+    // … and the install still proceeded to infra (warn-loud-and-proceed).
+    expect(blob).toMatch(/INFRA-STARTED/);
+    expect(blob).toMatch(/install complete/);
   });
 });
