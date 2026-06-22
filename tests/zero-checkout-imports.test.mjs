@@ -101,8 +101,8 @@ describe("thin-CLI contract — package.json declares no @cinatra-ai/* dependenc
     expect(offending).toEqual([]);
   });
 
-  it("the package name is the unscoped `cinatra` and bin is `cinatra`", () => {
-    expect(pkg.name).toBe("cinatra");
+  it("the package name is the scoped `@cinatra-ai/cinatra` and bin is `cinatra`", () => {
+    expect(pkg.name).toBe("@cinatra-ai/cinatra");
     expect(Object.keys(pkg.bin ?? {})).toEqual(["cinatra"]);
   });
 });
