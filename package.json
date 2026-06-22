@@ -1,7 +1,7 @@
 {
   "name": "cinatra",
-  "description": "The cinatra command-line tool for setting up, operating, and maintaining a Cinatra instance",
-  "version": "0.1.0",
+  "description": "Install, run, and maintain your own self-hosted Cinatra instance — the open-source AI platform — from the command line.",
+  "version": "0.1.1",
   "type": "module",
   "license": "Apache-2.0",
   "bin": {
