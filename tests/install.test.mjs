@@ -27,15 +27,21 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  DEFAULT_DEV_HOST_PORTS,
   DEFAULT_REPO_URL,
   assertAmbientModeMatches,
   assertSafeRepoUrl,
+  detectPortConflicts,
   ensureEnvLocal,
   normalizeRemote,
+  ownedPortsFromInspect,
+  parseComposePublishedPorts,
   parseInstallArgs,
   runInstall,
   runPreflight,
 } from "../src/install.mjs";
+
+import net from "node:net";
 
 // ---------------------------------------------------------------------------
 // 1. Flag parsing.
@@ -142,6 +148,8 @@ describe("runPreflight", () => {
     });
     expect(res.ok).toBe(true);
     expect(res.failures).toEqual([]);
+    // Docker + Compose present and infra not skipped → install will probe ports.
+    expect(res.infraWillStart).toBe(true);
   });
 
   it("folds an unwritable target dir into the failures", () => {
@@ -172,6 +180,8 @@ describe("runPreflight", () => {
     });
     expect(res.ok).toBe(true); // docker absence is only a warning under --no-infra.
     expect(res.warnings.join("\n")).toMatch(/Docker is not installed/);
+    // --no-infra ⇒ nothing to bring up ⇒ no port probe.
+    expect(res.infraWillStart).toBe(false);
   });
 });
 
@@ -378,5 +388,221 @@ describe("runInstall — from zero (local remote, --no-infra --no-setup)", () =>
         { log: () => {} },
       ),
     ).rejects.toThrow(/its origin is .* but --repo-url is/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. Host-port conflict detection (cinatra-cli#3).
+// ---------------------------------------------------------------------------
+describe("parseComposePublishedPorts", () => {
+  it("extracts published host ports (with host_ip) from `docker compose config --format json`", () => {
+    // Shape produced by `docker compose -f … config --format json`. Profile-
+    // gated services are already ABSENT from a no-`--profile` config, so the
+    // parser naturally yields only the default install band.
+    const cfg = {
+      services: {
+        postgres: { ports: [{ mode: "ingress", host_ip: "127.0.0.1", target: 5432, published: "5434", protocol: "tcp" }] },
+        redis: { ports: [{ mode: "ingress", host_ip: "127.0.0.1", target: 6379, published: "6379", protocol: "tcp" }] },
+        verdaccio: { ports: [{ mode: "ingress", target: 4873, published: "4873", protocol: "tcp" }] },
+        "nango-server": {
+          ports: [
+            { target: 3003, published: "3003", protocol: "tcp" },
+            { target: 3009, published: "3009", protocol: "tcp" },
+          ],
+        },
+        // A non-tcp (e.g. udp) publish is ignored; a service with no ports too.
+        somethingUdp: { ports: [{ target: 53, published: "53", protocol: "udp" }] },
+        noPorts: {},
+      },
+    };
+    const got = parseComposePublishedPorts(cfg);
+    expect(got).toContainEqual({ service: "postgres", host: "127.0.0.1", port: 5434 });
+    expect(got).toContainEqual({ service: "redis", host: "127.0.0.1", port: 6379 });
+    expect(got).toContainEqual({ service: "verdaccio", host: "0.0.0.0", port: 4873 }); // no host_ip → all-interfaces.
+    expect(got).toContainEqual({ service: "nango-server", host: "0.0.0.0", port: 3003 });
+    expect(got).toContainEqual({ service: "nango-server", host: "0.0.0.0", port: 3009 });
+    // udp publish dropped, no-ports service contributes nothing.
+    expect(got.find((p) => p.port === 53)).toBeUndefined();
+    expect(got.filter((p) => p.service === "noPorts")).toEqual([]);
+  });
+
+  it("returns [] for an empty / malformed config (fails safe, never throws)", () => {
+    expect(parseComposePublishedPorts(null)).toEqual([]);
+    expect(parseComposePublishedPorts({})).toEqual([]);
+    expect(parseComposePublishedPorts({ services: "nope" })).toEqual([]);
+  });
+
+  it("expands a port RANGE and never misparses '9000-9002' as 9000", () => {
+    const cfg = {
+      services: {
+        ranged: { ports: [{ target: 9000, published: "9000-9002", protocol: "tcp" }] },
+        numericPublished: { ports: [{ target: 7000, published: 7000, protocol: "tcp" }] },
+        bogus: { ports: [{ target: 1, published: "not-a-port", protocol: "tcp" }] },
+      },
+    };
+    const got = parseComposePublishedPorts(cfg);
+    const ranged = got.filter((p) => p.service === "ranged").map((p) => p.port).sort((a, b) => a - b);
+    expect(ranged).toEqual([9000, 9001, 9002]); // full range, NOT just 9000.
+    expect(got).toContainEqual({ service: "numericPublished", host: "0.0.0.0", port: 7000 });
+    expect(got.find((p) => p.service === "bogus")).toBeUndefined(); // non-numeric dropped.
+  });
+});
+
+describe("ownedPortsFromInspect", () => {
+  const DIR = "/home/me/cinatra-out";
+  const containerInDir = (workingDir, ports) => ({
+    Config: { Labels: { "com.docker.compose.project.working_dir": workingDir } },
+    NetworkSettings: { Ports: ports },
+  });
+
+  it("returns only host ports whose container is rooted at OUR working_dir", () => {
+    const rows = [
+      containerInDir(DIR, { "5432/tcp": [{ HostIp: "127.0.0.1", HostPort: "5434" }] }),
+      containerInDir(DIR, { "4873/tcp": [{ HostIp: "0.0.0.0", HostPort: "4873" }] }),
+      // A DIFFERENT checkout that shares our basename (default compose project
+      // name = dir basename) but a DIFFERENT working_dir → must NOT be exempted.
+      containerInDir("/elsewhere/cinatra-out", { "6379/tcp": [{ HostPort: "6379" }] }),
+    ];
+    const owned = ownedPortsFromInspect(rows, DIR);
+    expect(owned.has(5434)).toBe(true);
+    expect(owned.has(4873)).toBe(true);
+    expect(owned.has(6379)).toBe(false); // stranger's port — never exempted.
+  });
+
+  it("ignores non-TCP published ports (the probe only checks TCP)", () => {
+    const rows = [
+      containerInDir(DIR, {
+        "53/udp": [{ HostPort: "5353" }],
+        "8000/tcp": [{ HostPort: "8000" }],
+      }),
+    ];
+    const owned = ownedPortsFromInspect(rows, DIR);
+    expect(owned.has(8000)).toBe(true);
+    expect(owned.has(5353)).toBe(false);
+  });
+
+  it("fails safe to an empty set on missing label / bad input", () => {
+    expect([...ownedPortsFromInspect(null, DIR)]).toEqual([]);
+    expect([...ownedPortsFromInspect([], DIR)]).toEqual([]);
+    expect([...ownedPortsFromInspect([{ Config: {} }], DIR)]).toEqual([]);
+    // No expectDir → nothing is "ours".
+    expect([...ownedPortsFromInspect([containerInDir(DIR, { "1/tcp": [{ HostPort: "1" }] })], "")]).toEqual([]);
+  });
+});
+
+describe("DEFAULT_DEV_HOST_PORTS", () => {
+  it("is the no-profile default band (loopback DBs + all-interface registry/app ports)", () => {
+    const byPort = Object.fromEntries(DEFAULT_DEV_HOST_PORTS.map((e) => [e.port, e]));
+    // Loopback-only DB/cache ports.
+    expect(byPort[5434]?.host).toBe("127.0.0.1");
+    expect(byPort[6379]?.host).toBe("127.0.0.1");
+    // All-interface registry/services.
+    expect(byPort[4873]?.host).toBe("0.0.0.0");
+    expect(byPort[3003]?.host).toBe("0.0.0.0");
+    // Profile-gated ports must NOT be in the default band (3307 wordpress,
+    // 8082 drupal, 3400 plane, 3300 twenty, 10001 a2a-peers).
+    for (const profilePort of [3307, 8082, 3400, 3300, 10001]) {
+      expect(byPort[profilePort]).toBeUndefined();
+    }
+  });
+});
+
+describe("detectPortConflicts", () => {
+  const band = [
+    { service: "verdaccio", host: "0.0.0.0", port: 4873 },
+    { service: "postgres", host: "127.0.0.1", port: 5434 },
+    { service: "redis", host: "127.0.0.1", port: 6379 },
+  ];
+
+  it("reports NO conflicts when every probe says the port is free", async () => {
+    const conflicts = await detectPortConflicts(band, { probe: () => true });
+    expect(conflicts).toEqual([]);
+  });
+
+  it("reports a conflict per occupied port, with a best-effort holder", async () => {
+    const occupied = new Set([4873, 6379]);
+    const conflicts = await detectPortConflicts(band, {
+      probe: (_host, port) => !occupied.has(port),
+      describeHolder: (port) => (port === 4873 ? "Verdaccio (pid 4242)" : null),
+    });
+    expect(conflicts.map((c) => c.port).sort()).toEqual([4873, 6379]);
+    const v = conflicts.find((c) => c.port === 4873);
+    expect(v.service).toBe("verdaccio");
+    expect(v.holder).toBe("Verdaccio (pid 4242)");
+    // No holder resolvable → null, not undefined.
+    expect(conflicts.find((c) => c.port === 6379).holder).toBe(null);
+  });
+
+  it("awaits an ASYNC probe (Promise-returning)", async () => {
+    const conflicts = await detectPortConflicts(band, {
+      probe: async (_host, port) => port !== 5434, // 5434 occupied.
+    });
+    expect(conflicts.map((c) => c.port)).toEqual([5434]);
+  });
+
+  it("EXEMPTS ports our own running stack already publishes (idempotent re-run)", async () => {
+    // 4873 is occupied AND owned-by-us → not a conflict. 6379 is occupied but NOT
+    // owned (a stranger holds it) → still a real conflict (no blanket project skip).
+    const occupied = new Set([4873, 6379]);
+    const conflicts = await detectPortConflicts(band, {
+      probe: (_host, port) => !occupied.has(port),
+      ownedPorts: new Set([4873]),
+      describeHolder: () => null,
+    });
+    expect(conflicts.map((c) => c.port)).toEqual([6379]);
+  });
+
+  it("an exempted (owned) port is not even probed", async () => {
+    let probed = [];
+    await detectPortConflicts(band, {
+      probe: (_host, port) => {
+        probed.push(port);
+        return true;
+      },
+      ownedPorts: new Set([4873]),
+    });
+    expect(probed).not.toContain(4873);
+    expect(probed).toContain(5434);
+  });
+
+  it("de-dupes identical host:port entries (probed once)", async () => {
+    let probes = 0;
+    const dup = [
+      { service: "a", host: "0.0.0.0", port: 4873 },
+      { service: "b", host: "0.0.0.0", port: 4873 },
+    ];
+    await detectPortConflicts(dup, {
+      probe: () => {
+        probes += 1;
+        return true;
+      },
+    });
+    expect(probes).toBe(1);
+  });
+
+  it("detects a REALLY-bound port via the default (real socket) probe", async () => {
+    // Bind a real loopback port, then assert detectPortConflicts sees it as a
+    // conflict — exercising the actual net.createServer bind probe end-to-end.
+    const server = net.createServer();
+    await new Promise((res, rej) => {
+      server.once("error", rej);
+      server.listen({ host: "127.0.0.1", port: 0 }, res);
+    });
+    const { port } = server.address();
+    try {
+      const conflicts = await detectPortConflicts(
+        [{ service: "probe-target", host: "127.0.0.1", port }],
+        { describeHolder: () => null }, // skip lsof in the unit test.
+      );
+      expect(conflicts.map((c) => c.port)).toEqual([port]);
+    } finally {
+      await new Promise((res) => server.close(res));
+    }
+    // And once freed, the same port reads as available.
+    const after = await detectPortConflicts(
+      [{ service: "probe-target", host: "127.0.0.1", port }],
+      { describeHolder: () => null },
+    );
+    expect(after).toEqual([]);
   });
 });
