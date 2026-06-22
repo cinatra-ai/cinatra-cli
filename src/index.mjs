@@ -319,6 +319,8 @@ Usage:
   cinatra extensions purge <packageName> --confirm <packageName> --digest <d>
                           [--reason <r>] [--app-url <url>] --yes
   cinatra extensions submit <tarball.tgz> [--description "<text>"]
+  cinatra create-extension <kind> [name] [--scope <scope>] [--display-name <name>]
+                           [--description <text>] [--dir <path>] [--force] [--yes]
   cinatra extensions acquire-prod
   cinatra mcp llm-access setup
   cinatra mcp llm-access refresh
@@ -389,6 +391,23 @@ Commands:
                     <tarball.tgz>     Path to the built .tgz.
                     --description     Optional short description recorded on
                                       the submission row.
+
+  create-extension  Scaffold a new Cinatra extension package on disk, ready to
+                    author + publish. One of five kinds: agent, connector,
+                    artifact, skill, workflow. Zero-dependency, offline; the
+                    generated repo pins @cinatra-ai/sdk-extensions as an
+                    OPTIONAL peer (never installed by this command). Replaces the
+                    retired \`npx create-cinatra-extension\` scaffolder.
+                    <kind>            agent | connector | artifact | skill | workflow.
+                    [name]            Extension name; the \`-<kind>\` (or \`-skills\`)
+                                      suffix is appended if absent. Prompted on a TTY.
+                    --scope <scope>   npm scope (default: cinatra-ai; connectors may
+                                      use any scope, skills a vendored scope).
+                    --display-name    Human display name (README H1).
+                    --description     One-line description.
+                    --dir <path>      Parent dir to scaffold into (default: cwd).
+                    --force           Scaffold into a non-empty directory.
+                    --yes, -y         Accept defaults, never prompt.
 
   extensions acquire-prod
                     Download the production required-extension set into
@@ -565,6 +584,33 @@ Commands:
  *
  * @param {import("./command-table.mjs").CommandDescriptor} descriptor
  */
+// Optional richer per-command help bodies, keyed by descriptor id. A command
+// whose own docs promise `--help` enumerates its kinds/flags (e.g.
+// `create-extension`) supplies a detailed block here so that promise is true;
+// every other command keeps the minimal synopsis. The block is printed AFTER the
+// `Usage:` synopsis and BEFORE the "see cinatra --help" pointer.
+const COMMAND_HELP_DETAILS = {
+  "create-extension": `Kinds:
+  agent       An OpenAgentSpec Flow + co-located skills (first-party scope).
+  connector   A capability/MCP provider with a register(ctx) server entry (any scope).
+  artifact    A semantic-artifact descriptor (first-party scope).
+  skill       A pure-content SKILL.md package (first-party or vendored scope).
+  workflow    A Cinatra BPMN Profile sidecar + optional dashboard (first-party scope).
+
+Options:
+  --scope <scope>          npm scope (default: cinatra-ai)
+  --display-name <name>    human display name (README H1)
+  --description <text>     one-line description
+  --dir <path>             parent directory to scaffold into (default: cwd)
+  --force                  scaffold into a non-empty directory
+  --yes, -y                accept defaults, never prompt
+
+Examples:
+  cinatra create-extension agent invoice-extractor
+  cinatra create-extension connector stripe --scope acme
+  cinatra create-extension skill pdf-tools --scope anthropics`,
+};
+
 function printCommandHelp(descriptor) {
   if (descriptor.hidden || !descriptor.summary) {
     // No standalone help row for hidden/summary-less descriptors — show the
@@ -574,6 +620,8 @@ function printCommandHelp(descriptor) {
   }
   const command = descriptor.path.join(" ");
   console.log(`Usage: cinatra ${command}\n\n  ${descriptor.summary}\n`);
+  const detail = COMMAND_HELP_DETAILS[descriptor.id];
+  if (detail) console.log(`${detail}\n`);
   console.log(`Run "cinatra --help" for the full command list and flags.`);
 }
 
@@ -9046,6 +9094,18 @@ function buildHandlers() {
     "extensions.submit": async (rest) => {
       const { runExtensionsSubmit } = await import("./extensions-submit.mjs");
       await runExtensionsSubmit(rest);
+    },
+    // Class-B authoring: scaffold a new extension package on disk. Folded from
+    // the retired `npx create-cinatra-extension` thin alias (cinatra#402) over a
+    // shared, zero-dependency authoring core lazy-loaded from ./authoring/.
+    // `create-extension` is a command-only descriptor, so the dispatcher's
+    // `mode` slot (argv[1]) holds the FIRST positional/option token (e.g. the
+    // `<kind>`) and is NOT in `rest`. Re-prepend it so the kind/name/flags are
+    // all visible to the scaffolder's parser (same shape as install/login).
+    "create-extension": async (rest, mode) => {
+      const args = mode !== undefined ? [mode, ...rest] : rest;
+      const { runCreateExtension } = await import("./authoring/cli.mjs");
+      await runCreateExtension(args);
     },
     "mcp.tunnel": () => {
       throw new Error(

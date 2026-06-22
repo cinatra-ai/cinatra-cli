@@ -1,0 +1,25 @@
+# Dependencies (CI installs fresh; no committed lockfile — see ci.yml)
+node_modules/
+pnpm-lock.yaml
+
+# Build output (tsconfig outDir)
+dist/
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+
+# Logs
+*.log
+
+# Env files & secrets
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Provenance sidecar written by the publish pipeline — never committed
+.cinatra-published.json

@@ -1,0 +1,105 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`create-extension scaffolds a valid agent > matches the golden generated file list 1`] = `
+[
+  ".gitattributes",
+  ".github/workflows/actions-pinned-gate.yml",
+  ".github/workflows/ci.yml",
+  ".github/workflows/gitignore-gate.yml",
+  ".github/workflows/release.yml",
+  ".github/workflows/source-leak-gate.yml",
+  ".gitignore",
+  ".npmrc",
+  "LICENSE",
+  "README.md",
+  "cinatra/oas.json",
+  "extension-kind-gate.mjs",
+  "package.json",
+  "renovate.json",
+  "skills/sample-thing-agent/SKILL.md",
+  "tsconfig.json",
+]
+`;
+
+exports[`create-extension scaffolds a valid artifact > matches the golden generated file list 1`] = `
+[
+  ".gitattributes",
+  ".github/workflows/actions-pinned-gate.yml",
+  ".github/workflows/ci.yml",
+  ".github/workflows/gitignore-gate.yml",
+  ".github/workflows/release.yml",
+  ".github/workflows/source-leak-gate.yml",
+  ".gitignore",
+  ".npmrc",
+  "LICENSE",
+  "README.md",
+  "package.json",
+  "renovate.json",
+  "skills/sample-thing-matcher/SKILL.md",
+  "src/index.ts",
+  "tsconfig.json",
+]
+`;
+
+exports[`create-extension scaffolds a valid connector > matches the golden generated file list 1`] = `
+[
+  ".gitattributes",
+  ".github/workflows/actions-pinned-gate.yml",
+  ".github/workflows/ci.yml",
+  ".github/workflows/gitignore-gate.yml",
+  ".github/workflows/release.yml",
+  ".github/workflows/source-leak-gate.yml",
+  ".gitignore",
+  ".npmrc",
+  "LICENSE",
+  "README.md",
+  "cinatra/migrations/ext_cinatra-ai_sample-thing-connector__0001_create-example.mjs",
+  "package.json",
+  "renovate.json",
+  "src/index.ts",
+  "src/provider.ts",
+  "src/register.ts",
+  "tsconfig.json",
+]
+`;
+
+exports[`create-extension scaffolds a valid skill > matches the golden generated file list 1`] = `
+[
+  ".gitattributes",
+  ".github/workflows/actions-pinned-gate.yml",
+  ".github/workflows/ci.yml",
+  ".github/workflows/gitignore-gate.yml",
+  ".github/workflows/release.yml",
+  ".github/workflows/source-leak-gate.yml",
+  ".gitignore",
+  ".npmrc",
+  "LICENSE",
+  "README.md",
+  "package.json",
+  "renovate.json",
+  "skills/sample-tools/SKILL.md",
+  "tsconfig.json",
+]
+`;
+
+exports[`create-extension scaffolds a valid workflow > matches the golden generated file list 1`] = `
+[
+  ".gitattributes",
+  ".github/workflows/actions-pinned-gate.yml",
+  ".github/workflows/ci.yml",
+  ".github/workflows/gitignore-gate.yml",
+  ".github/workflows/release.yml",
+  ".github/workflows/source-leak-gate.yml",
+  ".gitignore",
+  ".npmrc",
+  "LICENSE",
+  "README.md",
+  "cinatra/dashboard.json",
+  "cinatra/workflow.bpmn",
+  "extension-kind-gate.mjs",
+  "package.json",
+  "renovate.json",
+  "src/index.ts",
+  "tsconfig.json",
+]
+`;

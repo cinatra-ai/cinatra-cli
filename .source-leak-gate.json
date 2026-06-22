@@ -1,0 +1,6 @@
+{
+  "_comment": "Per-repo source-leak-gate config (cinatra-ai/ci reusable, profile default). The scaffold templates under templates/ are STILL fully scanned; this exempts ONLY the one unavoidable schema-version literal a scaffold dashboard.json carries (\"apiVersion\": \"vN.N\"). lineExcludes apply to every active rule, so the regex is FULL-LINE-ANCHORED to that exact JSON shape — it cannot mask a token anywhere else on a line. cinatra#402 fold.",
+  "lineExcludes": [
+    "^\\s*\"apiVersion\"\\s*:\\s*\"v\\d+\\.\\d+\"\\s*,?\\s*$"
+  ]
+}

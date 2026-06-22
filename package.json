@@ -17,6 +17,8 @@
   "files": [
     "bin",
     "src/*.mjs",
+    "src/authoring/*.mjs",
+    "templates",
     "README.md",
     "LICENSE"
   ],
