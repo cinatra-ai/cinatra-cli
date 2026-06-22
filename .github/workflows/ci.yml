@@ -49,13 +49,17 @@ jobs:
 
       - name: Assert zero @cinatra-ai/* in the resolved dependency tree
         # Belt-and-braces: prove nothing pulled a first-party package transitively.
+        # Match only INSTALLED packages (paths under node_modules/@cinatra-ai/),
+        # never the root package's own self-line — the CLI is itself published as
+        # @cinatra-ai/cinatra, so its own name legitimately appears as the tree root.
         run: |
-          if npm ls --all 2>/dev/null | grep -q "@cinatra-ai/"; then
+          installed="$(npm ls --all --parseable 2>/dev/null | grep "/node_modules/@cinatra-ai/" || true)"
+          if [ -n "$installed" ]; then
             echo "::error::@cinatra-ai/* present in the resolved dependency tree."
-            npm ls --all 2>/dev/null | grep "@cinatra-ai/" || true
+            echo "$installed"
             exit 1
           fi
-          echo "OK: no @cinatra-ai/* in the resolved dependency tree."
+          echo "OK: no @cinatra-ai/* dependency in the resolved tree."
 
       - name: Test (vitest run — includes the zero-checkout-imports contract)
         run: npm test
