@@ -365,8 +365,22 @@ function composeAvailable() {
  *  is currently accepting on it, and we never touch a stranger's service. An
  *  inconclusive probe (timeout / unexpected error) resolves FREE so a flaky
  *  probe never blocks an otherwise-valid install. */
+/** Canonicalize a publish interface into the key both the probe and the
+ *  owned-port exemption compare on, so the exemption granularity matches the
+ *  interface-aware probe exactly: an all-interfaces / unspecified publish
+ *  (`0.0.0.0`, `::`, empty) folds to `0.0.0.0`; any explicit interface
+ *  (`127.0.0.1`, a LAN ip, …) is kept verbatim. Used to build `host:port` keys. */
+function normalizeHostKey(host) {
+  return host === "0.0.0.0" || host === "::" || !host ? "0.0.0.0" : String(host);
+}
+
+/** The `host:port` key a band entry / owned binding is compared on. */
+function hostPortKey(host, port) {
+  return `${normalizeHostKey(host)}:${port}`;
+}
+
 function probeHostPortFree(host, port, { timeoutMs = 1500 } = {}) {
-  const bindHost = host === "0.0.0.0" || host === "::" || !host ? "0.0.0.0" : host;
+  const bindHost = normalizeHostKey(host);
   return new Promise((resolve) => {
     let settled = false;
     const finish = (free) => {
@@ -459,11 +473,16 @@ function composePublishedPortsForTarget(targetDir, deps = {}) {
   }
 }
 
-/** Extract the host PublishedPorts a docker-inspect record exposes, but ONLY
- *  when the container's compose `working_dir` label matches `expectDir` — i.e.
- *  the container genuinely belongs to THIS checkout, not merely a project that
+/** Extract the host bindings a docker-inspect record exposes, but ONLY when the
+ *  container's compose `working_dir` label matches `expectDir` — i.e. the
+ *  container genuinely belongs to THIS checkout, not merely a project that
  *  happens to share our directory basename (compose's default project name is
  *  the dir basename, so two checkouts named the same would otherwise collide).
+ *  Returns a `Set<string>` of `host:port` KEYS (interface-aware, not bare port
+ *  numbers): the binding's `HostIp` is preserved and canonicalized the same way
+ *  the probe canonicalizes its publish interface, so the owned-port exemption
+ *  granularity matches the interface-aware probe exactly — exempting the
+ *  target's own `127.0.0.1:5434` can NEVER mask a stranger's `0.0.0.0:5434`.
  *  Pure (no I/O) — the unit of test. `inspectRows` is the parsed `docker inspect`
  *  array (one entry per container). */
 export function ownedPortsFromInspect(inspectRows, expectDir) {
@@ -481,7 +500,14 @@ export function ownedPortsFromInspect(inspectRows, expectDir) {
       if (!/\/tcp$/i.test(spec)) continue;
       for (const b of Array.isArray(bindings) ? bindings : []) {
         const hp = Number.parseInt(String(b?.HostPort ?? ""), 10);
-        if (Number.isFinite(hp) && hp > 0) owned.add(hp);
+        if (!Number.isFinite(hp) || hp <= 0) continue;
+        // A `0.0.0.0` (or absent) HostIp publishes on all interfaces, so it owns
+        // BOTH the all-interfaces key AND any loopback probe the band may declare
+        // for the same port (binding 0.0.0.0:p also holds 127.0.0.1:p). Record
+        // the all-interfaces key in that case; an explicit interface records only
+        // its own key.
+        const hostIp = b?.HostIp;
+        owned.add(hostPortKey(hostIp, hp));
       }
     }
   }
@@ -517,23 +543,36 @@ function targetComposeOwnedPorts(targetDir, deps = {}) {
 /** Detect host-port conflicts for the dev band. `band` is `[{service,host,port}]`
  *  (the parsed authoritative band, or the static default). Probes each port and
  *  resolves `[{ service, host, port, holder }]` for those already occupied.
- *  `deps.ownedPorts` (a Set<number>) is EXEMPTED — those are ports proven to be
- *  held by THIS target's own running compose services (idempotent re-run), so a
- *  busy probe on one of them is us, not a clash. Other injectables:
- *  `deps.probe(host, port)` (sync bool or Promise) and `deps.describeHolder(port)`. */
+ *  `deps.ownedPorts` is EXEMPTED — a `Set` of either `host:port` KEYS (the
+ *  interface-aware form from `ownedPortsFromInspect`) or bare port NUMBERS
+ *  (legacy/back-compat) proven to be held by THIS target's own running compose
+ *  services (idempotent re-run), so a busy probe on one of them is us, not a
+ *  clash. A `host:port` key matches the band entry's exact interface; an owned
+ *  ALL-INTERFACES binding (`0.0.0.0:p`) additionally covers a same-port entry on
+ *  any narrower interface (binding `0.0.0.0:p` also holds `127.0.0.1:p`). A bare
+ *  numeric entry exempts that port on every interface (legacy semantics). Other
+ *  injectables: `deps.probe(host, port)` (sync bool or Promise) and
+ *  `deps.describeHolder(port)`. */
 export async function detectPortConflicts(band, deps = {}) {
   const probe = deps.probe ?? ((host, port) => probeHostPortFree(host, port));
   const describe = deps.describeHolder ?? ((port) => describePortHolder(port, deps));
   const owned = deps.ownedPorts instanceof Set ? deps.ownedPorts : new Set();
+  const isOwned = (host, port) =>
+    // Exact interface key (host:port) …
+    owned.has(hostPortKey(host, port)) ||
+    // … an owned all-interfaces binding covers any interface for the same port …
+    owned.has(hostPortKey("0.0.0.0", port)) ||
+    // … or a bare numeric entry (back-compat: exempt the port on every interface).
+    owned.has(port);
   // De-dupe identical host:port entries (a port can be declared once).
   const seen = new Set();
   const conflicts = [];
   for (const entry of band) {
-    const key = `${entry.host}:${entry.port}`;
+    const key = hostPortKey(entry.host, entry.port);
     if (seen.has(key)) continue;
     seen.add(key);
     // Exempt a port our OWN running stack already publishes — not a stranger.
-    if (owned.has(entry.port)) continue;
+    if (isOwned(entry.host, entry.port)) continue;
     const free = await probe(entry.host, entry.port);
     if (!free) {
       conflicts.push({ ...entry, holder: describe(entry.port) ?? null });
@@ -558,6 +597,43 @@ function formatPortConflictError(conflicts, { phase } = {}) {
     `infra and gives each clone its own app ports instead of a second full stack.\n` +
     `  • Or free the listed ports and retry.`
   );
+}
+
+/** Emit a PROMINENT warning when the AUTHORITATIVE port band could not be
+ *  derived from the checkout's own `docker compose config` (cinatra-cli#3,
+ *  finding #1). The post-clone gate then degrades to probing the STATIC default
+ *  band as a best-effort backstop — which is fine for the DEFAULT repo+ref (the
+ *  static band describes it and the pre-clone guard already probed it) but may be
+ *  INAPPLICABLE for a custom `--repo-url`/`--ref` whose fork can publish a
+ *  different band. We surface that loudly instead of silently fail-OPEN (the
+ *  classic "secure check can't run → permit anyway" anti-pattern); `docker
+ *  compose up` remains the final bind-conflict authority. Returns the lines it
+ *  logged (for tests). Pure but for the injected `log`. */
+export function emitDegradedBandWarning({ usesDefaultBand, ref, repoUrl, log = console.log } = {}) {
+  const lines = [
+    "⚠ ────────────────────────────────────────────────────────────────",
+    "⚠ DEGRADED PORT CHECK — could not derive the authoritative port band",
+    "⚠ from this checkout's `docker compose config` (compose could not model",
+    "⚠ it, or the JSON was unparseable). The authoritative host-port conflict",
+    "⚠ check did NOT run; falling back to probing the STATIC default band.",
+  ];
+  if (!usesDefaultBand) {
+    // The dangerous case: the static band describes the MAINLINE checkout only,
+    // and for a custom repo-url/ref it may not match the real published ports —
+    // so a genuine conflict could slip past this degraded probe.
+    const which = repoUrl && repoUrl !== DEFAULT_REPO_URL ? `repo-url "${repoUrl}"` : `ref "${ref}"`;
+    lines.push(
+      `⚠ NON-DEFAULT ${which}: the static fallback band may NOT match this`,
+      "⚠ checkout's real ports, so a port conflict could slip past THIS check.",
+    );
+  }
+  lines.push(
+    "⚠ `docker compose up` is still the final bind-conflict check — a real",
+    "⚠ collision will surface there (with the conflicting port named).",
+    "⚠ ────────────────────────────────────────────────────────────────",
+  );
+  for (const l of lines) log(l);
+  return lines;
 }
 
 // ---------------------------------------------------------------------------
@@ -862,8 +938,21 @@ async function confirm(question, { yes }) {
 // The command.
 // ---------------------------------------------------------------------------
 
-export async function runInstall(argv = [], { log = console.log } = {}) {
+export async function runInstall(argv = [], { log = console.log, deps = {} } = {}) {
   const opts = parseInstallArgs(argv);
+
+  // Injectable seams (default to the real implementations — production behavior
+  // is byte-identical when `deps` is empty). These let the integration tests
+  // exercise the REAL runInstall sequencing (pre-clone gate → clone → post-clone
+  // gate → infra) without a live Docker daemon, instead of the old `--no-infra`
+  // path that skips BOTH gates (cinatra-cli#3, finding #3).
+  const probePorts = deps.detectPortConflicts ?? detectPortConflicts;
+  const dockerPresent = deps.commandExists ?? ((c, a) => commandExists(c, a));
+  const composeOk = deps.composeAvailable ?? composeAvailable;
+  const deriveBand = deps.composePublishedPortsForTarget ?? composePublishedPortsForTarget;
+  const deriveOwnedPorts = deps.targetComposeOwnedPorts ?? targetComposeOwnedPorts;
+  const startInfra = deps.bringUpInfra ?? bringUpInfra;
+  const preflight = deps.runPreflight ?? runPreflight;
 
   // 1. Resolve the target dir (prompt on a TTY when not given).
   let targetDir = opts.dir;
@@ -879,7 +968,7 @@ export async function runInstall(argv = [], { log = console.log } = {}) {
 
   // 2. PREFLIGHT FIRST — before any download. Fail fast with the full list.
   log("Checking requirements…");
-  const pre = runPreflight({ mode: opts.mode, targetDir, noInfra: opts.noInfra });
+  const pre = preflight({ mode: opts.mode, targetDir, noInfra: opts.noInfra });
   for (const w of pre.warnings) log(`  ⚠ ${w}`);
   if (!pre.ok) {
     const lines = pre.failures.map((f) => `  ✗ ${f}`).join("\n");
@@ -911,7 +1000,7 @@ export async function runInstall(argv = [], { log = console.log } = {}) {
   const usesDefaultBand =
     opts.repoUrl === DEFAULT_REPO_URL && opts.ref === "main";
   if (pre.infraWillStart && !alreadyCheckout && usesDefaultBand) {
-    const conflicts = await detectPortConflicts(DEFAULT_DEV_HOST_PORTS);
+    const conflicts = await probePorts(DEFAULT_DEV_HOST_PORTS);
     if (conflicts.length > 0) {
       throw new Error(formatPortConflictError(conflicts, { phase: "preflight, before clone" }));
     }
@@ -952,14 +1041,26 @@ export async function runInstall(argv = [], { log = console.log } = {}) {
   //     misleading "is the Docker daemon running?" at `docker compose up`.
   //     Skipped under --no-infra (nothing to bring up) and when the target's OWN
   //     compose project already owns the ports (idempotent re-run, not a clash).
-  if (!opts.noInfra && commandExists("docker", ["--version"]) && composeAvailable()) {
-    const band = composePublishedPortsForTarget(targetDir) ?? DEFAULT_DEV_HOST_PORTS;
+  if (!opts.noInfra && dockerPresent("docker", ["--version"]) && composeOk()) {
+    // Try to derive the AUTHORITATIVE band from the checkout's own compose config.
+    // `null` ⇒ `docker compose config` could not be captured/parsed (the check
+    // CANNOT run authoritatively). Do NOT silently fall back to the static band:
+    // emit a PROMINENT degraded-mode warning so the operator knows the
+    // authoritative port check did not run — fail LOUD, not silent
+    // (cinatra-cli#3, finding #1). The static band is then probed only as a
+    // best-effort backstop; `docker compose up` remains the final bind-conflict
+    // authority (it now surfaces the real "port is already allocated" stderr).
+    const authoritativeBand = deriveBand(targetDir);
+    if (authoritativeBand === null) {
+      emitDegradedBandWarning({ usesDefaultBand, ref: opts.ref, repoUrl: opts.repoUrl, log });
+    }
+    const band = authoritativeBand ?? DEFAULT_DEV_HOST_PORTS;
     if (band.length > 0) {
       // Exempt only the ports THIS target's own running compose services already
       // publish (idempotent re-run) — a stranger holding a not-yet-up service's
       // port is still a real conflict (codex must-fix: no blanket project-up skip).
-      const ownedPorts = targetComposeOwnedPorts(targetDir);
-      const conflicts = await detectPortConflicts(band, { ownedPorts });
+      const ownedPorts = deriveOwnedPorts(targetDir);
+      const conflicts = await probePorts(band, { ownedPorts });
       if (conflicts.length > 0) {
         throw new Error(formatPortConflictError(conflicts, { phase: "before bringing up infra" }));
       }
@@ -974,7 +1075,7 @@ export async function runInstall(argv = [], { log = console.log } = {}) {
   if (opts.noInfra) {
     log("- Skipping infrastructure startup (--no-infra). Ensure Postgres/Redis/Nango are reachable before setup.");
   } else {
-    bringUpInfra({ targetDir, log });
+    startInfra({ targetDir, log });
   }
 
   // 7. Clone ONLY the declared companion repos, THEN install, THEN setup.
