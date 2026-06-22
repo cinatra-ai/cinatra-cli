@@ -1,7 +1,8 @@
 {
   "name": "@cinatra-ai/cinatra",
   "description": "Command-line tool to install, run, and maintain a Cinatra instance — the open source AI workspace for teams.",
-  "version": "0.1.0",
+  "version": "0.1.1",
+  "author": "Cinatra <sandro@cinatra.ai>",
   "type": "module",
   "license": "Apache-2.0",
   "publishConfig": {
