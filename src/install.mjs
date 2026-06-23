@@ -404,21 +404,127 @@ function probeHostPortFree(host, port, { timeoutMs = 1500 } = {}) {
   });
 }
 
-/** Best-effort: name the process holding `port` (lsof), e.g. "verdaccio (pid
- *  4242)". Returns null when lsof is unavailable or finds nothing. */
-function describePortHolder(port, deps = {}) {
-  const cap = deps.capture ?? capture;
-  const out = cap("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fcn"]);
-  if (!out) return null;
-  // lsof -F output: lines prefixed by field char (c=command, n=name, p=pid).
-  let command = null;
-  let pid = null;
-  for (const line of out.split("\n")) {
-    if (line.startsWith("c")) command = line.slice(1);
-    else if (line.startsWith("p")) pid = line.slice(1);
+/** Find which RUNNING docker-compose project (if any) publishes the host
+ *  `host:port`, proven by that container's own compose labels — NOT inferred
+ *  from the Docker proxy process. `inspectRows` is the parsed `docker inspect`
+ *  array for the running containers; we match a container whose
+ *  `NetworkSettings.Ports` binds the host TCP `port` on a COMPATIBLE interface,
+ *  then read its compose identity from the labels. Returns `{ project,
+ *  workingDir }` (either may be null) or null when no compose container
+ *  publishes that binding. `host` is optional: when given, the binding must
+ *  match it on the same interface-aware key used by the probe (an
+ *  all-interfaces `0.0.0.0` binding also covers a narrower-interface lookup, so
+ *  `127.0.0.1:p` is attributed to a project binding `0.0.0.0:p`). When `host`
+ *  is omitted, any interface publishing `port` matches (the lsof-style lookup).
+ *  Pure (no I/O) — the unit of test.
+ *
+ *  This is the honest answer to issue #9: on Docker Desktop every published port
+ *  bottoms out at the shared `com.docker.backend` proxy in `lsof`, so lsof alone
+ *  cannot say WHICH stack owns it. The compose labels can. */
+export function identifyComposeHolder(port, inspectRows, host) {
+  if (!Array.isArray(inspectRows)) return null;
+  const want = String(port);
+  // The interface-aware key the band entry is probed on (when host is given).
+  const wantKey = host !== undefined && host !== null ? hostPortKey(host, port) : null;
+  for (const row of inspectRows) {
+    const portMap = row?.NetworkSettings?.Ports ?? {};
+    let publishesPort = false;
+    for (const [spec, bindings] of Object.entries(portMap)) {
+      if (!/\/tcp$/i.test(spec)) continue;
+      for (const b of Array.isArray(bindings) ? bindings : []) {
+        if (String(b?.HostPort ?? "") !== want) continue;
+        // Interface match: with no host filter, the port alone matches. With a
+        // host filter, the binding matches iff its (canonicalized) interface IS
+        // the requested one, OR it binds all-interfaces (which also holds any
+        // narrower interface for the same port) — exactly the probe's semantics.
+        if (
+          wantKey === null ||
+          hostPortKey(b?.HostIp, port) === wantKey ||
+          hostPortKey("0.0.0.0", port) === hostPortKey(b?.HostIp, port)
+        ) {
+          publishesPort = true;
+          break;
+        }
+      }
+      if (publishesPort) break;
+    }
+    if (!publishesPort) continue;
+    const labels = row?.Config?.Labels ?? {};
+    const project = labels["com.docker.compose.project"] || null;
+    const workingDir = labels["com.docker.compose.project.working_dir"] || null;
+    // Only claim a compose holder when we have a label proving it — otherwise
+    // this is a plain `docker run` container we can't attribute to a project.
+    if (!project && !workingDir) continue;
+    return { project, workingDir };
   }
-  if (!command) return null;
-  return pid ? `${command} (pid ${pid})` : command;
+  return null;
+}
+
+/** Run `docker inspect` over every RUNNING container and return the parsed
+ *  array, or null when docker isn't usable / the JSON is unparseable. Injectable
+ *  via `deps.capture` for tests. */
+function runningContainersInspect(deps = {}) {
+  const cap = deps.capture ?? capture;
+  const ids = cap("docker", ["ps", "-q"]);
+  const idList = (ids ?? "").split("\n").map((s) => s.trim()).filter(Boolean);
+  if (idList.length === 0) return null;
+  const raw = cap("docker", ["inspect", ...idList]);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/** Best-effort, HONEST description of what holds `port`. Returns a structured
+ *  holder `{ label, compose }`:
+ *   - `compose` is `{ project, workingDir, isCinatra }` when a running compose
+ *     project provably publishes the port (`isCinatra` proven by the working_dir
+ *     being a real cinatra checkout — NOT assumed), else null.
+ *   - `label` is a short human string for the conflict line: the compose project
+ *     name when known, otherwise the lsof process (e.g. "verdaccio (pid 4242)"),
+ *     otherwise null (the caller then says "could not determine which").
+ *  Critically, this NEVER claims "Cinatra" without filesystem proof, fixing the
+ *  issue-#9 misattribution where every port resolved to `com.docker.backend`. */
+function describePortHolder(port, host, deps = {}) {
+  const cap = deps.capture ?? capture;
+  // 1. Try to attribute the port to a specific running compose project (honest).
+  const inspectRows = deps.inspectRunning ? deps.inspectRunning() : runningContainersInspect(deps);
+  const composeRaw = identifyComposeHolder(port, inspectRows, host);
+  let compose = null;
+  if (composeRaw) {
+    const workingDir = composeRaw.workingDir;
+    const isCinatra = typeof workingDir === "string" && workingDir.length > 0 && isCinatraCheckout(workingDir);
+    compose = { project: composeRaw.project ?? null, workingDir: workingDir ?? null, isCinatra };
+  }
+
+  // 2. Fall back to the listening process name (lsof). On Docker Desktop this is
+  //    the shared proxy, so it is ONLY used as a label, never to assert a stack.
+  let lsofLabel = null;
+  const out = cap("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fcn"]);
+  if (out) {
+    // lsof -F output: lines prefixed by field char (c=command, n=name, p=pid).
+    let command = null;
+    let pid = null;
+    for (const line of out.split("\n")) {
+      if (line.startsWith("c")) command = line.slice(1);
+      else if (line.startsWith("p")) pid = line.slice(1);
+    }
+    if (command) lsofLabel = pid ? `${command} (pid ${pid})` : command;
+  }
+
+  let label = null;
+  if (compose) {
+    label = compose.project
+      ? `docker compose project "${compose.project}"`
+      : "a docker compose project";
+    if (compose.workingDir) label += ` (${compose.workingDir})`;
+  } else {
+    label = lsofLabel;
+  }
+  if (!label && !compose) return null;
+  return { label, compose };
 }
 
 /** Parse the published host ports out of a `docker compose config --format json`
@@ -552,10 +658,11 @@ function targetComposeOwnedPorts(targetDir, deps = {}) {
  *  any narrower interface (binding `0.0.0.0:p` also holds `127.0.0.1:p`). A bare
  *  numeric entry exempts that port on every interface (legacy semantics). Other
  *  injectables: `deps.probe(host, port)` (sync bool or Promise) and
- *  `deps.describeHolder(port)`. */
+ *  `deps.describeHolder(port, host)` (a legacy injection that takes only `port`
+ *  still works — the extra `host` arg is ignored by it). */
 export async function detectPortConflicts(band, deps = {}) {
   const probe = deps.probe ?? ((host, port) => probeHostPortFree(host, port));
-  const describe = deps.describeHolder ?? ((port) => describePortHolder(port, deps));
+  const describe = deps.describeHolder ?? ((port, host) => describePortHolder(port, host, deps));
   const owned = deps.ownedPorts instanceof Set ? deps.ownedPorts : new Set();
   const isOwned = (host, port) =>
     // Exact interface key (host:port) …
@@ -575,27 +682,91 @@ export async function detectPortConflicts(band, deps = {}) {
     if (isOwned(entry.host, entry.port)) continue;
     const free = await probe(entry.host, entry.port);
     if (!free) {
-      conflicts.push({ ...entry, holder: describe(entry.port) ?? null });
+      // `describe` may return a plain string (legacy/test injection) or the
+      // structured `{ label, compose }` from describePortHolder. Normalize to
+      // `holder` (the short human label, back-compat). Only attach a `compose`
+      // descriptor when one was provably derived — the historical conflict shape
+      // ({ service, host, port, holder }) is preserved byte-for-byte otherwise,
+      // so existing exact-equality consumers/tests are unaffected.
+      const d = describe(entry.port, entry.host) ?? null;
+      const holder = typeof d === "string" ? d : (d?.label ?? null);
+      const compose = d && typeof d === "object" ? (d.compose ?? null) : null;
+      const conflict = { ...entry, holder };
+      if (compose) conflict.compose = compose;
+      conflicts.push(conflict);
     }
   }
   return conflicts;
 }
 
-/** Render a port-conflict list into the actionable abort message. */
-function formatPortConflictError(conflicts, { phase } = {}) {
+/** Render a port-conflict list into an HONEST, actionable abort message
+ *  (issue #9). Each conflict line names its holder only as precisely as we can
+ *  prove it; the guidance never asserts "a Cinatra stack" unless a running
+ *  compose project's working_dir is provably a cinatra checkout. When it IS a
+ *  detectable Cinatra stack we name its directory and offer a guided replace
+ *  step; otherwise we say "another process (could not determine which)" and give
+ *  plain-language options, each with a one-sentence consequence. */
+export function formatPortConflictError(conflicts, { phase } = {}) {
   const lines = conflicts.map((c) => {
     const where = c.host === "0.0.0.0" ? `port ${c.port}` : `${c.host}:${c.port}`;
-    const by = c.holder ? ` (held by ${c.holder})` : "";
+    const by = c.holder
+      ? ` (held by ${c.holder})`
+      : " (held by another process — could not determine which)";
     return `  ✗ ${where} — already in use${by}${c.service ? ` [needed for ${c.service}]` : ""}`;
   });
-  return (
+
+  // Offer the single-stack "replace" wording ONLY when EVERY conflicting port is
+  // provably held by the SAME Cinatra stack — otherwise stopping that one stack
+  // would not free the other ports, and naming it as "the" holder would be
+  // dishonest. Identify a stack by its working_dir (preferred) or project name.
+  const stackKey = (m) => (m.workingDir ? `dir:${m.workingDir}` : `proj:${m.project ?? ""}`);
+  const allSameCinatraStack =
+    conflicts.length > 0 &&
+    conflicts.every((c) => c.compose && c.compose.isCinatra) &&
+    new Set(conflicts.map((c) => stackKey(c.compose))).size === 1;
+  const named = allSameCinatraStack
+    ? // Prefer the descriptor that knows the directory (they're all the one stack).
+      (conflicts.map((c) => c.compose).find((m) => m.workingDir) ?? conflicts[0].compose)
+    : null;
+
+  const header =
     `Host port conflict${conflicts.length > 1 ? "s" : ""} detected${phase ? ` (${phase})` : ""} — ` +
-    `\`cinatra install\` cannot bring up its dev stack on the default ports:\n${lines.join("\n")}\n` +
-    `\nAnother Cinatra stack (or another process) is already holding these ports. Options:\n` +
-    `  • Stop the other stack (e.g. \`docker compose down\` in its directory), then retry.\n` +
-    `  • To run a SECOND instance alongside the first, use \`cinatra setup clone\`, which shares ` +
-    `infra and gives each clone its own app ports instead of a second full stack.\n` +
-    `  • Or free the listed ports and retry.`
+    `\`cinatra install\` cannot bring up its dev stack on the default ports:\n${lines.join("\n")}\n`;
+
+  if (named) {
+    const dir = named.workingDir;
+    const label = named.project ? `the Cinatra stack "${named.project}"` : "an existing Cinatra stack";
+    const where = dir ? `${label} at ${dir}` : label;
+    const inDir = dir ? ` (run it from ${dir})` : "";
+    return (
+      header +
+      `\nThese ports are held by ${where}. Choose one:\n` +
+      `  • Stop it, keep its data: run \`docker compose down\`${inDir}, then re-run install — ` +
+      `this frees the ports and stops the old stack but PRESERVES its database volumes (your data).\n` +
+      `  • Wipe and replace it: run \`docker compose down -v\`${inDir} (the \`-v\` DELETES that ` +
+      `stack's database volumes — back them up first if you need the data), then re-run install for a clean slate.\n` +
+      `  • Run alongside it: \`cinatra setup clone\` starts a second instance that SHARES the existing ` +
+      `Postgres/Redis/Neo4j containers and only adds its own app ports — nothing is deleted, but both ` +
+      `instances then read/write the same database.\n` +
+      `  • Cancel: stop here and change nothing.`
+    );
+  }
+
+  // Generic guidance: the conflicting ports are NOT all held by a single Cinatra
+  // stack (some are unattributed, or held by different/non-Cinatra holders). Each
+  // line above names its holder as precisely as we could prove it; on Docker
+  // Desktop an unattributed port shows up only as the shared `com.docker.backend`
+  // proxy, which is why we don't guess. Stopping one stack may not free them all.
+  return (
+    header +
+    `\nThese ports are not all held by a single Cinatra stack, so there is no one stack to replace ` +
+    `(each line above names its holder as precisely as could be determined). Choose one:\n` +
+    `  • Free the ports: stop whatever is listening on each one (\`docker ps\` to find docker ` +
+    `containers, or \`lsof -i :<port>\`), then re-run install — this changes nothing else.\n` +
+    `  • Run a second instance: if a Cinatra stack you already trust owns these ports, ` +
+    `\`cinatra setup clone\` starts another instance that SHARES its Postgres/Redis/Neo4j containers ` +
+    `and only adds its own app ports — nothing is deleted, but both instances then share one database.\n` +
+    `  • Cancel: stop here and change nothing.`
   );
 }
 

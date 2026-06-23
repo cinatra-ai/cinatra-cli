@@ -34,6 +34,8 @@ import {
   detectPortConflicts,
   emitDegradedBandWarning,
   ensureEnvLocal,
+  formatPortConflictError,
+  identifyComposeHolder,
   normalizeRemote,
   ownedPortsFromInspect,
   parseComposePublishedPorts,
@@ -549,6 +551,41 @@ describe("detectPortConflicts", () => {
     expect(conflicts.find((c) => c.port === 6379).holder).toBe(null);
   });
 
+  it("preserves the historical conflict shape for a plain-string holder (no `compose` key)", () => {
+    // A legacy `describeHolder` returning a STRING must yield exactly the
+    // historical { service, host, port, holder } shape — no extra `compose`
+    // field — so existing exact-equality consumers are unaffected (issue #9
+    // back-compat).
+    return detectPortConflicts(
+      [{ service: "verdaccio", host: "0.0.0.0", port: 4873 }],
+      { probe: () => false, describeHolder: () => "verdaccio (pid 7)" },
+    ).then((conflicts) => {
+      expect(conflicts).toEqual([
+        { service: "verdaccio", host: "0.0.0.0", port: 4873, holder: "verdaccio (pid 7)" },
+      ]);
+      expect("compose" in conflicts[0]).toBe(false);
+    });
+  });
+
+  it("attaches a `compose` descriptor when the structured holder proves one", async () => {
+    const conflicts = await detectPortConflicts(
+      [{ service: "postgres", host: "127.0.0.1", port: 5434 }],
+      {
+        probe: () => false,
+        describeHolder: () => ({
+          label: 'docker compose project "cinatra" (/home/me/cinatra)',
+          compose: { project: "cinatra", workingDir: "/home/me/cinatra", isCinatra: true },
+        }),
+      },
+    );
+    expect(conflicts[0].holder).toBe('docker compose project "cinatra" (/home/me/cinatra)');
+    expect(conflicts[0].compose).toEqual({
+      project: "cinatra",
+      workingDir: "/home/me/cinatra",
+      isCinatra: true,
+    });
+  });
+
   it("awaits an ASYNC probe (Promise-returning)", async () => {
     const conflicts = await detectPortConflicts(band, {
       probe: async (_host, port) => port !== 5434, // 5434 occupied.
@@ -662,6 +699,217 @@ describe("detectPortConflicts", () => {
       { describeHolder: () => null },
     );
     expect(after).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6b. Issue #9 — HONEST holder identification + plain-language abort message.
+// ---------------------------------------------------------------------------
+describe("identifyComposeHolder (issue #9 — attribute a held port to its compose project)", () => {
+  const container = (labels, ports) => ({
+    Config: { Labels: labels },
+    NetworkSettings: { Ports: ports },
+  });
+
+  it("names the compose project + working_dir of the container publishing the port", () => {
+    const rows = [
+      container(
+        {
+          "com.docker.compose.project": "cinatra",
+          "com.docker.compose.project.working_dir": "/home/me/cinatra",
+        },
+        { "5432/tcp": [{ HostIp: "127.0.0.1", HostPort: "5434" }] },
+      ),
+    ];
+    expect(identifyComposeHolder(5434, rows)).toEqual({
+      project: "cinatra",
+      workingDir: "/home/me/cinatra",
+    });
+  });
+
+  it("returns null when no running container publishes the port", () => {
+    const rows = [
+      container(
+        { "com.docker.compose.project": "other" },
+        { "5432/tcp": [{ HostPort: "9999" }] },
+      ),
+    ];
+    expect(identifyComposeHolder(5434, rows)).toBe(null);
+  });
+
+  it("ignores a non-TCP binding on the same number (the probe only checks TCP)", () => {
+    const rows = [
+      container(
+        { "com.docker.compose.project": "udp-thing" },
+        { "53/udp": [{ HostPort: "5434" }] },
+      ),
+    ];
+    expect(identifyComposeHolder(5434, rows)).toBe(null);
+  });
+
+  it("does NOT claim a holder for a plain `docker run` container with no compose labels", () => {
+    const rows = [container({}, { "5432/tcp": [{ HostPort: "5434" }] })];
+    // No compose project/working_dir label ⇒ we can't honestly attribute it.
+    expect(identifyComposeHolder(5434, rows)).toBe(null);
+  });
+
+  it("is interface-aware when a host is given: a different-interface binding does NOT match", () => {
+    // A stranger publishes 5434 on 127.0.0.1; our band entry conflicts on
+    // 0.0.0.0:5434. A loopback-only binding does NOT hold the all-interfaces key,
+    // so it must NOT be attributed to the 0.0.0.0 conflict.
+    const rows = [
+      container(
+        { "com.docker.compose.project": "loopback-only" },
+        { "5432/tcp": [{ HostIp: "127.0.0.1", HostPort: "5434" }] },
+      ),
+    ];
+    expect(identifyComposeHolder(5434, rows, "0.0.0.0")).toBe(null);
+    // But the same row matches the loopback conflict (exact interface) …
+    expect(identifyComposeHolder(5434, rows, "127.0.0.1")?.project).toBe("loopback-only");
+    // … and an all-interfaces binding covers a narrower-interface lookup.
+    const allIface = [
+      container(
+        { "com.docker.compose.project": "all-iface" },
+        { "5432/tcp": [{ HostIp: "0.0.0.0", HostPort: "5434" }] },
+      ),
+    ];
+    expect(identifyComposeHolder(5434, allIface, "127.0.0.1")?.project).toBe("all-iface");
+  });
+
+  it("fails safe on bad input", () => {
+    expect(identifyComposeHolder(5434, null)).toBe(null);
+    expect(identifyComposeHolder(5434, [])).toBe(null);
+    expect(identifyComposeHolder(5434, [{}])).toBe(null);
+  });
+});
+
+describe("formatPortConflictError (issue #9 — honest, plain-language guidance)", () => {
+  it("NEVER asserts a Cinatra stack when the holder is unattributed", () => {
+    const msg = formatPortConflictError(
+      [{ service: "verdaccio", host: "0.0.0.0", port: 4873, holder: null, compose: null }],
+      { phase: "preflight, before clone" },
+    );
+    // The old misleading assertion is gone …
+    expect(msg).not.toMatch(/Another Cinatra stack/);
+    // … and the line is honest about not knowing the holder.
+    expect(msg).toMatch(/could not determine which/);
+    // Plain-language options with consequences, no destructive auto-action.
+    expect(msg).toMatch(/Free the ports/);
+    expect(msg).toMatch(/Run a second instance/);
+    expect(msg).toMatch(/Cancel: stop here and change nothing/);
+  });
+
+  it("names a DETECTED Cinatra stack (dir + project) and offers a guided replace step", () => {
+    const msg = formatPortConflictError(
+      [
+        {
+          service: "postgres",
+          host: "127.0.0.1",
+          port: 5434,
+          holder: 'docker compose project "cinatra" (/home/me/cinatra)',
+          compose: { project: "cinatra", workingDir: "/home/me/cinatra", isCinatra: true },
+        },
+      ],
+      { phase: "before bringing up infra" },
+    );
+    // The stack is named honestly (it was proven Cinatra) …
+    expect(msg).toMatch(/the Cinatra stack "cinatra" at \/home\/me\/cinatra/);
+    // … the data-preserving stop names the directory to run it from …
+    expect(msg).toMatch(/Stop it, keep its data: run `docker compose down` \(run it from \/home\/me\/cinatra\)/);
+    // … and is HONEST that `docker compose down` PRESERVES volumes (the issue-#9
+    //   correctness point: plain down does NOT delete named volumes) …
+    expect(msg).toMatch(/PRESERVES its database volumes/);
+    // … the destructive path is the explicit `-v` one, with a data-loss warning …
+    expect(msg).toMatch(/Wipe and replace it: run `docker compose down -v`/);
+    expect(msg).toMatch(/the `-v` DELETES that stack's database volumes/);
+    // … the run-alongside consequence (shared containers, one database) …
+    expect(msg).toMatch(/SHARES the existing Postgres\/Redis\/Neo4j containers/);
+    // … and a non-destructive cancel.
+    expect(msg).toMatch(/Cancel: stop here and change nothing/);
+  });
+
+  it("falls back to the generic-Cinatra wording when the directory is unknown", () => {
+    const msg = formatPortConflictError(
+      [
+        {
+          service: "redis",
+          host: "127.0.0.1",
+          port: 6379,
+          holder: 'docker compose project "cinatra"',
+          compose: { project: "cinatra", workingDir: null, isCinatra: true },
+        },
+      ],
+      {},
+    );
+    expect(msg).toMatch(/the Cinatra stack "cinatra"\. Choose one/);
+    // No "(run it from …)" suffix when we don't know the directory.
+    expect(msg).not.toMatch(/run it from/);
+  });
+
+  it("does NOT name a Cinatra stack when the compose holder was NOT proven Cinatra", () => {
+    const msg = formatPortConflictError(
+      [
+        {
+          service: "postgres",
+          host: "127.0.0.1",
+          port: 5434,
+          holder: 'docker compose project "some-other-app" (/srv/other)',
+          compose: { project: "some-other-app", workingDir: "/srv/other", isCinatra: false },
+        },
+      ],
+      {},
+    );
+    // A non-Cinatra compose project is honestly shown on the conflict line …
+    expect(msg).toMatch(/held by docker compose project "some-other-app" \(\/srv\/other\)/);
+    // … but the guidance must NOT pretend it is a Cinatra stack to replace.
+    expect(msg).not.toMatch(/the Cinatra stack/);
+    expect(msg).toMatch(/not all held by a single Cinatra stack/);
+  });
+
+  it("does NOT offer single-stack replace when conflicts are MIXED (Cinatra + a stranger)", () => {
+    // One port is held by a proven Cinatra stack; another by an unattributed
+    // process. Stopping the Cinatra stack would NOT free the stranger's port, so
+    // the single-stack "replace" wording would be dishonest/harmful — fall back
+    // to the generic guidance (codex round-2 finding).
+    const msg = formatPortConflictError(
+      [
+        {
+          service: "postgres",
+          host: "127.0.0.1",
+          port: 5434,
+          holder: 'docker compose project "cinatra" (/home/me/cinatra)',
+          compose: { project: "cinatra", workingDir: "/home/me/cinatra", isCinatra: true },
+        },
+        { service: "verdaccio", host: "0.0.0.0", port: 4873, holder: null },
+      ],
+      {},
+    );
+    // No single-stack replace wording …
+    expect(msg).not.toMatch(/Stop it, keep its data/);
+    expect(msg).not.toMatch(/Wipe and replace it/);
+    expect(msg).toMatch(/not all held by a single Cinatra stack/);
+    // … the Cinatra line is still shown honestly per-conflict …
+    expect(msg).toMatch(/held by docker compose project "cinatra" \(\/home\/me\/cinatra\)/);
+    // … and the stranger is honestly flagged as undetermined.
+    expect(msg).toMatch(/could not determine which/);
+  });
+
+  it("offers single-stack replace when MULTIPLE ports are all the SAME Cinatra stack", () => {
+    const same = {
+      project: "cinatra",
+      workingDir: "/home/me/cinatra",
+      isCinatra: true,
+    };
+    const msg = formatPortConflictError(
+      [
+        { service: "postgres", host: "127.0.0.1", port: 5434, holder: "x", compose: { ...same } },
+        { service: "redis", host: "127.0.0.1", port: 6379, holder: "x", compose: { ...same } },
+      ],
+      {},
+    );
+    // All ports trace to ONE stack ⇒ the guided replace IS offered.
+    expect(msg).toMatch(/the Cinatra stack "cinatra" at \/home\/me\/cinatra/);
+    expect(msg).toMatch(/Stop it, keep its data/);
   });
 });
 
