@@ -309,7 +309,7 @@ Usage:
   cinatra mcp llm-access setup
   cinatra mcp llm-access refresh
   cinatra mcp llm-access verify
-  cinatra doctor [--strict]
+  cinatra doctor [--strict] [--fix]
   cinatra agent export <id-or-name> [--file <output.zip>]
   cinatra agent import <file.zip> [--name <override-name>]
   cinatra agents install [<name>[@<range>]] [options]
@@ -467,6 +467,12 @@ Commands:
                     post-boot gate. It also runs (non-fatal) at the tail of
                     \`cinatra dev setup dev\`.
                     --strict          Exit non-zero on any SKIP (default: only FAIL).
+                    --fix             Opt-in: before reporting, run SAFE idempotent
+                                      remediations for the common FAILs (set the public
+                                      MCP URL via \`dev tunnel start\`; re-run \`setup dev\`
+                                      provisioning), then re-check. Dev-only; CMS/clone
+                                      checks are not auto-fixed. The post-fix report
+                                      still gates the exit code.
 
   agent export <id-or-name>
                     Export an agent template to a portable ZIP archive.
@@ -3550,27 +3556,195 @@ function printDoctorReport(report, { mode } = {}) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// `cinatra doctor --fix` — opt-in, idempotent auto-remediation (cinatra#14)
+// ---------------------------------------------------------------------------
+//
+// The standalone doctor is strictly read-only. `--fix` layers an OPT-IN
+// remediation pass on top: gather the report, decide which SAFE idempotent
+// fixes a FAIL/SKIP implies, run only those, then re-gather. The FINAL report
+// is the one that gates (so a fix that did not stick still FAILs the exit).
+//
+// Only TWO remediations are offered — each maps to a doctor verdict with a
+// single documented one-line manual fix the operator would otherwise run by
+// hand, and each is idempotent (re-running on an already-healthy instance is a
+// no-op the underlying command already guards):
+//   - "tunnel"  — bring the dev-main Funnel up + write the public MCP URL via
+//                 `runDevTunnel("start")`. Implied by NO public MCP URL set.
+//   - "setup"   — re-run dev provisioning via `runSetup("dev")` (re-provisions
+//                 LLM-MCP OAuth clients, JWKS, MCP settings, public URL).
+//                 Implied by missing provider creds, or a public endpoint that
+//                 rejects the minted Bearer / serves the wrong/stale tools.
+//
+// Both are DEV-ONLY by construction (`runDevTunnel` hard-refuses outside dev;
+// `runSetup("dev")` is the dev provisioner). The CMS (WordPress/Drupal) and
+// dev-app-clone assertions are NOT auto-remediated — starting/teardown of CMS
+// containers and cloning app repos are out of scope for a verify-and-heal pass
+// and are left to their explicit commands (the report still SKIPs/FAILs them
+// with their existing remediation hints).
+
+// Pure planner: map a doctor report to the ordered set of remediation actions
+// its FAIL/SKIP verdicts imply. No side effects, no network — unit-testable in
+// isolation. Returns string action ids in run order; "setup" before "tunnel"
+// so a fresh-provision re-establishes the URL the tunnel then verifies, and so
+// the two never double-bring-up. Empty array → nothing actionable to fix.
+//
+// @param {{ assertions: Array<{id:string,verdict:string,detail?:string}> }} report
+// @returns {string[]}  subset of ["setup","tunnel"], in run order
+function planDoctorFixActions(report) {
+  const assertions = report?.assertions ?? [];
+  const find = (id) => assertions.find((a) => a.id === id) ?? null;
+  const isBad = (a) => a != null && (a.verdict === "fail" || a.verdict === "skip");
+
+  const llm = find("llm-mcp-access");
+  const publicReach = find("public-reachability");
+
+  const actions = [];
+
+  // Re-provision (`setup dev`) when creds are missing OR the public endpoint
+  // actively rejected the Bearer / served the wrong tools (a FAIL — a stale or
+  // mis-pointed deployment, the exact case `runSetup` reconciles). A public
+  // SKIP ("no URL"/"unreachable") is the tunnel's job, NOT setup's, so it does
+  // not trigger a re-provision.
+  const credsMissing =
+    llm != null &&
+    llm.verdict === "fail" &&
+    typeof llm.detail === "string" &&
+    /no llm provider credentials/i.test(llm.detail);
+  const publicRejected = publicReach != null && publicReach.verdict === "fail";
+  if (credsMissing || publicRejected) {
+    actions.push("setup");
+  }
+
+  // Bring the Funnel up (`dev tunnel start`) when there is NO public MCP URL —
+  // surfaced either as the llm-mcp-access FAIL (creds present, URL missing) or
+  // the public-reachability SKIP ("no public MCP URL configured"). Idempotent:
+  // a live owned Funnel re-verifies without re-provisioning.
+  const noPublicUrl =
+    (llm != null &&
+      llm.verdict === "fail" &&
+      typeof llm.detail === "string" &&
+      /no public mcp url/i.test(llm.detail)) ||
+    (isBad(publicReach) &&
+      typeof publicReach.detail === "string" &&
+      /no public mcp url configured/i.test(publicReach.detail));
+  if (noPublicUrl) {
+    actions.push("tunnel");
+  }
+
+  return actions;
+}
+
+// Run the planned remediations through injectable seams. The seams default to
+// the real `runSetup` / `runDevTunnel`; the vitest suite overrides them to
+// drive every branch hermetically (no Docker, no live DB, no app). Soft-fail
+// per action: a remediation that throws is logged (status/booleans only, NEVER
+// a token/secret) and the pass continues to the next action — exactly like the
+// setup-tail self-heal, so `--fix` never hard-aborts the subsequent re-check.
+//
+// @param {object} args
+// @param {{ assertions: Array }} args.report  the FIRST (pre-fix) report
+// @param {object} [args.deps]  { runSetup, runDevTunnel } test seams
+// @returns {Promise<{ attempted: string[], applied: string[], failed: string[] }>}
+async function applyDoctorFix({ report, deps = {} } = {}) {
+  const setup = deps.runSetup ?? runSetup;
+  const devTunnel = deps.runDevTunnel ?? runDevTunnel;
+
+  const attempted = planDoctorFixActions(report);
+  const applied = [];
+  const failed = [];
+
+  if (attempted.length === 0) {
+    console.log(
+      "  --fix: nothing to auto-remediate (no failing check maps to a safe idempotent fix).",
+    );
+    return { attempted, applied, failed };
+  }
+
+  for (const action of attempted) {
+    try {
+      if (action === "setup") {
+        console.log("  --fix: re-running dev provisioning (`cinatra setup dev`)…");
+        await setup("dev");
+      } else if (action === "tunnel") {
+        console.log("  --fix: bringing the dev tunnel up (`cinatra dev tunnel start`)…");
+        await devTunnel(["start"]);
+      }
+      applied.push(action);
+    } catch {
+      // SECRET BOUNDARY: NEVER echo the thrown error — a setup/tunnel failure
+      // message can carry the SUPABASE_DB_URL connection string, OAuth client
+      // material, or other secrets. Log only the action id + the command to
+      // re-run by hand (which surfaces the real error in its own, expected
+      // output channel).
+      failed.push(action);
+      const cmd = action === "setup" ? "cinatra setup dev" : "cinatra dev tunnel start";
+      console.error(
+        `  ⚠ --fix: remediation "${action}" failed — run \`${cmd}\` by hand to see the error, then re-run \`cinatra doctor\`.`,
+      );
+    }
+  }
+  return { attempted, applied, failed };
+}
+
 // Standalone `cinatra doctor` (alias: `cinatra mcp llm-access verify`). Opens its
 // own pg client, prints the report, and exits non-zero on any FAIL (the
 // authoritative post-boot gate). A SKIP alone warns + exits 0 unless --strict.
+// With `--fix`, an OPT-IN idempotent remediation pass runs between an initial
+// gather and a re-gather (see planDoctorFixActions/applyDoctorFix); the FINAL
+// report is the one printed AND the one that gates the exit code.
+// Orchestration core — gather → (optional) remediate → re-gather → print →
+// gate. Pulled out behind injectable seams (`gather` / `applyFix` / `print` /
+// `setExitCode`) so the FULL `--fix` wiring (initial gather, remediation,
+// FRESH re-gather, final-report gating) is unit-testable without a live DB,
+// matching the `deps` seam pattern used by `ensureDevPublicMcpUrl`. The seam
+// for `applyFix` defaults to the real `applyDoctorFix`; production behaviour is
+// identical to a single inline body.
+//
+// @returns {Promise<{report:object, fixed:boolean}>}
+async function runDoctorCore({ strict, fix, gather, applyFix = applyDoctorFix } = {}) {
+  let report = await gather();
+  let fixed = false;
+
+  if (fix && (report.counts.fail > 0 || report.counts.skip > 0)) {
+    console.log("\n- Applying `cinatra doctor --fix` remediations…");
+    await applyFix({ report });
+    console.log("- Re-running the self-check after remediation…");
+    report = await gather(); // FRESH gather — never reuse the pre-fix report/env.
+    fixed = true;
+  } else if (fix) {
+    console.log("\n- `cinatra doctor --fix`: all checks pass — nothing to remediate.");
+  }
+
+  printDoctorReport(report, { mode: "standalone" });
+  const exitNonZero = report.counts.fail > 0 || (strict && report.counts.skip > 0);
+  return { report, fixed, exitNonZero };
+}
+
 async function runDoctor(rest = []) {
   const strict = rest.includes("--strict");
+  const fix = rest.includes("--fix");
   const repoRoot = getRepoRoot();
-  const env = collectEnvironment(repoRoot);
-  const connectionString = requiredEnv(env, "SUPABASE_DB_URL");
-  const schemaName = env.SUPABASE_SCHEMA?.trim() || "cinatra";
-  const client = await createClient(connectionString);
-  await client.connect();
-  let report;
-  try {
-    report = await gatherDoctorReport({ client, schemaName, env, repoRoot });
-  } finally {
-    await client.end();
+
+  // Re-read `.env.local` on EVERY gather — a `--fix` remediation (`setup dev`)
+  // can rewrite env-authoritative config (e.g. MCP_PUBLIC_BASE_URL), so the
+  // post-fix re-check must NOT reuse the pre-fix environment snapshot or it
+  // could read stale config and still FAIL after a successful heal.
+  async function gather() {
+    const env = collectEnvironment(repoRoot);
+    const connectionString = requiredEnv(env, "SUPABASE_DB_URL");
+    const schemaName = env.SUPABASE_SCHEMA?.trim() || "cinatra";
+    const client = await createClient(connectionString);
+    await client.connect();
+    try {
+      return await gatherDoctorReport({ client, schemaName, env, repoRoot });
+    } finally {
+      await client.end();
+    }
   }
-  printDoctorReport(report, { mode: "standalone" });
-  if (report.counts.fail > 0) {
-    process.exitCode = 1;
-  } else if (strict && report.counts.skip > 0) {
+
+  const { exitNonZero } = await runDoctorCore({ strict, fix, gather });
+  if (exitNonZero) {
     process.exitCode = 1;
   }
 }
@@ -9913,6 +10087,9 @@ export {
   resolveLocalOrigin,
   gatherStatus,
   gatherDoctorReport,
+  planDoctorFixActions,
+  applyDoctorFix,
+  runDoctorCore,
   deriveConfiguredPublicMcpUrl,
   doctorAssertLlmMcpAccess,
   doctorAssertDevAppsPresence,
