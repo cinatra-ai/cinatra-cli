@@ -3637,15 +3637,27 @@ function planDoctorFixActions(report) {
 
 // Run the planned remediations through injectable seams. The seams default to
 // the real `runSetup` / `runDevTunnel`; the vitest suite overrides them to
-// drive every branch hermetically (no Docker, no live DB, no app). Soft-fail
-// per action: a remediation that throws is logged (status/booleans only, NEVER
-// a token/secret) and the pass continues to the next action — exactly like the
-// setup-tail self-heal, so `--fix` never hard-aborts the subsequent re-check.
+// drive every branch hermetically (no Docker, no live DB, no app).
+//
+// FAIL-CLOSED on a failed PREREQUISITE: `tunnel` (Funnel bring-up) depends on
+// `setup` having succeeded — `setup dev` is what provisions the LLM-MCP OAuth
+// clients / JWKS / public URL that the public MCP endpoint authenticates
+// against. If `setup` is attempted and FAILS, we MUST NOT bring the Funnel up:
+// doing so would expose the public MCP endpoint via Funnel BEFORE OAuth/JWKS
+// provisioning succeeded — an unauthenticated/half-provisioned auth surface.
+// So when the prerequisite `setup` fails we ABORT every dependent remediation
+// (currently just `tunnel`), record them as `aborted`, and let the FRESH
+// re-gather report the still-failing prerequisite. Independent remediations
+// (none today) would still soft-fail per action.
+//
+// SECRET BOUNDARY for soft-fail: a remediation that throws is logged with the
+// action id + the by-hand command ONLY — never the thrown message, which can
+// carry the SUPABASE_DB_URL connection string or OAuth client material.
 //
 // @param {object} args
 // @param {{ assertions: Array }} args.report  the FIRST (pre-fix) report
 // @param {object} [args.deps]  { runSetup, runDevTunnel } test seams
-// @returns {Promise<{ attempted: string[], applied: string[], failed: string[] }>}
+// @returns {Promise<{ attempted: string[], applied: string[], failed: string[], aborted: string[] }>}
 async function applyDoctorFix({ report, deps = {} } = {}) {
   const setup = deps.runSetup ?? runSetup;
   const devTunnel = deps.runDevTunnel ?? runDevTunnel;
@@ -3653,15 +3665,36 @@ async function applyDoctorFix({ report, deps = {} } = {}) {
   const attempted = planDoctorFixActions(report);
   const applied = [];
   const failed = [];
+  const aborted = [];
 
   if (attempted.length === 0) {
     console.log(
       "  --fix: nothing to auto-remediate (no failing check maps to a safe idempotent fix).",
     );
-    return { attempted, applied, failed };
+    return { attempted, applied, failed, aborted };
   }
 
+  // `tunnel` depends on `setup`: it may only bring the public Funnel up once
+  // provisioning succeeded. Track whether the prerequisite failed so we abort
+  // (never run) the dependent action rather than exposing an unprovisioned
+  // endpoint.
+  let setupFailed = false;
+
   for (const action of attempted) {
+    // Dependency gate: refuse to bring the public Funnel up if its `setup`
+    // prerequisite failed. ABORT (do not attempt) — fail-closed on the auth
+    // surface; the re-gather will report the still-failing prerequisite.
+    if (action === "tunnel" && setupFailed) {
+      aborted.push(action);
+      console.error(
+        '  ⚠ --fix: aborting "tunnel" — its prerequisite "setup" failed; ' +
+          "refusing to expose the public MCP endpoint via Funnel before " +
+          "provisioning (OAuth/JWKS) succeeded. Run `cinatra setup dev` by hand, " +
+          "then re-run `cinatra doctor --fix`.",
+      );
+      continue;
+    }
+
     try {
       if (action === "setup") {
         console.log("  --fix: re-running dev provisioning (`cinatra setup dev`)…");
@@ -3678,13 +3711,14 @@ async function applyDoctorFix({ report, deps = {} } = {}) {
       // re-run by hand (which surfaces the real error in its own, expected
       // output channel).
       failed.push(action);
+      if (action === "setup") setupFailed = true; // gate the dependent tunnel
       const cmd = action === "setup" ? "cinatra setup dev" : "cinatra dev tunnel start";
       console.error(
         `  ⚠ --fix: remediation "${action}" failed — run \`${cmd}\` by hand to see the error, then re-run \`cinatra doctor\`.`,
       );
     }
   }
-  return { attempted, applied, failed };
+  return { attempted, applied, failed, aborted };
 }
 
 // Standalone `cinatra doctor` (alias: `cinatra mcp llm-access verify`). Opens its

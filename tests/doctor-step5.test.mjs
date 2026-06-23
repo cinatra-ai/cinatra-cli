@@ -639,7 +639,11 @@ describe("applyDoctorFix — runs planned remediations through injected seams", 
     expect(result.attempted).toEqual([]);
   });
 
-  it("a throwing remediation is soft-failed and the pass continues", async () => {
+  it("a failed `setup` prerequisite ABORTS the dependent tunnel bring-up (fail-closed)", async () => {
+    // SECURITY: `tunnel` exposes the public MCP endpoint via Funnel; it must
+    // only run once `setup` (OAuth/JWKS/public-URL provisioning) succeeded. If
+    // setup fails we MUST NOT bring the Funnel up over an unprovisioned auth
+    // surface — the dependent action is aborted, never attempted.
     const calls = [];
     const deps = {
       runSetup: async () => {
@@ -657,10 +661,37 @@ describe("applyDoctorFix — runs planned remediations through injected seams", 
       },
     });
     const result = await applyDoctorFix({ report, deps });
-    // setup threw, but tunnel still ran.
-    expect(calls).toEqual(["setup", "tunnel:start"]);
+    // setup threw → tunnel is ABORTED, never invoked.
+    expect(calls).toEqual(["setup"]);
+    expect(calls).not.toContain("tunnel:start");
     expect(result.failed).toEqual(["setup"]);
-    expect(result.applied).toEqual(["tunnel"]);
+    expect(result.aborted).toEqual(["tunnel"]);
+    expect(result.applied).toEqual([]);
+  });
+
+  it("a failed independent remediation does NOT abort the tunnel when setup succeeded", async () => {
+    // Guard the converse: only a FAILED PREREQUISITE gates the tunnel. When
+    // setup SUCCEEDS, the tunnel still runs as planned.
+    const calls = [];
+    const deps = {
+      runSetup: async () => {
+        calls.push("setup");
+      },
+      runDevTunnel: async (argv) => {
+        calls.push(`tunnel:${argv.join(" ")}`);
+      },
+    };
+    const report = makeReport({
+      "llm-mcp-access": {
+        verdict: "fail",
+        detail: "no LLM provider credentials and no public MCP URL",
+      },
+    });
+    const result = await applyDoctorFix({ report, deps });
+    expect(calls).toEqual(["setup", "tunnel:start"]);
+    expect(result.applied).toEqual(["setup", "tunnel"]);
+    expect(result.aborted).toEqual([]);
+    expect(result.failed).toEqual([]);
   });
 
   it("SECRET BOUNDARY: a thrown remediation error is NOT echoed to output", async () => {
