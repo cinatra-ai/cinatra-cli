@@ -428,6 +428,31 @@ async function writeLockfile(lockfilePath, lockfile) {
   await writeFile(lockfilePath, stableStringifyLockfile(lockfile), "utf8");
 }
 
+/**
+ * Summarize a parsed lockfile's `packages` map into a deterministic,
+ * alphabetically-sorted list of installed agent packages — the read model
+ * behind `cinatra agents list`. The root package is flagged so the printer can
+ * distinguish the requested agent from its resolved dependencies.
+ *
+ * Pure (no I/O): exported via `__test` and consumed by the CLI `agents list`
+ * handler, which owns reading the lockfile bytes off disk.
+ *
+ * @param {object|null} lockfile A parsed `cinatra-agents.lock` (or null/garbage).
+ * @returns {{ packageName: string, version: string, root: boolean }[]}
+ */
+function summarizeLockfilePackages(lockfile) {
+  const packages = lockfile?.packages;
+  if (!packages || typeof packages !== "object") return [];
+  const rootName = lockfile?.root?.packageName;
+  return Object.keys(packages)
+    .sort()
+    .map((name) => ({
+      packageName: name,
+      version: packages[name]?.version ?? "",
+      root: name === rootName,
+    }));
+}
+
 function lockfileToTree(lockfile) {
   const all = new Map();
   for (const [name, entry] of Object.entries(lockfile.packages)) {
@@ -784,10 +809,299 @@ export async function runAgentsInstall(argv, io = {}) {
   return exit(0);
 }
 
+// ---------------------------------------------------------------------------
+// `cinatra agents list` — read the lockfile and print installed agents.
+// ---------------------------------------------------------------------------
+
+const LIST_USAGE = `Usage: cinatra agents list [options]
+Options:
+  --lockfile <path>   Lockfile path (default: ./cinatra-agents.lock)
+  --json              Emit the installed set as JSON instead of a table
+`;
+
+/**
+ * Consume the value that follows a value-taking flag (e.g. `--lockfile`).
+ * Rejects a missing value OR a value that is itself a `--flag`, so
+ * `agents uninstall @a --lockfile --keep-db` can never silently swallow
+ * `--keep-db` as the path and leave the destructive `--keep-db` un-set. Mirrors
+ * the `Missing value for <flag>` guard in index.mjs's readOptionValue.
+ *
+ * @throws {Error} when no usable value follows the flag.
+ * @returns {{ value: string, nextIndex: number }}
+ */
+function takeFlagValue(argv, index, flag) {
+  const value = argv[index + 1];
+  if (value === undefined || (typeof value === "string" && value.startsWith("--"))) {
+    throw new Error(`Missing value for ${flag}.`);
+  }
+  return { value, nextIndex: index + 1 };
+}
+
+/**
+ * `cinatra agents list` — read `cinatra-agents.lock` (the file `agents install`
+ * writes) and print the installed agent packages. The lockfile is the source of
+ * truth for "what was installed from Verdaccio"; this never touches the DB, so
+ * it is safe to run without SUPABASE_DB_URL.
+ */
+export async function runAgentsList(argv, io = {}) {
+  const stdout = io.stdout ?? process.stdout;
+  const stderr = io.stderr ?? process.stderr;
+  const exit = io.exit ?? ((c) => process.exit(c));
+
+  let lockfilePathArg;
+  let asJson = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--json") asJson = true;
+    else if (a === "--lockfile") {
+      try {
+        const { value, nextIndex } = takeFlagValue(argv, i, "--lockfile");
+        lockfilePathArg = value;
+        i = nextIndex;
+      } catch (err) {
+        stderr.write(`${err.message}\n${LIST_USAGE}`);
+        return exit(1);
+      }
+    } else if (a && a.startsWith("--")) {
+      stderr.write(`Unknown flag: ${a}\n${LIST_USAGE}`);
+      return exit(1);
+    } else if (a) {
+      stderr.write(`Unexpected argument: ${a}\n${LIST_USAGE}`);
+      return exit(1);
+    }
+  }
+
+  const lockfilePath = resolvePath(lockfilePathArg ?? "./cinatra-agents.lock");
+  const lockfile = await readLockfile(lockfilePath);
+  const rows = summarizeLockfilePackages(lockfile);
+
+  if (asJson) {
+    stdout.write(JSON.stringify(rows, null, 2) + "\n");
+    return exit(0);
+  }
+
+  if (rows.length === 0) {
+    stdout.write(
+      lockfile
+        ? "No agents installed (lockfile has no packages).\n"
+        : `No agents installed (no lockfile at ${lockfilePath}).\n`,
+    );
+    return exit(0);
+  }
+
+  const nameWidth = Math.max(...rows.map((r) => r.packageName.length), 7);
+  stdout.write(`${"PACKAGE".padEnd(nameWidth)}  VERSION  ROLE\n`);
+  for (const r of rows) {
+    stdout.write(
+      `${r.packageName.padEnd(nameWidth)}  ${(r.version || "-").padEnd(7)}  ${r.root ? "root" : "dependency"}\n`,
+    );
+  }
+  return exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// `cinatra agents uninstall` — counterpart to `agents install`: drop the agent
+// template (and its versions) from the DB and prune the lockfile entry.
+// ---------------------------------------------------------------------------
+
+const UNINSTALL_USAGE = `Usage: cinatra agents uninstall <name> [options]
+Options:
+  --lockfile <path>   Lockfile path (default: ./cinatra-agents.lock)
+  --keep-db           Prune the lockfile entry only; leave DB rows in place
+  --keep-lockfile     Delete DB rows only; leave the lockfile entry in place
+
+Exit codes:
+  0 success | 1 usage error
+`;
+
+/**
+ * Remove a single package entry from a parsed lockfile, returning a NEW lockfile
+ * object (the input is not mutated). The root entry is left untouched even when
+ * a dependency is removed — pruning the requested root is fine, but a `root`
+ * field that points at a now-absent package is still a faithful record of what
+ * was requested. Pure: exported via `__test`.
+ *
+ * @returns {{ lockfile: object, removed: boolean }}
+ */
+function removeLockfilePackage(lockfile, packageName) {
+  if (!lockfile?.packages || typeof lockfile.packages !== "object") {
+    return { lockfile, removed: false };
+  }
+  if (!Object.prototype.hasOwnProperty.call(lockfile.packages, packageName)) {
+    return { lockfile, removed: false };
+  }
+  const packages = { ...lockfile.packages };
+  delete packages[packageName];
+  return { lockfile: { ...lockfile, packages }, removed: true };
+}
+
+/**
+ * Delete the agent template matching `packageName` (and its versions) from the
+ * app DB. Uses pg directly — same connection contract as the install side
+ * (SUPABASE_DB_URL + SUPABASE_SCHEMA). Versions are deleted explicitly first so
+ * the uninstall does not depend on a DB-level ON DELETE CASCADE being present.
+ * Returns the number of templates removed (0 when nothing matched).
+ */
+async function deleteAgentTemplateByPackage(packageName) {
+  const { default: pg } = await import("pg");
+  const dbUrl = process.env.SUPABASE_DB_URL;
+  if (!dbUrl) {
+    throw new Error(
+      "SUPABASE_DB_URL is required to remove DB rows. " +
+        "Use --keep-db to prune the lockfile entry only.",
+    );
+  }
+  const schema = process.env.SUPABASE_SCHEMA ?? "cinatra";
+  const client = new pg.Client({ connectionString: dbUrl });
+  await client.connect();
+  try {
+    // The two deletes run in one transaction: since we deliberately do NOT rely
+    // on a DB-level ON DELETE CASCADE, a mid-sequence failure (lock timeout,
+    // connection drop) must not leave a template row orphaned without its
+    // versions. BEGIN/COMMIT make the pair atomic; any error rolls back.
+    await client.query("BEGIN");
+    const found = await client.query(
+      `SELECT id FROM ${schema}.agent_templates WHERE package_name = $1`,
+      [packageName],
+    );
+    if (found.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return 0;
+    }
+    const ids = found.rows.map((r) => r.id);
+    await client.query(
+      `DELETE FROM ${schema}.agent_versions WHERE template_id = ANY($1::uuid[])`,
+      [ids],
+    );
+    const deleted = await client.query(
+      `DELETE FROM ${schema}.agent_templates WHERE package_name = $1`,
+      [packageName],
+    );
+    await client.query("COMMIT");
+    return deleted.rowCount ?? ids.length;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    await client.end();
+  }
+}
+
+/**
+ * `cinatra agents uninstall <name>` — the inverse of `agents install`. By
+ * default it removes the template's DB rows (matched on `package_name`) AND
+ * prunes the lockfile entry. `--keep-db` / `--keep-lockfile` scope it to one
+ * side. It removes ONLY the named package, never its dependency closure
+ * (dependencies may be shared by other installed agents).
+ */
+export async function runAgentsUninstall(argv, io = {}) {
+  const stdout = io.stdout ?? process.stdout;
+  const stderr = io.stderr ?? process.stderr;
+  const exit = io.exit ?? ((c) => process.exit(c));
+
+  let lockfilePathArg;
+  let keepDb = false;
+  let keepLockfile = false;
+  const positionals = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--keep-db") keepDb = true;
+    else if (a === "--keep-lockfile") keepLockfile = true;
+    else if (a === "--lockfile") {
+      // A value-taking flag: reject a missing value or a flag-like next token so
+      // `uninstall @a --lockfile --keep-db` cannot swallow --keep-db as the path
+      // and silently fall through to a DB delete it was meant to skip.
+      try {
+        const { value, nextIndex } = takeFlagValue(argv, i, "--lockfile");
+        lockfilePathArg = value;
+        i = nextIndex;
+      } catch (err) {
+        stderr.write(`${err.message}\n${UNINSTALL_USAGE}`);
+        return exit(1);
+      }
+    } else if (a && a.startsWith("--")) {
+      stderr.write(`Unknown flag: ${a}\n${UNINSTALL_USAGE}`);
+      return exit(1);
+    } else if (a) {
+      positionals.push(a);
+    }
+  }
+
+  const packageName = positionals[0];
+  if (!packageName) {
+    stderr.write(UNINSTALL_USAGE);
+    return exit(1);
+  }
+  // A single `<name>` is the entire contract; extra positionals are almost
+  // certainly a mistake (e.g. an unquoted glob) — refuse rather than silently
+  // operate on only the first for a destructive command.
+  if (positionals.length > 1) {
+    stderr.write(
+      `agents uninstall takes exactly one <name>; received: ${positionals.join(" ")}\n${UNINSTALL_USAGE}`,
+    );
+    return exit(1);
+  }
+  if (keepDb && keepLockfile) {
+    stderr.write(`--keep-db and --keep-lockfile cannot be combined (nothing left to do).\n${UNINSTALL_USAGE}`);
+    return exit(1);
+  }
+
+  const lockfilePath = resolvePath(lockfilePathArg ?? "./cinatra-agents.lock");
+
+  let dbRemoved = 0;
+  if (!keepDb) {
+    try {
+      dbRemoved = await deleteAgentTemplateByPackage(packageName);
+    } catch (err) {
+      stderr.write(`Uninstall error: ${err?.message ?? String(err)}\n`);
+      return exit(1);
+    }
+  }
+
+  let lockfileRemoved = false;
+  if (!keepLockfile) {
+    // Guard the lockfile read/write: if the DB rows were already removed and the
+    // write fails (permissions, disk), report it AND surface that the DB side
+    // already succeeded, so the operator knows the uninstall was partial.
+    try {
+      const existing = await readLockfile(lockfilePath);
+      if (existing) {
+        const { lockfile: pruned, removed } = removeLockfilePackage(existing, packageName);
+        lockfileRemoved = removed;
+        if (removed) await writeLockfile(lockfilePath, pruned);
+      }
+    } catch (err) {
+      stderr.write(
+        `Uninstall error pruning lockfile: ${err?.message ?? String(err)}` +
+          (dbRemoved > 0 ? " (DB rows were already removed)" : "") +
+          "\n",
+      );
+      return exit(1);
+    }
+  }
+
+  // "Nothing removed" across every side we were asked to operate on → report
+  // the package was not installed (still exit 0; uninstall is idempotent).
+  const dbDidNothing = keepDb || dbRemoved === 0;
+  const lockfileDidNothing = keepLockfile || !lockfileRemoved;
+  if (dbDidNothing && lockfileDidNothing) {
+    stdout.write(`agents uninstall: ${packageName} was not installed (nothing to remove).\n`);
+    return exit(0);
+  }
+
+  const parts = [];
+  if (!keepDb) parts.push(dbRemoved > 0 ? `removed ${dbRemoved} template row(s)` : "no matching DB rows");
+  if (!keepLockfile) parts.push(lockfileRemoved ? "pruned lockfile entry" : "no lockfile entry");
+  stdout.write(`Uninstalled ${packageName}: ${parts.join("; ")}.\n`);
+  return exit(0);
+}
+
 export const __test = {
   parseArgv,
   parseSpec,
   redactToken,
+  summarizeLockfilePackages,
+  removeLockfilePackage,
   // Exported so the #179 regression (flat pacote `token` option, ignored by
   // npm-registry-fetch) stays pinned at the CLI layer too.
   registryScopedAuthOptions,

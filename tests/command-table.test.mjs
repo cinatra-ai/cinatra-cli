@@ -108,6 +108,12 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode",
         },
         {
+          "command": "extensions list",
+          "hidden": false,
+          "id": "extensions.list",
+          "match": "command+mode",
+        },
+        {
           "command": "create-extension",
           "hidden": false,
           "id": "create-extension",
@@ -306,6 +312,18 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode",
         },
         {
+          "command": "agents list",
+          "hidden": false,
+          "id": "agents.list",
+          "match": "command+mode",
+        },
+        {
+          "command": "agents uninstall",
+          "hidden": false,
+          "id": "agents.uninstall",
+          "match": "command+mode",
+        },
+        {
           "command": "agent export",
           "hidden": false,
           "id": "agent.export",
@@ -362,6 +380,7 @@ describe("command table — routing equivalence with the prior if-chain", () => 
     [["extensions", "purge"], "extensions.purge"],
     [["extensions", "acquire-prod"], "extensions.acquire-prod"],
     [["extensions", "submit"], "extensions.submit"],
+    [["extensions", "list"], "extensions.list"],
     [["mcp", "tunnel"], "mcp.tunnel"],
     [["backup", "create"], "backup.create"],
     [["backup", "import"], "backup.import"],
@@ -403,6 +422,9 @@ describe("command table — routing equivalence with the prior if-chain", () => 
     [["doctor", "--strict"], "doctor"],
     [["agents", "install"], "agents.install"],
     [["agents", "install", "@scope/x"], "agents.install"],
+    [["agents", "list"], "agents.list"],
+    [["agents", "uninstall"], "agents.uninstall"],
+    [["agents", "uninstall", "@scope/x"], "agents.uninstall"],
     [["agent", "export"], "agent.export"],
     [["agent", "import"], "agent.import"],
     // Non-matches: fall through to the fallback / unknown handling in runCli.

@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID, createHash } from "node:crypto";
-import { closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -16,7 +16,7 @@ import { resolveTeardownNames } from "./teardown-config.mjs";
 // from the checkout's installed `@cinatra-ai/migrations`.
 import { importFromCheckout } from "./checkout-resolve.mjs";
 import { syncDevApps, readDevAppsConfig } from "./dev-apps.mjs";
-import { syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
+import { deriveKindFromName, syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
 import { seedLocalRegistryExtensions } from "./seed-local-registry.mjs";
 import { parseDevRefreshFlags, describeDockerDecision } from "./dev-refresh.mjs";
 import {
@@ -333,6 +333,7 @@ Usage:
   cinatra extensions purge <packageName> --confirm <packageName> --digest <d>
                           [--reason <r>] [--app-url <url>] --yes
   cinatra extensions submit <tarball.tgz> [--description "<text>"]
+  cinatra extensions list [--json]
   cinatra create-extension <kind> [name] [--scope <scope>] [--display-name <name>]
                            [--description <text>] [--dir <path>] [--force] [--yes]
   cinatra extensions acquire-prod
@@ -343,6 +344,8 @@ Usage:
   cinatra agent export <id-or-name> [--file <output.zip>]
   cinatra agent import <file.zip> [--name <override-name>]
   cinatra agents install [<name>[@<range>]] [options]
+  cinatra agents list [--lockfile <path>] [--json]
+  cinatra agents uninstall <name> [--lockfile <path>] [--keep-db|--keep-lockfile]
 
 Commands:
   install           Bootstrap a Cinatra instance FROM ZERO — the only command
@@ -436,6 +439,11 @@ Commands:
                     <tarball.tgz>     Path to the built .tgz.
                     --description     Optional short description recorded on
                                       the submission row.
+
+  extensions list   List the extensions installed under the extensions/ tree
+                    (the layout acquire-prod materializes and dev clones into):
+                    name, derived kind, and version. Read-only; no DB/registry.
+                    --json            Emit the installed set as JSON.
 
   create-extension  Scaffold a new Cinatra extension package on disk, ready to
                     author + publish. One of five kinds: agent, connector,
@@ -652,6 +660,21 @@ Commands:
                     --dry-run               Print resolved tree; write nothing.
                     --registry-url <url>    Verdaccio registry URL override.
                     --registry-token <tok>  Verdaccio token override.
+
+  agents list       List the agents recorded in ./cinatra-agents.lock (the file
+                    "agents install" writes): package, version, and root-vs-
+                    dependency role. Read-only; never touches the DB.
+                    --lockfile <path>       Lockfile path (default ./cinatra-agents.lock).
+                    --json                  Emit the installed set as JSON.
+
+  agents uninstall <name>
+                    Counterpart to "agents install": remove an installed agent's
+                    template rows (matched on package_name) and its versions from
+                    the DB, and prune the lockfile entry. Removes ONLY the named
+                    package, never its dependency closure.
+                    --lockfile <path>       Lockfile path (default ./cinatra-agents.lock).
+                    --keep-db               Prune the lockfile entry only.
+                    --keep-lockfile         Delete DB rows only.
 `);
 }
 
@@ -9541,6 +9564,86 @@ async function runExtensionsPurge(argv) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// extensions list — enumerate the on-disk extensions tree (the same
+// `extensions/<scope>/<name>/` layout `acquire-prod` materializes and dev
+// clones into). IoC: we enumerate what is installed on disk, never a hardcoded
+// name list. Read-only — touches no DB, no registry, no network.
+// ---------------------------------------------------------------------------
+
+/**
+ * Walk `extensions/<scope>/<name>/` under `repoRoot` and return one record per
+ * installed extension package (those that carry a `package.json`). `kind` is
+ * derived from the declared `cinatra.kind`/`cinatra.type` or the name suffix
+ * (best-effort), mirroring `deriveKindFromName`. Returns an alphabetically
+ * sorted list; an absent `extensions/` directory yields [].
+ *
+ * @param {string} repoRoot
+ * @returns {{ name: string, version: string, kind: string|null, dir: string }[]}
+ */
+function listInstalledExtensions(repoRoot) {
+  const extRoot = path.join(repoRoot, "extensions");
+  // existsSync alone admits a non-directory `extensions` path; statSync-guard so
+  // a stray file there degrades to "none installed" instead of an ENOTDIR crash.
+  if (!existsSync(extRoot) || !statSync(extRoot).isDirectory()) return [];
+  const out = [];
+  for (const scope of readdirSync(extRoot, { withFileTypes: true })) {
+    if (!scope.isDirectory()) continue;
+    const scopeDir = path.join(extRoot, scope.name);
+    for (const pkg of readdirSync(scopeDir, { withFileTypes: true })) {
+      if (!pkg.isDirectory()) continue;
+      const dir = path.join(scopeDir, pkg.name);
+      const manifestPath = path.join(dir, "package.json");
+      if (!existsSync(manifestPath)) continue;
+      let manifest;
+      try {
+        manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      } catch {
+        continue; // a non-package dir or partial clone — skip rather than fail the listing.
+      }
+      const name = typeof manifest?.name === "string" ? manifest.name : `@${scope.name}/${pkg.name}`;
+      out.push({
+        name,
+        version: typeof manifest?.version === "string" ? manifest.version : "",
+        kind: deriveKindFromName(name, manifest?.cinatra?.kind ?? manifest?.cinatra?.type),
+        dir,
+      });
+    }
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+async function runExtensionsList(argv = []) {
+  // `--json` is the only accepted token; reject anything else rather than
+  // silently ignoring a typo'd flag or stray positional.
+  for (const a of argv) {
+    if (a !== "--json") {
+      throw new Error(`Unexpected argument: ${a}\nUsage: cinatra extensions list [--json]`);
+    }
+  }
+
+  const repoRoot = getRepoRoot();
+  const rows = listInstalledExtensions(repoRoot);
+
+  if (argv.includes("--json")) {
+    console.log(JSON.stringify(rows, null, 2));
+    return;
+  }
+
+  if (rows.length === 0) {
+    console.log(`No extensions installed under ${path.join(repoRoot, "extensions")}.`);
+    return;
+  }
+
+  const nameWidth = Math.max(...rows.map((r) => r.name.length), 9);
+  const kindWidth = Math.max(...rows.map((r) => (r.kind ?? "-").length), 4);
+  console.log(`${"EXTENSION".padEnd(nameWidth)}  ${"KIND".padEnd(kindWidth)}  VERSION`);
+  for (const r of rows) {
+    console.log(`${r.name.padEnd(nameWidth)}  ${(r.kind ?? "-").padEnd(kindWidth)}  ${r.version || "-"}`);
+  }
+}
+
 async function runStatus(argv = []) {
   // Remote path: when an explicit target is selected (--app-url or --profile),
   // call the instance's authenticated /api/cli/status over HTTP using the
@@ -9943,6 +10046,9 @@ function buildHandlers() {
       const { runExtensionsSubmit } = await import("./extensions-submit.mjs");
       await runExtensionsSubmit(rest);
     },
+    "extensions.list": async (rest) => {
+      await runExtensionsList(rest);
+    },
     // Class-B authoring: scaffold a new extension package on disk. Folded from
     // the retired `npx create-cinatra-extension` thin alias (cinatra#402) over a
     // shared, zero-dependency authoring core lazy-loaded from ./authoring/.
@@ -10062,6 +10168,16 @@ function buildHandlers() {
       // from the operator's checkout (not bundled in the thin CLI). agents
       // install operates on a cinatra checkout, so anchor on getRepoRoot().
       return runAgentsInstall(rest, { repoRoot: getRepoRoot() });
+    },
+    "agents.list": async (rest) => {
+      // Read-only lockfile listing: no checkout/DB needed (the lockfile lives in
+      // cwd by default), so it does not anchor on getRepoRoot().
+      const { runAgentsList } = await import("./agents-install.mjs");
+      return runAgentsList(rest);
+    },
+    "agents.uninstall": async (rest) => {
+      const { runAgentsUninstall } = await import("./agents-install.mjs");
+      return runAgentsUninstall(rest);
     },
     "agent.export": async (rest) => {
       await runAgentExport(rest);

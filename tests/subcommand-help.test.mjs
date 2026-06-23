@@ -107,6 +107,9 @@ describe("cinatra <subcommand> --help across matcher shapes", () => {
     [["doctor", "--help"], "cinatra doctor"], // command (read-only, still must not run)
     [["status", "-h"], "cinatra status"], // command, -h alias
     [["logs", "--help"], "cinatra logs"], // command, read-only — usage only, no log read/compose spawn
+    [["agents", "list", "--help"], "cinatra agents list"], // command+mode, read-only — usage only, no lockfile read
+    [["agents", "uninstall", "--help"], "cinatra agents uninstall"], // command+mode, destructive — must NOT touch DB/lockfile on --help
+    [["extensions", "list", "--help"], "cinatra extensions list"], // command+mode, read-only — usage only, no fs walk
   ];
 
   it.each(cases)("`%j` prints usage, exits 0, no side effect", (args, token) => {

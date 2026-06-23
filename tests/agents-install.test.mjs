@@ -330,3 +330,151 @@ describe("safeJsonParse", () => {
     expect(__test.safeJsonParse("{not json")).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// agents list / uninstall — pure read-model + lockfile-pruning helpers.
+// ---------------------------------------------------------------------------
+
+describe("summarizeLockfilePackages", () => {
+  const lf = {
+    lockfileVersion: 2,
+    root: { packageName: "@cinatra/a", version: "1.2.0" },
+    packages: {
+      "@cinatra/b": { version: "2.0.0" },
+      "@cinatra/a": { version: "1.2.0" },
+    },
+  };
+
+  it("returns rows sorted by package name with the root flagged", () => {
+    expect(__test.summarizeLockfilePackages(lf)).toEqual([
+      { packageName: "@cinatra/a", version: "1.2.0", root: true },
+      { packageName: "@cinatra/b", version: "2.0.0", root: false },
+    ]);
+  });
+
+  it("returns [] for null / packageless lockfiles", () => {
+    expect(__test.summarizeLockfilePackages(null)).toEqual([]);
+    expect(__test.summarizeLockfilePackages({})).toEqual([]);
+    expect(__test.summarizeLockfilePackages({ packages: null })).toEqual([]);
+  });
+
+  it("tolerates a missing version field", () => {
+    const rows = __test.summarizeLockfilePackages({ packages: { "@cinatra/x": {} } });
+    expect(rows).toEqual([{ packageName: "@cinatra/x", version: "", root: false }]);
+  });
+});
+
+describe("removeLockfilePackage", () => {
+  const base = {
+    lockfileVersion: 2,
+    root: { packageName: "@cinatra/a", version: "1.0.0" },
+    packages: { "@cinatra/a": { version: "1.0.0" }, "@cinatra/b": { version: "1.0.0" } },
+  };
+
+  it("removes the named package without mutating the input", () => {
+    const { lockfile, removed } = __test.removeLockfilePackage(base, "@cinatra/b");
+    expect(removed).toBe(true);
+    expect(Object.keys(lockfile.packages)).toEqual(["@cinatra/a"]);
+    // input untouched
+    expect(Object.keys(base.packages)).toEqual(["@cinatra/a", "@cinatra/b"]);
+  });
+
+  it("reports removed:false for an absent package", () => {
+    const { removed } = __test.removeLockfilePackage(base, "@cinatra/zzz");
+    expect(removed).toBe(false);
+  });
+
+  it("is a no-op for a packageless lockfile", () => {
+    const { removed } = __test.removeLockfilePackage({}, "@cinatra/a");
+    expect(removed).toBe(false);
+  });
+});
+
+describe("runAgentsList", () => {
+  beforeEach(() => vi.resetModules());
+
+  it("exits 1 on an unknown flag", async () => {
+    const { runAgentsList } = await import("../src/agents-install.mjs");
+    const exit = vi.fn();
+    await runAgentsList(["--nope"], { exit, stderr: { write: vi.fn() }, stdout: { write: vi.fn() } });
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it("reports an empty set (exit 0) when no lockfile exists", async () => {
+    const { runAgentsList } = await import("../src/agents-install.mjs");
+    const exit = vi.fn();
+    const stdout = { write: vi.fn() };
+    await runAgentsList(["--lockfile", "/nonexistent/path/cinatra-agents.lock"], {
+      exit,
+      stderr: { write: vi.fn() },
+      stdout,
+    });
+    expect(exit).toHaveBeenCalledWith(0);
+    expect(stdout.write.mock.calls.map((c) => c[0]).join("")).toMatch(/No agents installed/);
+  });
+});
+
+describe("runAgentsUninstall", () => {
+  beforeEach(() => vi.resetModules());
+
+  it("exits 1 with usage when no package name is given", async () => {
+    const { runAgentsUninstall } = await import("../src/agents-install.mjs");
+    const exit = vi.fn();
+    const stderr = { write: vi.fn() };
+    await runAgentsUninstall([], { exit, stderr, stdout: { write: vi.fn() } });
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(stderr.write.mock.calls.map((c) => c[0]).join("")).toMatch(/Usage:/);
+  });
+
+  it("rejects --keep-db with --keep-lockfile (exit 1)", async () => {
+    const { runAgentsUninstall } = await import("../src/agents-install.mjs");
+    const exit = vi.fn();
+    await runAgentsUninstall(["@cinatra/a", "--keep-db", "--keep-lockfile"], {
+      exit,
+      stderr: { write: vi.fn() },
+      stdout: { write: vi.fn() },
+    });
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it("rejects --lockfile with a flag-like next token instead of consuming it (no DB delete)", async () => {
+    // Guard against `uninstall @a --lockfile --keep-db` swallowing --keep-db as
+    // the path: that would leave keepDb=false and proceed to a DB delete the
+    // user meant to skip. Must be a usage error (exit 1) BEFORE any DB work.
+    const { runAgentsUninstall } = await import("../src/agents-install.mjs");
+    const exit = vi.fn();
+    const stderr = { write: vi.fn() };
+    await runAgentsUninstall(["@cinatra/a", "--lockfile", "--keep-db"], {
+      exit,
+      stderr,
+      stdout: { write: vi.fn() },
+    });
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(stderr.write.mock.calls.map((c) => c[0]).join("")).toMatch(/Missing value for --lockfile/);
+  });
+
+  it("rejects extra positionals (exit 1)", async () => {
+    const { runAgentsUninstall } = await import("../src/agents-install.mjs");
+    const exit = vi.fn();
+    const stderr = { write: vi.fn() };
+    await runAgentsUninstall(["@cinatra/a", "@cinatra/b", "--keep-db"], {
+      exit,
+      stderr,
+      stdout: { write: vi.fn() },
+    });
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(stderr.write.mock.calls.map((c) => c[0]).join("")).toMatch(/exactly one <name>/);
+  });
+
+  it("--keep-db with no lockfile entry reports not-installed (exit 0, no DB needed)", async () => {
+    const { runAgentsUninstall } = await import("../src/agents-install.mjs");
+    const exit = vi.fn();
+    const stdout = { write: vi.fn() };
+    await runAgentsUninstall(
+      ["@cinatra/absent", "--keep-db", "--lockfile", "/nonexistent/path/cinatra-agents.lock"],
+      { exit, stderr: { write: vi.fn() }, stdout },
+    );
+    expect(exit).toHaveBeenCalledWith(0);
+    expect(stdout.write.mock.calls.map((c) => c[0]).join("")).toMatch(/was not installed|no lockfile entry/);
+  });
+});

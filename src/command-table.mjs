@@ -111,6 +111,12 @@ export const COMMAND_DESCRIPTORS = [
     summary: "Submit a built extension tarball to the Cinatra Marketplace for review.",
   },
   {
+    id: "extensions.list",
+    path: ["extensions", "list"],
+    match: "command+mode",
+    summary: "List installed extensions (name, kind, version) from the extensions/ tree.",
+  },
+  {
     id: "create-extension",
     path: ["create-extension"],
     match: "command",
@@ -307,6 +313,18 @@ export const COMMAND_DESCRIPTORS = [
     path: ["agents", "install"],
     match: "command+mode",
     summary: "Resolve and install an agent package tree from Verdaccio.",
+  },
+  {
+    id: "agents.list",
+    path: ["agents", "list"],
+    match: "command+mode",
+    summary: "List installed agents (package, version, role) from cinatra-agents.lock.",
+  },
+  {
+    id: "agents.uninstall",
+    path: ["agents", "uninstall"],
+    match: "command+mode",
+    summary: "Remove an installed agent (DB template rows + lockfile entry).",
   },
   {
     id: "agent.export",
