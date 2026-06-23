@@ -1329,79 +1329,277 @@ async function cloneOrUpdateHost({ targetDir, repoUrl, ref, alreadyCheckout, for
       );
     }
 
-    if (workingTreeIsDirty(targetDir)) {
-      if (!force) {
-        throw new Error(
-          `Refusing to update ${targetDir}: the working tree has uncommitted changes. ` +
-            `Commit/stash them, or re-run with --force (which stashes them first).`,
-        );
-      }
-      log("  --force: stashing local changes (including untracked) before update…");
-      const stash = git(["-C", targetDir, "stash", "push", "--include-untracked", "-m", "cinatra install --force"]);
-      if (stash.status !== 0) {
-        throw new Error(`git stash failed; refusing to hard-update a dirty tree: ${(stash.stderr ?? "").trim()}`);
-      }
-      log(`  Local changes stashed — recover via: git -C ${targetDir} stash list && git -C ${targetDir} stash pop`);
-    }
-
-    const fetch = git(["-C", targetDir, "fetch", "origin", ref, "--tags"]);
-    if (fetch.status !== 0) {
-      throw new Error(`git fetch origin ${ref} failed: ${(fetch.stderr ?? "").trim()}`);
-    }
-  } else {
-    if (existsSync(targetDir) && !isEmptyDir(targetDir)) {
-      // Non-empty + --force was confirmed above; clone into it is unsafe, so
-      // require an explicit confirmation that we may clone into a NON-empty dir.
-      const ok = await confirm(`Clone INTO non-empty ${targetDir}? Existing contents may collide.`, { yes });
-      if (!ok) throw new Error(`Aborted: ${targetDir} is not empty. Choose an empty --dir.`);
-    }
-    mkdirSync(targetDir, { recursive: true });
-    log(`- Cloning ${repoUrl} into ${targetDir}…`);
-    const clone = git(["clone", "--", repoUrl, targetDir]);
-    if (clone.status !== 0) {
-      throw new Error(
-        `git clone failed: ${(clone.stderr ?? "").trim()}\n` +
-          `  Check network access and that you can read ${repoUrl} ` +
-          `(use --repo-url for an SSH/token remote if the repo is private).`,
-      );
-    }
+    // Reuse the single shared git-move primitive (fetch ref + tags → resolve to
+    // a concrete commit → fast-forward / --force hard-reset). The same helper
+    // backs `cinatra update`, so install and update can never drift apart.
+    return moveExistingCheckoutToRef({ targetDir, ref, force, log });
   }
 
-  // Resolve `ref` to a commit and check it out detached-then-by-name so both a
-  // branch and a raw sha work. We checkout the FETCH_HEAD/ref so an update lands
-  // on the requested ref deterministically.
+  if (existsSync(targetDir) && !isEmptyDir(targetDir)) {
+    // Non-empty + --force was confirmed above; clone into it is unsafe, so
+    // require an explicit confirmation that we may clone into a NON-empty dir.
+    const ok = await confirm(`Clone INTO non-empty ${targetDir}? Existing contents may collide.`, { yes });
+    if (!ok) throw new Error(`Aborted: ${targetDir} is not empty. Choose an empty --dir.`);
+  }
+  mkdirSync(targetDir, { recursive: true });
+  log(`- Cloning ${repoUrl} into ${targetDir}…`);
+  const clone = git(["clone", "--", repoUrl, targetDir]);
+  if (clone.status !== 0) {
+    throw new Error(
+      `git clone failed: ${(clone.stderr ?? "").trim()}\n` +
+        `  Check network access and that you can read ${repoUrl} ` +
+        `(use --repo-url for an SSH/token remote if the repo is private).`,
+    );
+  }
+
+  // Fresh clone: check out the requested ref (the clone default is the remote
+  // HEAD branch). Resolve `ref` to a commit and check it out detached-then-by-
+  // name so both a branch and a raw sha work.
   const checkout = git(["-C", targetDir, "checkout", ref]);
   if (checkout.status !== 0) {
-    // Fall back to FETCH_HEAD (covers a freshly-fetched sha/tag not yet a local ref).
-    const fh = git(["-C", targetDir, "checkout", "FETCH_HEAD"]);
+    // Fetch the ref explicitly (covers a tag/sha not in the default clone) then
+    // check out the fetched commit.
+    const fetched = git(["-C", targetDir, "fetch", "origin", ref, "--tags"]);
+    const fh = fetched.status === 0 ? git(["-C", targetDir, "checkout", "FETCH_HEAD"]) : fetched;
     if (fh.status !== 0) {
       throw new Error(
         `Could not check out ref "${ref}": ${(checkout.stderr ?? "").trim()}. ` +
           `Verify the branch/tag/sha exists in ${repoUrl}.`,
       );
     }
-  } else if (alreadyCheckout) {
-    // For a branch update, fast-forward to the fetched tip. A divergent local
-    // branch fails --ff-only; surface it (with the --force remediation) rather
-    // than silently returning the stale HEAD as "updated".
-    const ff = git(["-C", targetDir, "merge", "--ff-only", "FETCH_HEAD"]);
-    if (ff.status !== 0) {
-      if (!force) {
-        throw new Error(
-          `Could not fast-forward ${targetDir} to the fetched "${ref}" tip ` +
-            `(the local branch has diverged): ${(ff.stderr ?? "").trim()}. ` +
-            `Reconcile manually, or re-run with --force to hard-reset to the fetched tip.`,
-        );
-      }
-      log("  --force: local branch diverged — hard-resetting to the fetched tip…");
-      const reset = git(["-C", targetDir, "reset", "--hard", "FETCH_HEAD"]);
-      if (reset.status !== 0) {
-        throw new Error(`git reset --hard FETCH_HEAD failed: ${(reset.stderr ?? "").trim()}`);
-      }
-    }
   }
 
   const sha = capture("git", ["-C", targetDir, "rev-parse", "HEAD"], { env: gitEnv() });
+  if (!sha) throw new Error(`Could not resolve the checked-out commit in ${targetDir}.`);
+  return sha;
+}
+
+// ---------------------------------------------------------------------------
+// Shared git-move helper (cinatra-cli#11).
+//
+// `moveExistingCheckoutToRef` is the single git-move primitive for an EXISTING
+// checkout: fetch the requested ref from origin, resolve it to a CONCRETE target
+// commit, then fast-forward (or, under --force, hard-reset) the checkout onto
+// THAT commit. Both `cloneOrUpdateHost`'s update branch (install on an existing
+// checkout) AND `cinatra update`/`upgrade` route through it, so install and
+// update can never drift apart.
+//
+// Why an explicitly-resolved target commit (not ambient FETCH_HEAD): `update`
+// resolves the latest `v*` tag by first fetching `--tags` (whose FETCH_HEAD is
+// the DEFAULT BRANCH tip, not the chosen tag), so moving to ambient FETCH_HEAD
+// would land on origin/main instead of the release. We always fetch the exact
+// ref and `rev-parse <ref>^{commit}` it, making the move deterministic.
+//
+// Import-light (node builtins + git subprocesses + a LAZY `semver` import) so it
+// never drags the heavy `index.mjs` graph into the published thin CLI;
+// `index.mjs`'s update handler imports it via the same lazy `import(...)` it
+// already uses for `runInstall`. `deps`-injectable so it unit-tests without a
+// network.
+// ---------------------------------------------------------------------------
+
+// A release tag we are willing to move to: a `v`-prefixed semver (the leading
+// `v` followed by MAJOR.MINOR.PATCH and an optional pre-release/build suffix).
+// Conservative — anchored, no whitespace/option-injection, so a tag name can
+// never be mistaken for a git flag. The leading `v` is required so arbitrary
+// annotated tags (e.g. `nightly`, `latest`) are never treated as a release.
+const RELEASE_TAG_RE = /^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
+
+/** Pick the highest `v<semver>` release tag from a list (pure; testable without
+ *  git). Non-release tags (no leading `v`, non-semver) are ignored.
+ *
+ *  Stable releases ALWAYS win over pre-releases: a pre-release tag is eligible
+ *  ONLY when the list contains NO stable release tag at all (so a release
+ *  candidate is never chosen over an existing stable release). Among stable tags
+ *  — or, when none exist, among pre-releases — the highest by semver precedence
+ *  wins. Returns the tag string, or null when none qualify. */
+export async function pickLatestReleaseTag(tags) {
+  const { default: semver } = await import("semver");
+  let bestStable = null; // { tag, version }
+  let bestPre = null; // { tag, version }
+  for (const tag of Array.isArray(tags) ? tags : []) {
+    if (typeof tag !== "string" || !RELEASE_TAG_RE.test(tag)) continue;
+    const version = semver.valid(tag.slice(1));
+    if (!version) continue;
+    const isPre = semver.prerelease(version) !== null;
+    const slot = isPre ? bestPre : bestStable;
+    if (slot === null || semver.gt(version, slot.version)) {
+      if (isPre) bestPre = { tag, version };
+      else bestStable = { tag, version };
+    }
+  }
+  // Stable releases take precedence over ANY pre-release; pre-releases are a
+  // fallback used only when no stable release tag exists.
+  const best = bestStable ?? bestPre;
+  return best ? best.tag : null;
+}
+
+/** List the `v*` release tags published on ORIGIN (not local tag state) via
+ *  `git ls-remote --tags origin "v*"`. Deriving candidates from the remote means
+ *  a stale/private LOCAL-only tag can never be chosen as "the latest release".
+ *  Strips the `refs/tags/` prefix and the `^{}` peeled-ref suffix annotated tags
+ *  emit. Returns deduped tag names. Injectable via `deps.capture`. */
+function listRemoteReleaseTags(targetDir, deps = {}) {
+  const cap = deps.capture ?? capture;
+  const raw = cap("git", ["-C", targetDir, "ls-remote", "--tags", "origin", "v*"], { env: gitEnv() });
+  if (raw === null) {
+    throw new Error(
+      `git ls-remote --tags origin failed for ${targetDir} — could not list release tags ` +
+        "from the remote (is origin reachable?).",
+    );
+  }
+  const tags = new Set();
+  for (const line of raw.split("\n")) {
+    // "<sha>\trefs/tags/<name>"; annotated tags also emit a "…^{}" peeled line.
+    const m = line.match(/\trefs\/tags\/(.+?)(\^\{\})?$/);
+    if (m && m[1]) tags.add(m[1].trim());
+  }
+  return [...tags];
+}
+
+/** Resolve the LATEST `v*` release tag PUBLISHED ON ORIGIN (highest semver;
+ *  stable preferred). Candidates are read from the remote via `git ls-remote`
+ *  (NOT local tag state), so a stale local-only tag can never win. Returns the
+ *  tag string. Throws an actionable error when the remote can't be listed or
+ *  publishes no release tag. `deps` injects `listTags` for tests. */
+export async function resolveLatestReleaseTag({ targetDir, log = console.log, deps = {} } = {}) {
+  log("- Querying origin for the latest release tag…");
+  const tags = (deps.listTags ?? (() => listRemoteReleaseTags(targetDir, deps)))();
+  const latest = await pickLatestReleaseTag(tags);
+  if (!latest) {
+    throw new Error(
+      `No release tag (a \`v*\` semver tag) found on origin for ${targetDir}. ` +
+        "`cinatra update` moves a checkout to the latest published release; this remote has none.",
+    );
+  }
+  return latest;
+}
+
+/** Move an EXISTING checkout at `targetDir` onto `ref` (a branch, tag, or sha):
+ *  fetch the ref from origin, resolve it to a CONCRETE target commit, then
+ *  fast-forward — or, under `force`, hard-reset — the checkout onto that commit.
+ *  Refuses a dirty working tree unless `force` (stash first); refuses a
+ *  divergent/non-fast-forward move unless `force` (hard-reset). Returns the
+ *  resolved HEAD sha.
+ *
+ *  `kind` disambiguates a tag/branch NAME COLLISION (a release tag and a local
+ *  branch that happen to share the same name):
+ *    - "tag"    — `ref` is a release tag: fetch it as `refs/tags/<ref>` and check
+ *                 out its commit DETACHED, so a colliding local branch can never
+ *                 be mutated (the correct state for a release pin). Used by
+ *                 `cinatra update`'s latest-release path.
+ *    - "ref"    — (default) auto-detect: a `ref` that names a local BRANCH lands
+ *                 on (and stays on) that branch; anything else detaches at the
+ *                 resolved commit. Used by `install`/`cloneOrUpdateHost` so
+ *                 `--ref main` keeps tracking `main`.
+ *
+ *  `fetch: false` skips the fetch step (the caller already fetched the ref).
+ *  `deps` injects `runGit(args)` + `workingTreeIsDirty` + `capture` for tests. */
+export function moveExistingCheckoutToRef({
+  targetDir,
+  ref,
+  kind = "ref",
+  force = false,
+  fetch = true,
+  log = console.log,
+  deps = {},
+} = {}) {
+  const runGit = deps.runGit ?? ((args) => git(["-C", targetDir, ...args]));
+  const cap = deps.capture ?? capture;
+  const isDirty = deps.workingTreeIsDirty ?? (() => workingTreeIsDirty(targetDir));
+
+  // 1. Refuse / stash a dirty tree FIRST (before any fetch or move side effect).
+  if (isDirty()) {
+    if (!force) {
+      throw new Error(
+        `Refusing to move ${targetDir}: the working tree has uncommitted changes. ` +
+          `Commit/stash them, or re-run with --force (which stashes them first).`,
+      );
+    }
+    log("  --force: stashing local changes (including untracked) before the move…");
+    const stash = runGit(["stash", "push", "--include-untracked", "-m", `cinatra move ${ref}`]);
+    if (stash.status !== 0) {
+      throw new Error(`git stash failed; refusing to hard-move a dirty tree: ${(stash.stderr ?? "").trim()}`);
+    }
+    log(`  Local changes stashed — recover via: git -C ${targetDir} stash list && git -C ${targetDir} stash pop`);
+  }
+
+  // 2. Fetch the EXACT ref so it is local, then resolve it to a concrete commit.
+  //    For a "tag" move we fetch the FULLY-QUALIFIED `refs/tags/<ref>` into a
+  //    local `refs/tags/<ref>` so the resolved commit is the TAG's — never a
+  //    colliding branch's. We resolve the commit directly (NOT ambient
+  //    FETCH_HEAD): a `--tags` fetch leaves FETCH_HEAD at the default branch, so
+  //    trusting ambient FETCH_HEAD could land on the wrong commit for a tag move.
+  const isTag = kind === "tag";
+  if (fetch) {
+    const fetchArgs = isTag
+      ? ["fetch", "origin", "--force", `refs/tags/${ref}:refs/tags/${ref}`]
+      : ["fetch", "origin", ref, "--tags", "--force"];
+    const fetched = runGit(fetchArgs);
+    if (fetched.status !== 0) {
+      throw new Error(`git fetch origin ${ref} failed: ${(fetched.stderr ?? "").trim()}`);
+    }
+  }
+  // Tag: resolve the tag-qualified ref unambiguously. Ref: try FETCH_HEAD (the
+  // just-fetched ref), then origin/<ref>, then the bare ref — so a stale local
+  // ref of the same name never wins over the freshly-fetched remote commit.
+  const candidates = isTag ? [`refs/tags/${ref}`] : ["FETCH_HEAD", `origin/${ref}`, ref];
+  let targetCommit = null;
+  for (const candidate of candidates) {
+    const r = runGit(["rev-parse", "--verify", "--quiet", `${candidate}^{commit}`]);
+    if (r.status === 0 && typeof r.stdout === "string" && r.stdout.trim()) {
+      targetCommit = r.stdout.trim();
+      break;
+    }
+  }
+  if (!targetCommit) {
+    throw new Error(
+      `Could not resolve ${isTag ? "tag" : "ref"} "${ref}" to a commit after fetching. ` +
+        `Verify the ${isTag ? "tag" : "branch/tag/sha"} exists in origin.`,
+    );
+  }
+
+  // 3. Check out the target. A "tag" move ALWAYS detaches at the tag commit (a
+  //    release pin), immune to a tag/branch name collision. A "ref" move that
+  //    names a LOCAL BRANCH checks out that branch BY NAME (so it lands on, and
+  //    stays on, the branch — preserving tracking for `--ref main`); otherwise
+  //    it detaches at the resolved commit. The branch check uses an exact
+  //    `refs/heads/<ref>` lookup, NOT a bare `checkout <ref>` (which would prefer
+  //    a branch over a same-named tag and silently mutate the wrong thing).
+  const isLocalBranch =
+    !isTag &&
+    runGit(["show-ref", "--verify", "--quiet", `refs/heads/${ref}`]).status === 0;
+  const checkoutTarget = isLocalBranch ? ref : targetCommit;
+  const checkout = runGit(["checkout", checkoutTarget]);
+  if (checkout.status !== 0) {
+    throw new Error(
+      `Could not check out ${isTag ? "tag" : "ref"} "${ref}": ${(checkout.stderr ?? "").trim()}.`,
+    );
+  }
+
+  // 4. Advance to the resolved target commit. With --force, hard-reset (covers a
+  //    divergent local branch / a backward move, and stays on the branch for a
+  //    branch ref). Otherwise require a clean fast-forward of HEAD onto the
+  //    target — `merge --ff-only` advances a branch in place (no detach) and is
+  //    a no-op when already at the target; a divergent move surfaces the --force
+  //    remediation rather than silently reporting a stale HEAD as "moved".
+  const headSha = () => (cap("git", ["-C", targetDir, "rev-parse", "HEAD"], { env: gitEnv() }) ?? "").trim();
+  if (force) {
+    const reset = runGit(["reset", "--hard", targetCommit]);
+    if (reset.status !== 0) {
+      throw new Error(`git reset --hard ${ref} failed: ${(reset.stderr ?? "").trim()}`);
+    }
+  } else if (headSha() !== targetCommit) {
+    const ff = runGit(["merge", "--ff-only", targetCommit]);
+    if (ff.status !== 0) {
+      throw new Error(
+        `Could not fast-forward ${targetDir} to "${ref}" (the local checkout has diverged ` +
+          `from it): ${(ff.stderr ?? "").trim()}. ` +
+          `Reconcile manually, or re-run with --force to hard-reset to "${ref}".`,
+      );
+    }
+  }
+
+  const sha = headSha();
   if (!sha) throw new Error(`Could not resolve the checked-out commit in ${targetDir}.`);
   return sha;
 }

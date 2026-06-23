@@ -54,6 +54,18 @@ describe("command table — descriptor snapshot", () => {
           "match": "command",
         },
         {
+          "command": "update",
+          "hidden": false,
+          "id": "update",
+          "match": "command",
+        },
+        {
+          "command": "upgrade",
+          "hidden": false,
+          "id": "upgrade",
+          "match": "command",
+        },
+        {
           "command": "login",
           "hidden": false,
           "id": "login",
@@ -318,6 +330,10 @@ describe("command table — routing equivalence with the prior if-chain", () => 
     [["install"], "install"],
     [["install", "--dir", "/tmp/x"], "install"], // command-only: flags ignored by the matcher.
     [["install", "--ref", "main"], "install"],
+    [["update"], "update"],
+    [["update", "--ref", "release-branch"], "update"], // command-only: flags ignored by the matcher.
+    [["upgrade"], "upgrade"],
+    [["upgrade", "--force"], "upgrade"],
     [["status"], "status"],
     [["status", "extra"], "status"], // command-only: ignores trailing tokens.
     [["skills", "reset-repo"], "skills.reset-repo"],
