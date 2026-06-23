@@ -45,6 +45,36 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
+import { isValidSlug } from "./clone-registry.mjs";
+import {
+  defaultInstanceRegistryPath,
+  requireUsableInstanceRegistry,
+  writeInstanceRegistry,
+  allocateInstance,
+  markInstanceReady,
+  releaseInstance,
+  getInstance,
+  listInstances,
+} from "./instance-registry.mjs";
+import {
+  writeMarker,
+  readMarker,
+  reconcileMarker,
+} from "./instance-marker.mjs";
+import {
+  defaultAllocLockPath,
+  withAllocLock,
+  allocateAppPort,
+  allocateBandOffset,
+  validateAppPort,
+  validatePortOffset,
+} from "./instance-alloc.mjs";
+import {
+  classifyPortHolder,
+  generateIsolatedCompose,
+  writeIsolatedComposeFile,
+  ISOLATED_COMPOSE_FILENAME,
+} from "./install-isolation.mjs";
 
 // Absolute path to THIS published `cinatra` CLI's own bin entry. After the
 // monorepo's `packages/cli` is removed (cinatra#402, P2), the freshly-cloned
@@ -161,6 +191,17 @@ function git(args, { cwd } = {}) {
  *  flag-shaped token (`--ref --dir x`) — a classic foot-gun that would
  *  otherwise silently consume the next flag as a value. */
 function readOption(argv, flag) {
+  // Support BOTH the space form (`--flag value`) and the inline form
+  // (`--flag=value`). The README / `--help` / CHANGELOG advertise the `=` form
+  // for the cinatra-cli#17 surface (e.g. `--infra=share`, `--on-conflict=isolated`),
+  // so the install parser MUST honour it — otherwise a documented `--infra=share`
+  // would silently parse as absent and bypass the co-use gate. Mirrors
+  // index.mjs's readOptionValue. The `=` form wins if both appear.
+  const eqPrefix = `${flag}=`;
+  const eqArg = argv.find((a) => typeof a === "string" && a.startsWith(eqPrefix));
+  if (eqArg !== undefined) {
+    return eqArg.slice(eqPrefix.length); // may be "" for `--flag=` (caller validates)
+  }
   const i = argv.indexOf(flag);
   if (i === -1) return null;
   const value = argv[i + 1];
@@ -176,6 +217,41 @@ const VALID_MODES = new Set(["dev", "prod"]);
 // no refspec/glob metacharacters. Covers `main`, dotted release tags, and
 // 7-40 hex shas.
 const SAFE_REF_RE = /^(?!-)[A-Za-z0-9._\/-]+$/;
+
+// ── Multi-instance install surface (cinatra-cli#17) ─────────────────────────
+// `--infra` chooses where infra comes from: a NEW install-owned stack (default),
+// EXTERNAL operator-supplied infra (the old `--no-infra` generalised into an
+// execute-against-external), or SHARE (co-use — GATED: accepted by the enum but
+// dispatched to a loud "not yet available" until the namespacing prerequisites
+// land; never a silent no-op). `--on-conflict` chooses what to do when a host
+// port is already held: fail (abort), prompt (the interactive execute-menu),
+// isolated (a second full stack on a remapped band), stop-existing (tear the
+// recorded holder down, then install on default ports), attach (converge on the
+// existing checkout), external (re-route to operator infra), or co-use (GATED,
+// like `--infra=share`).
+const VALID_INFRA = new Set(["new", "external", "share"]);
+const VALID_ON_CONFLICT = new Set([
+  "fail",
+  "prompt",
+  "isolated",
+  "stop-existing",
+  "attach",
+  "external",
+  "co-use",
+]);
+// The single settled spelling of the GATED co-use mode (the design's `couse`
+// was a typo): `--infra=share` and `--on-conflict=co-use`.
+const GATED_INFRA = "share";
+const GATED_ON_CONFLICT = "co-use";
+
+function readEnumOption(argv, flag, validSet, label) {
+  const v = readOption(argv, flag);
+  if (v == null) return null;
+  if (!validSet.has(v)) {
+    throw new Error(`Invalid ${flag} "${v}". Use one of: ${[...validSet].join(", ")}.`);
+  }
+  return v;
+}
 
 export function parseInstallArgs(argv = []) {
   const dirOpt = readOption(argv, "--dir");
@@ -202,6 +278,51 @@ export function parseInstallArgs(argv = []) {
   const repoUrl = repoUrlOpt ?? DEFAULT_REPO_URL;
   assertSafeRepoUrl(repoUrl);
 
+  // Instance enum surface. The parser ACCEPTS the full enum (so an unknown value
+  // still errors cleanly); the GATED values (`share` / `co-use`) are valid here
+  // and routed to a loud-fail at dispatch (T5b), not rejected as invalid.
+  let infra = readEnumOption(argv, "--infra", VALID_INFRA, "--infra");
+  const onConflict = readEnumOption(argv, "--on-conflict", VALID_ON_CONFLICT, "--on-conflict");
+
+  // `--no-infra` is an ALIAS for `--infra=external` (don't silently drop it).
+  const noInfraFlag = argv.includes("--no-infra");
+  if (noInfraFlag) {
+    if (infra && infra !== "external") {
+      throw new Error(`--no-infra conflicts with --infra=${infra}. Use one (—no-infra means --infra=external).`);
+    }
+    infra = "external";
+  }
+  // The legacy boolean other code reads: external infra means "do not bring up".
+  const noInfra = infra === "external";
+
+  // --instance slug (reuse the clone slug shape).
+  const instanceOpt = readOption(argv, "--instance");
+  if (instanceOpt != null && !isValidSlug(instanceOpt)) {
+    throw new Error(`Invalid --instance "${instanceOpt}". Must match /^[a-z0-9][a-z0-9-]{0,29}$/.`);
+  }
+
+  // --port-offset auto|<n> and --app-port <n>.
+  const portOffsetOpt = readOption(argv, "--port-offset");
+  let portOffset = null;
+  if (portOffsetOpt != null) {
+    portOffset = portOffsetOpt === "auto" ? "auto" : validatePortOffset(portOffsetOpt);
+  }
+  const appPortOpt = readOption(argv, "--app-port");
+  const appPort = appPortOpt != null ? validateAppPort(appPortOpt) : null;
+
+  // External-infra URLs (validated for shape at dispatch when used).
+  const dbUrl = readOption(argv, "--db-url");
+  const redisUrl = readOption(argv, "--redis-url");
+  const nangoUrl = readOption(argv, "--nango-url");
+  const graphitiUrl = readOption(argv, "--graphiti-url");
+
+  // GATED co-use sidecar flags — accepted, but their presence forces the T5b
+  // loud-fail (they advertise a surface that does nothing until co-use lands).
+  const reuseFrom = readOption(argv, "--reuse-from");
+  const dbName = readOption(argv, "--db-name");
+  const redisDb = readOption(argv, "--redis-db");
+  const bullmqQueue = readOption(argv, "--bullmq-queue");
+
   return {
     dir: dirOpt, // null → resolved later (prompt on TTY, else default).
     ref,
@@ -212,10 +333,39 @@ export function parseInstallArgs(argv = []) {
     resetEnv: argv.includes("--reset-env"),
     skipDevApps: argv.includes("--skip-dev-apps"),
     noSetup: argv.includes("--no-setup"),
-    noInfra: argv.includes("--no-infra"),
+    noInfra,
     // --no-install ⇒ clone + env only; pnpm install + setup both skipped
     // (setup needs the installed deps, so skipping install implies skipping setup).
     noInstall: argv.includes("--no-install"),
+
+    // cinatra-cli#17 surface.
+    infra, // null | "new" | "external" | "share"(gated)
+    onConflict, // null | one of VALID_ON_CONFLICT (co-use gated)
+    instance: instanceOpt,
+    portOffset, // null | "auto" | <number>
+    appPort, // null | <number>
+    dryRun: argv.includes("--dry-run"),
+    resume: argv.includes("--resume"),
+    status: argv.includes("--status"),
+    listInstances: argv.includes("--list-instances"),
+    teardownExisting: argv.includes("--teardown-existing"),
+    // Explicit acknowledgement that an --infra=external --db-url target is
+    // DISPOSABLE (setup + migrations may mutate it irreversibly; it is never
+    // install-owned / auto-rolled-back). REQUIRED to arm an external DB
+    // non-interactively — a bare --yes must NOT silently authorise pointing
+    // setup at an arbitrary external database (non-rollbackable data path).
+    externalDbDisposable: argv.includes("--external-db-disposable"),
+    external: { dbUrl, redisUrl, nangoUrl, graphitiUrl },
+    // The presence of ANY gated co-use signal (the gated enum values or the
+    // co-use sidecar flags) routes to the T5b loud-fail.
+    couseRequested:
+      infra === GATED_INFRA ||
+      onConflict === GATED_ON_CONFLICT ||
+      reuseFrom != null ||
+      dbName != null ||
+      redisDb != null ||
+      bullmqQueue != null,
+    couseSidecar: { reuseFrom, dbName, redisDb, bullmqQueue },
   };
 }
 
@@ -699,14 +849,17 @@ export async function detectPortConflicts(band, deps = {}) {
   return conflicts;
 }
 
-/** Render a port-conflict list into an HONEST, actionable abort message
- *  (issue #9). Each conflict line names its holder only as precisely as we can
- *  prove it; the guidance never asserts "a Cinatra stack" unless a running
- *  compose project's working_dir is provably a cinatra checkout. When it IS a
- *  detectable Cinatra stack we name its directory and offer a guided replace
- *  step; otherwise we say "another process (could not determine which)" and give
- *  plain-language options, each with a one-sentence consequence. */
-export function formatPortConflictError(conflicts, { phase } = {}) {
+/** Render a port-conflict list into an HONEST, actionable abort message that
+ *  ALSO surfaces the cinatra-cli#17 EXECUTABLE options. Honesty (issue #9):
+ *  each line names its holder only as precisely as we can prove it, and we name
+ *  "a Cinatra stack" only when a running compose project's working_dir is
+ *  provably a cinatra checkout (the `compose` descriptor `detectPortConflicts`
+ *  attaches). cinatra-cli#17 (T10): we then offer the EXECUTABLE option menu
+ *  (--on-conflict=isolated / stop-existing / attach, --infra=external) instead of
+ *  the old `cinatra setup clone` pointer (which is the dev-worktree path, out of
+ *  scope for a from-zero second instance). `owner` is the classifier verdict; a
+ *  `mixed` holder is called out so the reader knows a stop/teardown will refuse. */
+export function formatPortConflictError(conflicts, { phase, owner } = {}) {
   const lines = conflicts.map((c) => {
     const where = c.host === "0.0.0.0" ? `port ${c.port}` : `${c.host}:${c.port}`;
     const by = c.holder
@@ -715,58 +868,65 @@ export function formatPortConflictError(conflicts, { phase } = {}) {
     return `  ✗ ${where} — already in use${by}${c.service ? ` [needed for ${c.service}]` : ""}`;
   });
 
-  // Offer the single-stack "replace" wording ONLY when EVERY conflicting port is
-  // provably held by the SAME Cinatra stack — otherwise stopping that one stack
-  // would not free the other ports, and naming it as "the" holder would be
-  // dishonest. Identify a stack by its working_dir (preferred) or project name.
+  // Identify a SINGLE owning Cinatra stack only when EVERY conflicting port is
+  // provably held by the SAME cinatra checkout (working_dir) — otherwise naming
+  // one stack as "the" holder would be dishonest (stopping it may not free the
+  // rest). This `compose`-descriptor signal complements the classifier `owner`.
   const stackKey = (m) => (m.workingDir ? `dir:${m.workingDir}` : `proj:${m.project ?? ""}`);
   const allSameCinatraStack =
     conflicts.length > 0 &&
     conflicts.every((c) => c.compose && c.compose.isCinatra) &&
     new Set(conflicts.map((c) => stackKey(c.compose))).size === 1;
   const named = allSameCinatraStack
-    ? // Prefer the descriptor that knows the directory (they're all the one stack).
-      (conflicts.map((c) => c.compose).find((m) => m.workingDir) ?? conflicts[0].compose)
+    ? (conflicts.map((c) => c.compose).find((m) => m.workingDir) ?? conflicts[0].compose)
     : null;
 
   const header =
     `Host port conflict${conflicts.length > 1 ? "s" : ""} detected${phase ? ` (${phase})` : ""} — ` +
-    `\`cinatra install\` cannot bring up its dev stack on the default ports:\n${lines.join("\n")}\n`;
+    `\`cinatra install\` cannot bring up its stack on the default ports:\n${lines.join("\n")}\n`;
+
+  // The cinatra-cli#17 executable option menu (shared by both branches). NO
+  // `cinatra setup clone` pointer — that is the dev-worktree path.
+  const optionMenu =
+    `  • --on-conflict=isolated      Run a second FULL stack on a remapped port band + its own app port (nothing deleted).\n` +
+    `  • --on-conflict=stop-existing Stop the existing stack first, then install on the default ports.\n` +
+    `  • --on-conflict=attach        Converge on the existing checkout instead of a second stack.\n` +
+    `  • --infra=external            Point this install at external Postgres/Redis/Nango (no local infra).`;
 
   if (named) {
     const dir = named.workingDir;
     const label = named.project ? `the Cinatra stack "${named.project}"` : "an existing Cinatra stack";
     const where = dir ? `${label} at ${dir}` : label;
-    const inDir = dir ? ` (run it from ${dir})` : "";
     return (
       header +
-      `\nThese ports are held by ${where}. Choose one:\n` +
-      `  • Stop it, keep its data: run \`docker compose down\`${inDir}, then re-run install — ` +
-      `this frees the ports and stops the old stack but PRESERVES its database volumes (your data).\n` +
-      `  • Wipe and replace it: run \`docker compose down -v\`${inDir} (the \`-v\` DELETES that ` +
-      `stack's database volumes — back them up first if you need the data), then re-run install for a clean slate.\n` +
-      `  • Run alongside it: \`cinatra setup clone\` starts a second instance that SHARES the existing ` +
-      `Postgres/Redis/Neo4j containers and only adds its own app ports — nothing is deleted, but both ` +
-      `instances then read/write the same database.\n` +
-      `  • Cancel: stop here and change nothing.`
+      `\nThese ports are held by ${where}. To install a SECOND Cinatra instance alongside it, choose one:\n` +
+      optionMenu +
+      `\nOr stop that stack yourself (\`docker compose down\`${dir ? ` from ${dir}` : ""}) / free the ports and retry.`
     );
   }
 
-  // Generic guidance: the conflicting ports are NOT all held by a single Cinatra
-  // stack (some are unattributed, or held by different/non-Cinatra holders). Each
-  // line above names its holder as precisely as we could prove it; on Docker
-  // Desktop an unattributed port shows up only as the shared `com.docker.backend`
-  // proxy, which is why we don't guess. Stopping one stack may not free them all.
+  // Generic guidance: the conflicting ports are NOT all provably one Cinatra
+  // stack (some unattributed, or held by different/non-Cinatra holders). On
+  // Docker Desktop an unattributed port shows only as the shared
+  // `com.docker.backend` proxy, which is why we don't guess.
+  let who;
+  if (owner === "other-cinatra") {
+    who = "Another Cinatra instance is already holding these ports.";
+  } else if (owner === "mixed") {
+    who =
+      "These ports are held by a MIX of a Cinatra instance and an unrelated process — " +
+      "a stop/teardown will REFUSE this ambiguous holder.";
+  } else {
+    who =
+      "These ports are not all held by a single Cinatra stack (each line above names its holder as " +
+      "precisely as could be determined), so there is no one stack to replace.";
+  }
   return (
     header +
-    `\nThese ports are not all held by a single Cinatra stack, so there is no one stack to replace ` +
-    `(each line above names its holder as precisely as could be determined). Choose one:\n` +
-    `  • Free the ports: stop whatever is listening on each one (\`docker ps\` to find docker ` +
-    `containers, or \`lsof -i :<port>\`), then re-run install — this changes nothing else.\n` +
-    `  • Run a second instance: if a Cinatra stack you already trust owns these ports, ` +
-    `\`cinatra setup clone\` starts another instance that SHARES its Postgres/Redis/Neo4j containers ` +
-    `and only adds its own app ports — nothing is deleted, but both instances then share one database.\n` +
-    `  • Cancel: stop here and change nothing.`
+    `\n${who} Choose one:\n` +
+    `  • Free the ports: stop whatever is listening on each (\`docker ps\` / \`lsof -i :<port>\`), then re-run install.\n` +
+    optionMenu +
+    `\n  • Cancel: stop here and change nothing.`
   );
 }
 
@@ -973,12 +1133,32 @@ function upsertEnvKey(body, key, value) {
 // Infra (docker compose up + wait), pre-install-safe.
 // ---------------------------------------------------------------------------
 
-function bringUpInfra({ targetDir, log = console.log }) {
+function bringUpInfra({ targetDir, log = console.log, composeFiles = null, composeProject = null, envFile = null, nangoHealthUrl = null }) {
   log("- Starting infrastructure (Postgres + Redis + Nango)…");
-  composeUpOrThrow(targetDir);
-  waitForCompose(targetDir, "postgres", ["pg_isready", "-U", "postgres"], "Postgres", log);
-  waitForCompose(targetDir, "redis", ["redis-cli", "ping"], "Redis", log);
-  waitForNango(log);
+  composeUpOrThrow(targetDir, { composeFiles, composeProject, envFile });
+  const composeBase = composeArgsFor({ composeFiles, composeProject, envFile });
+  waitForCompose(targetDir, "postgres", ["pg_isready", "-U", "postgres"], "Postgres", log, 60, composeBase);
+  waitForCompose(targetDir, "redis", ["redis-cli", "ping"], "Redis", log, 60, composeBase);
+  waitForNango(log, 60, nangoHealthUrl);
+}
+
+/** The leading `compose` argv that selects the recorded files + project (+ an
+ *  optional env-file). When `composeFiles`/`composeProject` are null, falls back
+ *  to the base default pair with no `-p` (byte-identical to the legacy default
+ *  invocation). The recorded set is the authority (cinatra-cli#17 §C.8) so
+ *  up/exec/down all target the same files+project. An `envFile` is threaded so
+ *  the ISOLATED generated compose can resolve its scrubbed `${VAR}` placeholders
+ *  from .env.local at up-time (review hardening #1) — the default path omits it, keeping
+ *  compose's normal `.env` discovery (byte-identical to before). */
+function composeArgsFor({ composeFiles = null, composeProject = null, envFile = null } = {}) {
+  const files = composeFiles && composeFiles.length
+    ? composeFiles
+    : ["docker-compose.yml", "docker-compose.dev.yml"];
+  const fileArgs = files.flatMap((f) => ["-f", f]);
+  const projectArgs = composeProject ? ["-p", composeProject] : [];
+  const envArgs = envFile ? ["--env-file", envFile] : [];
+  // `--env-file`/`-p`/`-f` are all top-level compose flags (before the subcommand).
+  return ["compose", ...envArgs, ...projectArgs, ...fileArgs];
 }
 
 /** Run `docker compose up -d` and, on failure, surface the REAL stderr instead
@@ -986,8 +1166,8 @@ function bringUpInfra({ targetDir, log = console.log }) {
  *  collision now reads e.g. "Bind for 0.0.0.0:4873 failed: port is already
  *  allocated" rather than misattributing it to the daemon. stderr is streamed
  *  to the user (pipe) AND captured so it can be folded into the thrown error. */
-function composeUpOrThrow(targetDir) {
-  const args = ["compose", "-f", "docker-compose.yml", "-f", "docker-compose.dev.yml", "up", "-d"];
+function composeUpOrThrow(targetDir, { composeFiles = null, composeProject = null, envFile = null } = {}) {
+  const args = [...composeArgsFor({ composeFiles, composeProject, envFile }), "up", "-d"];
   const result = spawnSync("docker", args, {
     cwd: targetDir,
     env: process.env,
@@ -1005,15 +1185,15 @@ function composeUpOrThrow(targetDir) {
     const detail = stderr ? `\n${stderr}` : "";
     const hint = /already allocated|address already in use|port is already/i.test(stderr)
       ? "\n  A published host port is already in use — stop the conflicting stack, " +
-        "or use `cinatra setup clone` to run a second instance on its own ports."
+        "or re-run `cinatra install` with --on-conflict=isolated to bring up a second instance on its own port band."
       : "\n  Ensure the Docker daemon is running and reachable, then retry.";
     throw new Error(`docker compose up -d failed (exit ${result.status}).${detail}${hint}`);
   }
 }
 
-function waitForCompose(targetDir, service, readyCmd, label, log, maxAttempts = 60) {
+function waitForCompose(targetDir, service, readyCmd, label, log, maxAttempts = 60, composeBase = ["compose"]) {
   for (let i = 0; i < maxAttempts; i += 1) {
-    const r = spawnSync("docker", ["compose", "exec", "-T", service, ...readyCmd], {
+    const r = spawnSync("docker", [...composeBase, "exec", "-T", service, ...readyCmd], {
       stdio: "ignore",
       cwd: targetDir,
     });
@@ -1026,9 +1206,10 @@ function waitForCompose(targetDir, service, readyCmd, label, log, maxAttempts = 
   throw new Error(`${label} did not become ready within ${maxAttempts} seconds.`);
 }
 
-function waitForNango(log, maxAttempts = 60) {
+function waitForNango(log, maxAttempts = 60, healthUrl = null) {
+  const url = healthUrl ?? "http://127.0.0.1:3003/health";
   for (let i = 0; i < maxAttempts; i += 1) {
-    const r = spawnSync("curl", ["-sf", "http://127.0.0.1:3003/health"], {
+    const r = spawnSync("curl", ["-sf", url], {
       stdio: "ignore",
       timeout: 3000,
     });
@@ -1115,12 +1296,1278 @@ async function confirm(question, { yes }) {
   return /^y(es)?$/i.test(answer);
 }
 
+/** A destructive confirm that requires typing an EXACT phrase (never satisfied
+ *  by `--yes`). For data-destroying actions (volume teardown, an external prod
+ *  DB) where a stray `y` must not arm it. Non-interactive → always refuses. */
+async function typedConfirm(question, phrase) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return false;
+  const answer = await promptLine(`${question}\n  Type "${phrase}" to confirm: `, "");
+  return answer === phrase;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-instance install: detection authority + execute-menu + the option
+// executors (Isolated / stop-existing / attach / external) — cinatra-cli#17.
+// ---------------------------------------------------------------------------
+
+/** Run `docker compose config --format json` for an explicit file set and return
+ *  the parsed document (or null when compose can't model it). Used by the
+ *  ISOLATED path to resolve the band it then remaps. Injectable for tests. */
+function composeConfigForFiles(targetDir, composeFiles, deps = {}) {
+  const cap = deps.capture ?? capture;
+  const fileArgs = (composeFiles && composeFiles.length
+    ? composeFiles
+    : ["docker-compose.yml", "docker-compose.dev.yml"]
+  ).flatMap((f) => ["-f", f]);
+  const raw = cap("docker", ["compose", ...fileArgs, "config", "--format", "json"], { cwd: targetDir });
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/** Inspect the live containers of the compose project rooted at `targetDir`
+ *  (default base pair, cwd-scoped). Returns the parsed `docker inspect` array
+ *  for the classifier (working_dir-label ownership). Empty array on any error. */
+function liveComposeInspect(targetDir, deps = {}) {
+  const cap = deps.capture ?? capture;
+  const ids = cap(
+    "docker",
+    ["compose", "-f", "docker-compose.yml", "-f", "docker-compose.dev.yml", "ps", "-q"],
+    { cwd: targetDir },
+  );
+  const idList = (ids ?? "").split("\n").map((s) => s.trim()).filter(Boolean);
+  if (idList.length === 0) {
+    // Fall back to a broad inspect of all running containers so we can still
+    // attribute a conflict to ANOTHER checkout's project (not just our cwd).
+    const allIds = cap("docker", ["ps", "-q"]);
+    const allList = (allIds ?? "").split("\n").map((s) => s.trim()).filter(Boolean);
+    if (allList.length === 0) return [];
+    const rawAll = cap("docker", ["inspect", ...allList]);
+    if (!rawAll) return [];
+    try {
+      return JSON.parse(rawAll);
+    } catch {
+      return [];
+    }
+  }
+  const raw = cap("docker", ["inspect", ...idList]);
+  if (!raw) return [];
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+/** Ensure the per-checkout marker dir `.cinatra/` is locally git-ignored so the
+ *  marker file (and the generated isolated compose) never make the working tree
+ *  DIRTY — which would otherwise break the idempotent-update re-run and surprise
+ *  the operator with an untracked file. Uses `.git/info/exclude` (a LOCAL,
+ *  non-committed ignore) so it needs NO change to the cinatra repo. Best-effort:
+ *  a non-git dir or a write failure is silently tolerated. */
+function ensureMarkerIgnored(targetDir) {
+  try {
+    const gitDir = capture("git", ["-C", targetDir, "rev-parse", "--git-dir"], { env: gitEnv() });
+    if (!gitDir) return;
+    const excludePath = path.isAbsolute(gitDir)
+      ? path.join(gitDir, "info", "exclude")
+      : path.join(targetDir, gitDir, "info", "exclude");
+    mkdirSync(path.dirname(excludePath), { recursive: true });
+    const existing = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
+    const want = [".cinatra/", ISOLATED_COMPOSE_FILENAME];
+    let body = existing;
+    for (const entry of want) {
+      const re = new RegExp(`^${entry.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}\\s*$`, "m");
+      if (!re.test(body)) {
+        body = body.endsWith("\n") || body.length === 0 ? `${body}${entry}\n` : `${body}\n${entry}\n`;
+      }
+    }
+    if (body !== existing) writeFileSync(excludePath, body);
+  } catch {
+    /* best-effort: never fail the install over a local-ignore write */
+  }
+}
+
+/** Read both registries (read-only) for classification / status. */
+function readBothRegistries(deps = {}) {
+  const instReader = deps.readInstanceRegistry ?? (() => requireUsableInstanceRegistry(defaultInstanceRegistryPath()));
+  let cloneRegistry = null;
+  try {
+    cloneRegistry = deps.readCloneRegistry ? deps.readCloneRegistry() : null;
+  } catch {
+    cloneRegistry = null;
+  }
+  let instanceRegistry = null;
+  try {
+    instanceRegistry = instReader();
+  } catch {
+    instanceRegistry = null;
+  }
+  return { instanceRegistry, cloneRegistry };
+}
+
+/** Validate an external-infra URL (shape only). Allows postgres(ql)/redis(s)/
+ *  http(s). A flag-shaped or unparseable value throws. */
+function assertExternalUrl(flag, value, allowedProtocols) {
+  if (typeof value !== "string" || value.length === 0 || value.startsWith("-")) {
+    throw new Error(`${flag} requires a URL value.`);
+  }
+  let proto;
+  try {
+    proto = new URL(value).protocol.replace(/:$/, "");
+  } catch {
+    throw new Error(`Invalid ${flag} "${value}" (not a parseable URL).`);
+  }
+  if (!allowedProtocols.includes(proto)) {
+    throw new Error(`Invalid ${flag} protocol "${proto}". Allowed: ${allowedProtocols.join(", ")}.`);
+  }
+  return value;
+}
+
+// ── T5b — gated co-use loud-fail ────────────────────────────────────────────
+/** Throw the explicit "co-use not yet available" error when any gated co-use
+ *  signal is present. Called BEFORE any side effect. Never a silent no-op — we
+ *  do not advertise a public surface that does nothing (cinatra-cli#17 T5b). */
+function refuseCoUseIfRequested(opts) {
+  if (!opts.couseRequested) return;
+  throw new Error(
+    "Co-use (--infra=share / --on-conflict=co-use) is NOT yet available in this release.\n" +
+      "  Co-use lets a second instance SHARE one infra stack (separate DB + Redis namespace + Nango env).\n" +
+      "  It is gated on per-instance Redis-prefix, Better-Auth cookie-prefix, and Nango-environment support\n" +
+      "  that is still landing — shipping it now would silently cross-clobber sessions/data on the same host.\n" +
+      "  Use --on-conflict=isolated for a fully-separate second stack today (tracking cinatra-cli#17 follow-up).",
+  );
+}
+
+// ── T6 — read-only --status / --list-instances ──────────────────────────────
+/** Print the instance registry + (for a resolved checkout) the per-checkout
+ *  marker, reconciled. Registry/live are shown as TRUTH; the marker is labelled
+ *  a HINT. Read-only — no side effects. */
+function printInstanceStatus({ targetDir, listAll, log = console.log, deps = {} }) {
+  const { instanceRegistry } = readBothRegistries(deps);
+  const instances = instanceRegistry ? listInstances(instanceRegistry) : [];
+
+  log("Cinatra instances (registry is authoritative; the per-checkout marker is a HINT):");
+  if (instances.length === 0) {
+    log("  (none recorded in ~/.cinatra/instances.json)");
+  } else {
+    for (const inst of instances) {
+      const ports = Object.entries(inst.ports ?? {})
+        .map(([svc, list]) => `${svc}=${(list ?? []).join("/")}`)
+        .join(" ");
+      log(
+        `  • ${inst.slug}  [${inst.state}]  ${inst.mode}  app:${inst.appPort ?? "?"}  ` +
+          `project:${inst.composeProject}  dir:${inst.installDir}`,
+      );
+      if (ports) log(`      infra ports: ${ports}`);
+    }
+  }
+
+  // For a specific checkout (not --list-instances), reconcile its marker.
+  if (!listAll && targetDir) {
+    const markerRead = (deps.readMarker ?? readMarker)(targetDir);
+    const row = instanceRegistry
+      ? listInstances(instanceRegistry).find((i) => path.resolve(i.installDir) === path.resolve(targetDir)) ?? null
+      : null;
+    // Best-effort live signal: does this checkout own any live container?
+    let liveOwned = false;
+    try {
+      const owned = (deps.targetComposeOwnedPorts ?? targetComposeOwnedPorts)(targetDir);
+      liveOwned = owned instanceof Set && owned.size > 0;
+    } catch {
+      liveOwned = false;
+    }
+    const reconciled = reconcileMarker(markerRead.marker, row, liveOwned);
+    log("");
+    log(`This checkout (${targetDir}):`);
+    log(`  marker:    ${markerRead.status}${markerRead.marker?.slug ? ` (claims "${markerRead.marker.slug}")` : ""}`);
+    log(`  reconciled: ${reconciled.state} — ${reconciled.reason}`);
+  }
+}
+
+// ── T8/T9 — ISOLATED install executor + tagged rollback ─────────────────────
+/**
+ * Bring up an ISOLATED second instance: a full stack on a remapped port band +
+ * its own compose project + its own app port. Ordering (review hardening #4):
+ * allocate offset → render + RE-PROBE the remapped band FIRST → only THEN
+ * persist the generated compose + provisioning row + marker → up → mark ready.
+ * A failure before `ready` triggers the tagged rollback (no leaked project/row).
+ *
+ * Returns { slug, composeProject, composeFiles, appPort, ports }.
+ */
+async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = console.log, deps = {} }) {
+  const probePorts = deps.detectPortConflicts ?? detectPortConflicts;
+  const startInfra = deps.bringUpInfra ?? bringUpInfra;
+  const getConfig = deps.composeConfigForFiles ?? composeConfigForFiles;
+  const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
+  const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
+  const readClone = deps.readCloneRegistry ?? (() => null);
+
+  // Slug: explicit --instance, else derived from the install dir basename.
+  const slug = opts.instance ?? deriveInstanceSlug(targetDir);
+  if (!isValidSlug(slug)) {
+    throw new Error(
+      `Could not derive a valid instance slug from ${targetDir}. Pass --instance <slug> ` +
+        `(/^[a-z0-9][a-z0-9-]{0,29}$/).`,
+    );
+  }
+  const composeProject = `cinatra_${slug.replace(/-/g, "_")}`;
+
+  // Resolve the base band from the checkout's own compose config.
+  const resolvedConfig = getConfig(targetDir, ["docker-compose.yml", "docker-compose.dev.yml"], deps);
+  if (!resolvedConfig) {
+    throw new Error(
+      "Could not resolve the checkout's `docker compose config` to build an isolated stack. " +
+        "Ensure Docker Compose v2 is available and the checkout is intact, then retry.",
+    );
+  }
+  const baseBand = parseComposePublishedPorts(resolvedConfig);
+  if (baseBand.length === 0) {
+    throw new Error("The checkout's compose config publishes no host ports — nothing to isolate.");
+  }
+
+  // The whole allocate → re-probe → persist sequence runs under the shared
+  // alloc lock so two installs can never pick the same offset/app-port and the
+  // provisioning row is durable before the lock releases.
+  const persisted = await withAllocLock(lockPath, async () => {
+    const cloneRegistry = (() => {
+      try {
+        return readClone();
+      } catch {
+        return null;
+      }
+    })();
+    const instanceRegistry = requireUsableInstanceRegistry(registryPath);
+
+    // Idempotent re-run: an existing READY row for this dir → return it as-is.
+    const existing = getInstance(instanceRegistry, slug);
+    if (existing && path.resolve(existing.installDir) === path.resolve(targetDir) && existing.state === "ready") {
+      log(`  Instance "${slug}" already recorded ready — converging (idempotent).`);
+      return { slot: existing, generatedFile: existing.composeFiles?.[0], idempotent: true };
+    }
+
+    // App port: explicit --app-port, else allocate.
+    const appPort =
+      opts.appPort ?? allocateAppPort({ cloneRegistry, instanceRegistry });
+
+    // Offset: explicit numeric --port-offset, else auto. Then RE-PROBE the
+    // remapped band; on a stranger, bump to the next free offset (auto only).
+    let offset;
+    let remapped;
+    if (typeof opts.portOffset === "number") {
+      ({ offset, remapped } = pickFixedOffset(baseBand, opts.portOffset, cloneRegistry, instanceRegistry));
+    } else {
+      ({ offset, remapped } = allocateBandOffset({ band: baseBand, cloneRegistry, instanceRegistry }));
+    }
+
+    // Re-probe the remapped band (auto-bump loop). The band's host bindings are
+    // the same interfaces as the base; probe each remapped host:port.
+    const auto = typeof opts.portOffset !== "number";
+    let attempts = 0;
+    while (true) {
+      const conflicts = await probePorts(remapped);
+      if (conflicts.length === 0) break;
+      if (!auto || attempts >= 8) {
+        throw new Error(
+          formatPortConflictError(conflicts, {
+            phase: `isolated band probe (offset ${offset})`,
+          }) + `\n  The chosen isolated band is itself occupied; pick a free --port-offset.`,
+        );
+      }
+      attempts += 1;
+      ({ offset, remapped } = allocateBandOffset({
+        band: baseBand,
+        cloneRegistry,
+        instanceRegistry,
+        min: offset + 10000,
+      }));
+    }
+
+    // Render the resolved isolated compose for the FINAL offset.
+    const { doc, ports } = generateIsolatedCompose({
+      resolvedConfig,
+      offset,
+      projectName: composeProject,
+      slug,
+      appPort,
+    });
+
+    if (opts.dryRun) {
+      log(`  [dry-run] would write isolated compose to ${path.join(targetDir, ISOLATED_COMPOSE_FILENAME)}`);
+      log(`  [dry-run] would record instance "${slug}" project ${composeProject} app:${appPort} offset:${offset}`);
+      return { slot: null, generatedFile: null, dryRun: true, appPort, ports, offset };
+    }
+
+    // Persist the generated compose + provisioning row + marker (recording the
+    // generated SOLE file as composeFiles[]).
+    const generatedFile = writeIsolatedComposeFile(path.join(targetDir, ISOLATED_COMPOSE_FILENAME), doc);
+    const composeFiles = [ISOLATED_COMPOSE_FILENAME];
+    const { registry: next, slot } = allocateInstance(instanceRegistry, slug, {
+      mode: opts.mode,
+      installDir: targetDir,
+      composeProject,
+      composeFiles,
+      ports,
+      appPort,
+      repoUrl: opts.repoUrl,
+      ref: opts.ref,
+      sha: resolvedSha,
+      infraMode: "new",
+      createdResources: [generatedFile],
+      state: "provisioning",
+    });
+    writeInstanceRegistry(registryPath, next);
+    writeMarker(targetDir, {
+      slug,
+      id: slot.id,
+      mode: opts.mode,
+      composeProject,
+      composeFiles,
+      appPort,
+      ref: opts.ref,
+      sha: resolvedSha,
+      infraMode: "new",
+      state: "provisioning",
+    });
+    return { slot, generatedFile, composeFiles, appPort, ports, offset };
+  });
+
+  if (persisted.dryRun) {
+    return { slug, composeProject, composeFiles: [ISOLATED_COMPOSE_FILENAME], appPort: persisted.appPort, ports: persisted.ports, dryRun: true };
+  }
+
+  // Idempotent re-run of a recorded ready row: still ENSURE its stack is up
+  // (review hardening #4 — a stopped recorded stack must come back up, not silently
+  // "succeed" without bringing it up). No rollback (it is already ready).
+  if (persisted.idempotent) {
+    const slot = persisted.slot;
+    const envFile = path.join(targetDir, ".env.local");
+    if (!opts.dryRun) {
+      ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: slot.appPort, ports: slot.ports, log });
+      startInfra({
+        targetDir,
+        log,
+        composeFiles: slot.composeFiles,
+        composeProject: slot.composeProject,
+        envFile: existsSync(envFile) ? envFile : null,
+        nangoHealthUrl: nangoHealthUrlForPorts(slot.ports),
+      });
+    }
+    return {
+      slug,
+      composeProject: slot.composeProject,
+      composeFiles: slot.composeFiles,
+      appPort: slot.appPort,
+      ports: slot.ports,
+      idempotent: true,
+    };
+  }
+
+  const composeFiles = persisted.composeFiles;
+  const appPort = persisted.appPort;
+  const envFile = path.join(targetDir, ".env.local");
+
+  // review hardening #1/#3: WRITE the env (incl. the remapped infra URLs) BEFORE the
+  // isolated `up`, and bring up WITH `--env-file .env.local` so the generated
+  // compose's scrubbed `${VAR}` placeholders + the remapped URLs resolve from
+  // the file (never an empty/default secret). Mirrors the default flow's
+  // env-before-infra ordering. A failure rolls the pending instance back.
+  try {
+    log(`- Configuring isolated environment for "${slug}"…`);
+    ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort, ports: persisted.ports, log });
+
+    log(`- Bringing up isolated instance "${slug}" (project ${composeProject}, app port ${appPort})…`);
+    startInfra({
+      targetDir,
+      log,
+      composeFiles,
+      composeProject,
+      envFile: existsSync(envFile) ? envFile : null,
+      // The isolated Nango publishes on a remapped port; health-probe it there.
+      nangoHealthUrl: nangoHealthUrlForPorts(persisted.ports),
+    });
+    // Mark ready ONLY after health.
+    await withAllocLock(lockPath, async () => {
+      const reg = requireUsableInstanceRegistry(registryPath);
+      writeInstanceRegistry(registryPath, markInstanceReady(reg, slug, { sha: resolvedSha, ports: persisted.ports }));
+    });
+    writeMarker(targetDir, {
+      slug,
+      id: persisted.slot.id,
+      mode: opts.mode,
+      composeProject,
+      composeFiles,
+      appPort,
+      ref: opts.ref,
+      sha: resolvedSha,
+      infraMode: "new",
+      state: "ready",
+    });
+  } catch (err) {
+    log(`  ✗ Isolated bring-up failed — rolling back the pending instance "${slug}".`);
+    await rollbackIsolatedInstance({ targetDir, slug, composeProject, composeFiles, log, deps }).catch((e) =>
+      log(`  ⚠ Rollback best-effort error: ${e.message}`),
+    );
+    throw err;
+  }
+
+  return { slug, composeProject, composeFiles, appPort, ports: persisted.ports, envWritten: true };
+}
+
+/** Ensure `.env.local` exists (creating it from .env.example if needed) and
+ *  carry the ISOLATED app port + remapped infra URLs. Combines `ensureEnvLocal`
+ *  with `writeIsolatedAppEnv`, and refuses an exported infra var that would
+ *  override the rewritten value (review hardening #3). Idempotent — safe to call from the
+ *  isolated executor (before up) and again from step 5b. */
+function ensureIsolatedEnv({ targetDir, mode, resetEnv = false, appPort, ports = {}, log = console.log }) {
+  ensureEnvLocal({ targetDir, mode, resetEnv, log });
+  assertNoOverridingInfraEnv(ports);
+  writeIsolatedAppEnv({ targetDir, appPort, ports, log });
+}
+
+// The infra-URL env keys an isolated install writes; an EXPORTED value for any
+// of these would be overlaid over .env.local by setup (collectEnvironment),
+// silently re-routing the isolated app to the default/another stack. We refuse a
+// non-empty exported value so the rewrite stays authoritative (review hardening #3).
+const ISOLATED_INFRA_ENV_KEYS = [
+  "SUPABASE_DB_URL",
+  "REDIS_URL",
+  "NANGO_SERVER_URL",
+  "NANGO_DATABASE_URL",
+  "NANGO_DB_URL",
+  "GRAPHITI_URL",
+];
+
+function assertNoOverridingInfraEnv(ports = {}, env = process.env) {
+  const offenders = ISOLATED_INFRA_ENV_KEYS.filter(
+    (k) => typeof env[k] === "string" && env[k].trim().length > 0,
+  );
+  if (offenders.length > 0) {
+    throw new Error(
+      `Refusing an isolated install while these infra vars are EXPORTED in your shell: ${offenders.join(", ")}.\n` +
+        `  setup overlays the shell environment over .env.local, so an exported value would silently re-route the\n` +
+        `  isolated app to the default/another stack (defeating isolation). Unset them and retry:\n` +
+        offenders.map((k) => `    unset ${k}`).join("\n"),
+    );
+  }
+}
+
+/** Pick a FIXED operator-supplied offset, verifying the remapped band does not
+ *  collide with reserved ports (else throw — never silently shift it). */
+function pickFixedOffset(band, offset, cloneRegistry, instanceRegistry) {
+  // Reuse the allocator's reservation set by trying a single-candidate window.
+  try {
+    return allocateBandOffset({
+      band,
+      cloneRegistry,
+      instanceRegistry,
+      min: offset,
+      max: offset,
+      step: 1,
+    });
+  } catch {
+    throw new Error(
+      `--port-offset ${offset} collides with a reserved port (default stack / clones / another instance), ` +
+        `or pushes a port past 65535. Choose a different offset.`,
+    );
+  }
+}
+
+/** Best-effort isolated Nango health URL from the remapped ports map (the
+ *  service is named `nango-server`; its first remapped host port serves /health).
+ *  Falls back to null (skip the targeted probe) when not found. */
+function nangoHealthUrlForPorts(ports) {
+  const list = ports?.["nango-server"];
+  if (Array.isArray(list) && list.length) {
+    return `http://127.0.0.1:${list[0]}/health`;
+  }
+  return null;
+}
+
+/** T9 — tagged rollback for a PRE-READY isolated instance: remove only THIS
+ *  pending project (recorded -p + -f) + project-scoped volumes + registry row +
+ *  marker + the generated compose file. "Drop only if owner metadata matches". */
+async function rollbackIsolatedInstance({ targetDir, slug, composeProject, composeFiles, log = console.log, deps = {} }) {
+  const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
+  const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
+  const runCompose = deps.runComposeDown ?? composeDown;
+
+  // Only roll back a project whose registry row still belongs to THIS dir and is
+  // NOT ready (pre-ready rollback only — never drop a healthy instance). The
+  // state re-check AND the `down` BOTH run inside ONE held alloc lock so a
+  // concurrent --resume/install cannot flip the row to `ready` in the window
+  // between the check and the teardown (TOCTOU): "rollback never drops a READY
+  // instance" must hold even under a race. The pending instance's `down` is a
+  // brief local subprocess on a freshly-allocated stack, so holding the lock
+  // across it is acceptable (and far safer than a racy check-then-act).
+  let downAttempted = false;
+  let downError = null;
+  await withAllocLock(lockPath, async () => {
+    let reg;
+    try {
+      reg = requireUsableInstanceRegistry(registryPath);
+    } catch {
+      reg = null;
+    }
+    const row = reg ? getInstance(reg, slug) : null;
+    if (!row || path.resolve(row.installDir) !== path.resolve(targetDir)) {
+      return; // nothing of ours to roll back
+    }
+    if (row.state === "ready") {
+      log(`  ⚠ Refusing rollback: instance "${slug}" is recorded READY (owner-metadata guard).`);
+      return;
+    }
+    // review hardening #3: tear the project DOWN FIRST, THEN release the row — so if
+    // `down` fails (or the process dies between), the row survives for a retried
+    // rollback and we never orphan a live, UNREGISTERED stack. The `down` runs the
+    // recorded -p + -f with -v (the pending instance's volumes are brand-new → safe).
+    downAttempted = true;
+    try {
+      runCompose(targetDir, { composeFiles, composeProject, volumes: true });
+    } catch (e) {
+      // Down failed → keep the row so a retried rollback can finish; surface it.
+      downError = e;
+      return;
+    }
+    // Down succeeded → release the registry row (still under the same lock).
+    if (getInstance(reg, slug)) {
+      const { registry: next } = releaseInstance(reg, slug);
+      writeInstanceRegistry(registryPath, next);
+    }
+  });
+  if (downAttempted && !downError) {
+    try {
+      const markerFile = path.join(targetDir, ".cinatra", "instance.json");
+      if (existsSync(markerFile)) spawnSync("rm", ["-f", markerFile]);
+    } catch {
+      /* best-effort */
+    }
+    try {
+      for (const f of composeFiles ?? []) {
+        const p = path.join(targetDir, f);
+        if (existsSync(p) && f === ISOLATED_COMPOSE_FILENAME) spawnSync("rm", ["-f", p]);
+      }
+    } catch {
+      /* best-effort */
+    }
+  }
+  if (downError) {
+    log(
+      `  ⚠ Rollback teardown of "${slug}" failed (${downError.message}); the registry row is kept ` +
+        `so a retried install/--resume can finish the rollback (no orphaned unregistered stack).`,
+    );
+  }
+}
+
+/** `docker compose -p <project> -f <files…> down [-v]` for the RECORDED set.
+ *  Streams output; throws on hard failure. */
+function composeDown(targetDir, { composeFiles = null, composeProject = null, volumes = false } = {}) {
+  const args = [...composeArgsFor({ composeFiles, composeProject }), "down"];
+  if (volumes) args.push("-v");
+  const result = spawnSync("docker", args, { cwd: targetDir, env: process.env, encoding: "utf8", stdio: ["inherit", "inherit", "pipe"] });
+  const stderr = (result.stderr ?? "").trim();
+  if (stderr) process.stderr.write(`${stderr}\n`);
+  if (result.error) throw new Error(`docker compose down failed: ${result.error.message}`);
+  if (result.status !== 0) throw new Error(`docker compose down failed (exit ${result.status}).${stderr ? `\n${stderr}` : ""}`);
+}
+
+/** Derive an instance slug from the install dir basename (sanitised to the slug
+ *  shape). The default install dir basename is `cinatra` → slug `cinatra`. */
+function deriveInstanceSlug(targetDir) {
+  const base = path.basename(path.resolve(targetDir));
+  return base
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 30);
+}
+
+// ── T8c — record the DEFAULT (non-conflict) install ─────────────────────────
+/** Record a registry provisioning→ready row + marker for a plain default
+ *  install (default band, base compose pair, no generated file). Default
+ *  detection is via registry + the live compose `working_dir` label (NOT an
+ *  injected label-only file — that would change the most-trodden default `up`
+ *  invocation; accepted this lower-risk choice; documented in the PR).
+ *  Returns the slug recorded, or null when the registry is unavailable. */
+async function recordDefaultInstance({ targetDir, opts, resolvedSha, state, log = console.log, deps = {} }) {
+  const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
+  const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
+  const slug = opts.instance ?? deriveInstanceSlug(targetDir);
+  if (!isValidSlug(slug)) return null;
+  const composeProject = "cinatra"; // the default compose project (dir basename / no -p).
+  const composeFiles = ["docker-compose.yml", "docker-compose.dev.yml"];
+  // The default infra band as a per-service ports map.
+  const ports = {};
+  for (const { service, port } of DEFAULT_DEV_HOST_PORTS) {
+    (ports[service] ??= []).push(port);
+  }
+
+  if (opts.dryRun) {
+    log(`  [dry-run] would record default instance "${slug}" project ${composeProject} app:${DEFAULT_APP_PORT_FOR_RECORD}`);
+    return slug;
+  }
+
+  // Recording is BEST-EFFORT metadata for --status/--attach/stop-existing — a
+  // registry conflict (e.g. a stale row from another checkout that still claims
+  // the default app port, or a malformed file) must NEVER fail the install
+  // itself. On any error: warn + skip the row (the marker is still written).
+  let recorded = false;
+  try {
+    await withAllocLock(lockPath, async () => {
+      const reg = requireUsableInstanceRegistry(registryPath);
+      const existing = getInstance(reg, slug);
+      if (existing && path.resolve(existing.installDir) !== path.resolve(targetDir)) {
+        log(`  ⚠ Instance slug "${slug}" already maps to ${existing.installDir}; skipping the default registry record for ${targetDir}.`);
+        return;
+      }
+      let working = reg;
+      if (!existing) {
+        const { registry: next } = allocateInstance(reg, slug, {
+          mode: opts.mode,
+          installDir: targetDir,
+          composeProject,
+          composeFiles,
+          ports,
+          appPort: DEFAULT_APP_PORT_FOR_RECORD,
+          repoUrl: opts.repoUrl,
+          ref: opts.ref,
+          sha: resolvedSha,
+          infraMode: state === "external" ? "external" : "new",
+          state: "provisioning",
+        });
+        writeInstanceRegistry(registryPath, next);
+        working = next;
+      }
+      // Flip to the final state.
+      writeInstanceRegistry(registryPath, markInstanceReadyWithState(working, slug, state, { sha: resolvedSha }));
+      recorded = true;
+    });
+  } catch (err) {
+    log(`  ⚠ Could not record the instance registry row (${err.message}). Continuing — \`cinatra install --status\` may be incomplete for this checkout.`);
+  }
+
+  writeMarker(targetDir, {
+    slug,
+    id: `inst_${slug}`,
+    mode: opts.mode,
+    composeProject,
+    composeFiles,
+    appPort: DEFAULT_APP_PORT_FOR_RECORD,
+    ref: opts.ref,
+    sha: resolvedSha,
+    infraMode: state === "external" ? "external" : "new",
+    state,
+  });
+  return recorded ? slug : null;
+}
+
+// The host app port the default stack binds (`pnpm dev` → 3000). Recorded so a
+// second isolated instance's allocator can avoid it.
+const DEFAULT_APP_PORT_FOR_RECORD = 3000;
+
+/** markInstanceReady but allowing an `external` terminal state too (a default
+ *  external install records state=external, never auto-dropped). */
+function markInstanceReadyWithState(registry, slug, state, patch = {}) {
+  if (state === "ready") return markInstanceReady(registry, slug, patch);
+  // external: set state directly (allocateInstance + this is the only writer).
+  const existing = getInstance(registry, slug);
+  if (!existing) throw new Error(`Cannot finalize unknown instance "${slug}".`);
+  const next = { version: registry.version, instances: { ...registry.instances } };
+  next.instances[slug] = { ...existing, ...patch, slug, state };
+  return next;
+}
+
+// ── T13 — external infra execution ──────────────────────────────────────────
+/** Validate the four external URLs + write them into .env.local with the
+ *  sanitized-env guard so an exported SUPABASE_DB_URL/REDIS_URL/NANGO_* cannot
+ *  override the generated values; record the instance as `external` (never
+ *  auto-dropped). A destructive-leaning target needs a typed NON-ROLLBACKABLE
+ *  confirm. Returns the env keys written. */
+async function executeExternalEnv({ targetDir, opts, conflictResolution = false, log = console.log }) {
+  const ext = opts.external ?? {};
+  // At least one external URL must be supplied to wire anything; an --infra=
+  // external with no URLs simply skips bring-up (today's --no-infra behaviour).
+  const provided = Object.entries({
+    SUPABASE_DB_URL: ext.dbUrl,
+    REDIS_URL: ext.redisUrl,
+    NANGO_SERVER_URL: ext.nangoUrl,
+    GRAPHITI_URL: ext.graphitiUrl,
+  }).filter(([, v]) => v != null);
+
+  // When external was chosen TO RESOLVE a live port conflict, the local stack
+  // that holds the ports is UP. The DATABASE is the mutation target (setup +
+  // migrations write to SUPABASE_DB_URL), so unless an explicit --db-url
+  // re-points it OFF the localhost default, setup would migrate that CONFLICTING
+  // local DB. Require --db-url SPECIFICALLY here — another external URL (e.g.
+  // only --redis-url) does NOT move the DB off localhost and must NOT satisfy the
+  // guard. (The no-conflict --no-infra path is unaffected — there the operator
+  // owns their own .env.local; see the no-URL skip below.)
+  if (conflictResolution && ext.dbUrl == null) {
+    throw new Error(
+      "Refusing --infra=external as a conflict resolution without --db-url: a local stack is holding the " +
+        "ports, so proceeding would point setup + migrations at that CONFLICTING local database (the default " +
+        "localhost SUPABASE_DB_URL). Pass --db-url to target a real external database (add --redis-url/--nango-url " +
+        "as needed), or choose --on-conflict=isolated for a separate local stack.",
+    );
+  }
+
+  if (provided.length === 0) {
+    // No-conflict --no-infra / --infra=external with no URLs: skip bring-up only
+    // (the operator owns their own .env.local). The conflict path is already
+    // handled by the --db-url guard above, so this branch is the legacy case.
+    log("- External infra (--infra=external): no --db-url/--redis-url/--nango-url/--graphiti-url given; " +
+      "skipping infra bring-up only (ensure your external Postgres/Redis/Nango are reachable before setup).");
+    return { wrote: [] };
+  }
+
+  // Shape-validate each provided URL.
+  const validators = {
+    SUPABASE_DB_URL: () => assertExternalUrl("--db-url", ext.dbUrl, ["postgres", "postgresql"]),
+    REDIS_URL: () => assertExternalUrl("--redis-url", ext.redisUrl, ["redis", "rediss"]),
+    NANGO_SERVER_URL: () => assertExternalUrl("--nango-url", ext.nangoUrl, ["http", "https"]),
+    GRAPHITI_URL: () => assertExternalUrl("--graphiti-url", ext.graphitiUrl, ["http", "https"]),
+  };
+  const values = {};
+  for (const [key] of provided) values[key] = validators[key]();
+
+  // Guard against an exported env var silently overriding the generated value
+  // (setup overlays process.env over .env.local — same precedent as
+  // assertAmbientModeMatches). Refuse a contradicting export.
+  for (const [key, want] of Object.entries(values)) {
+    const ambient = process.env[key];
+    if (typeof ambient === "string" && ambient.trim().length > 0 && ambient.trim() !== want) {
+      throw new Error(
+        `Exported ${key}=${ambient.trim()} would override the --${externalFlagFor(key)} value you passed ` +
+          `(setup overlays the shell env over .env.local). Unset ${key} (or align it) and retry.`,
+      );
+    }
+  }
+
+  // A DB pointed at a non-empty / production database is destructive-leaning:
+  // setup/migrations CAN mutate it. Require a NON-ROLLBACKABLE acknowledgement
+  // (URL validation alone is insufficient). A bare --yes must NOT silently
+  // authorise this (same class as --teardown-existing's `-v`): non-interactively
+  // the operator must pass the explicit --external-db-disposable ack; on a TTY a
+  // typed confirm is accepted. (`--yes` still pre-accepts the TTY prompt only
+  // when the disposable ack is ALSO present.)
+  if (values.SUPABASE_DB_URL) {
+    let ok = false;
+    if (opts.externalDbDisposable) {
+      ok = true; // explicit acknowledgement the target is disposable.
+    } else if (opts.yes) {
+      // A bare --yes is NOT enough for a non-rollbackable external DB.
+      throw new Error(
+        `Refusing to point setup + migrations at an EXTERNAL database (${redactUrl(values.SUPABASE_DB_URL)}) ` +
+          `on a bare --yes. These resources are NOT install-owned and are NEVER auto-rolled-back; setup may ` +
+          `mutate a non-empty/production DB irreversibly. Re-run with --external-db-disposable to acknowledge ` +
+          `the target is disposable (or run interactively to type the confirmation).`,
+      );
+    } else {
+      ok = await typedConfirm(
+        `⚠ --infra=external points setup + migrations at an EXTERNAL database (${redactUrl(values.SUPABASE_DB_URL)}).\n` +
+          `  These resources are NOT install-owned and will NEVER be auto-rolled-back. If this DB is non-empty\n` +
+          `  or production, setup may mutate it irreversibly.`,
+        "I understand",
+      );
+    }
+    if (!ok) {
+      throw new Error(
+        "Aborted: external DB not confirmed (type \"I understand\", or pass --external-db-disposable if the target is disposable).",
+      );
+    }
+  }
+
+  // Write into .env.local (preserve existing unrelated keys).
+  const envPath = path.join(targetDir, ".env.local");
+  let body = existsSync(envPath) ? readFileSync(envPath, "utf8") : "";
+  for (const [key, val] of Object.entries(values)) {
+    body = upsertEnvKey(body, key, val);
+  }
+  writeFileSync(envPath, body);
+  log(`- External infra: wrote ${Object.keys(values).join(", ")} into .env.local (resources are operator-owned; not install-managed).`);
+  return { wrote: Object.keys(values) };
+}
+
+function externalFlagFor(key) {
+  return {
+    SUPABASE_DB_URL: "db-url",
+    REDIS_URL: "redis-url",
+    NANGO_SERVER_URL: "nango-url",
+    GRAPHITI_URL: "graphiti-url",
+  }[key] ?? key;
+}
+
+/** Redact credentials from a URL for display (user:pass@host → user:***@host). */
+function redactUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.password) u.password = "***";
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+/** Rewrite a connection-URL's host PORT to `newPort`, preserving scheme, auth,
+ *  host, path (db name), and query. Falls back to a default `proto://127.0.0.1:
+ *  port/` when there is no existing URL to preserve. */
+function rewriteUrlPort(existing, newPort, fallbackProto, fallbackPath = "") {
+  if (typeof existing === "string" && existing.length > 0) {
+    try {
+      const u = new URL(existing);
+      u.port = String(newPort);
+      return u.toString();
+    } catch {
+      /* fall through to a fresh URL */
+    }
+  }
+  return `${fallbackProto}://127.0.0.1:${newPort}${fallbackPath}`;
+}
+
+/**
+ * Write the host app env for an ISOLATED instance: its own PORT + Better-Auth
+ * URLs (so `pnpm dev` binds the isolated app port, not 3000 — review hardening #3) AND
+ * the infra connection URLs RE-POINTED at the remapped host ports (review hardening #1 —
+ * otherwise setup connects to the DEFAULT/conflicting stack). The remapped host
+ * ports come from the generated compose's per-service `ports` map. Existing URL
+ * credentials / db-name are preserved; only the port is rewritten.
+ */
+function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = console.log }) {
+  const envPath = path.join(targetDir, ".env.local");
+  if (!existsSync(envPath)) return;
+  const baseUrl = `http://localhost:${appPort}`;
+  let body = readFileSync(envPath, "utf8");
+  body = upsertEnvKey(body, "PORT", String(appPort));
+  body = upsertEnvKey(body, "BETTER_AUTH_URL", baseUrl);
+  body = upsertEnvKey(body, "NEXT_PUBLIC_BETTER_AUTH_URL", baseUrl);
+
+  // Read the current env values (to preserve credentials/db-name on rewrite).
+  const cur = parseEnvBody(body);
+  const first = (svc) => {
+    const list = ports?.[svc];
+    return Array.isArray(list) && list.length ? list[0] : null;
+  };
+
+  // Map the well-known infra services → their connection-URL env keys, re-pointed
+  // at the remapped host ports. Only services actually present in the remapped
+  // band are rewritten.
+  const pgPort = first("postgres");
+  if (pgPort) body = upsertEnvKey(body, "SUPABASE_DB_URL", rewriteUrlPort(cur.SUPABASE_DB_URL, pgPort, "postgresql", "/postgres"));
+  const redisPort = first("redis");
+  if (redisPort) body = upsertEnvKey(body, "REDIS_URL", rewriteUrlPort(cur.REDIS_URL, redisPort, "redis", ""));
+  const nangoPort = first("nango-server");
+  if (nangoPort) body = upsertEnvKey(body, "NANGO_SERVER_URL", rewriteUrlPort(cur.NANGO_SERVER_URL, nangoPort, "http", ""));
+  // The Nango DB is a SEPARATE service (`nango-db`); setup reads NANGO_DATABASE_URL
+  // (or NANGO_DB_URL) and otherwise falls back to the DEFAULT local Nango DB
+  // (index.mjs getNangoDatabaseUrl) — so it MUST be re-pointed too (review hardening #2).
+  const nangoDbPort = first("nango-db");
+  if (nangoDbPort) {
+    const nangoDbUrl = rewriteUrlPort(cur.NANGO_DATABASE_URL ?? cur.NANGO_DB_URL, nangoDbPort, "postgresql", "/nango");
+    body = upsertEnvKey(body, "NANGO_DATABASE_URL", nangoDbUrl);
+    if (cur.NANGO_DB_URL != null) body = upsertEnvKey(body, "NANGO_DB_URL", nangoDbUrl);
+  }
+  const graphitiPort = first("graphiti");
+  if (graphitiPort) body = upsertEnvKey(body, "GRAPHITI_URL", rewriteUrlPort(cur.GRAPHITI_URL, graphitiPort, "http", ""));
+
+  writeFileSync(envPath, body);
+  const remapped = [
+    pgPort && `db:${pgPort}`,
+    redisPort && `redis:${redisPort}`,
+    nangoPort && `nango:${nangoPort}`,
+    nangoDbPort && `nango-db:${nangoDbPort}`,
+    graphitiPort && `graphiti:${graphitiPort}`,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  log(`  Isolated app port ${appPort}; infra URLs re-pointed (${remapped}) in .env.local.`);
+}
+
+/** Minimal `.env` body → { KEY: value } map (last wins; quotes stripped). Used
+ *  only to PRESERVE existing credentials when re-pointing an isolated URL. */
+function parseEnvBody(body) {
+  const out = {};
+  for (const raw of String(body ?? "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const m = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+    if (!m) continue;
+    let v = m[2].trim();
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    out[m[1]] = v;
+  }
+  return out;
+}
+
+// ── conflict resolution orchestrator (classify → offer + execute) ───────────
+/**
+ * On a detected host-port conflict, CLASSIFY the holder then OFFER + EXECUTE an
+ * isolation option (the literal issue title). Returns
+ * `{ infraPlan, instance?, done }` where `infraPlan` ∈
+ * {"default","isolated","external","attach","skip"}.
+ *
+ * Decision order:
+ *   1. Idempotent re-run / self-instance (our own checkout owns the ports) →
+ *      attach/converge (or --resume to reconcile a provisioning ghost).
+ *   2. Explicit --on-conflict / --infra → execute that option.
+ *   3. Interactive TTY, no explicit flag → the MINIMAL execute-menu
+ *      {Isolated / Abort / Attach} (T8b) — EXECUTE the choice.
+ *   4. Non-interactive, no explicit flag → abort with the classified message.
+ * Destructive options (stop-existing/teardown) REFUSE an `unrelated`/`mixed`
+ * holder. `--yes` never silently picks stop/teardown/share.
+ */
+async function resolveConflict({ targetDir, opts, conflicts, resolvedSha, log = console.log, deps = {} }) {
+  const inspect = (deps.liveComposeInspect ?? liveComposeInspect)(targetDir, deps);
+  const { instanceRegistry, cloneRegistry } = readBothRegistries(deps);
+  const cls = classifyPortHolder({
+    // Interface-aware: pass the full `{host, port}` bindings (review hardening #4).
+    conflicts: conflicts.map((c) => ({ host: c.host, port: c.port })),
+    inspectRows: inspect,
+    instanceRegistry,
+    cloneRegistry,
+    installDir: targetDir,
+  });
+
+  // 1. Our OWN checkout owns the ports → idempotent re-run / attach.
+  if (cls.kind === "idempotent-rerun" || cls.kind === "self-instance") {
+    log("- This checkout's own stack already holds these ports (idempotent re-run).");
+    return executeAttach({ targetDir, opts, resolvedSha, classified: cls, log, deps });
+  }
+
+  // Resolve the requested option: --on-conflict wins; else --infra=external maps
+  // to external; else null (decide by menu / abort).
+  let choice = opts.onConflict;
+  if (!choice && opts.infra === "external") choice = "external";
+
+  // 2/3. No explicit choice.
+  if (!choice) {
+    const interactive = process.stdin.isTTY && process.stdout.isTTY;
+    if (!interactive) {
+      // Non-interactive abort-by-default.
+      throw new Error(
+        formatPortConflictError(conflicts, { phase: "before bringing up infra", owner: cls.kind }) +
+          `\n  (non-interactive: pass an explicit --on-conflict=… or --infra=external to proceed.)`,
+      );
+    }
+    choice = await runExecuteMenu({ conflicts, classified: cls, opts, log });
+  }
+
+  switch (choice) {
+    case "isolated":
+    case "prompt": {
+      // "prompt" already resolved to a concrete choice via the menu when
+      // interactive; reaching here with "prompt" means an explicit
+      // --on-conflict=prompt — run the menu now.
+      if (choice === "prompt") {
+        const sub = await runExecuteMenu({ conflicts, classified: cls, opts, log });
+        return dispatchChoice({ choice: sub, targetDir, opts, conflicts, resolvedSha, classified: cls, log, deps });
+      }
+      return dispatchChoice({ choice: "isolated", targetDir, opts, conflicts, resolvedSha, classified: cls, log, deps });
+    }
+    default:
+      return dispatchChoice({ choice, targetDir, opts, conflicts, resolvedSha, classified: cls, log, deps });
+  }
+}
+
+/** Execute one concrete conflict-resolution choice. */
+async function dispatchChoice({ choice, targetDir, opts, conflicts, resolvedSha, classified, log, deps }) {
+  switch (choice) {
+    case "isolated": {
+      const inst = await executeIsolatedInstall({ targetDir, opts, resolvedSha, log, deps });
+      if (inst.dryRun) {
+        log("  [dry-run] isolated install planned; no infra brought up.");
+        return { infraPlan: "skip", instance: inst, done: false, dryRun: true };
+      }
+      return { infraPlan: "isolated", instance: inst, done: true };
+    }
+    case "external":
+      // env wiring + record handled in steps 5c/7b; here just signal the plan.
+      return { infraPlan: "external", done: false };
+    case "attach":
+      return executeAttach({ targetDir, opts, resolvedSha, classified, log, deps });
+    case "stop-existing":
+      return executeStopExisting({ targetDir, opts, conflicts, classified, log, deps });
+    case "fail":
+    case "abort":
+      throw new Error(formatPortConflictError(conflicts, { phase: "before bringing up infra", owner: classified.kind }));
+    default:
+      throw new Error(`Unsupported --on-conflict choice "${choice}".`);
+  }
+}
+
+/** T8b — the interactive execute-menu. Returns the chosen action string. The
+ *  options offered mirror the flag surface 1:1 (acceptance: each option is
+ *  selectable interactively AND via flags): Isolated / Attach / Stop-existing /
+ *  External / Abort. Stop-existing is only OFFERED for a single proven
+ *  `other-cinatra` holder (it refuses an unrelated/mixed holder at execution, so
+ *  offering it elsewhere would be a dead option). Co-use is GATED → it is named
+ *  as unavailable, never offered. `--yes` does NOT silently pick a destructive
+ *  option; it only pre-accepts the SAFE default (Isolated). */
+async function runExecuteMenu({ conflicts, classified, opts, log = console.log }) {
+  const isSingleCinatra = classified.kind === "other-cinatra" && classified.instance;
+  const owner = isSingleCinatra
+    ? `another Cinatra instance${classified.instance?.slug ? ` ("${classified.instance.slug}")` : ""}`
+    : classified.kind === "mixed"
+      ? "a MIX of a Cinatra instance and an unrelated process"
+      : "another process";
+  log("");
+  log(`Port conflict — these ports are held by ${owner}:`);
+  for (const c of conflicts) {
+    const where = c.host === "0.0.0.0" ? `port ${c.port}` : `${c.host}:${c.port}`;
+    log(`  ✗ ${where}${c.service ? ` [${c.service}]` : ""}`);
+  }
+  log("");
+  log("How would you like to proceed?");
+  log("  [i] Isolated  — install a second FULL stack on its own remapped ports + app port (safe, recommended)");
+  log("  [a] Attach    — converge on the existing checkout instead of a second stack");
+  if (isSingleCinatra) {
+    log(`  [s] Stop      — stop the existing instance "${classified.instance.slug}" first, then install on the default ports`);
+  }
+  log("  [e] External  — point this install at external Postgres/Redis/Nango (pass --db-url/--redis-url/… ; no local infra)");
+  log("  [x] Abort     — stop and let me free the ports myself");
+  log("  (Co-use / sharing one infra stack between two instances is not yet available — use Isolated.)");
+  // --yes pre-accepts the SAFE default only (never a destructive Stop).
+  if (opts.yes) {
+    log("  (--yes: choosing Isolated, the safe default.)");
+    return "isolated";
+  }
+  const hint = isSingleCinatra ? "[i/a/s/e/x]" : "[i/a/e/x]";
+  const answer = (await promptLine(`Choice ${hint}: `, "x")).trim().toLowerCase();
+  if (answer === "i" || answer === "isolated") return "isolated";
+  if (answer === "a" || answer === "attach") return "attach";
+  if (isSingleCinatra && (answer === "s" || answer === "stop" || answer === "stop-existing")) return "stop-existing";
+  if (answer === "e" || answer === "external") return "external";
+  return "abort";
+}
+
+/** Read the instance-registry row that records THIS checkout AS an ISOLATED
+ *  instance (its own compose project, not the default `cinatra`). Returns the
+ *  row or null. Best-effort (a malformed/missing registry → null). */
+function lookupOwnIsolatedRow(targetDir) {
+  try {
+    const reg = requireUsableInstanceRegistry(defaultInstanceRegistryPath());
+    const row = listInstances(reg).find((i) => path.resolve(i.installDir) === path.resolve(targetDir)) ?? null;
+    if (row && row.composeProject && row.composeProject !== "cinatra" && row.infraMode !== "external") {
+      return row;
+    }
+  } catch {
+    /* best-effort */
+  }
+  return null;
+}
+
+/** Re-converge on a checkout's OWN recorded isolated stack: bring it up via the
+ *  RECORDED compose files + project, re-point the env at its remapped ports, and
+ *  return an "isolated" plan so the later steps treat it as isolated. */
+async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = console.log, deps = {} }) {
+  const startInfra = deps.bringUpInfra ?? bringUpInfra;
+  const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
+  const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
+  if (opts.dryRun) {
+    log(`  [dry-run] would bring up isolated project ${row.composeProject} from ${(row.composeFiles ?? []).join(", ")}`);
+    return { infraPlan: "isolated", instance: row, done: false, dryRun: true };
+  }
+  // Re-point the env at the recorded remapped ports + bring up WITH
+  // `--env-file .env.local` so the generated isolated compose's scrubbed
+  // `${VAR}` placeholders resolve from the file (never blank/shell defaults) —
+  // mirrors the primary isolated `up`. Without this an idempotent re-converge of
+  // a stopped isolated stack would start with empty secrets/wrong URLs.
+  ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: row.ports ?? {}, log });
+  const reconvEnvFile = path.join(targetDir, ".env.local");
+  startInfra({
+    targetDir,
+    log,
+    composeFiles: row.composeFiles,
+    composeProject: row.composeProject,
+    envFile: existsSync(reconvEnvFile) ? reconvEnvFile : null,
+    nangoHealthUrl: nangoHealthUrlForPorts(row.ports),
+  });
+  // Promote a stale provisioning row to ready after a successful ensure.
+  if (row.state !== "ready") {
+    await withAllocLock(lockPath, async () => {
+      const reg = requireUsableInstanceRegistry(registryPath);
+      if (getInstance(reg, row.slug)) {
+        writeInstanceRegistry(registryPath, markInstanceReady(reg, row.slug, { sha: resolvedSha }));
+      }
+    });
+  }
+  return { infraPlan: "isolated", instance: row, done: true };
+}
+
+/** T12 — attach / resume: converge on THIS checkout's OWN existing instance.
+ *  Attach is for the SELF case (our own checkout already has a stack) — it is
+ *  NOT a way to graft a fresh checkout onto a DIFFERENT instance's stack. So:
+ *    - holder is a DIFFERENT recorded Cinatra instance (other-cinatra) AND this
+ *      checkout has NO row of its own → REFUSE with guidance (review hardening #2: don't
+ *      pretend to attach to a stack we don't own; use isolated/stop-existing).
+ *    - this checkout HAS its own row → ensure ITS recorded stack is up, and only
+ *      promote provisioning→ready when the bring-up SUCCEEDED (never on failure).
+ *    - --resume reconciles a stale provisioning row of THIS checkout. */
+async function executeAttach({ targetDir, opts, resolvedSha, classified, log = console.log, deps = {} }) {
+  const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
+  const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
+  const startInfra = deps.bringUpInfra ?? bringUpInfra;
+
+  // Determine the instance row THIS checkout maps to (registry = authority).
+  let row = null;
+  let reg = null;
+  try {
+    reg = requireUsableInstanceRegistry(registryPath);
+    row = listInstances(reg).find((i) => path.resolve(i.installDir) === path.resolve(targetDir)) ?? null;
+  } catch {
+    reg = null;
+  }
+
+  // A DIFFERENT instance holds the ports and this checkout is not it → refuse.
+  if (!row && classified?.kind === "other-cinatra" && classified.instance) {
+    throw new Error(
+      `Refusing --on-conflict=attach: the conflicting ports belong to a DIFFERENT instance ` +
+        `"${classified.instance.slug}" at ${classified.instance.installDir}, not this checkout (${targetDir}). ` +
+        `Attach only converges on YOUR OWN existing checkout. Re-run inside ${classified.instance.installDir} to ` +
+        `update that instance, use --on-conflict=isolated for a separate stack here, or --on-conflict=stop-existing.`,
+    );
+  }
+
+  if (opts.resume && row && row.state === "provisioning") {
+    log(`- --resume: reconciling the stale provisioning row for "${row.slug}".`);
+  }
+
+  // Bring THIS checkout's recorded stack up idempotently (owned-port exemption
+  // applies). Use the RECORDED compose files/project when known, else the base.
+  let broughtUp = false;
+  if (!opts.dryRun) {
+    const composeFiles = row?.composeFiles ?? null;
+    const composeProject = row?.composeProject && row.composeProject !== "cinatra" ? row.composeProject : null;
+    // When attaching to an ISOLATED instance (its own compose project), the
+    // recorded compose is the generated file whose secrets are scrubbed to
+    // `${VAR}`; re-point the env at the recorded remapped ports and bring up WITH
+    // `--env-file .env.local` so those placeholders resolve (parity with the
+    // primary isolated `up`). A default-stack attach keeps compose's normal `.env`
+    // discovery (no env-file), byte-identical to before.
+    const isIsolatedRow = composeProject != null && row?.infraMode !== "external";
+    let attachEnvFile = null;
+    if (isIsolatedRow) {
+      ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: row.ports ?? {}, log });
+      const envCandidate = path.join(targetDir, ".env.local");
+      attachEnvFile = existsSync(envCandidate) ? envCandidate : null;
+    }
+    try {
+      log("- Ensuring this checkout's own infra is up (attach)…");
+      startInfra({ targetDir, log, composeFiles, composeProject, envFile: attachEnvFile, nangoHealthUrl: nangoHealthUrlForPorts(row?.ports) });
+      broughtUp = true;
+    } catch (err) {
+      log(`  ⚠ Attach bring-up reported: ${err.message}`);
+      // Re-throw a hard failure so we never proceed (or promote) on a broken stack.
+      throw err;
+    }
+    // Promote a provisioning row to ready ONLY after a SUCCESSFUL ensure.
+    if (broughtUp && reg && row && row.state !== "ready") {
+      await withAllocLock(lockPath, async () => {
+        const fresh = requireUsableInstanceRegistry(registryPath);
+        if (getInstance(fresh, row.slug)) {
+          writeInstanceRegistry(registryPath, markInstanceReady(fresh, row.slug, { sha: resolvedSha }));
+        }
+      });
+    }
+  }
+
+  return { infraPlan: "attach", instance: row ?? undefined, done: true };
+}
+
+/** T11 — stop-existing: tear down the RECORDED PROJECT of the holder, then
+ *  install on the default ports. `--teardown-existing` adds `-v` behind a
+ *  SEPARATE typed confirm. REFUSES an `unrelated`/`mixed` holder. After a
+ *  successful down, RELEASES the torn-down instance's row + marker + alloc band
+ *  reservation transactionally (review hardening #6 / §C.8). */
+async function executeStopExisting({ targetDir, opts, conflicts, classified, log = console.log, deps = {} }) {
+  if (classified.kind !== "other-cinatra") {
+    throw new Error(
+      `Refusing --on-conflict=stop-existing: the conflicting ports are NOT proven to be a single Cinatra ` +
+        `instance (classified "${classified.kind}"). Stopping an unrelated/ambiguous holder could take down ` +
+        `the wrong process. Stop it yourself, or use --on-conflict=isolated.`,
+    );
+  }
+  const holder = classified.instance;
+  const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
+  const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
+  const runCompose = deps.runComposeDown ?? composeDown;
+
+  const withVolumes = opts.teardownExisting;
+  // Loud notice (review hardening #5): a no-`-v` down preserves the named
+  // volumes, and the new default install will REUSE that data. `-v` wipes it.
+  if (withVolumes) {
+    const ok = await typedConfirm(
+      `⚠ --teardown-existing will DELETE instance "${holder.slug}"'s data volumes (project ${holder.composeProject}).\n` +
+        `  This is IRREVERSIBLE.`,
+      `delete ${holder.slug}`,
+    );
+    if (!ok) {
+      throw new Error(`Aborted: volume teardown of "${holder.slug}" not confirmed (type "delete ${holder.slug}").`);
+    }
+  } else {
+    log(
+      `- Stopping existing instance "${holder.slug}" (project ${holder.composeProject}) WITHOUT removing volumes.\n` +
+        `  Its named volumes (data) are PRESERVED — the new default install will REUSE that existing data.\n` +
+        `  Pass --teardown-existing for a clean slate (deletes the volumes; requires a typed confirm).`,
+    );
+  }
+
+  if (opts.dryRun) {
+    log(`  [dry-run] would \`docker compose -p ${holder.composeProject} -f ${(holder.composeFiles ?? []).join(" -f ")} down${withVolumes ? " -v" : ""}\``);
+    return { infraPlan: "skip", done: false, dryRun: true };
+  }
+
+  // Tear down the RECORDED project + files (never a bare dir `down`).
+  runCompose(holder.installDir, {
+    composeFiles: holder.composeFiles,
+    composeProject: holder.composeProject && holder.composeProject !== "cinatra" ? holder.composeProject : null,
+    volumes: withVolumes,
+  });
+
+  // Transactional release of the torn-down instance's row + marker + band.
+  await withAllocLock(lockPath, async () => {
+    let reg;
+    try {
+      reg = requireUsableInstanceRegistry(registryPath);
+    } catch {
+      reg = null;
+    }
+    if (reg && getInstance(reg, holder.slug)) {
+      const { registry: next } = releaseInstance(reg, holder.slug);
+      writeInstanceRegistry(registryPath, next);
+    }
+  });
+  try {
+    const markerFile = path.join(holder.installDir, ".cinatra", "instance.json");
+    if (existsSync(markerFile)) spawnSync("rm", ["-f", markerFile]);
+  } catch {
+    /* best-effort */
+  }
+  log(`  Stopped "${holder.slug}". Installing on the default ports.`);
+
+  // Proceed with a DEFAULT install on the now-free default band.
+  return { infraPlan: "default", done: false };
+}
+
 // ---------------------------------------------------------------------------
 // The command.
 // ---------------------------------------------------------------------------
 
 export async function runInstall(argv = [], { log = console.log, deps = {} } = {}) {
   const opts = parseInstallArgs(argv);
+
+  // T5b — gated co-use signals fail LOUD BEFORE any side effect (never a silent
+  // no-op surface). cinatra-cli#17.
+  refuseCoUseIfRequested(opts);
+
+  // T6 — read-only --status / --list-instances short-circuit (no side effects).
+  if (opts.status || opts.listInstances) {
+    const dirForStatus = opts.dir ? path.resolve(opts.dir) : null;
+    printInstanceStatus({ targetDir: dirForStatus, listAll: opts.listInstances && !opts.status, log, deps });
+    return { status: true };
+  }
 
   // Injectable seams (default to the real implementations — production behavior
   // is byte-identical when `deps` is empty). These let the integration tests
@@ -1180,7 +2627,21 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   //     the ports — the post-clone gate applies the project-up exemption).
   const usesDefaultBand =
     opts.repoUrl === DEFAULT_REPO_URL && opts.ref === "main";
-  if (pre.infraWillStart && !alreadyCheckout && usesDefaultBand) {
+  // cinatra-cli#17: the pre-clone abort is a fast early-out for the COMMON
+  // case (no isolation requested, non-interactive). When the operator has opted
+  // into a conflict-resolution path (an explicit --on-conflict/--infra, an
+  // isolation flag, or an interactive TTY where the execute-menu can offer
+  // options), DON'T hard-abort here — let the post-clone classifier offer +
+  // execute the chosen option (the clone is needed to resolve the real band).
+  const wantsConflictResolution =
+    opts.onConflict != null ||
+    opts.infra != null ||
+    opts.instance != null ||
+    opts.portOffset != null ||
+    opts.appPort != null ||
+    opts.resume ||
+    (process.stdin.isTTY && process.stdout.isTTY);
+  if (pre.infraWillStart && !alreadyCheckout && usesDefaultBand && !wantsConflictResolution) {
     const conflicts = await probePorts(DEFAULT_DEV_HOST_PORTS);
     if (conflicts.length > 0) {
       throw new Error(formatPortConflictError(conflicts, { phase: "preflight, before clone" }));
@@ -1214,15 +2675,42 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   }
   log(`✓ Cinatra checked out at ${targetDir} @ ${resolvedSha} (ref: ${opts.ref}).`);
 
+  // Locally git-ignore the per-checkout marker dir + the generated isolated
+  // compose so neither dirties the working tree (keeps idempotent re-runs clean;
+  // needs no change to the cinatra repo). cinatra-cli#17.
+  ensureMarkerIgnored(targetDir);
+
+  let infraPlan = opts.noInfra ? "external" : "default";
+  let resolution = null;
+
+  // 4a-bis. RE-RUN of an already-recorded ISOLATED instance (review hardening #6): if
+  //     the registry records THIS checkout as an isolated instance (its own
+  //     compose project, not the default), a plain re-run must converge on its
+  //     OWN remapped stack — NOT probe + start the default band (which would
+  //     spin up a second, default-port stack from an isolated checkout). Detect
+  //     it up front and route to the isolated re-converge path. Skipped under
+  //     --infra=external and when --on-conflict/--infra explicitly overrides.
+  if (!opts.noInfra && !opts.onConflict && opts.infra == null) {
+    const ownIso = lookupOwnIsolatedRow(targetDir);
+    if (ownIso) {
+      log(`- This checkout is the recorded isolated instance "${ownIso.slug}" (project ${ownIso.composeProject}) — converging on its own stack.`);
+      resolution = await reconvergeIsolated({ targetDir, opts, resolvedSha, row: ownIso, log, deps });
+      infraPlan = resolution.infraPlan;
+    }
+  }
+
   // 4b. AUTHORITATIVE host-port gate (cinatra-cli#3): re-derive the published
   //     band from THIS checkout's own `docker compose config` and probe it,
-  //     BEFORE writing .env.local / bringing infra up. This adapts to whatever
-  //     the cloned ref declares (the preflight static band is only an early
-  //     guess) and fails fast with an accurate message instead of the old
-  //     misleading "is the Docker daemon running?" at `docker compose up`.
-  //     Skipped under --no-infra (nothing to bring up) and when the target's OWN
-  //     compose project already owns the ports (idempotent re-run, not a clash).
-  if (!opts.noInfra && dockerPresent("docker", ["--version"]) && composeOk()) {
+  //     BEFORE writing .env.local / bringing infra up. On a conflict, cinatra-
+  //     cli#17 CLASSIFIES the holder and OFFERS + EXECUTES an isolation option
+  //     instead of always aborting. `infraPlan` records which infra path the
+  //     later steps take: "default" (bring up the base stack), "isolated"
+  //     (already handled here — bring up a remapped second stack), "external"
+  //     (skip bring-up), "attach" (converge on the existing checkout), or
+  //     "skip" (infra already satisfied / nothing to do).
+  //     Skipped entirely under --infra=external (nothing local to bring up),
+  //     and when an isolated re-converge already set the plan above.
+  if (infraPlan === "default" && !opts.noInfra && dockerPresent("docker", ["--version"]) && composeOk()) {
     // Try to derive the AUTHORITATIVE band from the checkout's own compose config.
     // `null` ⇒ `docker compose config` could not be captured/parsed (the check
     // CANNOT run authoritatively). Do NOT silently fall back to the static band:
@@ -1239,11 +2727,20 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     if (band.length > 0) {
       // Exempt only the ports THIS target's own running compose services already
       // publish (idempotent re-run) — a stranger holding a not-yet-up service's
-      // port is still a real conflict (codex must-fix: no blanket project-up skip).
+      // port is still a real conflict (hardening requirement: no blanket project-up skip).
       const ownedPorts = deriveOwnedPorts(targetDir);
       const conflicts = await probePorts(band, { ownedPorts });
       if (conflicts.length > 0) {
-        throw new Error(formatPortConflictError(conflicts, { phase: "before bringing up infra" }));
+        // cinatra-cli#17: classify the holder, then offer + execute an option.
+        resolution = await resolveConflict({
+          targetDir,
+          opts,
+          conflicts,
+          resolvedSha,
+          log,
+          deps,
+        });
+        infraPlan = resolution.infraPlan;
       }
     }
   }
@@ -1252,9 +2749,43 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   log("- Configuring environment…");
   ensureEnvLocal({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, log });
 
-  // 6. Bring up + wait for docker infra (skippable for external infra).
-  if (opts.noInfra) {
-    log("- Skipping infrastructure startup (--no-infra). Ensure Postgres/Redis/Nango are reachable before setup.");
+  // 5b. For an ISOLATED instance, point the HOST app at its own port + URLs
+  //     (review hardening #3: compose isolation only covers INFRA ports; the
+  //     app uses PORT/BETTER_AUTH_URL/NEXT_PUBLIC_BETTER_AUTH_URL — mirror what
+  //     `setup branch`/clone write, else `pnpm dev` still collides on 3000).
+  if (infraPlan === "isolated" && resolution?.instance?.appPort) {
+    writeIsolatedAppEnv({
+      targetDir,
+      appPort: resolution.instance.appPort,
+      ports: resolution.instance.ports ?? {},
+      log,
+    });
+  }
+
+  // 5c. EXTERNAL infra (T13): wire the operator-supplied URLs into .env.local
+  //     (sanitized-env guarded) and record the instance as `external`.
+  //     `conflictResolution` is true when external was chosen TO RESOLVE a live
+  //     port conflict (a real local stack is holding the ports): in that case
+  //     proceeding with NO external URLs would silently leave setup pointed at
+  //     the CONFLICTING local DB and migrate it — so executeExternalEnv aborts
+  //     unless a --db-url is supplied (review hardening: conflict-external must
+  //     not fall back to the occupied local DB).
+  if (infraPlan === "external") {
+    const conflictResolution = resolution != null && resolution.infraPlan === "external";
+    await executeExternalEnv({ targetDir, opts, conflictResolution, log });
+  }
+
+  // 6. Bring up + wait for docker infra, per the resolved plan.
+  //    - "isolated"/"attach": already provisioned during conflict resolution.
+  //    - "external": no local infra to start.
+  //    - "default": bring up the base stack (no conflict, or conflict resolved
+  //      to default via stop-existing's teardown).
+  if (infraPlan === "external") {
+    log("- Skipping local infrastructure startup (external infra). Ensure Postgres/Redis/Nango are reachable before setup.");
+  } else if (infraPlan === "isolated") {
+    log(`- Isolated instance "${resolution?.instance?.slug}" infra is up (project ${resolution?.instance?.composeProject}).`);
+  } else if (infraPlan === "attach") {
+    log("- Attached to the existing instance's infra (no second stack started).");
   } else {
     startInfra({ targetDir, log });
   }
@@ -1305,18 +2836,46 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     }
   }
 
+  // 7b. T8c — record a registry row + marker for the DEFAULT / EXTERNAL install
+  //     (the ISOLATED path already records its row inside the executor; an
+  //     ATTACH converged on an existing row). This gives --status / --attach /
+  //     stop-existing an authoritative source to read for default installs too.
+  let recordedSlug = resolution?.instance?.slug ?? null;
+  if (infraPlan === "default" || infraPlan === "external") {
+    recordedSlug = await recordDefaultInstance({
+      targetDir,
+      opts,
+      resolvedSha,
+      state: infraPlan === "external" ? "external" : "ready",
+      log,
+      deps,
+    });
+  }
+
   // 8. Done.
+  const appPortForSummary =
+    infraPlan === "isolated" ? resolution?.instance?.appPort ?? DEFAULT_APP_PORT_FOR_RECORD : DEFAULT_APP_PORT_FOR_RECORD;
   log("");
   log("✓ Cinatra install complete.");
   log(`  Directory:     ${targetDir}`);
   log(`  Ref / commit:  ${opts.ref} (${resolvedSha})`);
   log(`  Mode:          ${opts.mode}`);
+  if (recordedSlug) log(`  Instance:      ${recordedSlug}${infraPlan === "isolated" ? ` (isolated, project ${resolution?.instance?.composeProject})` : ""}`);
+  if (infraPlan === "external") log("  Infra:         external (operator-owned; not install-managed)");
   log("");
   log("  Next:");
   log(`    cd ${targetDir}`);
-  log("    pnpm dev        # start the app at http://localhost:3000");
+  log(`    pnpm dev        # start the app at http://localhost:${appPortForSummary}`);
   log("    The first user to register becomes the admin.");
-  return { targetDir, ref: opts.ref, sha: resolvedSha, mode: opts.mode };
+  return {
+    targetDir,
+    ref: opts.ref,
+    sha: resolvedSha,
+    mode: opts.mode,
+    instance: recordedSlug,
+    infraPlan,
+    appPort: appPortForSummary,
+  };
 }
 
 /** Clone a fresh host repo or update an existing checkout to `ref`; return the

@@ -294,6 +294,11 @@ describe("runInstall — from zero (local remote, --no-infra --no-setup)", () =>
 
   beforeAll(() => {
     sandbox = mkdtempSync(path.join(os.tmpdir(), "cinatra-install-e2e-"));
+    // Redirect the instance registry + alloc lock into the sandbox so the
+    // best-effort T8c default-record (cinatra-cli#17) never touches the real
+    // ~/.cinatra and never cross-contaminates between tests.
+    process.env.CINATRA_INSTANCE_REGISTRY = path.join(sandbox, "instances.json");
+    process.env.CINATRA_ALLOC_LOCK = path.join(sandbox, "alloc.lock");
 
     // Build a minimal but VALID "cinatra" source repo and push it to a bare
     // origin so `git clone file://…` exercises the real clone path.
@@ -343,7 +348,11 @@ describe("runInstall — from zero (local remote, --no-infra --no-setup)", () =>
     installDir = path.join(sandbox, "out");
   });
 
-  afterAll(() => rmSync(sandbox, { recursive: true, force: true }));
+  afterAll(() => {
+    delete process.env.CINATRA_INSTANCE_REGISTRY;
+    delete process.env.CINATRA_ALLOC_LOCK;
+    rmSync(sandbox, { recursive: true, force: true });
+  });
 
   it("clones the host, records the SHA, creates .env.local; no setup/infra", async () => {
     const logs = [];
@@ -790,23 +799,32 @@ describe("identifyComposeHolder (issue #9 — attribute a held port to its compo
   });
 });
 
-describe("formatPortConflictError (issue #9 — honest, plain-language guidance)", () => {
+describe("formatPortConflictError (issue #9 honesty + cinatra-cli#17 executable menu)", () => {
+  // The cinatra-cli#17 merge keeps #23's HONEST holder detection but replaces the
+  // manual `docker compose down`/`setup clone` instructions with the EXECUTABLE
+  // option menu (--on-conflict=isolated/stop-existing/attach, --infra=external).
+  const expectMenu = (msg) => {
+    expect(msg).toMatch(/--on-conflict=isolated/);
+    expect(msg).toMatch(/--on-conflict=stop-existing/);
+    expect(msg).toMatch(/--on-conflict=attach/);
+    expect(msg).toMatch(/--infra=external/);
+    // The old dev-worktree pointer is gone.
+    expect(msg).not.toMatch(/setup clone/);
+  };
+
   it("NEVER asserts a Cinatra stack when the holder is unattributed", () => {
     const msg = formatPortConflictError(
       [{ service: "verdaccio", host: "0.0.0.0", port: 4873, holder: null, compose: null }],
       { phase: "preflight, before clone" },
     );
-    // The old misleading assertion is gone …
     expect(msg).not.toMatch(/Another Cinatra stack/);
-    // … and the line is honest about not knowing the holder.
     expect(msg).toMatch(/could not determine which/);
-    // Plain-language options with consequences, no destructive auto-action.
     expect(msg).toMatch(/Free the ports/);
-    expect(msg).toMatch(/Run a second instance/);
     expect(msg).toMatch(/Cancel: stop here and change nothing/);
+    expectMenu(msg);
   });
 
-  it("names a DETECTED Cinatra stack (dir + project) and offers a guided replace step", () => {
+  it("names a DETECTED Cinatra stack (dir + project) and offers the executable menu", () => {
     const msg = formatPortConflictError(
       [
         {
@@ -821,18 +839,11 @@ describe("formatPortConflictError (issue #9 — honest, plain-language guidance)
     );
     // The stack is named honestly (it was proven Cinatra) …
     expect(msg).toMatch(/the Cinatra stack "cinatra" at \/home\/me\/cinatra/);
-    // … the data-preserving stop names the directory to run it from …
-    expect(msg).toMatch(/Stop it, keep its data: run `docker compose down` \(run it from \/home\/me\/cinatra\)/);
-    // … and is HONEST that `docker compose down` PRESERVES volumes (the issue-#9
-    //   correctness point: plain down does NOT delete named volumes) …
-    expect(msg).toMatch(/PRESERVES its database volumes/);
-    // … the destructive path is the explicit `-v` one, with a data-loss warning …
-    expect(msg).toMatch(/Wipe and replace it: run `docker compose down -v`/);
-    expect(msg).toMatch(/the `-v` DELETES that stack's database volumes/);
-    // … the run-alongside consequence (shared containers, one database) …
-    expect(msg).toMatch(/SHARES the existing Postgres\/Redis\/Neo4j containers/);
-    // … and a non-destructive cancel.
-    expect(msg).toMatch(/Cancel: stop here and change nothing/);
+    // … and the executable options are offered (no manual down -v / setup clone).
+    expectMenu(msg);
+    expect(msg).not.toMatch(/Wipe and replace it/);
+    // It still tells you that you can stop the stack yourself from its dir.
+    expect(msg).toMatch(/docker compose down.*from \/home\/me\/cinatra/);
   });
 
   it("falls back to the generic-Cinatra wording when the directory is unknown", () => {
@@ -848,9 +859,10 @@ describe("formatPortConflictError (issue #9 — honest, plain-language guidance)
       ],
       {},
     );
-    expect(msg).toMatch(/the Cinatra stack "cinatra"\. Choose one/);
-    // No "(run it from …)" suffix when we don't know the directory.
-    expect(msg).not.toMatch(/run it from/);
+    expect(msg).toMatch(/the Cinatra stack "cinatra"\. To install a SECOND/);
+    // No "from <dir>" suffix when we don't know the directory.
+    expect(msg).not.toMatch(/down.*from \//);
+    expectMenu(msg);
   });
 
   it("does NOT name a Cinatra stack when the compose holder was NOT proven Cinatra", () => {
@@ -866,18 +878,13 @@ describe("formatPortConflictError (issue #9 — honest, plain-language guidance)
       ],
       {},
     );
-    // A non-Cinatra compose project is honestly shown on the conflict line …
     expect(msg).toMatch(/held by docker compose project "some-other-app" \(\/srv\/other\)/);
-    // … but the guidance must NOT pretend it is a Cinatra stack to replace.
     expect(msg).not.toMatch(/the Cinatra stack/);
     expect(msg).toMatch(/not all held by a single Cinatra stack/);
+    expectMenu(msg);
   });
 
-  it("does NOT offer single-stack replace when conflicts are MIXED (Cinatra + a stranger)", () => {
-    // One port is held by a proven Cinatra stack; another by an unattributed
-    // process. Stopping the Cinatra stack would NOT free the stranger's port, so
-    // the single-stack "replace" wording would be dishonest/harmful — fall back
-    // to the generic guidance (codex round-2 finding).
+  it("does NOT name a single owning stack when conflicts are MIXED (Cinatra + a stranger)", () => {
     const msg = formatPortConflictError(
       [
         {
@@ -891,22 +898,26 @@ describe("formatPortConflictError (issue #9 — honest, plain-language guidance)
       ],
       {},
     );
-    // No single-stack replace wording …
-    expect(msg).not.toMatch(/Stop it, keep its data/);
-    expect(msg).not.toMatch(/Wipe and replace it/);
+    // No single owning-stack naming (stopping it would not free the stranger).
+    expect(msg).not.toMatch(/These ports are held by the Cinatra stack/);
     expect(msg).toMatch(/not all held by a single Cinatra stack/);
-    // … the Cinatra line is still shown honestly per-conflict …
     expect(msg).toMatch(/held by docker compose project "cinatra" \(\/home\/me\/cinatra\)/);
-    // … and the stranger is honestly flagged as undetermined.
     expect(msg).toMatch(/could not determine which/);
+    expectMenu(msg);
   });
 
-  it("offers single-stack replace when MULTIPLE ports are all the SAME Cinatra stack", () => {
-    const same = {
-      project: "cinatra",
-      workingDir: "/home/me/cinatra",
-      isCinatra: true,
-    };
+  it("the classifier `owner=mixed` verdict is surfaced (refusal of a destructive action)", () => {
+    const msg = formatPortConflictError(
+      [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+      { owner: "mixed" },
+    );
+    expect(msg).toMatch(/MIX of a Cinatra instance and an unrelated process/);
+    expect(msg).toMatch(/REFUSE/);
+    expectMenu(msg);
+  });
+
+  it("names the single owning stack when MULTIPLE ports are all the SAME Cinatra stack", () => {
+    const same = { project: "cinatra", workingDir: "/home/me/cinatra", isCinatra: true };
     const msg = formatPortConflictError(
       [
         { service: "postgres", host: "127.0.0.1", port: 5434, holder: "x", compose: { ...same } },
@@ -914,9 +925,9 @@ describe("formatPortConflictError (issue #9 — honest, plain-language guidance)
       ],
       {},
     );
-    // All ports trace to ONE stack ⇒ the guided replace IS offered.
+    // All ports trace to ONE stack ⇒ it is named.
     expect(msg).toMatch(/the Cinatra stack "cinatra" at \/home\/me\/cinatra/);
-    expect(msg).toMatch(/Stop it, keep its data/);
+    expectMenu(msg);
   });
 });
 
@@ -987,6 +998,8 @@ describe("runInstall — real gate sequencing (finding #3, infra NOT skipped)", 
 
   beforeAll(() => {
     sandbox = mkdtempSync(path.join(os.tmpdir(), "cinatra-install-seq-"));
+    process.env.CINATRA_INSTANCE_REGISTRY = path.join(sandbox, "instances.json");
+    process.env.CINATRA_ALLOC_LOCK = path.join(sandbox, "alloc.lock");
     const src = path.join(sandbox, "src");
     mkdirSync(path.join(src, "packages", "migrations"), { recursive: true });
     writeFileSync(path.join(src, "pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n");
@@ -1016,7 +1029,11 @@ describe("runInstall — real gate sequencing (finding #3, infra NOT skipped)", 
     G(["clone", "--bare", src, originRepo], sandbox);
   });
 
-  afterAll(() => rmSync(sandbox, { recursive: true, force: true }));
+  afterAll(() => {
+    delete process.env.CINATRA_INSTANCE_REGISTRY;
+    delete process.env.CINATRA_ALLOC_LOCK;
+    rmSync(sandbox, { recursive: true, force: true });
+  });
 
   it("(a) a PRE-CLONE port conflict throws BEFORE any clone / .env.local side-effect", async () => {
     const installDir = path.join(sandbox, "out-preclone");
