@@ -25,15 +25,30 @@ Requires Node.js >= 24.
 ## What you can do
 
     cinatra install                  # set up a new Cinatra instance from scratch
-    cinatra setup dev                # provision a local development instance
-    cinatra setup prod               # provision a production instance
-    cinatra db migrate               # apply schema updates to an instance
     cinatra status                   # check an instance's status
     cinatra doctor                   # diagnose your local setup
     cinatra agents install <name>    # add an agent to your instance
     cinatra create-extension <kind>  # scaffold a new extension to author
 
-Run `cinatra --help` for the full command list.
+The local host/monorepo bootstrap commands you run from inside a Cinatra
+checkout now live under `cinatra dev …`:
+
+    cinatra dev setup dev            # provision a local development instance
+    cinatra dev setup prod           # provision a production instance
+    cinatra dev db migrate           # apply schema updates (works when the app is down)
+    cinatra dev clone new <name>     # create an isolated deep-fork clone
+    cinatra dev refresh              # reconcile deps + dev DB to your checkout
+    cinatra dev tunnel start         # manage the dev Tailscale Funnel
+    cinatra dev backup create        # take a local backup bundle
+    cinatra dev reset --yes          # reset the development environment
+
+Run `cinatra --help` for the top-level command list, or `cinatra dev --help`
+for the full local-bootstrap command list.
+
+> The old bare forms (`cinatra setup dev`, `cinatra db migrate`, `cinatra clone …`,
+> `cinatra reset dev`, `cinatra backup …`) still work this release but are
+> deprecated — they print a one-line hint pointing at the new `cinatra dev …`
+> form. Update your scripts to the namespaced commands.
 
 ## Running more than one instance
 

@@ -40,7 +40,7 @@
 // ABSENT on a fresh checkout. It is loaded lazily inside
 // `verifyRegisteredHostnameMatchesPrediction` so this module — and any host
 // (CLI) module that statically imports it — resolves on an extension-empty
-// checkout. By the time a provisioning caller invokes verify, `cinatra setup
+// checkout. By the time a provisioning caller invokes verify, `cinatra dev setup
 // dev` has populated the extension.
 
 /**

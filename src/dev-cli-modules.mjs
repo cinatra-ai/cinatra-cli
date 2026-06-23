@@ -9,7 +9,7 @@
 //
 // Absence posture (UNCHANGED from the retired literal lazy imports): the
 // extensions tree is a gitignored clone-back target, ABSENT on a fresh
-// checkout until `cinatra setup dev` populates it. When no present extension
+// checkout until `cinatra dev setup dev` populates it. When no present extension
 // declares the requested key, the loader throws an Error with
 // `.code = "ERR_MODULE_NOT_FOUND"` — the exact failure class the inline
 // `import()` of a missing path produced — so every caller's existing
@@ -82,7 +82,7 @@ export async function loadDevCliModule(key, repoRoot = REPO_ROOT) {
   if (!modulePath) {
     const err = new Error(
       `Cannot find module for dev-CLI key "${key}" — no extension present under extensions/ ` +
-        `declares cinatra.devCliModules["${key}"] (the extensions tree is populated by \`cinatra setup dev\`).`,
+        `declares cinatra.devCliModules["${key}"] (the extensions tree is populated by \`cinatra dev setup dev\`).`,
     );
     err.code = "ERR_MODULE_NOT_FOUND";
     throw err;

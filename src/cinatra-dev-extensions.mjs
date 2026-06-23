@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { defaultRepoSyncDeps, normalizeGitHubRemote, syncOneRepo } from "./dev-repo-sync.mjs";
 
 // ---------------------------------------------------------------------------
-// `cinatra setup` dev-extension clone bootstrap.
+// `cinatra dev setup` dev-extension clone bootstrap.
 //
 // Dev consumes each extension from a git checkout under
 // `extensions/<scope>/<name>/` (git-ignored after the cutover). This module
@@ -20,7 +20,7 @@ import { defaultRepoSyncDeps, normalizeGitHubRemote, syncOneRepo } from "./dev-r
 // `--pinned` (CI; cinatra#141) swaps tip-tracking for detached checkouts at
 // the shas committed in the two lock files (see `loadDevExtensionPins`), so a
 // companion-repo merge can never change what a host CI run validates. Local
-// `cinatra setup` keeps tip-tracking — devs want tips.
+// `cinatra dev setup` keeps tip-tracking — devs want tips.
 //
 // `syncCinatraDevExtensions` returns `{ skipped: true, reason: "no-config" }` on
 // an empty map, or `{ results: [...] }` with one entry per selected extension
@@ -330,7 +330,7 @@ export async function syncCinatraDevExtensions({
       deps: realDeps,
       log,
       forceFlagHint: "--force",
-      stashLabel: "cinatra setup --force (devExtensions)",
+      stashLabel: "cinatra dev setup --force (devExtensions)",
     });
     results.push({ ...r, kind, dest });
   }

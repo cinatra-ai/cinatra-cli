@@ -85,7 +85,7 @@ export function cloneSlugFromBranch(branch) {
     .slice(0, 30);
 }
 
-/** A slug is valid iff it matches the same shape `cinatra setup branch` enforces. */
+/** A slug is valid iff it matches the same shape `cinatra dev setup branch` enforces. */
 export function isValidSlug(slug) {
   return typeof slug === "string" && /^[a-z0-9][a-z0-9-]{0,29}$/.test(slug);
 }
@@ -492,7 +492,7 @@ export function allocateSlot(registry, slug, { worktreePath }) {
   }
   if (index === -1) {
     throw new Error(
-      `All ${CLONE_MAX_INDEX + 1} clone slots are in use. Run 'cinatra clone prune' on a ` +
+      `All ${CLONE_MAX_INDEX + 1} clone slots are in use. Run 'cinatra dev clone prune' on a ` +
         `clone you no longer need.`,
     );
   }

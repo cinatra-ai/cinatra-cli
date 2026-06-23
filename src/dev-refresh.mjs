@@ -80,7 +80,7 @@ export function looksLikeBundledStack(env = {}) {
  * True when this checkout is an isolated worktree/clone that borrows the shared
  * main docker stack rather than owning it. Bringing the bundled compose stack up
  * from such a checkout would port-conflict with the main dev server, so `auto`
- * mode must skip docker here. Detected via the markers `cinatra setup branch` /
+ * mode must skip docker here. Detected via the markers `cinatra dev setup branch` /
  * `setup clone` write into the worktree `.env.local`.
  */
 export function isIsolatedWorktree(env = {}) {
