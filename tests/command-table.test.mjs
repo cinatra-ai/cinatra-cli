@@ -78,6 +78,12 @@ describe("command table — descriptor snapshot", () => {
           "match": "command",
         },
         {
+          "command": "logs",
+          "hidden": false,
+          "id": "logs",
+          "match": "command",
+        },
+        {
           "command": "skills reset-repo",
           "hidden": false,
           "id": "skills.reset-repo",
@@ -336,6 +342,10 @@ describe("command table — routing equivalence with the prior if-chain", () => 
     [["upgrade", "--force"], "upgrade"],
     [["status"], "status"],
     [["status", "extra"], "status"], // command-only: ignores trailing tokens.
+    [["logs"], "logs"],
+    [["logs", "--app"], "logs"], // command-only: flags ignored by the matcher.
+    [["logs", "--service", "postgres"], "logs"],
+    [["logs", "--follow"], "logs"],
     [["skills", "reset-repo"], "skills.reset-repo"],
     [["extensions", "purge"], "extensions.purge"],
     [["extensions", "acquire-prod"], "extensions.acquire-prod"],

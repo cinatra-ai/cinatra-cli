@@ -320,6 +320,7 @@ Usage:
   cinatra dev restart
   cinatra login --app-url <https://instance> [--profile <name>] [--default]
   cinatra status [--app-url <url>|--profile <name>]
+  cinatra logs [--app | --service <name>] [--follow|-f]
   cinatra backup create [--file <path>]
   cinatra backup import [--file <path>|<filename>] [--yes]
   cinatra backup export-api-configs [--file <path>]
@@ -543,6 +544,21 @@ Commands:
   dev restart       Restart the dev main (\`dev stop\` then \`dev start\`).
 
   status            Show current setup state (auth tables, user count, MCP config).
+
+  logs              Surface the dev-main app log and/or the bundled docker compose
+                    container logs (Postgres/Redis/Nango/…) without hunting for
+                    files by hand. Read-only — starts/stops nothing. With NO flag,
+                    prints the app log then ALL container logs. Resolves the
+                    checkout via the same root as \`dev start\`.
+                    --app             Only the dev-main app log
+                                      (~/.cinatra/clones/dev-main/nextjs.log,
+                                      written by \`cinatra dev start\`).
+                    --service <name>  Only that compose service's container log.
+                    --follow, -f      Stream live instead of a snapshot. With --app
+                                      it \`tail -f\`s the app log; with --service it
+                                      follows that container; with neither it prints
+                                      the app-log snapshot then follows ALL
+                                      containers (docker compose multiplexes them).
 
   backup create     Export a full backup bundle to data/backups/ (app DB, optional Nango DB,
                     and data directory files such as skills and logs).
@@ -7779,6 +7795,191 @@ async function runDevRestart(argv) {
 }
 
 // ---------------------------------------------------------------------------
+// `cinatra logs [--app] [--service <name>] [--follow|-f]` (cinatra#12).
+//
+// Surfaces the two log sources an operator otherwise has to hunt for by hand:
+//   * the dev MAIN app log written by `cinatra dev start` (the host-native
+//     `pnpm dev` stdout/stderr at ~/.cinatra/clones/dev-main/nextjs.log), and
+//   * the bundled docker-compose container logs (Postgres/Redis/Nango/…).
+//
+// Selection (mutually exclusive — `--app` + `--service` is rejected):
+//   * --app             ONLY the dev-main app log.
+//   * --service <name>  ONLY that compose service's container log.
+//   * (neither)         BOTH — app log first, then all container logs.
+// `--follow` / `-f` streams instead of printing a snapshot: with --app it
+// `tail -f`s the app log; with --service it follows that one container; with
+// NEITHER it prints the app-log snapshot first (a file tail and a compose
+// stream cannot share one foreground process) and then hands the foreground to
+// `docker compose logs --follow`, which natively multiplexes EVERY container.
+//
+// Read-only: it never starts/stops anything and mutates no state. It resolves
+// the checkout via `getRepoRoot()` exactly like `dev start` / `status`. A
+// non-zero `docker compose` exit propagates to the process exit code (a failed
+// `logs` is never reported as success); a compose-unavailable skip is an honest
+// warn + exit 0.
+const LOGS_DEFAULT_TAIL_LINES = 200;
+
+function parseLogsFlags(argv) {
+  const app = argv.includes("--app");
+  const follow = argv.includes("--follow") || argv.includes("-f");
+  const service = readOptionValue(argv, "--service"); // null when absent
+  if (app && service) {
+    throw new Error(
+      "`cinatra logs`: pass either --app or --service <name>, not both. " +
+        "Omit both to see the app log and all container logs together.",
+    );
+  }
+  return { app, service, follow };
+}
+
+// Print the last `maxLines` lines of a UTF-8 log file. Returns false when the
+// file does not exist yet (no `dev start` has run), true once anything (even an
+// empty file) was read, so the caller can print an honest "no log yet" hint.
+function printFileTail(logPath, maxLines) {
+  if (!existsSync(logPath)) return false;
+  let raw = "";
+  try {
+    raw = readFileSync(logPath, "utf8");
+  } catch (err) {
+    console.warn(`  Could not read ${logPath}: ${err?.message ?? err}`);
+    return true;
+  }
+  // Drop a single trailing newline so a normal log doesn't render a blank last
+  // line, then take the final `maxLines` entries.
+  const lines = raw.replace(/\n$/, "").split("\n");
+  const tail = lines.length > maxLines ? lines.slice(-maxLines) : lines;
+  if (tail.length === 1 && tail[0] === "") {
+    console.log("  (app log is empty)");
+  } else {
+    console.log(tail.join("\n"));
+  }
+  return true;
+}
+
+// Stream the app log live. Prefer `tail -f` (line-buffered, handles truncation
+// on a `dev restart`); if `tail` is not on PATH, fall back to a one-shot tail so
+// the command is never a hard failure on a `tail`-less host.
+function followFileTail(logPath, maxLines) {
+  const probe = spawnSync("tail", ["--version"], { stdio: "ignore" });
+  const tailAvailable = probe.status === 0 || probe.error == null;
+  if (!tailAvailable || probe.error) {
+    console.warn("  `tail` is not available — printing a one-shot snapshot instead of following.");
+    printFileTail(logPath, maxLines);
+    return;
+  }
+  // Inherit stdio so output streams straight through; this blocks until the
+  // user interrupts (Ctrl-C), which is the expected `--follow` UX.
+  const result = spawnSync("tail", ["-n", String(maxLines), "-f", logPath], {
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  if (result.error) {
+    console.warn(`  Could not follow ${logPath}: ${result.error.message}. Printing a snapshot instead.`);
+    printFileTail(logPath, maxLines);
+  }
+}
+
+// Run `docker compose [-f …] logs [--follow] [<service>]` against the bundled
+// stack with stdio inherited (so compose owns colorization + the live stream on
+// --follow). docker compose `logs` natively multiplexes ALL services, so a
+// no-service follow streams every container at once. Honest no-op + hint when
+// docker compose is unavailable rather than a confusing ENOENT.
+//
+// Returns `{ available, status }`: `available:false` when compose is absent (so
+// the caller does NOT treat a skipped section as a failure); otherwise `status`
+// is the compose exit code (non-zero on an invalid service / missing compose
+// file / runtime failure), which the caller surfaces via process.exitCode so a
+// failed `cinatra logs` is never reported as success.
+function runComposeLogs(repoRoot, { service, follow, tailLines }) {
+  if (!isComposeAvailable()) {
+    console.warn(
+      "  docker compose is not available — skipping container logs. " +
+        "Install Docker + the compose plugin to see container logs.",
+    );
+    return { available: false, status: null };
+  }
+  const args = [
+    "compose",
+    "-f",
+    "docker-compose.yml",
+    "-f",
+    "docker-compose.dev.yml",
+    "logs",
+    "--tail",
+    String(tailLines),
+  ];
+  if (follow) args.push("--follow");
+  if (service) args.push(service);
+  const result = spawnSync("docker", args, {
+    cwd: repoRoot,
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  // `result.error` (e.g. ENOENT despite the availability probe) and a non-zero
+  // exit both mean compose did not succeed.
+  const status = result.error ? 1 : (result.status ?? 1);
+  return { available: true, status };
+}
+
+// Reflect a compose result onto the process exit code: a non-zero compose exit
+// (invalid --service, missing compose file, runtime failure) makes `cinatra
+// logs` exit non-zero too, instead of masking the failure as success. A
+// compose-unavailable skip is NOT a failure (we warned + degraded honestly).
+function applyComposeStatus({ available, status }) {
+  if (available && status !== 0) {
+    process.exitCode = status || 1;
+  }
+}
+
+async function runLogs(argv = []) {
+  rejectTailscaleAuthkeyFlag(argv);
+  const { app, service, follow } = parseLogsFlags(argv);
+  const repoRoot = getRepoRoot();
+  const appLogPath = cloneLogPath(DEV_MAIN_SLUG);
+
+  // --service: container logs only (the app log is irrelevant to a single
+  // service). Pass the service + follow straight through to docker compose.
+  if (service) {
+    applyComposeStatus(
+      runComposeLogs(repoRoot, { service, follow, tailLines: LOGS_DEFAULT_TAIL_LINES }),
+    );
+    return;
+  }
+
+  // --app: app log only.
+  if (app) {
+    if (follow) {
+      console.log(`Following dev main app log (${appLogPath}) — Ctrl-C to stop.`);
+      followFileTail(appLogPath, LOGS_DEFAULT_TAIL_LINES);
+      return;
+    }
+    console.log(`Dev main app log (${appLogPath}):`);
+    if (!printFileTail(appLogPath, LOGS_DEFAULT_TAIL_LINES)) {
+      console.log("  No app log yet — start the dev main with `cinatra dev start`.");
+    }
+    return;
+  }
+
+  // Default (neither --app nor --service): BOTH sources. The app log is a file
+  // tail and the container logs are a separate stream; one foreground process
+  // cannot `tail -f` the file AND stream compose at the same time, so on
+  // `--follow` we print a one-shot app-log snapshot FIRST and then hand the
+  // foreground to `docker compose logs --follow` (which multiplexes every
+  // container). Without `--follow` both are one-shot snapshots.
+  console.log(`Dev main app log (${appLogPath}):`);
+  if (!printFileTail(appLogPath, LOGS_DEFAULT_TAIL_LINES)) {
+    console.log("  No app log yet — start the dev main with `cinatra dev start`.");
+  }
+  console.log("");
+  console.log(
+    follow
+      ? "Container logs (docker compose, following — Ctrl-C to stop):"
+      : "Container logs (docker compose):",
+  );
+  applyComposeStatus(
+    runComposeLogs(repoRoot, { service: null, follow, tailLines: LOGS_DEFAULT_TAIL_LINES }),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // `cinatra dev tunnel <start|stop|status>`.
 //
 // This is a CLI verb, not a dev-boot hook: explicit, no surprise sidecars,
@@ -9590,6 +9791,14 @@ function buildHandlers() {
       // remote-target flags (`--app-url` / `--profile`) can land in `mode`.
       const args = mode !== undefined ? [mode, ...rest] : rest;
       await runStatus(args);
+    },
+    logs: async (rest, mode) => {
+      // `logs` is a command-only descriptor, so the dispatcher's `mode` slot
+      // (argv[1]) holds the FIRST flag (e.g. `--app` / `--service` / `--follow`)
+      // and is NOT in `rest`. Re-prepend it so every flag reaches parseLogsFlags
+      // (same reconstruction as `status` / `login` / `create-extension`).
+      const args = mode !== undefined ? [mode, ...rest] : rest;
+      await runLogs(args);
     },
     "skills.reset-repo": async (rest) => {
       await runSkillsResetRepo(rest);

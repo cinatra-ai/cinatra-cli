@@ -81,6 +81,12 @@ export const COMMAND_DESCRIPTORS = [
     summary: "Show current setup state (auth tables, user count, MCP config).",
   },
   {
+    id: "logs",
+    path: ["logs"],
+    match: "command",
+    summary: "Tail the dev-main app log and/or docker compose container logs.",
+  },
+  {
     id: "skills.reset-repo",
     path: ["skills", "reset-repo"],
     match: "command+mode",
