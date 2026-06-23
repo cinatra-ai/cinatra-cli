@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID, createHash } from "node:crypto";
-import { closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -9583,7 +9583,9 @@ async function runExtensionsPurge(argv) {
  */
 function listInstalledExtensions(repoRoot) {
   const extRoot = path.join(repoRoot, "extensions");
-  if (!existsSync(extRoot)) return [];
+  // existsSync alone admits a non-directory `extensions` path; statSync-guard so
+  // a stray file there degrades to "none installed" instead of an ENOTDIR crash.
+  if (!existsSync(extRoot) || !statSync(extRoot).isDirectory()) return [];
   const out = [];
   for (const scope of readdirSync(extRoot, { withFileTypes: true })) {
     if (!scope.isDirectory()) continue;

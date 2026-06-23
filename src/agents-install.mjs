@@ -955,11 +955,19 @@ async function deleteAgentTemplateByPackage(packageName) {
   const client = new pg.Client({ connectionString: dbUrl });
   await client.connect();
   try {
+    // The two deletes run in one transaction: since we deliberately do NOT rely
+    // on a DB-level ON DELETE CASCADE, a mid-sequence failure (lock timeout,
+    // connection drop) must not leave a template row orphaned without its
+    // versions. BEGIN/COMMIT make the pair atomic; any error rolls back.
+    await client.query("BEGIN");
     const found = await client.query(
       `SELECT id FROM ${schema}.agent_templates WHERE package_name = $1`,
       [packageName],
     );
-    if (found.rows.length === 0) return 0;
+    if (found.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return 0;
+    }
     const ids = found.rows.map((r) => r.id);
     await client.query(
       `DELETE FROM ${schema}.agent_versions WHERE template_id = ANY($1::uuid[])`,
@@ -969,7 +977,11 @@ async function deleteAgentTemplateByPackage(packageName) {
       `DELETE FROM ${schema}.agent_templates WHERE package_name = $1`,
       [packageName],
     );
+    await client.query("COMMIT");
     return deleted.rowCount ?? ids.length;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
   } finally {
     await client.end();
   }
@@ -1048,11 +1060,23 @@ export async function runAgentsUninstall(argv, io = {}) {
 
   let lockfileRemoved = false;
   if (!keepLockfile) {
-    const existing = await readLockfile(lockfilePath);
-    if (existing) {
-      const { lockfile: pruned, removed } = removeLockfilePackage(existing, packageName);
-      lockfileRemoved = removed;
-      if (removed) await writeLockfile(lockfilePath, pruned);
+    // Guard the lockfile read/write: if the DB rows were already removed and the
+    // write fails (permissions, disk), report it AND surface that the DB side
+    // already succeeded, so the operator knows the uninstall was partial.
+    try {
+      const existing = await readLockfile(lockfilePath);
+      if (existing) {
+        const { lockfile: pruned, removed } = removeLockfilePackage(existing, packageName);
+        lockfileRemoved = removed;
+        if (removed) await writeLockfile(lockfilePath, pruned);
+      }
+    } catch (err) {
+      stderr.write(
+        `Uninstall error pruning lockfile: ${err?.message ?? String(err)}` +
+          (dbRemoved > 0 ? " (DB rows were already removed)" : "") +
+          "\n",
+      );
+      return exit(1);
     }
   }
 
