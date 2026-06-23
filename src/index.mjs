@@ -307,6 +307,9 @@ Usage:
   cinatra dev tunnel start
   cinatra dev tunnel stop
   cinatra dev tunnel status
+  cinatra dev start
+  cinatra dev stop
+  cinatra dev restart
   cinatra login --app-url <https://instance> [--profile <name>] [--default]
   cinatra status [--app-url <url>|--profile <name>]
   cinatra backup create [--file <path>]
@@ -488,6 +491,17 @@ Commands:
   dev tunnel start            Provision a Tailscale Funnel for the local dev main (CINATRA_RUNTIME_MODE=development only).
   dev tunnel stop             Tear the dev-main Tailscale sidecar down and clear publicBaseUrl.
   dev tunnel status           Show predicted vs registered hostname + whether publicBaseUrl is set.
+
+  dev start         Start the local dev MAIN instance: spawns host-native
+                    \`pnpm dev\` (port 3000, or PORT) as a detached process
+                    group, recording a pid + log file under
+                    ~/.cinatra/clones/dev-main/. Idempotent — a re-run with a
+                    live, healthy instance is a no-op. Replaces launching the
+                    app by hand (what \`cinatra doctor\` used to instruct).
+  dev stop          Stop the dev main started by \`dev start\` (cwd-verified
+                    SIGTERM→SIGKILL of its process group). Best-effort and
+                    non-destructive.
+  dev restart       Restart the dev main (\`dev stop\` then \`dev start\`).
 
   status            Show current setup state (auth tables, user count, MCP config).
 
@@ -7270,6 +7284,286 @@ async function runCloneStart(argv) {
 }
 
 // ---------------------------------------------------------------------------
+// `cinatra dev start|stop|restart` — main-instance lifecycle (cinatra#10).
+//
+// `clone start|stop` only ever drove the 3100+/3200+ deep-fork clones; the
+// MAIN dev instance still had to be launched by hand with `pnpm dev` (even
+// `cinatra doctor` instructs "Start the app (`pnpm dev`)"). These verbs give
+// the main instance the same ergonomics as a clone, mirroring the
+// `runCloneStart`/`runCloneStop` spawn+kill pattern (host-native `pnpm dev`
+// as a detached process-group LEADER, a pid + log file under the per-main
+// runtime dir, a health-probe-before-skip idempotency check, and a
+// cwd-verified SIGTERM→SIGKILL group stop).
+//
+// Reuses the SAME reserved per-main slug as `dev tunnel` ("dev-main") so the
+// clone-runtime PURE path builders (`clonePidPath` / `cloneLogPath` /
+// `cloneRuntimeDir`) yield the per-main pid/log under
+// `~/.cinatra/clones/dev-main/`. `dev tunnel` uses that dir only for the
+// compose / Tailscale-serve files (it has no pid file), so there is no
+// collision: `dev start` owns `dev-main/nextjs.pid` + `dev-main/nextjs.log`.
+//
+// Deliberate divergences from `runCloneStart`: NO clone registry, NO docker
+// compose / WayFlow / Tailscale, NO bridge-token mint. The main instance is
+// the operator's own checkout (resolved via `getRepoRoot()` exactly like
+// `dev tunnel`) on the bare `pnpm dev` port (PORT env, default 3000) — the
+// only moving parts are the `pnpm dev` process group, its pid/log files, and
+// the `/api/health` probe.
+const DEV_MAIN_SLUG = "dev-main";
+
+// Resolve the main checkout + its dev port. `getRepoRoot()` is the same
+// resolver `dev tunnel` uses: module-relative in-repo, or the operator's
+// checkout when run standalone. PORT mirrors `runDevTunnel`'s `nextjsPort`.
+function resolveDevMainTarget() {
+  const repoRoot = getRepoRoot();
+  const env = collectEnvironment(repoRoot);
+  const port = Number(env.PORT) || 3000;
+  return { repoRoot, port };
+}
+
+async function runDevStart(argv) {
+  // No flags consumed today; reject `--tailscale-authkey` for parity with the
+  // other lifecycle verbs (the main instance never takes the secret as an arg).
+  rejectTailscaleAuthkeyFlag(argv);
+  const { repoRoot, port } = resolveDevMainTarget();
+  const pidPath = clonePidPath(DEV_MAIN_SLUG);
+  const logPath = cloneLogPath(DEV_MAIN_SLUG);
+  const healthUrl = `http://localhost:${port}/api/health`;
+  ensureCloneRuntimeDir(DEV_MAIN_SLUG);
+
+  // Take the per-main runtime lock so start cannot race a concurrent
+  // start/stop on the same reserved slug.
+  acquireRuntimeLock(DEV_MAIN_SLUG);
+  let success = false;
+  let spawnedChildPid = null;
+  try {
+    // Idempotency: pid file present + process alive + cwd matches the main
+    // checkout + `/api/health` 200 → no-op. cwd is the strong disambiguator
+    // (a stale pid reused by another process must never read as ours).
+    if (existsSync(pidPath)) {
+      const recordedPid = readPidFromFile(pidPath);
+      if (recordedPid != null) {
+        const match = processCommandLineMatches(recordedPid, {
+          cwdMustEqual: repoRoot,
+        });
+        if (match.alive && match.ours) {
+          const probe = await probeHttp(healthUrl, { timeoutMs: 1_500, intervalMs: 500 });
+          if (probe.ok) {
+            console.log(`Dev main already running (pid ${recordedPid}) at http://localhost:${port}.`);
+            success = true;
+            return;
+          }
+          // Alive + cwd-matched but unhealthy — kill the group before respawn
+          // (mirrors runCloneStart's unhealthy-restart path).
+          console.log(`Dev main pid ${recordedPid} alive but unhealthy — restarting.`);
+          try { process.kill(-recordedPid, "SIGTERM"); } catch { /* best-effort */ }
+          await new Promise((r) => setTimeout(r, 3_000));
+          if (isPidAlive(recordedPid)) {
+            try { process.kill(-recordedPid, "SIGKILL"); } catch { /* gone */ }
+          }
+          try { rmSync(pidPath, { force: true }); } catch { /* best-effort */ }
+        } else if (match.alive && !match.ours) {
+          throw new Error(
+            `Dev main: pid ${recordedPid} is alive but does not match the main checkout (${match.why}). Refusing to spawn a second instance.`,
+          );
+        } else {
+          // Dead — stale pid file. Auto-clean.
+          try { rmSync(pidPath, { force: true }); } catch { /* best-effort */ }
+        }
+      }
+    }
+
+    // Port-not-already-bound precheck. Skip when our own (just-validated) pid
+    // owns the port from the idempotent/repair path above.
+    const ourPidOwnsPort = existsSync(pidPath) && (() => {
+      const p = readPidFromFile(pidPath);
+      return p != null && isPidAlive(p);
+    })();
+    if (!ourPidOwnsPort && await isHostPortBound(port)) {
+      throw new Error(
+        `Dev main: port ${port} is already bound by another process. Free it (or set PORT) before starting.`,
+      );
+    }
+
+    // Spawn host-native `pnpm dev`. Truncate log + write pid file. Process
+    // group LEADER (detached=true) so `dev stop` SIGTERMs the whole tree
+    // (turbopack, tsc-watch, etc.) — identical to runCloneStart.
+    truncateCloneLog(DEV_MAIN_SLUG);
+    const logFd = openSync(logPath, "a", 0o600);
+    const child = spawn("pnpm", ["dev"], {
+      cwd: repoRoot,
+      env: { ...process.env, ...readEnvFileSnapshot(path.join(repoRoot, ".env.local")) },
+      detached: true,
+      stdio: ["ignore", logFd, logFd],
+    });
+    closeSync(logFd);
+    // A spawn that fails to EXEC (e.g. `pnpm` not on PATH) emits 'error'
+    // ASYNCHRONOUSLY rather than throwing — and `child.pid` is still set on
+    // Unix (the pid is assigned before exec), so the `!child.pid` guard alone
+    // does not catch it. Without a listener the unhandled error crashes the
+    // CLI past the `finally` cleanup; without short-circuiting we would also
+    // sit in the 60s health probe waiting for a process that never execed,
+    // and leave a stale pid file. Capture the error, then yield one event-loop
+    // turn so a synchronously-queued ENOENT is delivered before we proceed.
+    let spawnError = null;
+    child.on("error", (err) => { spawnError = err; });
+    if (!child.pid) {
+      throw new Error("Failed to spawn `pnpm dev` for the dev main.");
+    }
+    writeFileSync(pidPath, `${child.pid}\n${new Date().toISOString()}\n`, { mode: 0o600 });
+    spawnedChildPid = child.pid;
+    child.unref();
+    await new Promise((r) => setImmediate(r));
+    if (spawnError) {
+      throw new Error(
+        `Failed to spawn \`pnpm dev\` for the dev main: ${spawnError.message ?? spawnError}. ` +
+          `Is pnpm on PATH? Inspect ${logPath}.`,
+      );
+    }
+
+    // Health probe. A slow Next.js boot that exceeds the window is NOT a
+    // failed start (the process may still be coming up): mirror runCloneStart
+    // and WARN rather than kill — `success` stays true so the just-spawned
+    // group is not torn down. The message is honest about what was (not)
+    // confirmed so the operator knows to check the log on a warn.
+    console.log(`Waiting for Next.js at ${healthUrl} ...`);
+    const health = await probeHttp(healthUrl, { timeoutMs: 60_000 });
+    if (!health.ok) {
+      console.warn(`  Next.js health failed: ${health.error}. Inspect ${logPath}.`);
+    } else {
+      console.log("  Next.js: OK");
+    }
+
+    success = true;
+    console.log("");
+    console.log(
+      health.ok
+        ? "Dev main started."
+        : "Dev main spawned (health not yet confirmed — check the log).",
+    );
+    console.log(`  Next.js:  http://localhost:${port}`);
+    console.log(`  pid:      ${pidPath}`);
+    console.log(`  log:      ${logPath}`);
+  } finally {
+    if (!success && spawnedChildPid != null) {
+      // We spawned `pnpm dev` THIS run but start ultimately failed — don't
+      // leak the Next.js process group + a dangling pid file. (Only a pid WE
+      // spawned is signalled; a pre-existing healthy main is never touched.)
+      try {
+        process.kill(-spawnedChildPid, "SIGTERM");
+      } catch {
+        try { process.kill(spawnedChildPid, "SIGTERM"); } catch { /* gone */ }
+      }
+      const deadline = Date.now() + 3_000;
+      while (Date.now() < deadline && isPidAlive(spawnedChildPid)) {
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      if (isPidAlive(spawnedChildPid)) {
+        try { process.kill(-spawnedChildPid, "SIGKILL"); } catch { /* gone */ }
+        try { process.kill(spawnedChildPid, "SIGKILL"); } catch { /* gone */ }
+      }
+      try { rmSync(pidPath, { force: true }); } catch { /* best-effort */ }
+    }
+    releaseRuntimeLock(DEV_MAIN_SLUG);
+  }
+}
+
+// SIGTERM the dev-main process group; SIGKILL after 10s. cwd-verify before
+// signalling so a stale/reused pid is NEVER killed. Returns
+// { stopped, reason? } mirroring `stopCloneRuntime`. The pid file is preserved
+// on `stopped:false` so the operator / a re-run can still find it.
+async function stopDevMainRuntime(repoRoot) {
+  const pidPath = clonePidPath(DEV_MAIN_SLUG);
+  if (!existsSync(pidPath)) {
+    return { stopped: true };
+  }
+  const recordedPid = readPidFromFile(pidPath);
+  if (recordedPid == null || !isPidAlive(recordedPid)) {
+    try { rmSync(pidPath, { force: true }); } catch { /* best-effort */ }
+    return { stopped: true };
+  }
+  const match = processCommandLineMatches(recordedPid, { cwdMustEqual: repoRoot });
+  if (!match.alive) {
+    try { rmSync(pidPath, { force: true }); } catch { /* best-effort */ }
+    return { stopped: true };
+  }
+  if (match.indeterminate) {
+    console.warn(
+      `Dev main stop: pid ${recordedPid} alive but unverifiable (${match.why}). NOT signalling.`,
+    );
+    return { stopped: false, reason: `pid ${recordedPid} alive but unverifiable (${match.why})` };
+  }
+  if (!match.ours) {
+    console.warn(
+      `Dev main stop: pid ${recordedPid} is a different process (${match.why}); treating dev main as not running.`,
+    );
+    try { rmSync(pidPath, { force: true }); } catch { /* best-effort */ }
+    return { stopped: true };
+  }
+  // It's our dev main — SIGTERM the group, grace, then SIGKILL.
+  try {
+    process.kill(-recordedPid, "SIGTERM");
+  } catch {
+    try { process.kill(recordedPid, "SIGTERM"); } catch { /* gone */ }
+  }
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && isPidAlive(recordedPid)) {
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  if (isPidAlive(recordedPid)) {
+    try { process.kill(-recordedPid, "SIGKILL"); } catch { /* gone */ }
+    try { process.kill(recordedPid, "SIGKILL"); } catch { /* gone */ }
+    await new Promise((r) => setTimeout(r, 500));
+    if (isPidAlive(recordedPid)) {
+      return { stopped: false, reason: `pid ${recordedPid} still alive after SIGTERM+SIGKILL` };
+    }
+  }
+  try { rmSync(pidPath, { force: true }); } catch { /* best-effort */ }
+  return { stopped: true };
+}
+
+// Returns the structured `{ stopped, reason? }` from stopDevMainRuntime so
+// callers (runDevRestart) can branch on the real outcome rather than a global
+// side-channel. Still owns the CLI-surface concerns: lock acquire/release,
+// the success/warn log line, and the `process.exitCode = 1` on a
+// could-not-confirm stop.
+async function runDevStop(argv) {
+  rejectTailscaleAuthkeyFlag(argv);
+  const { repoRoot } = resolveDevMainTarget();
+
+  // Per-main runtime lock so stop cannot race a concurrent start.
+  acquireRuntimeLock(DEV_MAIN_SLUG);
+  let stopResult;
+  try {
+    stopResult = await stopDevMainRuntime(repoRoot);
+  } finally {
+    releaseRuntimeLock(DEV_MAIN_SLUG);
+  }
+
+  if (stopResult.stopped) {
+    console.log("Dev main stopped.");
+  } else {
+    // Best-effort + non-destructive — loud warning, not a throw.
+    console.warn(`Dev main: could not confirm it stopped (${stopResult.reason}). Investigate manually.`);
+    process.exitCode = 1;
+  }
+  return stopResult;
+}
+
+async function runDevRestart(argv) {
+  // Branch on the structured stop RESULT, not the global `process.exitCode`
+  // side-channel: a restart must NOT start a second instance on top of a
+  // possibly-live one (the start would refuse on the not-ours guard anyway,
+  // but failing fast here is clearer and not coupled to exit-code convention).
+  const stopResult = await runDevStop(argv);
+  if (!stopResult.stopped) {
+    throw new Error(
+      `Dev main restart aborted: stop could not be confirmed (${stopResult.reason}).`,
+    );
+  }
+  await runDevStart(argv);
+}
+
+// ---------------------------------------------------------------------------
 // `cinatra dev tunnel <start|stop|status>`.
 //
 // This is a CLI verb, not a dev-boot hook: explicit, no surprise sidecars,
@@ -9175,6 +9469,15 @@ function buildHandlers() {
     },
     "dev.tunnel": async (rest) => {
       await runDevTunnel(rest);
+    },
+    "dev.start": async (rest) => {
+      await runDevStart(rest);
+    },
+    "dev.stop": async (rest) => {
+      await runDevStop(rest);
+    },
+    "dev.restart": async (rest) => {
+      await runDevRestart(rest);
     },
     "reset.dev": async (rest) => {
       await runResetDev(rest);

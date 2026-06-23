@@ -225,6 +225,24 @@ export const COMMAND_DESCRIPTORS = [
     summary: "Manage the dev-main Tailscale Funnel (start|stop|status).",
   },
   {
+    id: "dev.start",
+    path: ["dev", "start"],
+    match: "command+mode",
+    summary: "Start the local dev main instance (host-native `pnpm dev` on port 3000).",
+  },
+  {
+    id: "dev.stop",
+    path: ["dev", "stop"],
+    match: "command+mode",
+    summary: "Stop the local dev main instance started by `dev start`.",
+  },
+  {
+    id: "dev.restart",
+    path: ["dev", "restart"],
+    match: "command+mode",
+    summary: "Restart the local dev main instance (`dev stop` then `dev start`).",
+  },
+  {
     id: "reset.dev",
     path: ["reset", "dev"],
     match: "command+mode",

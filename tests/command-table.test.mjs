@@ -222,6 +222,24 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode",
         },
         {
+          "command": "dev start",
+          "hidden": false,
+          "id": "dev.start",
+          "match": "command+mode",
+        },
+        {
+          "command": "dev stop",
+          "hidden": false,
+          "id": "dev.stop",
+          "match": "command+mode",
+        },
+        {
+          "command": "dev restart",
+          "hidden": false,
+          "id": "dev.restart",
+          "match": "command+mode",
+        },
+        {
           "command": "reset dev",
           "hidden": false,
           "id": "reset.dev",
@@ -329,6 +347,9 @@ describe("command table — routing equivalence with the prior if-chain", () => 
     [["dev", "refresh"], "dev.refresh"],
     [["dev", "tunnel"], "dev.tunnel"],
     [["dev", "tunnel", "start"], "dev.tunnel"], // tunnel sub-verbs route to the same handler.
+    [["dev", "start"], "dev.start"],
+    [["dev", "stop"], "dev.stop"],
+    [["dev", "restart"], "dev.restart"],
     [["reset", "dev"], "reset.dev"],
     [["mcp", "llm-access", "setup"], "mcp.llm-access.setup"],
     [["mcp", "llm-access", "refresh"], "mcp.llm-access.refresh"],
