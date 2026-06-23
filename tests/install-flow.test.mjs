@@ -528,7 +528,9 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     const res = await runInstall(
       [
         "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
-        "--yes", "--no-install", "--infra", "external",
+        // An external --db-url is a NON-ROLLBACKABLE target → it needs the
+        // explicit disposable acknowledgement (a bare --yes is refused, below).
+        "--yes", "--external-db-disposable", "--no-install", "--infra", "external",
         // No inline credentials in the fixture URL (a `user:pass@` form trips the
         // secret-scan gate's Postgres detector); the credential-bearing path is
         // covered by the isolated-URL-rewrite unit tests instead.
@@ -544,6 +546,31 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     const reg = readInstanceRegistry(regPath);
     expect(reg.registry.instances.ext.state).toBe("external");
     expect(reg.registry.instances.ext.infraMode).toBe("external");
+  });
+
+  it("T13b: a bare --yes does NOT silently arm an external --db-url (refuses without the disposable ack)", async () => {
+    const installDir = path.join(sandbox, "ext-bare-yes");
+    await expect(
+      runInstall(
+        [
+          "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+          "--yes", "--no-install", "--infra", "external",
+          "--db-url", "postgres://db.example:5432/cinatra",
+        ],
+        { log: () => {}, deps: flowDeps() },
+      ),
+    ).rejects.toThrow(/bare --yes|--external-db-disposable/s);
+    // A non-DB external target (redis only) is NOT gated by the disposable ack.
+    const redisOnlyDir = path.join(sandbox, "ext-redis-only");
+    const res = await runInstall(
+      [
+        "--dir", redisOnlyDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--infra", "external",
+        "--redis-url", "redis://cache.example:6379",
+      ],
+      { log: () => {}, deps: flowDeps() },
+    );
+    expect(res.infraPlan).toBe("external");
   });
 
   it("non-interactive conflict with NO explicit option aborts (does not silently isolate)", async () => {

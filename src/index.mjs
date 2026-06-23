@@ -287,7 +287,8 @@ Usage:
                   [--infra new|external] [--instance <slug>] [--app-port <n>]
                   [--port-offset auto|<n>] [--db-url <url>] [--redis-url <url>]
                   [--nango-url <url>] [--graphiti-url <url>] [--teardown-existing]
-                  [--resume] [--dry-run] [--status] [--list-instances]
+                  [--external-db-disposable] [--resume] [--dry-run] [--status]
+                  [--list-instances]
   cinatra update [--ref <ref>] [--force] [--docker=auto|always|--no-docker]
   cinatra upgrade [--ref <ref>] [--force] [--docker=auto|always|--no-docker]
   cinatra setup dev [--skip-dev-apps] [--force-dev-apps]
@@ -369,6 +370,8 @@ Commands:
                     --on-conflict=attach    Converge on the existing checkout (no second stack).
                     --infra=external        Point at external Postgres/Redis/Nango (--db-url/
                                             --redis-url/--nango-url/--graphiti-url); no local infra.
+                    --external-db-disposable Acknowledge an external --db-url target is disposable
+                                            (REQUIRED non-interactively; a bare --yes won't arm it).
                     --instance <slug>       Name the instance (default: the install-dir basename).
                     --app-port <n>          App port for an isolated instance.
                     --port-offset auto|<n>  Host-port shift for an isolated instance's infra band.

@@ -48,7 +48,9 @@ option up front with a flag:
                                                   # then install on the default ports
     cinatra install --on-conflict=attach     # re-use / update the existing checkout
     cinatra install --infra=external \       # point at your own database/cache
-        --db-url <url> --redis-url <url> --nango-url <url> --graphiti-url <url>
+        --db-url <url> --redis-url <url> --nango-url <url> --graphiti-url <url> \
+        --external-db-disposable             # confirm the external DB is disposable
+                                             # (setup may write to it; required for --db-url)
 
 Useful extras:
 
@@ -61,7 +63,10 @@ Useful extras:
     cinatra install --resume                 # finish an install that was interrupted
 
 `--list-instances` / `--status` are read-only. Stopping or wiping an existing
-instance always asks for confirmation first; `--yes` alone never deletes data.
+instance always asks for confirmation first; `--yes` alone never deletes data
+(and pointing setup at your own external database with `--db-url` likewise needs
+the explicit `--external-db-disposable` acknowledgement — a bare `--yes` won't do
+it, because setup can write to that database).
 
 > Sharing one set of services between two instances (`co-use`) is not available
 > yet — `cinatra install` will tell you so and point you at `--on-conflict=isolated`,

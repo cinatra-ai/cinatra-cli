@@ -338,6 +338,12 @@ export function parseInstallArgs(argv = []) {
     status: argv.includes("--status"),
     listInstances: argv.includes("--list-instances"),
     teardownExisting: argv.includes("--teardown-existing"),
+    // Explicit acknowledgement that an --infra=external --db-url target is
+    // DISPOSABLE (setup + migrations may mutate it irreversibly; it is never
+    // install-owned / auto-rolled-back). REQUIRED to arm an external DB
+    // non-interactively — a bare --yes must NOT silently authorise pointing
+    // setup at an arbitrary external database (non-rollbackable data path).
+    externalDbDisposable: argv.includes("--external-db-disposable"),
     external: { dbUrl, redisUrl, nangoUrl, graphitiUrl },
     // The presence of ANY gated co-use signal (the gated enum values or the
     // co-use sidecar flags) routes to the T5b loud-fail.
@@ -1779,8 +1785,15 @@ async function rollbackIsolatedInstance({ targetDir, slug, composeProject, compo
   const runCompose = deps.runComposeDown ?? composeDown;
 
   // Only roll back a project whose registry row still belongs to THIS dir and is
-  // NOT ready (pre-ready rollback only — never drop a healthy instance).
-  let shouldDown = false;
+  // NOT ready (pre-ready rollback only — never drop a healthy instance). The
+  // state re-check AND the `down` BOTH run inside ONE held alloc lock so a
+  // concurrent --resume/install cannot flip the row to `ready` in the window
+  // between the check and the teardown (TOCTOU): "rollback never drops a READY
+  // instance" must hold even under a race. The pending instance's `down` is a
+  // brief local subprocess on a freshly-allocated stack, so holding the lock
+  // across it is acceptable (and far safer than a racy check-then-act).
+  let downAttempted = false;
+  let downError = null;
   await withAllocLock(lockPath, async () => {
     let reg;
     try {
@@ -1789,32 +1802,32 @@ async function rollbackIsolatedInstance({ targetDir, slug, composeProject, compo
       reg = null;
     }
     const row = reg ? getInstance(reg, slug) : null;
-    if (row && path.resolve(row.installDir) === path.resolve(targetDir) && row.state !== "ready") {
-      shouldDown = true;
-    } else if (row && row.state === "ready") {
+    if (!row || path.resolve(row.installDir) !== path.resolve(targetDir)) {
+      return; // nothing of ours to roll back
+    }
+    if (row.state === "ready") {
       log(`  ⚠ Refusing rollback: instance "${slug}" is recorded READY (owner-metadata guard).`);
+      return;
+    }
+    // review hardening #3: tear the project DOWN FIRST, THEN release the row — so if
+    // `down` fails (or the process dies between), the row survives for a retried
+    // rollback and we never orphan a live, UNREGISTERED stack. The `down` runs the
+    // recorded -p + -f with -v (the pending instance's volumes are brand-new → safe).
+    downAttempted = true;
+    try {
+      runCompose(targetDir, { composeFiles, composeProject, volumes: true });
+    } catch (e) {
+      // Down failed → keep the row so a retried rollback can finish; surface it.
+      downError = e;
+      return;
+    }
+    // Down succeeded → release the registry row (still under the same lock).
+    if (getInstance(reg, slug)) {
+      const { registry: next } = releaseInstance(reg, slug);
+      writeInstanceRegistry(registryPath, next);
     }
   });
-
-  // review hardening #3: tear the project DOWN FIRST, THEN release the row — so if `down`
-  // fails (or the process dies between), the row survives for a retried rollback
-  // and we never orphan a live, UNREGISTERED stack. The `down` runs the recorded
-  // -p + -f with -v (the pending instance's volumes are brand-new → safe to drop).
-  if (shouldDown) {
-    runCompose(targetDir, { composeFiles, composeProject, volumes: true });
-    // Down succeeded → NOW release the registry row + clean marker + generated file.
-    await withAllocLock(lockPath, async () => {
-      let reg;
-      try {
-        reg = requireUsableInstanceRegistry(registryPath);
-      } catch {
-        reg = null;
-      }
-      if (reg && getInstance(reg, slug)) {
-        const { registry: next } = releaseInstance(reg, slug);
-        writeInstanceRegistry(registryPath, next);
-      }
-    });
+  if (downAttempted && !downError) {
     try {
       const markerFile = path.join(targetDir, ".cinatra", "instance.json");
       if (existsSync(markerFile)) spawnSync("rm", ["-f", markerFile]);
@@ -1829,6 +1842,12 @@ async function rollbackIsolatedInstance({ targetDir, slug, composeProject, compo
     } catch {
       /* best-effort */
     }
+  }
+  if (downError) {
+    log(
+      `  ⚠ Rollback teardown of "${slug}" failed (${downError.message}); the registry row is kept ` +
+        `so a retried install/--resume can finish the rollback (no orphaned unregistered stack).`,
+    );
   }
 }
 
@@ -1997,20 +2016,36 @@ async function executeExternalEnv({ targetDir, opts, log = console.log }) {
   }
 
   // A DB pointed at a non-empty / production database is destructive-leaning:
-  // setup/migrations CAN mutate it. Require a typed NON-ROLLBACKABLE confirm
-  // (URL validation alone is insufficient) unless --yes is paired with the
-  // explicit acknowledgement that the target is disposable.
+  // setup/migrations CAN mutate it. Require a NON-ROLLBACKABLE acknowledgement
+  // (URL validation alone is insufficient). A bare --yes must NOT silently
+  // authorise this (same class as --teardown-existing's `-v`): non-interactively
+  // the operator must pass the explicit --external-db-disposable ack; on a TTY a
+  // typed confirm is accepted. (`--yes` still pre-accepts the TTY prompt only
+  // when the disposable ack is ALSO present.)
   if (values.SUPABASE_DB_URL) {
-    const ok = opts.yes
-      ? true
-      : await typedConfirm(
-          `⚠ --infra=external points setup + migrations at an EXTERNAL database (${redactUrl(values.SUPABASE_DB_URL)}).\n` +
-            `  These resources are NOT install-owned and will NEVER be auto-rolled-back. If this DB is non-empty\n` +
-            `  or production, setup may mutate it irreversibly.`,
-          "I understand",
-        );
+    let ok = false;
+    if (opts.externalDbDisposable) {
+      ok = true; // explicit acknowledgement the target is disposable.
+    } else if (opts.yes) {
+      // A bare --yes is NOT enough for a non-rollbackable external DB.
+      throw new Error(
+        `Refusing to point setup + migrations at an EXTERNAL database (${redactUrl(values.SUPABASE_DB_URL)}) ` +
+          `on a bare --yes. These resources are NOT install-owned and are NEVER auto-rolled-back; setup may ` +
+          `mutate a non-empty/production DB irreversibly. Re-run with --external-db-disposable to acknowledge ` +
+          `the target is disposable (or run interactively to type the confirmation).`,
+      );
+    } else {
+      ok = await typedConfirm(
+        `⚠ --infra=external points setup + migrations at an EXTERNAL database (${redactUrl(values.SUPABASE_DB_URL)}).\n` +
+          `  These resources are NOT install-owned and will NEVER be auto-rolled-back. If this DB is non-empty\n` +
+          `  or production, setup may mutate it irreversibly.`,
+        "I understand",
+      );
+    }
     if (!ok) {
-      throw new Error("Aborted: external DB not confirmed (type \"I understand\", or pass --yes if the target is disposable).");
+      throw new Error(
+        "Aborted: external DB not confirmed (type \"I understand\", or pass --external-db-disposable if the target is disposable).",
+      );
     }
   }
 
@@ -2231,16 +2266,21 @@ async function dispatchChoice({ choice, targetDir, opts, conflicts, resolvedSha,
   }
 }
 
-/** T8b — the MINIMAL execute-menu {Isolated / Abort / Attach}. Returns the
- *  chosen action string. `--yes` does NOT silently pick a destructive option;
- *  it only pre-accepts the SAFE default (Isolated). */
+/** T8b — the interactive execute-menu. Returns the chosen action string. The
+ *  options offered mirror the flag surface 1:1 (acceptance: each option is
+ *  selectable interactively AND via flags): Isolated / Attach / Stop-existing /
+ *  External / Abort. Stop-existing is only OFFERED for a single proven
+ *  `other-cinatra` holder (it refuses an unrelated/mixed holder at execution, so
+ *  offering it elsewhere would be a dead option). Co-use is GATED → it is named
+ *  as unavailable, never offered. `--yes` does NOT silently pick a destructive
+ *  option; it only pre-accepts the SAFE default (Isolated). */
 async function runExecuteMenu({ conflicts, classified, opts, log = console.log }) {
-  const owner =
-    classified.kind === "other-cinatra"
-      ? `another Cinatra instance${classified.instance?.slug ? ` ("${classified.instance.slug}")` : ""}`
-      : classified.kind === "mixed"
-        ? "a MIX of a Cinatra instance and an unrelated process"
-        : "another process";
+  const isSingleCinatra = classified.kind === "other-cinatra" && classified.instance;
+  const owner = isSingleCinatra
+    ? `another Cinatra instance${classified.instance?.slug ? ` ("${classified.instance.slug}")` : ""}`
+    : classified.kind === "mixed"
+      ? "a MIX of a Cinatra instance and an unrelated process"
+      : "another process";
   log("");
   log(`Port conflict — these ports are held by ${owner}:`);
   for (const c of conflicts) {
@@ -2251,15 +2291,23 @@ async function runExecuteMenu({ conflicts, classified, opts, log = console.log }
   log("How would you like to proceed?");
   log("  [i] Isolated  — install a second FULL stack on its own remapped ports + app port (safe, recommended)");
   log("  [a] Attach    — converge on the existing checkout instead of a second stack");
+  if (isSingleCinatra) {
+    log(`  [s] Stop      — stop the existing instance "${classified.instance.slug}" first, then install on the default ports`);
+  }
+  log("  [e] External  — point this install at external Postgres/Redis/Nango (pass --db-url/--redis-url/… ; no local infra)");
   log("  [x] Abort     — stop and let me free the ports myself");
-  // --yes pre-accepts the SAFE default only.
+  log("  (Co-use / sharing one infra stack between two instances is not yet available — use Isolated.)");
+  // --yes pre-accepts the SAFE default only (never a destructive Stop).
   if (opts.yes) {
     log("  (--yes: choosing Isolated, the safe default.)");
     return "isolated";
   }
-  const answer = (await promptLine("Choice [i/a/x]: ", "x")).trim().toLowerCase();
+  const hint = isSingleCinatra ? "[i/a/s/e/x]" : "[i/a/e/x]";
+  const answer = (await promptLine(`Choice ${hint}: `, "x")).trim().toLowerCase();
   if (answer === "i" || answer === "isolated") return "isolated";
   if (answer === "a" || answer === "attach") return "attach";
+  if (isSingleCinatra && (answer === "s" || answer === "stop" || answer === "stop-existing")) return "stop-existing";
+  if (answer === "e" || answer === "external") return "external";
   return "abort";
 }
 
@@ -2290,11 +2338,19 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     log(`  [dry-run] would bring up isolated project ${row.composeProject} from ${(row.composeFiles ?? []).join(", ")}`);
     return { infraPlan: "isolated", instance: row, done: false, dryRun: true };
   }
+  // Re-point the env at the recorded remapped ports + bring up WITH
+  // `--env-file .env.local` so the generated isolated compose's scrubbed
+  // `${VAR}` placeholders resolve from the file (never blank/shell defaults) —
+  // mirrors the primary isolated `up`. Without this an idempotent re-converge of
+  // a stopped isolated stack would start with empty secrets/wrong URLs.
+  ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: row.ports ?? {}, log });
+  const reconvEnvFile = path.join(targetDir, ".env.local");
   startInfra({
     targetDir,
     log,
     composeFiles: row.composeFiles,
     composeProject: row.composeProject,
+    envFile: existsSync(reconvEnvFile) ? reconvEnvFile : null,
     nangoHealthUrl: nangoHealthUrlForPorts(row.ports),
   });
   // Promote a stale provisioning row to ready after a successful ensure.
@@ -2353,9 +2409,22 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
   if (!opts.dryRun) {
     const composeFiles = row?.composeFiles ?? null;
     const composeProject = row?.composeProject && row.composeProject !== "cinatra" ? row.composeProject : null;
+    // When attaching to an ISOLATED instance (its own compose project), the
+    // recorded compose is the generated file whose secrets are scrubbed to
+    // `${VAR}`; re-point the env at the recorded remapped ports and bring up WITH
+    // `--env-file .env.local` so those placeholders resolve (parity with the
+    // primary isolated `up`). A default-stack attach keeps compose's normal `.env`
+    // discovery (no env-file), byte-identical to before.
+    const isIsolatedRow = composeProject != null && row?.infraMode !== "external";
+    let attachEnvFile = null;
+    if (isIsolatedRow) {
+      ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: row.ports ?? {}, log });
+      const envCandidate = path.join(targetDir, ".env.local");
+      attachEnvFile = existsSync(envCandidate) ? envCandidate : null;
+    }
     try {
       log("- Ensuring this checkout's own infra is up (attach)…");
-      startInfra({ targetDir, log, composeFiles, composeProject, nangoHealthUrl: nangoHealthUrlForPorts(row?.ports) });
+      startInfra({ targetDir, log, composeFiles, composeProject, envFile: attachEnvFile, nangoHealthUrl: nangoHealthUrlForPorts(row?.ports) });
       broughtUp = true;
     } catch (err) {
       log(`  ⚠ Attach bring-up reported: ${err.message}`);
