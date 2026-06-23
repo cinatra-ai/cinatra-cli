@@ -261,6 +261,18 @@ export const COMMAND_DESCRIPTORS = [
     summary: "Restart the local dev main instance (`dev stop` then `dev start`).",
   },
   {
+    id: "dev.wordpress",
+    path: ["dev", "wordpress"],
+    match: "command+mode",
+    summary: "Manage the WordPress CMS dev container (start|stop) via the compose `wordpress` profile.",
+  },
+  {
+    id: "dev.drupal",
+    path: ["dev", "drupal"],
+    match: "command+mode",
+    summary: "Manage the Drupal CMS dev container (start|stop) via the compose `drupal` profile.",
+  },
+  {
     id: "reset.dev",
     path: ["reset", "dev"],
     match: "command+mode",

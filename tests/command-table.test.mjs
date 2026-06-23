@@ -258,6 +258,18 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode",
         },
         {
+          "command": "dev wordpress",
+          "hidden": false,
+          "id": "dev.wordpress",
+          "match": "command+mode",
+        },
+        {
+          "command": "dev drupal",
+          "hidden": false,
+          "id": "dev.drupal",
+          "match": "command+mode",
+        },
+        {
           "command": "reset dev",
           "hidden": false,
           "id": "reset.dev",
@@ -376,6 +388,12 @@ describe("command table — routing equivalence with the prior if-chain", () => 
     [["dev", "start"], "dev.start"],
     [["dev", "stop"], "dev.stop"],
     [["dev", "restart"], "dev.restart"],
+    [["dev", "wordpress"], "dev.wordpress"],
+    [["dev", "wordpress", "start"], "dev.wordpress"], // CMS sub-verbs route to the same handler.
+    [["dev", "wordpress", "stop"], "dev.wordpress"],
+    [["dev", "drupal"], "dev.drupal"],
+    [["dev", "drupal", "start"], "dev.drupal"],
+    [["dev", "drupal", "stop"], "dev.drupal"],
     [["reset", "dev"], "reset.dev"],
     [["mcp", "llm-access", "setup"], "mcp.llm-access.setup"],
     [["mcp", "llm-access", "refresh"], "mcp.llm-access.refresh"],

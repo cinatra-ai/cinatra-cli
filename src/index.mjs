@@ -318,6 +318,8 @@ Usage:
   cinatra dev start
   cinatra dev stop
   cinatra dev restart
+  cinatra dev wordpress start|stop
+  cinatra dev drupal start|stop
   cinatra login --app-url <https://instance> [--profile <name>] [--default]
   cinatra status [--app-url <url>|--profile <name>]
   cinatra logs [--app | --service <name>] [--follow|-f]
@@ -542,6 +544,20 @@ Commands:
                     SIGTERM→SIGKILL of its process group). Best-effort and
                     non-destructive.
   dev restart       Restart the dev main (\`dev stop\` then \`dev start\`).
+
+  dev wordpress start|stop
+                    Start or stop ONLY the WordPress CMS dev container (the
+                    profile-gated \`wordpress\` compose service). Replaces running
+                    the raw compose command by hand (what \`cinatra doctor\` used
+                    to instruct). start: \`--profile wordpress up -d wordpress\`;
+                    stop: \`rm -sf wordpress\` — scoped to that one container, so
+                    it never touches the always-on dev infra (Postgres/Redis/
+                    Nango) and preserves its named volumes (no \`-v\`). Resolves
+                    the checkout via the same root as \`dev start\`.
+  dev drupal start|stop
+                    Start or stop ONLY the Drupal CMS dev container (the
+                    profile-gated \`drupal\` compose service). Same single-service
+                    scoping + volume-preserving \`stop\` as \`dev wordpress\`.
 
   status            Show current setup state (auth tables, user count, MCP config).
 
@@ -3251,7 +3267,7 @@ async function doctorAssertWordPressReadiness({ fetchImpl, dockerImpl }) {
       label,
       "skip",
       `${DOCTOR_WORDPRESS.containerName} not running`,
-      "Start the WordPress dev container (`docker compose --profile wordpress up -d`), then re-run `cinatra doctor`.",
+      "Start the WordPress dev container (`cinatra dev wordpress start`), then re-run `cinatra doctor`.",
     );
   }
   // Route-presence probe (no secret), classified like the runtime classifier:
@@ -3336,7 +3352,7 @@ async function doctorAssertDrupalReadiness({ fetchImpl, dockerImpl }) {
       label,
       "skip",
       `${DOCTOR_DRUPAL.containerName} not running`,
-      "Start the Drupal dev container (`docker compose --profile drupal up -d`), then re-run `cinatra doctor`.",
+      "Start the Drupal dev container (`cinatra dev drupal start`), then re-run `cinatra doctor`.",
     );
   }
   // `/_mcp_tools` is served only when the cinatra mcp_tools route is installed.
@@ -7795,6 +7811,101 @@ async function runDevRestart(argv) {
 }
 
 // ---------------------------------------------------------------------------
+// `cinatra dev <wordpress|drupal> <start|stop>` (cinatra-cli#15).
+//
+// A thin, explicit affordance over the profile-gated CMS dev containers
+// `cinatra doctor` used to instruct operators to start by hand
+// (`docker compose --profile wordpress up -d`).
+//
+// CRITICAL SCOPING (codex review must-fix): every action is scoped to the
+// SINGLE named compose service, never to the profile-as-a-whole. In these
+// compose files the CMS service NAME equals its profile name ("wordpress" /
+// "drupal") and its container is `cinatra-<service>-1` (mirrored by the doctor
+// container-name constants above). We must NOT use `docker compose --profile
+// <name> down`: Compose's `down` (and an unscoped `--profile <name> down`)
+// stops/removes the profiled service AND every service WITHOUT a profile — i.e.
+// it would tear down the always-on dev infra (Postgres/Redis/Nango). So:
+//   start ->  docker compose -f … -f … --profile <svc> up -d <svc>
+//             (the `--profile` flag is required to ENABLE the profile-gated
+//              service; the trailing service arg scopes `up` to just it, so
+//              already-running infra is untouched and no OTHER profile starts)
+//   stop  ->  docker compose -f … -f … rm -sf <svc>
+//             (`-s` stop then `-f` force-remove ONLY that one container; no
+//              `-v`, so its named volumes — WP/Drupal DB + uploads — survive.
+//              A bare service name needs no `--profile` flag for stop/rm.)
+//
+// Reuses the same compose-invocation shape as `cinatra logs`: checkout resolved
+// via getRepoRoot(), the two bundled compose files passed explicitly, stdio
+// inherited so compose owns its progress output, compose-availability gated up
+// front (honest error, not a raw ENOENT), and a non-zero compose exit reflected
+// onto process.exitCode so a failed start/stop is never reported as success.
+const DEV_CMS_SERVICES = new Set(["wordpress", "drupal"]);
+
+function composeCmsArgs(service, verb) {
+  const base = ["compose", "-f", "docker-compose.yml", "-f", "docker-compose.dev.yml"];
+  // start: enable the profile-gated service, then scope `up` to ONLY it.
+  // stop: stop + remove ONLY that one named container (volumes preserved).
+  return verb === "start"
+    ? [...base, "--profile", service, "up", "-d", service]
+    : [...base, "rm", "-sf", service];
+}
+
+// `service` is the compose service name (also the descriptor mode token); `argv`
+// is the legacy rest (argv.slice(2)), whose first token is the start|stop verb.
+async function runDevCms(service, argv = []) {
+  rejectTailscaleAuthkeyFlag(argv);
+  if (!DEV_CMS_SERVICES.has(service)) {
+    // Defensive: the dispatcher only routes the two registered services, but
+    // keep the guard so a future descriptor mistake fails loud, not silently.
+    throw new Error(
+      `Unknown 'cinatra dev' CMS target "${service}". Expected: wordpress | drupal.`,
+    );
+  }
+  const verb = String(argv[0] ?? "").trim();
+  if (verb !== "start" && verb !== "stop") {
+    throw new Error(
+      `Unknown 'cinatra dev ${service}' sub-command "${argv[0] ?? ""}". ` +
+        `Expected: cinatra dev ${service} <start|stop>.`,
+    );
+  }
+  if (!isComposeAvailable()) {
+    throw new Error(
+      "`docker compose` is not available on PATH. Install Docker + the compose plugin, then retry.",
+    );
+  }
+  const repoRoot = getRepoRoot();
+  const args = composeCmsArgs(service, verb);
+  // `args` already leads with "compose"; prefix only the "docker" binary so the
+  // echoed command is the literal invocation (not "docker compose compose …").
+  const shownCmd = `docker ${args.join(" ")}`;
+  console.log(
+    verb === "start"
+      ? `Starting the ${service} dev container (${shownCmd}) ...`
+      : `Stopping the ${service} dev container (${shownCmd}) ...`,
+  );
+  const result = spawnSync("docker", args, {
+    cwd: repoRoot,
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  // `result.error` (e.g. ENOENT despite the availability probe) and a non-zero
+  // exit both mean compose did not succeed — surface it via the exit code so a
+  // failed start/stop is never reported as success.
+  const status = result.error ? 1 : (result.status ?? 1);
+  if (status !== 0) {
+    process.exitCode = status || 1;
+    console.error(
+      `\`${shownCmd}\` failed (exit ${status}).` + (result.error ? ` ${result.error.message}` : ""),
+    );
+    return;
+  }
+  console.log(
+    verb === "start"
+      ? `${service} dev container started. Re-run \`cinatra doctor\` to verify readiness.`
+      : `${service} dev container stopped (container removed; named volumes preserved).`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // `cinatra logs [--app] [--service <name>] [--follow|-f]` (cinatra#12).
 //
 // Surfaces the two log sources an operator otherwise has to hunt for by hand:
@@ -9911,6 +10022,12 @@ function buildHandlers() {
     },
     "dev.restart": async (rest) => {
       await runDevRestart(rest);
+    },
+    "dev.wordpress": async (rest) => {
+      await runDevCms("wordpress", rest);
+    },
+    "dev.drupal": async (rest) => {
+      await runDevCms("drupal", rest);
     },
     "reset.dev": async (rest) => {
       await runResetDev(rest);
