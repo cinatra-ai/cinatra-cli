@@ -9,7 +9,7 @@ import { defaultRepoSyncDeps, envOverrideVarFor, syncOneRepo } from "./dev-repo-
 // The WordPress plugin (cinatra-ai/wordpress-plugin) and Drupal module
 // (cinatra-ai/drupal-module) are EXTERNAL apps' integration code — they live in
 // their own git repos and ship to WordPress.org / Drupal.org, NOT cinatra's
-// marketplace. For the dev docker stack, `cinatra setup {dev,branch,clone}`
+// marketplace. For the dev docker stack, `cinatra dev setup {dev,branch,clone}`
 // clones / fast-forwards them into fixed paths under `dev/` (declared in
 // package.json `cinatra.devApps`). The source of truth is the companion repos,
 // NOT this tree (the clone paths are gitignored).

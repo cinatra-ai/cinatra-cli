@@ -92,17 +92,18 @@ describe("cinatra <subcommand> --help across matcher shapes", () => {
     [["install", "--help"], "cinatra install"], // command, destructive
     [["update", "--help"], "cinatra update"], // command, moves git + reconciles — must NOT run on --help
     [["upgrade", "--help"], "cinatra upgrade"], // command, alias of update — same footgun guard
-    [["setup", "dev", "--help"], "cinatra setup dev"], // command+mode (dev|prod alt), destructive
-    [["db", "migrate", "--help"], "cinatra db migrate"], // command+mode, destructive
-    [["clone", "prune", "--help"], "cinatra clone prune"], // command+mode, destructive
+    // eng#232: Class-C bootstrap commands are now namespaced under `cinatra dev …`.
+    [["dev", "setup", "dev", "--help"], "cinatra dev setup"], // command+mode+sub (dev|prod alt), destructive
+    [["dev", "db", "migrate", "--help"], "cinatra dev db migrate"], // command+mode+sub, destructive
+    [["dev", "clone", "prune", "--help"], "cinatra dev clone prune"], // command+mode+sub, destructive
     [["dev", "refresh", "--help"], "cinatra dev refresh"], // command+mode, destructive
     [["dev", "start", "--help"], "cinatra dev start"], // command+mode, spawns pnpm dev — must NOT run on --help
     [["dev", "stop", "--help"], "cinatra dev stop"], // command+mode, sends signals — must NOT run on --help
     [["dev", "restart", "--help"], "cinatra dev restart"], // command+mode, stop+start — must NOT run on --help
     [["dev", "wordpress", "start", "--help"], "cinatra dev wordpress"], // command+mode, spawns docker compose — must NOT run on --help
     [["dev", "drupal", "stop", "--help"], "cinatra dev drupal"], // command+mode, spawns docker compose — must NOT run on --help
-    [["backup", "import", "--help"], "cinatra backup import"], // command+mode, destructive
-    [["reset", "dev", "--help"], "cinatra reset dev"], // command+mode, destructive
+    [["dev", "backup", "import", "--help"], "cinatra dev backup import"], // command+mode+sub, destructive
+    [["dev", "reset", "--help"], "cinatra dev reset"], // command+mode, destructive
     [["mcp", "llm-access", "setup", "--help"], "cinatra mcp llm-access setup"], // command+mode+sub
     [["doctor", "--help"], "cinatra doctor"], // command (read-only, still must not run)
     [["status", "-h"], "cinatra status"], // command, -h alias
@@ -154,4 +155,27 @@ describe("cinatra <subcommand> --help edge cases", () => {
     const res = runHelp(["install", "--", "--help"]);
     expect(res.stdout).not.toMatch(/^Usage: cinatra install$/m);
   });
+
+  // eng#232: a DEPRECATED bare alias (`setup dev`, `db migrate`, …) with --help
+  // must still short-circuit (footgun guard: exit 0, NO side effect) and resolve
+  // to the CANONICAL `dev …` synopsis, steering the user to the new form.
+  const aliasHelpCases = [
+    [["setup", "dev", "--help"], "cinatra dev setup"],
+    [["db", "migrate", "--help"], "cinatra dev db migrate"],
+    [["clone", "prune", "--help"], "cinatra dev clone prune"],
+    [["reset", "dev", "--help"], "cinatra dev reset"],
+    [["backup", "import", "--help"], "cinatra dev backup import"],
+  ];
+
+  it.each(aliasHelpCases)(
+    "deprecated alias `%j --help` exits 0, shows the canonical synopsis, no side effect",
+    (args, canonicalToken) => {
+      const res = runHelp(args);
+      expect(res.status, `stderr: ${res.stderr}`).toBe(0);
+      expect(res.stdout).toContain(canonicalToken);
+      expect(res.stdout).toMatch(/deprecated form/i);
+      expect(res.stdout).toMatch(/Usage:/i);
+      assertNoSideEffect();
+    },
+  );
 });

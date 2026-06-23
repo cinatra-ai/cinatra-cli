@@ -48,6 +48,9 @@ describe("cinatra --version", () => {
     const res = runCli(["--help"]);
     expect(res.status).toBe(0);
     expect(res.stdout).toContain("Cinatra setup CLI");
-    expect(res.stdout).toContain("cinatra setup");
+    // eng#232: the local bootstrap commands moved under `cinatra dev …`; the
+    // top-level banner points at them rather than listing `cinatra setup`.
+    expect(res.stdout).toContain("cinatra dev");
+    expect(res.stdout).toContain("cinatra install");
   });
 });

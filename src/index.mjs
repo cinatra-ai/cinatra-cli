@@ -7,7 +7,13 @@ import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import net from "node:net";
-import pg from "pg";
+// `pg` is the one genuinely heavy native runtime dependency in the published
+// tarball. It is NO LONGER imported at top level (eng#232): importing this
+// module from `bin/cinatra.mjs` runs for EVERY command, and a top-level
+// `import pg` paid the native-load cost even for `--help` / `--version` /
+// `login` / `create-extension`, which never touch the DB. It is now lazy-loaded
+// behind the single `createClient` chokepoint via `getPgClientCtor()` below, so
+// only a command that actually opens a DB connection pulls it.
 import { resolveTeardownNames } from "./teardown-config.mjs";
 // The migration runner (`@cinatra-ai/migrations`) is NOT bundled into the
 // published thin CLI — it is resolved at COMMAND ENTRY from the operator's
@@ -85,7 +91,7 @@ import {
 // is extension-empty safe; the actual extension reach stays a lazy import()).
 import { loadDevCliModule } from "./dev-cli-modules.mjs";
 // Tailscale connector source lives in the gitignored `extensions/cinatra-ai/`
-// clone-back target, ABSENT on a fresh checkout until `cinatra setup dev`
+// clone-back target, ABSENT on a fresh checkout until `cinatra dev setup dev`
 // populates it. `mintTailscaleAuthKey`, `TailscaleApiError`, and
 // `deriveDevTailscaleHostname` are consumed ONLY by the post-config
 // provisioning handlers (`runCloneStart`, `runDevTunnel`,
@@ -104,8 +110,6 @@ import {
   TailscaleProvisionError,
   verifyRegisteredHostnameMatchesPrediction,
 } from "./tailscale-provision.mjs";
-
-const { Client } = pg;
 
 const AUTH_TABLES = [
   "user",
@@ -291,44 +295,9 @@ Usage:
                   [--list-instances]
   cinatra update [--ref <ref>] [--force] [--docker=auto|always|--no-docker]
   cinatra upgrade [--ref <ref>] [--force] [--docker=auto|always|--no-docker]
-  cinatra setup dev [--skip-dev-apps] [--force-dev-apps]
-  cinatra setup prod
-  cinatra setup nango
-  cinatra setup branch [--worktree-path <path>] [--slug <slug>] [--port <port>]
-                       [--source-env <path>] [--force]
-                       [--skip-dev-apps] [--force-dev-apps]
-  cinatra teardown branch [--worktree-path <path>] [--slug <slug>] --yes
-  cinatra clone refresh-seed [--source-env <path>]
-  cinatra setup clone [<name>] [--slug <name>] [--worktree-path <path>] [--source-env <path>] [--force]
-                      [--skip-dev-apps] [--force-dev-apps]
-  cinatra clone start [--slug <slug>] [--worktree-path <path>] [--rebuild-wayflow]
-                      [--tailscale-host-network]
-                      # TS_AUTHKEY is read from env (never a CLI arg, to keep
-                      # the secret out of shell history + ps output).
-  cinatra clone stop [--slug <slug>] [--worktree-path <path>]
-  cinatra clone status [--slug <slug>] [--worktree-path <path>]
-  cinatra clone slug-for-worktree --worktree-path <path>
-  cinatra clone prune [--worktree-path <path>] [--slug <slug>] --yes
-  cinatra clone list
-  cinatra db migrate [--down] [--count=N] [--dir <abs> --namespace <ns>]
-  cinatra dev refresh [--docker=auto|always|--no-docker]
-  cinatra dev tunnel start
-  cinatra dev tunnel stop
-  cinatra dev tunnel status
-  cinatra dev start
-  cinatra dev stop
-  cinatra dev restart
-  cinatra dev wordpress start|stop
-  cinatra dev drupal start|stop
   cinatra login --app-url <https://instance> [--profile <name>] [--default]
   cinatra status [--app-url <url>|--profile <name>]
   cinatra logs [--app | --service <name>] [--follow|-f]
-  cinatra backup create [--file <path>]
-  cinatra backup import [--file <path>|<filename>] [--yes]
-  cinatra backup export-api-configs [--file <path>]
-  cinatra backup import-api-configs [--file <path>|<filename>] [--yes]
-  cinatra reset dev --yes [--full] [--rebuild-env] [--backup|--no-backup]
-                         [--purge-app-data|--keep-app-data] [--file <path>]
   cinatra skills reset-repo --yes [--app-url <url>]
   cinatra extensions purge <packageName> --confirm <packageName> --digest <d>
                           [--reason <r>] [--app-url <url>] --yes
@@ -346,6 +315,10 @@ Usage:
   cinatra agents install [<name>[@<range>]] [options]
   cinatra agents list [--lockfile <path>] [--json]
   cinatra agents uninstall <name> [--lockfile <path>] [--keep-db|--keep-lockfile]
+
+  Local host/monorepo bootstrap commands live under \`cinatra dev …\`
+  (setup, db migrate, clone/worktree, dev refresh/tunnel/start, backups, reset).
+  Run \`cinatra dev --help\` for the full local-bootstrap command list.
 
 Commands:
   install           Bootstrap a Cinatra instance FROM ZERO — the only command
@@ -400,18 +373,6 @@ Commands:
                     --docker=auto     (default) start the bundled docker stack only when owned.
                     --docker=always   force docker compose up -d during the reconcile.
                     --no-docker       skip the docker step of the reconcile.
-  dev refresh       Reconcile your local dev environment (dependencies + dev
-                    database schema) to the code you have checked out. Run it
-                    after a git pull or branch switch. Dev mode only; it never
-                    touches git, extensions, or production — you manage git, this
-                    only brings deps + the dev DB in sync with what is on disk.
-                    --docker=auto     (default) start the bundled docker stack
-                                      only when this checkout owns it; skip for
-                                      isolated worktrees/clones + external infra.
-                    --docker=always   force docker compose up -d (fatal on failure).
-                    --no-docker       skip the docker step entirely.
-                    Applies the additive schema bootstrap, then the versioned
-                    core migration chain (migrations/core/, pgmigrations ledger).
   skills reset-repo Force-push the entire local skills store to the connected
                     GitHub skills repository (dev mode only). Replaces all repo
                     content with what is currently in data/skills/.
@@ -472,101 +433,6 @@ Commands:
                     \`corepack pnpm install\` afterwards to link the packages
                     (the Dockerfile and scripts/setup.sh prod flow do this).
 
-  setup dev|prod    Prepare Better Auth, workspace schema, Nango administration, MCP
-                    server, and OAuth clients. Leaves the app ready for first-user
-                    registration. LLM MCP access is provisioned in dev mode only.
-                    In dev mode, also clones/fast-forwards the WordPress plugin
-                    + Drupal module (cinatra.devApps) into the tree.
-                    --skip-dev-apps                    Do not clone/update them.
-                    --force-dev-apps                   Stash + hard-reset a DIRTY
-                                                       clone (never touches a clone
-                                                       with the wrong origin/branch).
-                    (Per-repo URL override: CINATRA_WORDPRESS_PLUGIN_REPO_URL,
-                     CINATRA_DRUPAL_MODULE_REPO_URL — HTTPS or SSH.)
-
-  setup branch      Provision an isolated dev environment for the current git worktree
-                    (writes .env.local, creates & migrates cinatra_<slug> schema).
-                    Runs a worktree-name collision guard before any side effect —
-                    blocks if the proposed slug already names an existing worktree
-                    or local branch.
-                    --worktree-path <path>     Worktree directory (default: cwd).
-                    --slug <slug>              Explicit slug (default: derived from branch).
-                    --port <port>              Explicit port (default: auto-detect from 3001).
-                    --source-env <path>        Source .env.local to copy (default: main repo).
-                    --force                    Overwrite existing .env.local; bypass
-                                               the collision guard.
-
-  teardown branch   Remove the isolated Postgres schema for the current git worktree
-                    (drops cinatra_<slug> schema). Requires --yes.
-                    --worktree-path <path>  Worktree directory (default: cwd).
-                    --slug <slug>           Explicit slug (default: derived from branch).
-
-  clone refresh-seed
-                    (Re)build the cinatra_seed template database — a scrubbed
-                    snapshot of the live app DB that 'setup clone' templates from.
-                    Run this once before the first 'setup clone', and again
-                    whenever clones should pick up fresher data.
-                    --source-env <path>     Source .env.local (default: main repo).
-
-  setup clone       Create + provision a DORMANT deep-fork clone. Given a <name>
-                    (positional or --slug), this CLI now CREATES the git worktree
-                    itself at ../cinatra-ai-<name> on branch cinatra-ai-<name>
-                    from origin/main, provisions a SEPARATE Postgres database
-                    cinatra_clone_<name> from the cinatra_seed template + a
-                    worktree .env.local on a dedicated port band (Next.js 3100+,
-                    WayFlow 3200+), then auto-runs 'corepack pnpm install' in the
-                    new worktree. This is the heavy isolation path and is fully
-                    command-managed (no automatic EnterWorktree hook, no worktree- prefix);
-                    'setup branch' remains the light schema-isolation path. With
-                    NO name it falls back to no-name mode (provision an
-                    already-existing worktree from the cwd branch; no creation,
-                    no auto-install). The clone is created stopped — 'clone
-                    start/stop' run it.
-                    <name> | --slug <name>  Clone name (lowercase/digits/dashes,
-                                            max 30). Triggers worktree creation.
-                    --worktree-path <path>  No-name mode path only (default: cwd).
-                    --source-env <path>     Source .env.local (default: main repo).
-                    --force                 Overwrite an incompatible existing .env.local.
-
-  clone prune       Destroy a clone: DROP its cinatra_clone_<slug> database, clean
-                    its Redis queue keys, release its registry slot, and (for
-                    command-managed heavy clones) also 'git worktree remove' the
-                    ../cinatra-ai-<slug> worktree. Unmanaged worktree
-                    entries are left untouched. Requires --yes.
-                    --worktree-path <path>  Worktree directory (default: cwd).
-                    --slug <slug>           Explicit slug (default: derived from branch).
-
-  clone list        List registered clones (slug, ports, database, state, worktree).
-
-  dev tunnel start            Provision a Tailscale Funnel for the local dev main (CINATRA_RUNTIME_MODE=development only).
-  dev tunnel stop             Tear the dev-main Tailscale sidecar down and clear publicBaseUrl.
-  dev tunnel status           Show predicted vs registered hostname + whether publicBaseUrl is set.
-
-  dev start         Start the local dev MAIN instance: spawns host-native
-                    \`pnpm dev\` (port 3000, or PORT) as a detached process
-                    group, recording a pid + log file under
-                    ~/.cinatra/clones/dev-main/. Idempotent — a re-run with a
-                    live, healthy instance is a no-op. Replaces launching the
-                    app by hand (what \`cinatra doctor\` used to instruct).
-  dev stop          Stop the dev main started by \`dev start\` (cwd-verified
-                    SIGTERM→SIGKILL of its process group). Best-effort and
-                    non-destructive.
-  dev restart       Restart the dev main (\`dev stop\` then \`dev start\`).
-
-  dev wordpress start|stop
-                    Start or stop ONLY the WordPress CMS dev container (the
-                    profile-gated \`wordpress\` compose service). Replaces running
-                    the raw compose command by hand (what \`cinatra doctor\` used
-                    to instruct). start: \`--profile wordpress up -d wordpress\`;
-                    stop: \`rm -sf wordpress\` — scoped to that one container, so
-                    it never touches the always-on dev infra (Postgres/Redis/
-                    Nango) and preserves its named volumes (no \`-v\`). Resolves
-                    the checkout via the same root as \`dev start\`.
-  dev drupal start|stop
-                    Start or stop ONLY the Drupal CMS dev container (the
-                    profile-gated \`drupal\` compose service). Same single-service
-                    scoping + volume-preserving \`stop\` as \`dev wordpress\`.
-
   status            Show current setup state (auth tables, user count, MCP config).
 
   logs              Surface the dev-main app log and/or the bundled docker compose
@@ -584,43 +450,6 @@ Commands:
                                       the app-log snapshot then follows ALL
                                       containers (docker compose multiplexes them).
 
-  backup create     Export a full backup bundle to data/backups/ (app DB, optional Nango DB,
-                    and data directory files such as skills and logs).
-                    --file <path>     Custom backup filename or path.
-
-  backup import     Import a backup bundle. Destructive — requires --yes.
-                    --file <path>     Backup file to import. When omitted, imports the
-                                      most recent cinatra-backup-*.tar.gz from data/backups/.
-                    --yes             Required confirmation flag.
-
-  backup export-api-configs
-                    Export all connector_config:* metadata keys and openai_connection
-                    to a JSON file. Safe to run on a live instance.
-                    --file <path>     Custom filename or path (default: cinatra-api-configs-<timestamp>.json in data/).
-
-  backup import-api-configs
-                    Import API configs from a JSON file exported by export-api-configs.
-                    Upserts each entry — safe to run on a fresh or existing instance.
-                    --file <path>     JSON file to import (required or auto-discovers latest).
-                    --yes             Required confirmation flag.
-
-  reset dev         Reset the development environment. Requires --yes. Dev mode only.
-                    Without --full (soft reset):
-                      Drops auth tables, optionally purges app data, flushes Redis,
-                      then runs setup to rebuild schemas and connections.
-                    --full            Full reset, equivalent to a fresh repo clone:
-                                      removes Docker volumes, node_modules, .pnpm-store,
-                                      .next, generated/, then rebuilds Docker containers,
-                                      installs dependencies, runs setup, and builds the
-                                      OpenAI shell Docker image.
-                    --rebuild-env     Regenerate .env.local with a fresh BETTER_AUTH_SECRET
-                                      and docker-compose Postgres connection. Requires --full.
-                    --backup          Create a backup before resetting.
-                    --no-backup       Skip the pre-reset backup.
-                    --purge-app-data  Purge workspace data (soft reset only).
-                    --keep-app-data   Keep workspace data (soft reset only).
-                    --file <path>     Custom backup filename (used with --backup).
-
   mcp llm-access setup     Provision OAuth clients for OpenAI, Anthropic, and Gemini
                             with restricted MCP permissions (dev only).
   mcp llm-access refresh   Rotate all LLM provider client secrets.
@@ -636,7 +465,7 @@ Commands:
                     (app, CMS container, public URL) is SKIPPED, never passed —
                     re-run after \`pnpm dev\` is up. This is the authoritative
                     post-boot gate. It also runs (non-fatal) at the tail of
-                    \`cinatra setup dev\`.
+                    \`cinatra dev setup dev\`.
                     --strict          Exit non-zero on any SKIP (default: only FAIL).
 
   agent export <id-or-name>
@@ -675,6 +504,111 @@ Commands:
                     --lockfile <path>       Lockfile path (default ./cinatra-agents.lock).
                     --keep-db               Prune the lockfile entry only.
                     --keep-lockfile         Delete DB rows only.
+`);
+}
+
+/**
+ * Print the `cinatra dev …` group banner (eng#232). This is the Class-C
+ * local host/monorepo bootstrap surface — the commands a contributor/operator
+ * runs from inside a checkout. It is shown for `cinatra dev --help` and for a
+ * bare `cinatra dev` (no subcommand). Every command listed here works LOCALLY
+ * and the DB-touching ones (`dev setup`, `dev db migrate`, …) work even when the
+ * app server is down — they talk to Postgres + local subprocesses directly,
+ * never through the running instance.
+ *
+ * @param {string} group  Currently only "dev" is supported.
+ */
+function printGroupHelp(group) {
+  if (group !== "dev") {
+    printHelp();
+    return;
+  }
+  console.log(`Cinatra dev — local host/monorepo bootstrap commands
+
+These run from inside a cinatra checkout. The DB-touching commands
+(\`dev setup\`, \`dev db migrate\`) work even when the app server is down.
+
+Usage:
+  cinatra dev setup dev [--skip-dev-apps] [--force-dev-apps]
+  cinatra dev setup prod
+  cinatra dev setup nango
+  cinatra dev setup branch [--worktree-path <path>] [--slug <slug>] [--port <port>]
+                           [--source-env <path>] [--force]
+                           [--skip-dev-apps] [--force-dev-apps]
+  cinatra dev teardown branch [--worktree-path <path>] [--slug <slug>] --yes
+  cinatra dev clone refresh-seed [--source-env <path>]
+  cinatra dev clone new [<name>] [--slug <name>] [--worktree-path <path>] [--source-env <path>] [--force]
+                        [--skip-dev-apps] [--force-dev-apps]
+  cinatra dev clone start [--slug <slug>] [--worktree-path <path>] [--rebuild-wayflow]
+                          [--tailscale-host-network]
+                          # TS_AUTHKEY is read from env (never a CLI arg, to keep
+                          # the secret out of shell history + ps output).
+  cinatra dev clone stop [--slug <slug>] [--worktree-path <path>]
+  cinatra dev clone status [--slug <slug>] [--worktree-path <path>]
+  cinatra dev clone slug-for-worktree --worktree-path <path>
+  cinatra dev clone prune [--worktree-path <path>] [--slug <slug>] --yes
+  cinatra dev clone list
+  cinatra dev db migrate [--down] [--count=N] [--dir <abs> --namespace <ns>]
+  cinatra dev refresh [--docker=auto|always|--no-docker]
+  cinatra dev tunnel start
+  cinatra dev tunnel stop
+  cinatra dev tunnel status
+  cinatra dev start
+  cinatra dev stop
+  cinatra dev restart
+  cinatra dev wordpress start|stop
+  cinatra dev drupal start|stop
+  cinatra dev backup create [--file <path>]
+  cinatra dev backup import [--file <path>|<filename>] [--yes]
+  cinatra dev backup export-api-configs [--file <path>]
+  cinatra dev backup import-api-configs [--file <path>|<filename>] [--yes]
+  cinatra dev reset --yes [--full] [--rebuild-env] [--backup|--no-backup]
+                    [--purge-app-data|--keep-app-data] [--file <path>]
+
+Commands:
+  dev setup dev|prod  Prepare Better Auth, workspace schema, Nango administration,
+                      MCP server, and OAuth clients. LLM MCP access is provisioned
+                      in dev mode only. In dev mode, also clones/fast-forwards the
+                      WordPress plugin + Drupal module (cinatra.devApps).
+  dev setup nango     Configure Nango administration only.
+  dev setup branch    Provision an isolated dev environment for the current git
+                      worktree (.env.local + cinatra_<slug> schema), behind a
+                      worktree-name collision guard.
+  dev teardown branch Drop the isolated cinatra_<slug> schema. Requires --yes.
+  dev clone refresh-seed
+                      (Re)build the cinatra_seed template database that
+                      \`dev clone new\` templates from.
+  dev clone new       Create + provision a DORMANT deep-fork clone (own worktree,
+                      own DB on a dedicated port band). Created stopped.
+  dev clone start|stop|status
+                      Run / halt / inspect a registered clone.
+  dev clone prune     Destroy a clone (drop DB, clean Redis, release slot, remove
+                      the managed worktree). Requires --yes.
+  dev clone list      List registered clones (slug, ports, database, state).
+  dev clone slug-for-worktree
+                      Registry lookup for shell hooks (resolve a worktree → slug).
+  dev db migrate      Apply the additive bootstrap + versioned core migration
+                      chain. WORKS WHEN THE APP IS DOWN — talks to Postgres
+                      directly, so it can repair a broken-schema instance.
+                      --down / --count=N / --dir <abs> --namespace <ns>.
+  dev refresh         Reconcile your local dev environment (deps + dev DB schema)
+                      to the code on disk. Dev mode only; never touches git.
+  dev tunnel start|stop|status
+                      Manage the dev-main Tailscale Funnel.
+  dev start|stop|restart
+                      Start / stop / restart the local dev MAIN instance
+                      (host-native \`pnpm dev\` on port 3000).
+  dev wordpress start|stop / dev drupal start|stop
+                      Start or stop ONLY the named CMS dev container (single
+                      compose service; preserves its named volumes).
+  dev backup create|import|export-api-configs|import-api-configs
+                      Local backup bundle + API-config export/import (pg_dump/psql).
+  dev reset           Reset the development environment. Requires --yes; dev only.
+                      --full removes Docker volumes / node_modules / .next and
+                      rebuilds from scratch.
+
+Run \`cinatra dev <command> --help\` for a single command's synopsis,
+or \`cinatra --help\` for the top-level command list.
 `);
 }
 
@@ -720,9 +654,33 @@ Examples:
 };
 
 function printCommandHelp(descriptor) {
+  // A deprecated alias (hidden) resolves to its canonical twin's synopsis so
+  // `cinatra setup dev --help` still prints useful help (exit 0, no side
+  // effect — the footgun guard) AND steers the user to the canonical form.
+  if (descriptor.deprecated) {
+    const canonical =
+      COMMAND_DESCRIPTORS.find(
+        (d) => d.id === descriptor.id && !d.deprecated && d.summary,
+      ) ?? null;
+    const oldForm = descriptor.path.join(" ");
+    if (canonical) {
+      console.log(
+        `Usage: cinatra ${canonical.path.join(" ")}\n\n  ${canonical.summary}\n\n` +
+          `Note: "cinatra ${oldForm}" is the deprecated form of ` +
+          `"cinatra ${canonical.path.join(" ")}" — the old form still works this release.\n`,
+      );
+      const detail = COMMAND_HELP_DETAILS[canonical.id];
+      if (detail) console.log(`${detail}\n`);
+      console.log(`Run "cinatra dev --help" for the local bootstrap commands.`);
+      return;
+    }
+    printHelp();
+    return;
+  }
   if (descriptor.hidden || !descriptor.summary) {
-    // No standalone help row for hidden/summary-less descriptors — show the
-    // full command list instead of inventing a synopsis.
+    // No standalone help row for hidden/summary-less descriptors (the no-mode
+    // setup forms, the removed `mcp tunnel` stub) — show the full command list
+    // instead of inventing a synopsis.
     printHelp();
     return;
   }
@@ -1065,7 +1023,25 @@ function readConfiguredRuntimeMode(env) {
   return "development";
 }
 
-function createClient(connectionString) {
+// Lazy `pg` (eng#232 §4.1). `pg` is a CJS module; under some loaders its
+// namespace exposes `Client` on `.default`, under others on the namespace
+// itself — normalize before reading `.Client`. Memoized so repeated DB
+// operations in one process pay the import cost once.
+let __pgClientCtor;
+async function getPgClientCtor() {
+  if (!__pgClientCtor) {
+    const mod = await import("pg");
+    const ns = mod.default ?? mod;
+    __pgClientCtor = ns.Client ?? mod.Client;
+    if (!__pgClientCtor) {
+      throw new Error("cinatra: failed to load the pg Client constructor.");
+    }
+  }
+  return __pgClientCtor;
+}
+
+async function createClient(connectionString) {
+  const Client = await getPgClientCtor();
   return new Client({
     connectionString,
   });
@@ -1218,7 +1194,7 @@ function rebuildEnvLocal(repoRoot) {
   const bridgeToken = randomBytes(32).toString("hex");
 
   const lines = [
-    "# Generated by: cinatra reset dev --full --rebuild-env",
+    "# Generated by: cinatra dev reset --full --rebuild-env",
     `# Date: ${new Date().toISOString()}`,
     "",
     "BETTER_AUTH_URL=http://localhost:3000",
@@ -1319,7 +1295,7 @@ async function discoverBootstrapNangoSettings(env, runtimeMode) {
     };
   }
 
-  const client = createClient(nangoDatabaseUrl);
+  const client = await createClient(nangoDatabaseUrl);
 
   try {
     await client.connect();
@@ -2119,12 +2095,12 @@ function resolveLocalOrigin(env) {
 }
 
 // Bounded timeout for the token-mint probe. A reachable-but-stalled token route
-// must NOT hang `cinatra setup dev` — on timeout we classify "app-down" (the
+// must NOT hang `cinatra dev setup dev` — on timeout we classify "app-down" (the
 // JWKS state is unknown, so we never heal/delete) and let setup continue.
 const TOKEN_MINT_PROBE_TIMEOUT_MS = 5000;
 
 // cinatra#260 Step 3 — finite safety bounds for the Docker steps invoked by
-// the dev-tunnel auto-bring-up path (`cinatra setup dev` → ensureDevPublicMcpUrl
+// the dev-tunnel auto-bring-up path (`cinatra dev setup dev` → ensureDevPublicMcpUrl
 // → runDevTunnel("start")). These are NOT normal-case limits (a cold image
 // build legitimately takes minutes); they exist so a HUNG docker can never
 // block setup indefinitely. On timeout spawnSync kills the child and returns
@@ -2139,7 +2115,7 @@ const TAILSCALE_STATUS_SPAWN_TIMEOUT_MS = 10_000; // 10s
 // Ceiling for the fast docker-CLI metadata probes (`compose version`,
 // `compose ps`, `image inspect`) that the setup auto-bring-up path now reaches
 // before the build/up/status calls. Sub-second normally; a hung docker CLI is
-// killed so `cinatra setup dev` can never block on these probes.
+// killed so `cinatra dev setup dev` can never block on these probes.
 const DOCKER_CLI_PROBE_TIMEOUT_MS = 15_000; // 15s
 
 /**
@@ -2159,7 +2135,7 @@ async function probeTokenMint({ origin, clientId, clientSecret, scope, timeoutMs
   const controller = new AbortController();
   // The timer covers the ENTIRE operation — request AND body read — and is
   // cleared only at the very end. A server that sends headers then stalls the
-  // body would otherwise hang `cinatra setup dev` indefinitely once the timer
+  // body would otherwise hang `cinatra dev setup dev` indefinitely once the timer
   // was cleared after fetch() resolved. The abort signal propagates to the body
   // stream, so response.json()/text() reject with AbortError on a body stall.
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -2259,7 +2235,7 @@ async function deleteLatestJwksRow(client) {
  *
  * Sequenced AFTER ensureSelfMcpClient (it needs a valid client_credentials
  * client to mint). Skips with a warning when the local app / token endpoint is
- * not running — `cinatra setup dev` does not guarantee the server is up.
+ * not running — `cinatra dev setup dev` does not guarantee the server is up.
  *
  * SECRET BOUNDARY: never logs the client secret or any minted token. Statuses
  * and counts only.
@@ -2287,7 +2263,7 @@ async function ensureDecryptableJwks(client, env, selfClient) {
   if (probe.outcome === "app-down") {
     console.warn(
       `⚠ JWKS self-heal skipped: the local app/token endpoint at ${origin} is not reachable or timed out ` +
-        "(setup does not start the server). Re-run `cinatra setup dev` once `pnpm dev` is up so the token-mint " +
+        "(setup does not start the server). Re-run `cinatra dev setup dev` once `pnpm dev` is up so the token-mint " +
         "probe can verify (and, if needed, self-heal) JWKS decryptability.",
     );
     return { status: "skipped-app-down" };
@@ -2337,7 +2313,7 @@ async function ensureDecryptableJwks(client, env, selfClient) {
   console.warn(
     `⚠ JWKS self-heal: removed ${deleted} undecryptable key, but the verification mint did not succeed ` +
       `(outcome=${retry.outcome}${retry.status ? `, HTTP ${retry.status}` : ""}). ` +
-      "Better Auth should regenerate on the next mint; re-run `cinatra setup dev` once the app has served a request to re-verify.",
+      "Better Auth should regenerate on the next mint; re-run `cinatra dev setup dev` once the app has served a request to re-verify.",
   );
   return { status: "healed-unverified", deleted, retriedOk: false };
 }
@@ -2377,7 +2353,7 @@ async function runLlmMcpAccessSetup() {
 
   const connectionString = requiredEnv(env, "SUPABASE_DB_URL");
   const schemaName = env.SUPABASE_SCHEMA?.trim() || "cinatra";
-  const client = createClient(connectionString);
+  const client = await createClient(connectionString);
   await client.connect();
 
   try {
@@ -2411,7 +2387,7 @@ async function runLlmMcpAccessRefresh() {
 
   const connectionString = requiredEnv(env, "SUPABASE_DB_URL");
   const schemaName = env.SUPABASE_SCHEMA?.trim() || "cinatra";
-  const client = createClient(connectionString);
+  const client = await createClient(connectionString);
   await client.connect();
 
   try {
@@ -2728,7 +2704,7 @@ async function maybeRunBetterAuthMigrate(client, repoRoot, authConfig) {
   if (tableState.present.length > 0) {
     throw new Error(
       `Better Auth appears partially initialized. Missing tables: ${tableState.missing.join(", ")}. ` +
-        `Use "cinatra reset dev --yes" for a clean rebuild in development, or start from a clean production database.`,
+        `Use "cinatra dev reset --yes" for a clean rebuild in development, or start from a clean production database.`,
     );
   }
 
@@ -2947,7 +2923,7 @@ async function doctorAssertLlmMcpAccess(client, schemaName) {
       detail,
       ok
         ? null
-        : "Run `cinatra setup dev` (provisions provider creds), then `cinatra dev tunnel start` " +
+        : "Run `cinatra dev setup dev` (provisions provider creds), then `cinatra dev tunnel start` " +
           "(or paste a public URL at /configuration/development?tab=tunnel) to set the public MCP URL.",
     ),
     // Surfaced to later assertions; never logged.
@@ -3019,7 +2995,7 @@ async function doctorAssertTokenMint({ origin, providers, fetchImpl }) {
         "Token-mint smoke (client_credentials)",
         "skip",
         "no LLM provider credentials to mint with",
-        "Run `cinatra setup dev` to provision LLM provider OAuth clients first.",
+        "Run `cinatra dev setup dev` to provision LLM provider OAuth clients first.",
       ),
       token: null,
     };
@@ -3062,7 +3038,7 @@ async function doctorAssertTokenMint({ origin, providers, fetchImpl }) {
       "fail",
       `HTTP ${result.status ?? "?"}; access_token present: false`,
       "Token mint failed. Check the OAuth client/scope and JWKS decryptability " +
-        "(`cinatra setup dev` self-heals JWKS once the app is up).",
+        "(`cinatra dev setup dev` self-heals JWKS once the app is up).",
     ),
     token: null,
   };
@@ -3135,7 +3111,7 @@ async function doctorAssertLocalToolsList({ origin, token, fetchImpl }) {
       "Local /api/mcp tools/list (incl. CMS-write tool)",
       "fail",
       `tools/list returned HTTP ${result.status}`,
-      "The MCP server rejected the minted Bearer. Re-run `cinatra setup dev` once the app is up.",
+      "The MCP server rejected the minted Bearer. Re-run `cinatra dev setup dev` once the app is up.",
     );
   }
   const hasTools = result.tools.length > 0;
@@ -3199,7 +3175,7 @@ async function doctorAssertPublicReachability({ publicMcpUrl, token, fetchImpl }
       "fail",
       `public tools/list returned HTTP ${result.status}`,
       "The hosted endpoint rejected the minted Bearer (origin/audience mismatch). " +
-        "Re-run `cinatra setup dev` so the public URL + trusted origins reconcile.",
+        "Re-run `cinatra dev setup dev` so the public URL + trusted origins reconcile.",
     );
   }
   // Require the SAME exact CMS-write tool as the local check (codex must-fix: a
@@ -3221,7 +3197,7 @@ async function doctorAssertPublicReachability({ publicMcpUrl, token, fetchImpl }
     result.tools.length === 0
       ? "public tools/list returned 0 tools"
       : `public tools/list has ${result.tools.length} tool(s) but no CMS-write tool (expected one of: ${DOCTOR_CMS_WRITE_TOOLS.join(", ")}) — the public endpoint may be stale/wrong`,
-    "Confirm the public MCP URL points at THIS instance and the content-publishing extension is active; re-run `cinatra setup dev`.",
+    "Confirm the public MCP URL points at THIS instance and the content-publishing extension is active; re-run `cinatra dev setup dev`.",
   );
 }
 
@@ -3316,7 +3292,7 @@ async function doctorAssertWordPressReadiness({ fetchImpl, dockerImpl }) {
       label,
       "fail",
       `mcp-adapter route absent (HTTP ${adapterStatus}) — the WP MCP plugins are not active`,
-      "Re-run the WP container entrypoint / `cinatra setup dev`; ensure cinatra, abilities-api, and mcp-adapter are active.",
+      "Re-run the WP container entrypoint / `cinatra dev setup dev`; ensure cinatra, abilities-api, and mcp-adapter are active.",
     );
   }
   // Read-only plugin-active list via wp-cli.
@@ -3354,7 +3330,7 @@ async function doctorAssertWordPressReadiness({ fetchImpl, dockerImpl }) {
       label,
       "fail",
       `inactive required plugin(s): ${missingPlugins.join(", ")}`,
-      "Activate the missing plugin(s) or re-run the WP entrypoint / `cinatra setup dev`.",
+      "Activate the missing plugin(s) or re-run the WP entrypoint / `cinatra dev setup dev`.",
     );
   }
   return makeAssertion(
@@ -3402,7 +3378,7 @@ async function doctorAssertDrupalReadiness({ fetchImpl, dockerImpl }) {
       label,
       "fail",
       `/_mcp_tools route absent (HTTP ${status}) — the cinatra module is not enabled`,
-      "Enable the cinatra Drupal module or re-run the Drupal entrypoint / `cinatra setup dev`.",
+      "Enable the cinatra Drupal module or re-run the Drupal entrypoint / `cinatra dev setup dev`.",
     );
   }
   const moduleList = doctorDockerRun(dockerImpl, [
@@ -3432,7 +3408,7 @@ async function doctorAssertDrupalReadiness({ fetchImpl, dockerImpl }) {
       label,
       "fail",
       `the "${DOCTOR_DRUPAL.requiredModule}" module is not enabled`,
-      "Enable the cinatra Drupal module (`drush en cinatra`) or re-run `cinatra setup dev`.",
+      "Enable the cinatra Drupal module (`drush en cinatra`) or re-run `cinatra dev setup dev`.",
     );
   }
   return makeAssertion(
@@ -3444,7 +3420,7 @@ async function doctorAssertDrupalReadiness({ fetchImpl, dockerImpl }) {
 }
 
 // Assertion 8 — dev-app clone presence. The WP plugin + Drupal module clones must
-// exist on disk (they are gitignored; `cinatra setup dev` syncs them). Pure fs.
+// exist on disk (they are gitignored; `cinatra dev setup dev` syncs them). Pure fs.
 function doctorAssertDevAppsPresence(repoRoot) {
   const config = readDevAppsConfig(repoRoot);
   const id = "dev-apps-presence";
@@ -3480,7 +3456,7 @@ function doctorAssertDevAppsPresence(repoRoot) {
       label,
       "fail",
       [undeclaredNote, missingNote].filter(Boolean).join("; "),
-      "Run `cinatra setup dev` (without --skip-dev-apps) to clone the WordPress plugin + Drupal module " +
+      "Run `cinatra dev setup dev` (without --skip-dev-apps) to clone the WordPress plugin + Drupal module " +
         "(and ensure both are declared in package.json `cinatra.devApps`).",
     );
   }
@@ -3583,7 +3559,7 @@ async function runDoctor(rest = []) {
   const env = collectEnvironment(repoRoot);
   const connectionString = requiredEnv(env, "SUPABASE_DB_URL");
   const schemaName = env.SUPABASE_SCHEMA?.trim() || "cinatra";
-  const client = createClient(connectionString);
+  const client = await createClient(connectionString);
   await client.connect();
   let report;
   try {
@@ -3800,7 +3776,7 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
     installAfterExtensionSync(repoRoot, acquisition, { failHard: true });
   }
 
-  const client = createClient(connectionString);
+  const client = await createClient(connectionString);
   await client.connect();
 
   try {
@@ -3901,7 +3877,7 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
 
     // Auto-register agent skills from <repoRoot>/agents/.
     // Wrapped in try/catch — a missing agents/ tree, malformed SKILL.md, or
-    // DB hiccup must NOT abort cinatra setup.
+    // DB hiccup must NOT abort cinatra dev setup.
     let agentSkillsSummary = null;
     try {
       // Resolve the skills walker from the checkout (heavy workspace deps; not
@@ -4092,7 +4068,7 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
         // codex must-fix — exit-code discipline at the SETUP TAIL: most chain
         // FAILs here are pre-boot-NORMAL (the app/CMS are not started by setup, a
         // public URL may not be established yet) and must NOT turn a successful
-        // `cinatra setup dev` into a non-zero exit — that would block a developer
+        // `cinatra dev setup dev` into a non-zero exit — that would block a developer
         // who only ran setup for a local dev DB. Those are surfaced as warnings
         // in the report; the STANDALONE `cinatra doctor` is the authoritative gate
         // that exits non-zero on every FAIL once the app is up. The ONE FAIL that
@@ -4126,7 +4102,7 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Core schema migrations (`cinatra db migrate [--down] [--count=N]`)
+// Core schema migrations (`cinatra dev db migrate [--down] [--count=N]`)
 // ---------------------------------------------------------------------------
 //
 // Ops entry point for the node-pg-migrate runner (cinatra#116/#118): applies
@@ -4136,7 +4112,7 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
 // packages/migrations, which the prod image copies in explicitly), run from the
 // published CLI against the checkout:
 //
-//   CINATRA_REPO_ROOT=/app npx cinatra db migrate --down
+//   CINATRA_REPO_ROOT=/app npx cinatra dev db migrate --down
 //
 // Setup and the app boot pass apply pending migrations automatically; this
 // command exists for manual remediation and rollback.
@@ -4162,7 +4138,7 @@ async function runDbMigrate(rest) {
     }
     if ([...valueTakingFlags].some((f) => arg.startsWith(`${f}=`))) continue;
     throw new Error(
-      `Unexpected argument "${arg}" for cinatra db migrate. Supported: --down, --count=N, --dir <abs> --namespace <ns>.`,
+      `Unexpected argument "${arg}" for cinatra dev db migrate. Supported: --down, --count=N, --dir <abs> --namespace <ns>.`,
     );
   }
   const repoRoot = getRepoRoot();
@@ -4183,13 +4159,13 @@ async function runDbMigrate(rest) {
   const dirRaw = readOptionValue(rest, "--dir");
   const namespaceRaw = readOptionValue(rest, "--namespace");
   if ((dirRaw === null) !== (namespaceRaw === null)) {
-    throw new Error("cinatra db migrate: --dir and --namespace must be provided together.");
+    throw new Error("cinatra dev db migrate: --dir and --namespace must be provided together.");
   }
   let result;
   let label = "Core";
   if (dirRaw !== null) {
     if (!path.isAbsolute(dirRaw)) {
-      throw new Error("cinatra db migrate: --dir must be an absolute path (the remediation target must not depend on cwd).");
+      throw new Error("cinatra dev db migrate: --dir must be an absolute path (the remediation target must not depend on cwd).");
     }
     label = namespaceRaw.replace(/__$/, "");
     // Namespace shape is validated by the runner itself (assertValidNamespace)
@@ -4662,7 +4638,7 @@ async function runSetupNango() {
   const runtimeMode = readConfiguredRuntimeMode(env);
 
   const bootstrapNangoSettings = await discoverBootstrapNangoSettings(env, runtimeMode);
-  const client = createClient(connectionString);
+  const client = await createClient(connectionString);
   await client.connect();
   try {
     const result = await ensureNangoSettings(client, schemaName, bootstrapNangoSettings);
@@ -4670,7 +4646,7 @@ async function runSetupNango() {
       console.log(`Nango administration saved (source: ${result.source}, serverUrl: ${result.administration?.serverUrl ?? "default"}).`);
     } else {
       console.warn(
-        "Nango secret key not found. Start the Nango container first (pnpm services), then re-run: cinatra setup nango",
+        "Nango secret key not found. Start the Nango container first (pnpm services), then re-run: cinatra dev setup nango",
       );
       process.exit(1);
     }
@@ -4762,7 +4738,7 @@ async function runSetupBranch(argv) {
   const { runCollisionCheck, makeDefaultGitImpl, formatResult } = await import(
     "./worktree-collision-guard.mjs"
   );
-  // Self-context — if `cinatra setup branch` is re-running inside the
+  // Self-context — if `cinatra dev setup branch` is re-running inside the
   // already-provisioned worktree, that's not a collision.
   let selfBranch = null;
   try {
@@ -4872,7 +4848,7 @@ async function runSetupBranch(argv) {
     );
   }
   const sourceSchemaName = sourceEnv.SUPABASE_SCHEMA?.trim() || "cinatra";
-  const client = createClient(connectionString);
+  const client = await createClient(connectionString);
   await client.connect();
   try {
     // Fresh branch schemas ledger-FAKE the core migration chain (the
@@ -5075,7 +5051,7 @@ async function runTeardownBranch(argv) {
 
   // 2. Require --yes (destructive-action gate; checked BEFORE any git / DB work)
   if (!argv.includes("--yes")) {
-    throw new Error("cinatra teardown branch is destructive. Re-run with --yes to confirm.");
+    throw new Error("cinatra dev teardown branch is destructive. Re-run with --yes to confirm.");
   }
 
   // 3. Derive slug — prefer --slug, else read git branch
@@ -5161,7 +5137,7 @@ async function runTeardownBranch(argv) {
   }
 
   // 6. Drop the schema (quoteIdentifier prevents SQL injection via slug)
-  const client = createClient(connectionString);
+  const client = await createClient(connectionString);
   await client.connect();
   try {
     await client.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schemaName)} CASCADE`);
@@ -5396,13 +5372,13 @@ function resolveRedisCliRunner(redisUrl, target) {
 // ===========================================================================
 // Clone-on-demand: seed DB + dormant deep-fork clone provisioning.
 //
-//   cinatra clone refresh-seed   — (re)build the `cinatra_seed` template DB
-//   cinatra setup clone          — provision a dormant clone for a worktree
-//   cinatra clone prune --yes    — destroy a clone's DB + registry slot
-//   cinatra clone list           — list registered clones
+//   cinatra dev clone refresh-seed   — (re)build the `cinatra_seed` template DB
+//   cinatra dev clone new          — provision a dormant clone for a worktree
+//   cinatra dev clone prune --yes    — destroy a clone's DB + registry slot
+//   cinatra dev clone list           — list registered clones
 //
 // A "clone" is a deep fork: a SEPARATE Postgres database `cinatra_clone_<slug>`
-// (vs the light `cinatra setup branch`, which is a `cinatra_<slug>` *schema* in
+// (vs the light `cinatra dev setup branch`, which is a `cinatra_<slug>` *schema* in
 // the shared `postgres` DB). Pure registry/slug/port logic lives in
 // `./clone-registry.mjs`; this file owns the DB + filesystem side effects.
 // ===========================================================================
@@ -5463,7 +5439,7 @@ async function runRefreshSeed(argv) {
   const appSchema = sourceEnv.SUPABASE_SCHEMA?.trim() || "cinatra";
   if (appSchema !== "cinatra") {
     throw new Error(
-      `cinatra clone refresh-seed only supports the default 'cinatra' app schema ` +
+      `cinatra dev clone refresh-seed only supports the default 'cinatra' app schema ` +
         `(found SUPABASE_SCHEMA=${appSchema}).`,
     );
   }
@@ -5473,7 +5449,7 @@ async function runRefreshSeed(argv) {
   const env = collectEnvironment(repoRoot);
 
   // 1. Drop any existing seed DB, then create a fresh empty one.
-  let adminClient = createClient(adminUrl);
+  let adminClient = await createClient(adminUrl);
   await adminClient.connect();
   try {
     const exists = await adminClient.query(
@@ -5546,7 +5522,7 @@ async function runRefreshSeed(argv) {
   }
 
   // 3. Scrub operational + volatile-auth tables inside the seed DB.
-  const seedClient = createClient(seedUrl);
+  const seedClient = await createClient(seedUrl);
   await seedClient.connect();
   const scrubbedOps = [];
   const scrubbedAuth = [];
@@ -5607,7 +5583,7 @@ async function runRefreshSeed(argv) {
   }
 
   // 5. Mark the seed as a template and lock out regular connections.
-  adminClient = createClient(adminUrl);
+  adminClient = await createClient(adminUrl);
   await adminClient.connect();
   try {
     await adminClient.query(
@@ -5693,7 +5669,7 @@ async function runSetupClone(argv) {
     } catch (error) {
       throw new Error(
         `Could not locate the main repo root via git: ${error.message}. ` +
-          `Run 'cinatra setup clone <name>' from inside the cinatra repo.`,
+          `Run 'cinatra dev clone new <name>' from inside the cinatra repo.`,
       );
     }
     const parentDir = path.dirname(mainRepoRoot);
@@ -5764,7 +5740,7 @@ async function runSetupClone(argv) {
   const appSchema = sourceEnv.SUPABASE_SCHEMA?.trim() || "cinatra";
   if (appSchema !== "cinatra") {
     throw new Error(
-      `cinatra setup clone only supports the default 'cinatra' app schema ` +
+      `cinatra dev clone new only supports the default 'cinatra' app schema ` +
         `(found SUPABASE_SCHEMA=${appSchema}).`,
     );
   }
@@ -5801,7 +5777,7 @@ async function runSetupClone(argv) {
         `${earlyEnvPath} exists and is ${
           existingSlug ? `wired to a different clone ("${existingSlug}")` : "not a clone env"
         } — refusing to provision clone "${slug}" over it. Re-run with --force to overwrite, ` +
-          `or 'cinatra clone prune' the existing clone first.`,
+          `or 'cinatra dev clone prune' the existing clone first.`,
       );
     }
   }
@@ -5809,7 +5785,7 @@ async function runSetupClone(argv) {
   // Verify the seed DB exists AND is a template.
   const adminUrl = adminConnString(connectionString);
   {
-    const adminClient = createClient(adminUrl);
+    const adminClient = await createClient(adminUrl);
     await adminClient.connect();
     try {
       const seedRow = await adminClient.query(
@@ -5818,12 +5794,12 @@ async function runSetupClone(argv) {
       );
       if (seedRow.rows.length === 0) {
         throw new Error(
-          `Seed database "${SEED_DB_NAME}" does not exist. Run: cinatra clone refresh-seed`,
+          `Seed database "${SEED_DB_NAME}" does not exist. Run: cinatra dev clone refresh-seed`,
         );
       }
       if (seedRow.rows[0].datistemplate !== true) {
         throw new Error(
-          `Database "${SEED_DB_NAME}" exists but is not a template. Run: cinatra clone refresh-seed`,
+          `Database "${SEED_DB_NAME}" exists but is not a template. Run: cinatra dev clone refresh-seed`,
         );
       }
     } finally {
@@ -5882,14 +5858,14 @@ async function runSetupClone(argv) {
       throw new Error(
         `${outPath} exists and does NOT match clone "${slug}":\n` +
           mismatches.join("\n") +
-          `\nRe-run with --force to overwrite, or 'cinatra clone prune' the existing clone first.`,
+          `\nRe-run with --force to overwrite, or 'cinatra dev clone prune' the existing clone first.`,
       );
     }
   }
 
   // Create the clone database from the seed template (idempotent).
   {
-    const adminClient = createClient(adminUrl);
+    const adminClient = await createClient(adminUrl);
     await adminClient.connect();
     try {
       const dbRow = await adminClient.query(
@@ -5921,7 +5897,7 @@ async function runSetupClone(argv) {
   // becomes "ready". `clone start` will write the clone's own Funnel URL
   // after Tailscale comes up.
   {
-    const cloneClient = createClient(cloneUrl);
+    const cloneClient = await createClient(cloneUrl);
     await cloneClient.connect();
     try {
       const current = await readMetadataValue(cloneClient, "cinatra", MCP_SETTINGS_KEY, {});
@@ -5965,7 +5941,7 @@ async function runSetupClone(argv) {
         console.error(
           `Re-run the install manually: cd ${worktreePath} && corepack pnpm install`,
         );
-        console.error("(Do NOT re-run 'cinatra setup clone' — that work is already done.)");
+        console.error("(Do NOT re-run 'cinatra dev clone new' — that work is already done.)");
         process.exitCode = 1;
         return;
       }
@@ -6021,7 +5997,7 @@ async function runSetupClone(argv) {
   console.log(`  Slug:          ${slug}`);
   console.log(`  Index:         ${slot.index}`);
   console.log(`  Next.js port:  ${slot.nextjsPort}`);
-  console.log(`  WayFlow port:  ${slot.wayflowPort}  (container starts on 'cinatra clone start')`);
+  console.log(`  WayFlow port:  ${slot.wayflowPort}  (container starts on 'cinatra dev clone start')`);
   console.log(`  Database:      ${dbName}  (from template ${SEED_DB_NAME})`);
   console.log(`  .env.local:    ${outPath}`);
   console.log("");
@@ -6131,7 +6107,7 @@ async function runClonePrune(argv) {
   }
 
   if (!argv.includes("--yes")) {
-    throw new Error("cinatra clone prune is destructive. Re-run with --yes to confirm.");
+    throw new Error("cinatra dev clone prune is destructive. Re-run with --yes to confirm.");
   }
   const worktreePath = path.resolve(
     readOptionValue(argv, "--worktree-path") ?? process.cwd(),
@@ -6141,7 +6117,7 @@ async function runClonePrune(argv) {
   let branch = null;
   if (!slug) {
     // Accept a positional <slug> as a convenience form. Use the shared helper
-    // so `cinatra clone prune --worktree-path /tmp/wt --yes` doesn't read
+    // so `cinatra dev clone prune --worktree-path /tmp/wt --yes` doesn't read
     // `/tmp/wt` as the slug.
     slug = findPositionalSlug(argv);
   }
@@ -6239,7 +6215,7 @@ async function runClonePrune(argv) {
     }
     if (isCloneRunning && !forceStop) {
       throw new Error(
-        `Clone "${slug}" is running. Run 'cinatra clone stop --slug ${slug}' first, or re-run prune with --force-stop.`,
+        `Clone "${slug}" is running. Run 'cinatra dev clone stop --slug ${slug}' first, or re-run prune with --force-stop.`,
       );
     }
     if (isCloneRunning && forceStop) {
@@ -6256,7 +6232,7 @@ async function runClonePrune(argv) {
         throw new Error(
           `Clone "${slug}": --force-stop could not prove the clone is stopped ` +
             `(${stopResult.reason}). Refusing to DROP the database. Stop the ` +
-            `process manually, then re-run 'cinatra clone prune --slug ${slug} --yes'.`,
+            `process manually, then re-run 'cinatra dev clone prune --slug ${slug} --yes'.`,
         );
       }
     }
@@ -6347,7 +6323,7 @@ async function runClonePrune(argv) {
   const adminUrl = adminConnString(connectionString);
 
   // Drop the clone database from the maintenance DB.
-  const adminClient = createClient(adminUrl);
+  const adminClient = await createClient(adminUrl);
   await adminClient.connect();
   try {
     await adminClient.query(
@@ -6375,7 +6351,7 @@ async function runClonePrune(argv) {
 
   // Release the registry slot ONLY when every cleanup step succeeded. If Redis
   // cleanup failed, keep the slot so the slug + queue name stay reserved — the
-  // clone DB is already dropped, so re-running 'cinatra clone prune' is a safe,
+  // clone DB is already dropped, so re-running 'cinatra dev clone prune' is a safe,
   // idempotent way to retry the Redis cleanup and then release the slot
   // idempotent way to retry the Redis cleanup and then release the slot.
   if (redisResult.ok) {
@@ -6400,7 +6376,7 @@ async function runClonePrune(argv) {
     console.log("");
     console.log(
       "Redis cleanup failed — the registry slot was retained. Clear the keys, then re-run " +
-        `'cinatra clone prune --slug ${slug} --yes' to release the slot. Manual key cleanup:`,
+        `'cinatra dev clone prune --slug ${slug} --yes' to release the slot. Manual key cleanup:`,
     );
     console.log(`  redis-cli --scan --pattern 'bull:${queueName}:*' | xargs redis-cli del`);
   }
@@ -6485,10 +6461,10 @@ function runCloneList() {
 // ---------------------------------------------------------------------------
 // Clone start/stop/status lifecycle.
 //
-//   cinatra clone start [--slug <s>] [--worktree-path <p>] [--rebuild-wayflow]
+//   cinatra dev clone start [--slug <s>] [--worktree-path <p>] [--rebuild-wayflow]
 //                       [--tailscale-host-network]
-//   cinatra clone stop  [--slug <s>] [--worktree-path <p>]
-//   cinatra clone status [--slug <s>] [--worktree-path <p>]
+//   cinatra dev clone stop  [--slug <s>] [--worktree-path <p>]
+//   cinatra dev clone status [--slug <s>] [--worktree-path <p>]
 //
 // `start` brings up host-native Next.js on port 31NN + a per-clone WayFlow
 // container on 32NN. A Tailscale Funnel sidecar is layered on top when
@@ -6496,7 +6472,7 @@ function runCloneList() {
 // **local-only** when it is unset.
 //
 // Lifecycle invariants enforced here:
-//   - registry slot must be state=ready (`cinatra setup clone` succeeded)
+//   - registry slot must be state=ready (`cinatra dev clone new` succeeded)
 //   - clone DB must exist (`pg_ping` succeeds against `cinatra_clone_<slug>`)
 //   - per-band port guard (3100-3119, 3200-3219) catches corrupt rows
 //   - per-clone runtime-state at `~/.cinatra/clones/<slug>/`:
@@ -6523,19 +6499,19 @@ function loadReadyCloneSlot(slug) {
   const slot = getClone(registry, slug);
   if (!slot) {
     throw new Error(
-      `No clone registered for slug "${slug}". Run 'cinatra setup clone' from the worktree first.`,
+      `No clone registered for slug "${slug}". Run 'cinatra dev clone new' from the worktree first.`,
     );
   }
   if (slot.state !== "ready") {
     throw new Error(
-      `Clone "${slug}" is in state "${slot.state}", not ready. Re-run 'cinatra setup clone' to repair.`,
+      `Clone "${slug}" is in state "${slot.state}", not ready. Re-run 'cinatra dev clone new' to repair.`,
     );
   }
   return { slot, registryPath };
 }
 
 async function pingCloneDb(connString) {
-  const client = createClient(connString);
+  const client = await createClient(connString);
   try {
     await Promise.race([
       client.connect(),
@@ -6554,7 +6530,7 @@ function isComposeAvailable() {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       // Bounded (cinatra#260 Step 3): this metadata probe is now on the
-      // `cinatra setup dev` auto-bring-up path — a hung docker CLI must not
+      // `cinatra dev setup dev` auto-bring-up path — a hung docker CLI must not
       // block setup. On timeout spawnSync returns non-zero/`error` → treated as
       // "not available" by the `status === 0` check.
       timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
@@ -6609,7 +6585,7 @@ function isComposeProjectUp(projectName) {
 // and propagate to both the host-native Next.js (via .env.local) and the
 // per-clone WayFlow container (via compose env).
 async function ensureCloneBridgeToken(cloneConnString) {
-  const client = createClient(cloneConnString);
+  const client = await createClient(cloneConnString);
   await client.connect();
   try {
     const current = await readMetadataValue(client, "cinatra", "bridge_token", {});
@@ -6645,7 +6621,7 @@ function ensureWayflowImage({ forceRebuild = false, repoRoot } = {}) {
     "docker",
     ["build", "-t", "cinatra-wayflow:local", path.join(repoRoot, "docker", "wayflow")],
     // Finite safety bound (cinatra#260 Step 3): a HUNG docker build must not
-    // block forever — the dev-tunnel auto-bring-up from `cinatra setup dev`
+    // block forever — the dev-tunnel auto-bring-up from `cinatra dev setup dev`
     // calls this path, and setup must never hang. Generous (10m) so a normal
     // cold build is unaffected; on timeout spawnSync kills the child and
     // returns a non-zero/`error` result → the throw below surfaces it.
@@ -6805,7 +6781,7 @@ async function ensureDevPublicMcpUrl({ dbUrl, schemaName, env, operatorUrl, deps
   const readStoredSettings =
     deps.readStoredMcpSettings ??
     (async (connString, schema) => {
-      const client = createClient(connString);
+      const client = await createClient(connString);
       try {
         await client.connect();
         return await readMetadataValue(client, schema, MCP_SETTINGS_KEY, {});
@@ -7108,7 +7084,7 @@ async function runCloneStart(argv) {
   ) {
     throw new Error(
       `Clone "${slug}" is registered at ${slot.worktreePath}, but --worktree-path resolved to ${callerWorktreePath}. ` +
-        `Re-run without --worktree-path, or fix the registry with 'cinatra setup clone --force'.`,
+        `Re-run without --worktree-path, or fix the registry with 'cinatra dev clone new --force'.`,
     );
   }
   const worktreePath = slot.worktreePath;
@@ -7281,14 +7257,14 @@ async function runCloneStart(argv) {
     // potential Tailscale auto-mint has had a chance to use it).
     if (!cloneUrl) {
       throw new Error(
-        `Clone "${slug}": ${path.join(worktreePath, ".env.local")} missing SUPABASE_DB_URL. Re-run 'cinatra setup clone --force'.`,
+        `Clone "${slug}": ${path.join(worktreePath, ".env.local")} missing SUPABASE_DB_URL. Re-run 'cinatra dev clone new --force'.`,
       );
     }
     try {
       await pingCloneDb(cloneUrl);
     } catch (err) {
       throw new Error(
-        `Clone "${slug}": cannot reach clone database (${err?.message ?? err}). Run 'cinatra setup clone --force' or check that Postgres is up.`,
+        `Clone "${slug}": cannot reach clone database (${err?.message ?? err}). Run 'cinatra dev clone new --force' or check that Postgres is up.`,
       );
     }
 
@@ -8271,7 +8247,7 @@ async function runDevTunnel(argv) {
     });
     let publicBaseUrl = null;
     if (mainDbUrl) {
-      const client = createClient(mainDbUrl);
+      const client = await createClient(mainDbUrl);
       try {
         await client.connect();
         const current = await readMetadataValue(
@@ -8328,7 +8304,7 @@ async function runDevTunnel(argv) {
       }
     }
     if (mainDbUrl) {
-      const client = createClient(mainDbUrl);
+      const client = await createClient(mainDbUrl);
       let src = null;
       try {
         await client.connect();
@@ -8650,7 +8626,7 @@ async function waitForTailscaleFunnelUrl({ projectName, composePath, composeEnv,
       ["compose", "-p", projectName, "-f", composePath, "exec", "-T", "tailscale", "tailscale", "status", "--json"],
       // Per-spawn timeout (cinatra#260 Step 3 codex must-fix): a HUNG
       // `docker compose exec` would otherwise never let the `timeoutMs` loop
-      // deadline be reached, so `cinatra setup dev` auto-bring-up could hang.
+      // deadline be reached, so `cinatra dev setup dev` auto-bring-up could hang.
       // A single status read is fast; cap it well under the loop interval so a
       // stuck exec is killed and the loop's deadline check stays authoritative.
       {
@@ -8769,7 +8745,7 @@ async function readTailscaleCredentialFromNango() {
  * @returns {Promise<string>}
  */
 async function readTailscaleCloneTagFromClone(cloneConnString) {
-  const client = createClient(cloneConnString);
+  const client = await createClient(cloneConnString);
   try {
     await client.connect();
     const raw = await readMetadataValue(client, "cinatra", "connector_config:tailscale", null);
@@ -8905,7 +8881,7 @@ async function autoMintTailscaleAuthKeyFromNango(cloneConnString) {
  */
 async function writeClonePublicBaseUrl(cloneConnString, url, options) {
   const schemaName = options?.schemaName?.trim() || "cinatra";
-  const client = createClient(cloneConnString);
+  const client = await createClient(cloneConnString);
   await client.connect();
   try {
     const current = await readMetadataValue(client, schemaName, MCP_SETTINGS_KEY, {});
@@ -9051,7 +9027,7 @@ async function runCloneStop(argv) {
     // is a loud warning, not a throw — the operator can investigate.
     console.warn(
       `Clone "${slug}": could not confirm the clone stopped (${stopResult.reason}). ` +
-        `Investigate with 'cinatra clone status --slug ${slug}'.`,
+        `Investigate with 'cinatra dev clone status --slug ${slug}'.`,
     );
     process.exitCode = 1;
   }
@@ -9111,7 +9087,7 @@ async function runCloneStatus(argv) {
 // ---------------------------------------------------------------------------
 // Registry lookup for shell hooks.
 //
-//   cinatra clone slug-for-worktree --worktree-path <p>
+//   cinatra dev clone slug-for-worktree --worktree-path <p>
 //
 // Prints the slug to stdout (exit 0). Prints nothing + exit 1 if no clone
 // is registered for the given path. Used by the ExitWorktree hook so it
@@ -9127,7 +9103,7 @@ async function runClonePruneStale(argv) {
   const dryRun = argv.includes("--dry-run");
   if (!dryRun && !argv.includes("--yes")) {
     throw new Error(
-      "cinatra clone prune --stale is destructive. Re-run with --yes to confirm, or pass --dry-run to preview.",
+      "cinatra dev clone prune --stale is destructive. Re-run with --yes to confirm, or pass --dry-run to preview.",
     );
   }
   const registryPath = defaultRegistryPath();
@@ -9194,7 +9170,7 @@ function runCloneSlugForWorktree(argv) {
 
 async function runResetDev(argv) {
   if (!argv.includes("--yes")) {
-    throw new Error('Development reset is destructive. Re-run with "cinatra reset dev --yes".');
+    throw new Error('Development reset is destructive. Re-run with "cinatra dev reset --yes".');
   }
 
   const repoRoot = getRepoRoot();
@@ -9273,7 +9249,7 @@ async function runResetDev(argv) {
 
     const purgeAppData = await resolveAppDataPurgePreference(argv);
 
-    const client = createClient(connectionString);
+    const client = await createClient(connectionString);
     await client.connect();
 
     try {
@@ -9317,14 +9293,14 @@ async function runBackupImport(argv) {
     if (!filePath) {
       throw new Error(
         `No backup files found in ${path.join(repoRoot, DEFAULT_BACKUP_DIRECTORY)}. ` +
-          `Create a backup first with "cinatra backup create", or specify a file with --file.`,
+          `Create a backup first with "cinatra dev backup create", or specify a file with --file.`,
       );
     }
     console.log(`No --file specified. Using most recent backup: ${path.basename(filePath)}`);
   }
 
   if (!argv.includes("--yes")) {
-    throw new Error('Backup import is destructive. Re-run with "cinatra backup import --yes".');
+    throw new Error('Backup import is destructive. Re-run with "cinatra dev backup import --yes".');
   }
 
   if (isLegacySqlBackupPath(filePath)) {
@@ -9377,7 +9353,7 @@ async function runBackupExportApiConfigs(argv) {
   const schemaName = env.SUPABASE_SCHEMA?.trim() || "cinatra";
   const filePath = resolveApiConfigsFilePath(repoRoot, readOptionValue(argv, "--file"));
 
-  const client = createClient(connectionString);
+  const client = await createClient(connectionString);
   await client.connect();
 
   try {
@@ -9432,14 +9408,14 @@ async function runBackupImportApiConfigs(argv) {
     if (!filePath) {
       throw new Error(
         `No API config files found in ${path.join(repoRoot, DEFAULT_BACKUP_DIRECTORY)}. ` +
-          `Export them first with "cinatra backup export-api-configs", or specify a file with --file.`,
+          `Export them first with "cinatra dev backup export-api-configs", or specify a file with --file.`,
       );
     }
     console.log(`No --file specified. Using most recent: ${path.basename(filePath)}`);
   }
 
   if (!argv.includes("--yes")) {
-    throw new Error('API config import will overwrite existing configs. Re-run with "cinatra backup import-api-configs --yes".');
+    throw new Error('API config import will overwrite existing configs. Re-run with "cinatra dev backup import-api-configs --yes".');
   }
 
   if (!existsSync(filePath)) {
@@ -9448,10 +9424,10 @@ async function runBackupImportApiConfigs(argv) {
 
   const raw = JSON.parse(readFileSync(filePath, "utf8"));
   if (raw.format !== "cinatra-api-configs" || !Array.isArray(raw.entries)) {
-    throw new Error(`Invalid API config file format. Expected a file created by "cinatra backup export-api-configs".`);
+    throw new Error(`Invalid API config file format. Expected a file created by "cinatra dev backup export-api-configs".`);
   }
 
-  const client = createClient(connectionString);
+  const client = await createClient(connectionString);
   await client.connect();
 
   try {
@@ -9664,7 +9640,7 @@ async function runStatus(argv = []) {
   const runtimeMode = readConfiguredRuntimeMode(env);
   const connectionString = requiredEnv(env, "SUPABASE_DB_URL");
   const schemaName = env.SUPABASE_SCHEMA?.trim() || "cinatra";
-  const client = createClient(connectionString);
+  const client = await createClient(connectionString);
   await client.connect();
 
   try {
@@ -9780,7 +9756,7 @@ async function runAgentExport(argv) {
   const query = argv.find((a) => !a.startsWith("--"));
   if (!query) throw new Error('Usage: cinatra agent export <id-or-name> [--file <output.zip>]');
 
-  const client = createClient(connectionString);
+  const client = await createClient(connectionString);
   await client.connect();
   try {
     // Try by exact ID, then by name (case-insensitive)
@@ -9881,7 +9857,7 @@ async function runAgentImport(argv) {
 
   const importedName = readOptionValue(argv, "--name") ?? agent.name ?? "Imported Agent";
 
-  const client = createClient(connectionString);
+  const client = await createClient(connectionString);
   await client.connect();
   try {
     const newId = randomUUID();
@@ -9965,64 +9941,53 @@ function readCliVersion() {
 }
 
 /**
- * Build the id-keyed handler map for `runCli`. Each handler is the
- * behavior-preserving body of the original if-chain branch, closing over the
- * local run* implementations. Handlers receive the LEGACY
- * `rest = argv.slice(2)`; the 3-token handlers re-slice themselves exactly as
- * before (`mcp llm-access verify` -> `runDoctor(rest.slice(1))`).
+ * Build the id-keyed handler map for `runCli`. Each handler closes over the
+ * local run* implementations.
+ *
+ * eng#232 dispatch contract: every handler receives `(rest, routedTokens)` where
+ * `rest = argv.slice(descriptor.path.length)` (every token AFTER the routed
+ * path) and `routedTokens = argv.slice(0, descriptor.path.length)`. A handler
+ * that needs a routed mode token reads it from `routedTokens` (e.g.
+ * `setup.dev|prod` reads the trailing `dev`/`prod`); no handler re-prepends a
+ * `mode` slot or re-slices `rest` anymore. A canonical `dev …` form and its
+ * deprecated bare alias each slice off THEIR OWN path length, so both deliver an
+ * identical `rest` to the shared handler.
  *
  * Returning (vs awaiting) is preserved where it was load-bearing:
  * `agents install` returns the `runAgentsInstall(rest)` promise.
  *
- * @returns {Record<string, (rest: string[]) => unknown>}
+ * @returns {Record<string, (rest: string[], routedTokens: string[]) => unknown>}
  */
 function buildHandlers() {
   return {
-    install: async (rest, mode) => {
-      // `install` is a command-only descriptor, so the dispatcher's `mode` slot
-      // (argv[1]) holds the FIRST option token (e.g. `--dir`) and is NOT in
-      // `rest`. Re-prepend it so all flags are visible to the parser. The heavy
-      // bootstrap body is lazy-loaded to keep the dependency-light core lean —
-      // install.mjs uses only node builtins + git/docker/corepack subprocesses
-      // + the pre-install-safe sync modules, and never imports this graph.
-      const args = mode !== undefined ? [mode, ...rest] : rest;
+    install: async (rest) => {
+      // eng#232 dispatcher contract: `rest = argv.slice(path.length)` already
+      // holds EVERY token after `install` (the old `mode` re-prepend is gone).
+      // The heavy bootstrap body is lazy-loaded to keep the dependency-light
+      // core lean — install.mjs uses only node builtins + git/docker/corepack
+      // subprocesses + the pre-install-safe sync modules, never this graph.
       const { runInstall } = await import("./install.mjs");
-      await runInstall(args);
+      await runInstall(rest);
     },
-    // `update` / `upgrade` are command-only descriptors, so the dispatcher's
-    // `mode` slot (argv[1]) holds the FIRST option token (e.g. `--ref`) and is
-    // NOT in `rest`. Re-prepend it so all flags reach runUpdate's parser.
-    update: async (rest, mode) => {
-      await runUpdate(mode !== undefined ? [mode, ...rest] : rest);
+    update: async (rest) => {
+      await runUpdate(rest);
     },
-    upgrade: async (rest, mode) => {
-      await runUpdate(mode !== undefined ? [mode, ...rest] : rest);
+    upgrade: async (rest) => {
+      await runUpdate(rest);
     },
-    login: async (rest, mode) => {
-      // `login` is a command-only descriptor, so the dispatcher's `mode` slot
-      // (argv[1]) holds the FIRST option token (e.g. `--app-url`) and is NOT in
-      // `rest`. Re-prepend it so all flags are visible to readOptionValue.
-      const args = mode !== undefined ? [mode, ...rest] : rest;
+    login: async (rest) => {
       const { runLogin } = await import("./login.mjs");
       await runLogin({
-        appUrl: readOptionValue(args, "--app-url"),
-        profile: readOptionValue(args, "--profile"),
-        makeDefault: args.includes("--default"),
+        appUrl: readOptionValue(rest, "--app-url"),
+        profile: readOptionValue(rest, "--profile"),
+        makeDefault: rest.includes("--default"),
       });
     },
-    status: async (rest, mode) => {
-      // Same command-only flag-reconstruction as `login` (see above): the
-      // remote-target flags (`--app-url` / `--profile`) can land in `mode`.
-      const args = mode !== undefined ? [mode, ...rest] : rest;
-      await runStatus(args);
+    status: async (rest) => {
+      await runStatus(rest);
     },
-    logs: async (rest, mode) => {
-      // `logs` is a command-only descriptor, so the dispatcher's `mode` slot
-      // (argv[1]) holds the FIRST flag (e.g. `--app` / `--service` / `--follow`)
-      // and is NOT in `rest`. Re-prepend it so every flag reaches parseLogsFlags
-      // (same reconstruction as `status` / `login` / `create-extension`).
-      const args = mode !== undefined ? [mode, ...rest] : rest;
-      await runLogs(args);
+    logs: async (rest) => {
+      await runLogs(rest);
     },
     "skills.reset-repo": async (rest) => {
       await runSkillsResetRepo(rest);
@@ -10052,14 +10017,10 @@ function buildHandlers() {
     // Class-B authoring: scaffold a new extension package on disk. Folded from
     // the retired `npx create-cinatra-extension` thin alias (cinatra#402) over a
     // shared, zero-dependency authoring core lazy-loaded from ./authoring/.
-    // `create-extension` is a command-only descriptor, so the dispatcher's
-    // `mode` slot (argv[1]) holds the FIRST positional/option token (e.g. the
-    // `<kind>`) and is NOT in `rest`. Re-prepend it so the kind/name/flags are
-    // all visible to the scaffolder's parser (same shape as install/login).
-    "create-extension": async (rest, mode) => {
-      const args = mode !== undefined ? [mode, ...rest] : rest;
+    // eng#232 dispatcher contract: `rest` already holds the `<kind>`/name/flags.
+    "create-extension": async (rest) => {
       const { runCreateExtension } = await import("./authoring/cli.mjs");
-      await runCreateExtension(args);
+      await runCreateExtension(rest);
     },
     "mcp.tunnel": () => {
       throw new Error(
@@ -10085,8 +10046,10 @@ function buildHandlers() {
       const env = collectEnvironment(getRepoRoot());
       await runSetup(readConfiguredRuntimeMode(env) === "production" ? "prod" : "dev");
     },
-    "setup.dev|prod": async (rest, mode) => {
-      await runSetup(mode);
+    "setup.dev|prod": async (rest, routedTokens) => {
+      // The `dev|prod` mode token is the LAST routed token (canonical path
+      // `["dev","setup","dev|prod"]`, alias path `["setup","dev|prod"]`).
+      await runSetup(routedTokens[routedTokens.length - 1]);
     },
     "setup.nango": async () => {
       await runSetupNango();
@@ -10158,9 +10121,10 @@ function buildHandlers() {
     doctor: async (rest) => {
       await runDoctor(rest);
     },
-    // Alias: `cinatra mcp llm-access verify` — drop the `verify` sub-token.
+    // Alias: `cinatra mcp llm-access verify`. eng#232: the `verify` token is now
+    // part of the routed path, so `rest` already excludes it (no `.slice(1)`).
     "mcp.llm-access.verify": async (rest) => {
-      await runDoctor(rest.slice(1));
+      await runDoctor(rest);
     },
     "agents.install": async (rest) => {
       const { runAgentsInstall } = await import("./agents-install.mjs");
@@ -10189,7 +10153,7 @@ function buildHandlers() {
 }
 
 export async function runCli(argv) {
-  const [command, mode, ...rest] = argv;
+  const [command, mode] = argv;
 
   // Reserve `--version` / `-v` for THIS CLI's SemVer (cinatra#255 §6 Q5). It is
   // handled at the very top so it never falls through to "Unknown command", and
@@ -10205,15 +10169,24 @@ export async function runCli(argv) {
   }
 
   // Central `--help`/`-h` guard (cinatra#255 footgun). A help flag on ANY
-  // subcommand (`cinatra install --help`, `cinatra setup dev -h`, …) must print
-  // usage and exit 0 WITHOUT running the handler — the per-command parsers used
-  // to silently ignore the unknown flag, so a destructive handler (install,
-  // setup, db, clone, dev, backup, reset) would EXECUTE on `--help`. This fires
-  // BEFORE dispatch, so no side effect can occur. `matchDescriptor` keys on the
-  // leading literal tokens and ignores trailing flags, so `install --help`
-  // still resolves to the `install` descriptor. An unknown command carrying a
-  // help flag (`cinatra bogus --help`) falls back to the full banner (exit 0).
+  // subcommand (`cinatra install --help`, `cinatra dev setup dev -h`, …) must
+  // print usage and exit 0 WITHOUT running the handler — the per-command parsers
+  // used to silently ignore the unknown flag, so a destructive handler would
+  // EXECUTE on `--help`. This fires BEFORE dispatch, so no side effect can occur.
+  //
+  // eng#232: the `dev` GROUP head is special-cased BEFORE the generic command
+  // help so `cinatra dev --help` (and a bare `cinatra dev`) print the Class-C
+  // sub-banner, not a per-command synopsis or the global banner.
   if (hasHelpFlag(argv)) {
+    if (command === "dev") {
+      const helpDescriptor = matchDescriptor(COMMAND_DESCRIPTORS, argv);
+      if (!helpDescriptor || helpDescriptor.match === "group") {
+        printGroupHelp("dev");
+        return;
+      }
+      printCommandHelp(helpDescriptor);
+      return;
+    }
     const helpDescriptor = matchDescriptor(COMMAND_DESCRIPTORS, argv);
     if (helpDescriptor) {
       printCommandHelp(helpDescriptor);
@@ -10225,10 +10198,29 @@ export async function runCli(argv) {
 
   const descriptor = matchDescriptor(COMMAND_DESCRIPTORS, argv);
   if (descriptor) {
+    // The `dev` group head has NO handler — a bare `cinatra dev` prints the
+    // group banner and exits non-zero (mirrors the old `agents`-no-mode
+    // fallback). A deprecation notice never applies to it.
+    if (descriptor.match === "group") {
+      printGroupHelp("dev");
+      process.exit(1);
+    }
+
+    // eng#232 dispatcher arg-slice contract: `rest` is everything AFTER the
+    // routed path tokens; `routedTokens` is the matched path slice (so a handler
+    // can read a routed mode token like `dev|prod`). Canonical and deprecated
+    // alias forms each slice off THEIR OWN path length, so the shared handler
+    // receives an identical `rest`.
+    const routedTokens = argv.slice(0, descriptor.path.length);
+    const rest = argv.slice(descriptor.path.length);
+
+    if (descriptor.deprecated) {
+      emitDeprecationNotice(descriptor, routedTokens);
+    }
+
     const handlers = buildHandlers();
     const handler = handlers[descriptor.id];
-    // `setup.dev|prod` needs the concrete mode token; everything else ignores it.
-    return handler(rest, mode);
+    return handler(rest, routedTokens);
   }
 
   // `agents` with no `install` mode is a fallback (NOT a real command): print
@@ -10239,4 +10231,39 @@ export async function runCli(argv) {
   }
 
   throw new Error(`Unknown command: ${[command, mode].filter(Boolean).join(" ")}. Run "cinatra --help" for usage.`);
+}
+
+/**
+ * Emit the one-line deprecation notice for a matched alias descriptor (eng#232
+ * §2.2 step 3). Goes to STDERR only (never STDOUT), so script/stdout consumers
+ * are unaffected. Suppressed for the machine-consumed hook command
+ * (`clone slug-for-worktree`) and when `CINATRA_SUPPRESS_DEPRECATION=1`.
+ *
+ * The `<old>`/`<new>` strings are built from the ACTUAL routed argv tokens, so
+ * an alternation alias prints the concrete token the user typed
+ * (`cinatra dev setup dev`), never the literal `dev|prod` pipe form.
+ *
+ * @param {import("./command-table.mjs").CommandDescriptor} descriptor
+ * @param {string[]} routedTokens
+ */
+function emitDeprecationNotice(descriptor, routedTokens) {
+  const suppress =
+    process.env.CINATRA_SUPPRESS_DEPRECATION === "1" ||
+    descriptor.id === "clone.slug-for-worktree";
+  if (suppress) return;
+  // `<old>` is the actual tokens the user typed for the matched alias path.
+  const oldForm = routedTokens.join(" ");
+  // `<new>` maps the canonical target, substituting the alias's concrete mode
+  // token into a trailing alternation slot (`setup dev` → `dev setup dev`).
+  const target = descriptor.deprecated;
+  let newForm = target;
+  const aliasHasModeToken = descriptor.path.some((t) => t.includes("|"));
+  if (aliasHasModeToken) {
+    const modeIdx = descriptor.path.findIndex((t) => t.includes("|"));
+    const concreteMode = routedTokens[modeIdx];
+    if (concreteMode) newForm = `${target} ${concreteMode}`;
+  }
+  process.stderr.write(
+    `"cinatra ${oldForm}" is now "cinatra ${newForm}" — the old form still works this release.\n`,
+  );
 }

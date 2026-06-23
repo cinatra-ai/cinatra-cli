@@ -6,6 +6,34 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Namespaced the local host/monorepo bootstrap commands under `cinatra dev …`.
+  The commands you run from inside a Cinatra checkout (`setup dev|prod|nango|branch`,
+  `teardown branch`, `db migrate`, the `clone …` worktree/seed commands —
+  including the renamed `setup clone` → `dev clone new` — `reset dev` → `dev reset`,
+  and the `backup …` commands) now live under the `cinatra dev …` group, with
+  `dev refresh` / `dev tunnel` / `dev start|stop|restart` / `dev wordpress|drupal`
+  keeping their existing paths. `cinatra dev --help` lists the full local-bootstrap
+  surface. The top-level funnel (`install`) and the control-plane commands
+  (`login`, `status`, `doctor`, `agents …`, `extensions …`, `create-extension`,
+  `mcp llm-access …`, `agent export|import`) are unchanged. The old bare forms
+  still work this release as DEPRECATED aliases — each prints a one-line stderr
+  hint pointing at its `cinatra dev …` form (suppressed for the
+  `clone slug-for-worktree` shell hook and via `CINATRA_SUPPRESS_DEPRECATION=1`).
+  They will be removed in a future minor; update your scripts to the namespaced
+  commands. (cinatra-ai/engineering#232)
+
+### Performance
+
+- `pg` (the one heavy native runtime dependency) is now lazy-loaded behind the
+  single database chokepoint instead of being imported at startup, so commands
+  that never touch the database (`--help`, `--version`, `login`,
+  `create-extension`, `cinatra dev --help`) no longer pay its load cost. The
+  local bootstrap commands still run fully LOCALLY — `cinatra dev db migrate`
+  and `cinatra dev setup` work even when the app server is down, talking to
+  Postgres and local tooling directly. (cinatra-ai/engineering#232)
+
 ### Added
 
 - `cinatra install` now detects an existing Cinatra instance whose ports are in

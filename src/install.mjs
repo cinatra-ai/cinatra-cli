@@ -856,7 +856,7 @@ export async function detectPortConflicts(band, deps = {}) {
  *  provably a cinatra checkout (the `compose` descriptor `detectPortConflicts`
  *  attaches). cinatra-cli#17 (T10): we then offer the EXECUTABLE option menu
  *  (--on-conflict=isolated / stop-existing / attach, --infra=external) instead of
- *  the old `cinatra setup clone` pointer (which is the dev-worktree path, out of
+ *  the old `cinatra dev clone new` pointer (which is the dev-worktree path, out of
  *  scope for a from-zero second instance). `owner` is the classifier verdict; a
  *  `mixed` holder is called out so the reader knows a stop/teardown will refuse. */
 export function formatPortConflictError(conflicts, { phase, owner } = {}) {
@@ -886,7 +886,7 @@ export function formatPortConflictError(conflicts, { phase, owner } = {}) {
     `\`cinatra install\` cannot bring up its stack on the default ports:\n${lines.join("\n")}\n`;
 
   // The cinatra-cli#17 executable option menu (shared by both branches). NO
-  // `cinatra setup clone` pointer — that is the dev-worktree path.
+  // `cinatra dev clone new` pointer — that is the dev-worktree path.
   const optionMenu =
     `  • --on-conflict=isolated      Run a second FULL stack on a remapped port band + its own app port (nothing deleted).\n` +
     `  • --on-conflict=stop-existing Stop the existing stack first, then install on the default ports.\n` +
@@ -1220,7 +1220,7 @@ function waitForNango(log, maxAttempts = 60, healthUrl = null) {
     spawnSync("sleep", ["2"]);
   }
   // Non-fatal: Nango can lag; setup re-probes. Warn, don't abort.
-  log("  ⚠ Nango did not report healthy in time — continuing; `cinatra setup` will re-check.");
+  log("  ⚠ Nango did not report healthy in time — continuing; `cinatra dev setup` will re-check.");
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,10 +1256,13 @@ function acquireProdExtensions({ targetDir, log = console.log }) {
 }
 
 function runSetupInTarget({ targetDir, mode, skipDevApps, log = console.log }) {
-  const setupArgs = [PUBLISHED_CLI_BIN, "setup", mode];
+  // eng#232: invoke the CANONICAL namespaced form (`cinatra dev setup <mode>`)
+  // so install's own flow never triggers a deprecation notice or steers the
+  // operator onto the deprecated bare alias.
+  const setupArgs = [PUBLISHED_CLI_BIN, "dev", "setup", mode];
   if (mode === "dev" && skipDevApps) setupArgs.push("--skip-dev-apps");
-  log(`- Running \`cinatra setup ${mode}\` inside ${targetDir}…`);
-  runOrThrow(process.execPath, setupArgs, `cinatra setup ${mode} failed inside the target.`, {
+  log(`- Running \`cinatra dev setup ${mode}\` inside ${targetDir}…`);
+  runOrThrow(process.execPath, setupArgs, `cinatra dev setup ${mode} failed inside the target.`, {
     cwd: targetDir,
     // Defensive belt-and-braces: the cwd-walk already resolves the root, but
     // pin CINATRA_REPO_ROOT so a stray ambient value can't redirect the child,
@@ -2810,11 +2813,11 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     }
 
     if (opts.noInstall) {
-      log("- Skipping dependency install + setup (--no-install). Checkout + env are ready; run `pnpm install && cinatra setup dev` inside the target when ready.");
+      log("- Skipping dependency install + setup (--no-install). Checkout + env are ready; run `pnpm install && cinatra dev setup dev` inside the target when ready.");
     } else {
       pnpmInstall({ targetDir, usePnpmDirect, log });
       if (opts.noSetup) {
-        log("- Skipping setup (--no-setup). Checkout + deps are ready; run `cinatra setup dev` inside the target when ready.");
+        log("- Skipping setup (--no-setup). Checkout + deps are ready; run `cinatra dev setup dev` inside the target when ready.");
       } else {
         // devApps are cloned by `setup dev` itself; passing --skip-dev-apps
         // through honors the operator's choice. (We do NOT sync devApps here to
@@ -2823,14 +2826,14 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
       }
     }
   } else if (opts.noInstall) {
-    log("- Skipping dependency install + setup (--no-install). Run `pnpm install && cinatra extensions acquire-prod && pnpm install && cinatra setup prod` inside the target when ready.");
+    log("- Skipping dependency install + setup (--no-install). Run `pnpm install && cinatra extensions acquire-prod && pnpm install && cinatra dev setup prod` inside the target when ready.");
   } else {
     // prod: install → acquire-prod → install → setup prod (mirrors setup.sh).
     pnpmInstall({ targetDir, usePnpmDirect, log });
     acquireProdExtensions({ targetDir, log });
     pnpmInstall({ targetDir, usePnpmDirect, log });
     if (opts.noSetup) {
-      log("- Skipping setup (--no-setup). Run `cinatra setup prod` inside the target when ready.");
+      log("- Skipping setup (--no-setup). Run `cinatra dev setup prod` inside the target when ready.");
     } else {
       runSetupInTarget({ targetDir, mode: "prod", skipDevApps: false, log });
     }
