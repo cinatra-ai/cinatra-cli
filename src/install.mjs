@@ -191,6 +191,17 @@ function git(args, { cwd } = {}) {
  *  flag-shaped token (`--ref --dir x`) — a classic foot-gun that would
  *  otherwise silently consume the next flag as a value. */
 function readOption(argv, flag) {
+  // Support BOTH the space form (`--flag value`) and the inline form
+  // (`--flag=value`). The README / `--help` / CHANGELOG advertise the `=` form
+  // for the cinatra-cli#17 surface (e.g. `--infra=share`, `--on-conflict=isolated`),
+  // so the install parser MUST honour it — otherwise a documented `--infra=share`
+  // would silently parse as absent and bypass the co-use gate. Mirrors
+  // index.mjs's readOptionValue. The `=` form wins if both appear.
+  const eqPrefix = `${flag}=`;
+  const eqArg = argv.find((a) => typeof a === "string" && a.startsWith(eqPrefix));
+  if (eqArg !== undefined) {
+    return eqArg.slice(eqPrefix.length); // may be "" for `--flag=` (caller validates)
+  }
   const i = argv.indexOf(flag);
   if (i === -1) return null;
   const value = argv[i + 1];

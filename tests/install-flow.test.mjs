@@ -42,6 +42,25 @@ describe("parseInstallArgs — cinatra-cli#17 surface", () => {
     expect(() => parseInstallArgs(["--on-conflict", "nope"])).toThrow(/Invalid --on-conflict/);
   });
 
+  it("honours the documented INLINE `--flag=value` form (not just `--flag value`)", () => {
+    // The README / --help / CHANGELOG advertise the `=` form; the install parser
+    // MUST honour it, or a documented `--infra=share` silently parses as absent
+    // and BYPASSES the co-use gate (and the other `=`-form flags no-op).
+    expect(parseInstallArgs(["--infra=share"]).infra).toBe("share");
+    expect(parseInstallArgs(["--infra=share"]).couseRequested).toBe(true);
+    expect(parseInstallArgs(["--on-conflict=co-use"]).couseRequested).toBe(true);
+    expect(parseInstallArgs(["--on-conflict=isolated"]).onConflict).toBe("isolated");
+    expect(parseInstallArgs(["--infra=external"]).infra).toBe("external");
+    expect(parseInstallArgs(["--instance=alpha"]).instance).toBe("alpha");
+    expect(parseInstallArgs(["--app-port=3400"]).appPort).toBe(3400);
+    expect(parseInstallArgs(["--port-offset=20000"]).portOffset).toBe(20000);
+    expect(parseInstallArgs(["--db-url=postgres://h/db"]).external.dbUrl).toBe("postgres://h/db");
+    // An unknown `=` value still errors cleanly.
+    expect(() => parseInstallArgs(["--infra=bogus"])).toThrow(/Invalid --infra/);
+    // `--db-name=` (a co-use sidecar) in the `=` form also trips the gate.
+    expect(parseInstallArgs(["--db-name=cinatra_x"]).couseRequested).toBe(true);
+  });
+
   it("--no-infra is an alias for --infra=external (not dropped)", () => {
     const o = parseInstallArgs(["--no-infra"]);
     expect(o.infra).toBe("external");
@@ -83,6 +102,17 @@ describe("runInstall — gated co-use loud-fail (T5b)", () => {
   });
   it("--on-conflict=co-use exits with the same loud failure", async () => {
     await expect(runInstall(["--on-conflict", "co-use", "--yes"], { log: () => {} })).rejects.toThrow(
+      /Co-use .* NOT yet available/s,
+    );
+  });
+  it("gates co-use through the INLINE `=` form too (the documented spelling)", async () => {
+    // Regression: the `=` form must gate BEFORE any side effect, exactly like the
+    // space form — otherwise `cinatra install --infra=share` proceeds to clone +
+    // bring up infra (co-use NOT actually gated).
+    await expect(runInstall(["--infra=share", "--yes"], { log: () => {} })).rejects.toThrow(
+      /Co-use .* NOT yet available/s,
+    );
+    await expect(runInstall(["--on-conflict=co-use", "--yes"], { log: () => {} })).rejects.toThrow(
       /Co-use .* NOT yet available/s,
     );
   });
