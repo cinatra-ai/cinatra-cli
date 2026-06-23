@@ -1,27 +1,32 @@
 name: release
 
-# Tag-time RELEASE VALIDATOR for the `@cinatra-ai/cinatra` CLI.
+# Tag-time OIDC PUBLISHER for the `@cinatra-ai/cinatra` CLI.
 #
-# Publishing is performed LOCALLY (a maintainer runs `npm publish --access public`
-# authenticated with the Infisical-held `/npm` token) — NOT in CI. So this
-# workflow does NOT publish; it exists only to FAIL LOUDLY if a `v*` tag is pushed
-# whose name does not equal the manifest version. The full install/test/pack
-# contract runs in ci.yml on every PR and on main; duplicating it here (as a
-# second mutable install/test gate) would add no signal once CI is not publishing.
+# Publishing uses npm Trusted Publishing (OIDC): there is NO npm token in this
+# path. A Trusted Publisher is configured on npmjs.com for this package
+# (@cinatra-ai/cinatra) binding it to GitHub Actions in org cinatra-ai, repo
+# cinatra-cli, workflow release.yml. When this workflow runs `npm publish`, the
+# OIDC token minted via `id-token: write` is presented to the registry and npm
+# authorizes the publish tokenlessly. Provenance/attestation is generated
+# automatically (no --provenance flag needed under trusted publishing).
 #
-# Trigger: pushing a tag `v<package.json .version>` (e.g. v0.1.2). The job passes
-# only when the tag matches the manifest version.
+# Requirements (npm docs, trusted-publishers): npm CLI >= 11.5.1 and Node >=
+# 22.14.0. Node 24 satisfies the Node floor; `npm install -g npm@latest` lifts
+# the bundled npm above the 11.5.1 floor.
+#
+# Trigger: pushing a tag `v<package.json .version>` (e.g. v0.1.2). The job
+# asserts the tag matches the manifest version, then publishes.
 
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch: {}
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
-  validate-tag:
+  publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -29,16 +34,24 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
+          registry-url: "https://registry.npmjs.org"
 
-      - name: Verify the pushed tag matches the manifest version
+      - name: Ensure npm meets the OIDC trusted-publishing floor (>= 11.5.1)
         run: |
-          version="$(node -e 'console.log(require("./package.json").version)')"
-          ref="${GITHUB_REF#refs/tags/}"
+          npm install -g npm@latest
+          echo "npm $(npm --version) / node $(node --version)"
+
+      - name: Assert the pushed tag matches the manifest version
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          tag="${GITHUB_REF_NAME#v}"
           echo "Manifest version: $version"
-          echo "Tag ref:          $ref"
-          if [ "$ref" != "v$version" ]; then
-            echo "::error::Tag ($ref) must equal v<package.json.version> (v$version)."
+          echo "Tag (stripped):   $tag"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::Tag (${GITHUB_REF_NAME}) must equal v<package.json.version> (v$version)."
             exit 1
           fi
-          echo "Tag matches @cinatra-ai/cinatra@$version."
-          echo "Publishing is performed locally via the Infisical /npm token, not in CI."
+          echo "Tag matches @cinatra-ai/cinatra@$version — publishing via OIDC."
+
+      - name: Publish to npm via OIDC trusted publishing (tokenless)
+        run: npm publish --access public
