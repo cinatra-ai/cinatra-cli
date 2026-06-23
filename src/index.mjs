@@ -7868,6 +7868,16 @@ async function runDevCms(service, argv = []) {
         `Expected: cinatra dev ${service} <start|stop>.`,
     );
   }
+  // Reject any unexpected trailing token (CodeRabbit): the verb is the ONLY
+  // accepted argument, so a malformed `dev <svc> start oops` / `--foo` must
+  // fail fast rather than silently perform a container action.
+  const extra = argv.slice(1).filter((tok) => String(tok ?? "").trim() !== "");
+  if (extra.length > 0) {
+    throw new Error(
+      `Unexpected argument(s) for 'cinatra dev ${service} ${verb}': ${extra.join(" ")}. ` +
+        `Expected: cinatra dev ${service} <start|stop>.`,
+    );
+  }
   if (!isComposeAvailable()) {
     throw new Error(
       "`docker compose` is not available on PATH. Install Docker + the compose plugin, then retry.",
