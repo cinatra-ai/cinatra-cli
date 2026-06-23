@@ -1,32 +1,27 @@
 name: release
 
-# Publish the `cinatra` CLI to the PUBLIC npm registry (registry.npmjs.org) on a
-# version tag. This is a DIRECT public `npm publish --access public` — NOT the
-# marketplace submission path the extension repos use.
+# Tag-time RELEASE VALIDATOR for the `@cinatra-ai/cinatra` CLI.
 #
-# Trigger: pushing a tag `v<package.json .version>` (e.g. v0.1.0). The job
-# refuses to publish unless the tag matches the manifest version, re-checks that
-# the version is not already on npm (E404 == available; a race could have
-# claimed it between repo creation and release), then publishes.
+# Publishing is performed LOCALLY (a maintainer runs `npm publish --access public`
+# authenticated with the Infisical-held `/npm` token) — NOT in CI. So this
+# workflow does NOT publish; it exists only to FAIL LOUDLY if a `v*` tag is pushed
+# whose name does not equal the manifest version. The full install/test/pack
+# contract runs in ci.yml on every PR and on main; duplicating it here (as a
+# second mutable install/test gate) would add no signal once CI is not publishing.
 #
-# OWNER-IRREDUCIBLE prerequisites (the workflow is dormant until both exist):
-#   1. The repo secret `NPM_TOKEN` — an npm automation token with publish rights
-#      for the unscoped `cinatra` package, under the owner's npm auth.
-#   2. The `v0.1.0` (and later) tag, created by the owner.
+# Trigger: pushing a tag `v<package.json .version>` (e.g. v0.1.2). The job passes
+# only when the tag matches the manifest version.
 
 on:
   push:
     tags: ["v*"]
-  # Manual backfill: must be dispatched against a TAG ref equal to
-  # v<package.json.version> (a branch HEAD can never publish — the guard below
-  # enforces tag==version).
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 jobs:
-  release:
+  validate-tag:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -34,44 +29,16 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
 
-      - name: Resolve + verify the release version matches the tag
-        id: ver
+      - name: Verify the pushed tag matches the manifest version
         run: |
           version="$(node -e 'console.log(require("./package.json").version)')"
           ref="${GITHUB_REF#refs/tags/}"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Manifest version: $version"
           echo "Tag ref:          $ref"
           if [ "$ref" != "v$version" ]; then
-            echo "::error::Tag ($ref) must equal v<package.json.version> (v$version). Refusing to publish."
+            echo "::error::Tag ($ref) must equal v<package.json.version> (v$version)."
             exit 1
           fi
-
-      - name: Re-check npm availability (E404 == available; a race could claim it)
-        run: |
-          version="${{ steps.ver.outputs.version }}"
-          # `npm view <pkg>` exits non-zero with E404 when the package does not
-          # exist (good — first publish). If it EXISTS, fail unless this exact
-          # version is not yet published.
-          if npm view "cinatra" version >/dev/null 2>&1; then
-            if npm view "cinatra@$version" version >/dev/null 2>&1; then
-              echo "::error::cinatra@$version is already published on npm. Bump the version."
-              exit 1
-            fi
-            echo "cinatra exists on npm but $version is unpublished — proceeding."
-          else
-            echo "cinatra is not yet on npm (E404) — first publish."
-          fi
-
-      - name: Install dependencies (npm ci)
-        run: npm ci
-
-      - name: Test before publish
-        run: npm test
-
-      - name: Publish to npm (public)
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          echo "Tag matches @cinatra-ai/cinatra@$version."
+          echo "Publishing is performed locally via the Infisical /npm token, not in CI."
