@@ -943,11 +943,21 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
   }
   copyFileSync(examplePath, envPath);
   const secret = randomBytes(32).toString("hex");
+  // Mint the other required secrets too, otherwise a fresh install is broken
+  // until they are set by hand:
+  //  - NANGO_ENCRYPTION_KEY (base64 32-byte key) — Nango's connect-session flow
+  //    throws (masked 500) when it is empty, so no OAuth connector can connect.
+  //  - CINATRA_BRIDGE_TOKEN (shared secret) — the wayflow → /api/llm-bridge
+  //    callback returns 403 (content-edit "(no response)") when it is empty.
+  const nangoEncryptionKey = randomBytes(32).toString("base64");
+  const bridgeToken = randomBytes(32).toString("hex");
   let body = readFileSync(envPath, "utf8");
   body = upsertEnvKey(body, "BETTER_AUTH_SECRET", secret);
+  body = upsertEnvKey(body, "NANGO_ENCRYPTION_KEY", nangoEncryptionKey);
+  body = upsertEnvKey(body, "CINATRA_BRIDGE_TOKEN", bridgeToken);
   body = upsertEnvKey(body, "CINATRA_RUNTIME_MODE", wantMode);
   writeFileSync(envPath, body);
-  log(`  .env.local created from .env.example with a fresh BETTER_AUTH_SECRET and CINATRA_RUNTIME_MODE=${wantMode}.`);
+  log(`  .env.local created from .env.example with fresh BETTER_AUTH_SECRET, NANGO_ENCRYPTION_KEY, CINATRA_BRIDGE_TOKEN, and CINATRA_RUNTIME_MODE=${wantMode}.`);
   return { created: true, envPath };
 }
 

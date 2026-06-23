@@ -249,6 +249,10 @@ describe("ensureEnvLocal", () => {
     expect(r.created).toBe(true);
     const body = readFileSync(path.join(dir, ".env.local"), "utf8");
     expect(body).toMatch(/^BETTER_AUTH_SECRET=[0-9a-f]{64}$/m);
+    // The other required secrets are minted too (empty values break Nango
+    // connect-sessions and the wayflow bridge — see ensureEnvLocal).
+    expect(body).toMatch(/^NANGO_ENCRYPTION_KEY=\S{40,}$/m); // base64 32-byte key
+    expect(body).toMatch(/^CINATRA_BRIDGE_TOKEN=[0-9a-f]{64}$/m);
     expect(body).toMatch(/^CINATRA_RUNTIME_MODE=development$/m);
     expect(body).toMatch(/^OTHER=keepme$/m); // other keys preserved.
   });
