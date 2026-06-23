@@ -8,7 +8,6 @@
     "cinatra": {
       "type": "flow",
       "packageName": "{{packageName}}",
-      "packageVersion": "0.1.0",
       "hitlScreens": [],
       "llm": {
         "preferredProvider": "anthropic",
