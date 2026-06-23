@@ -1986,7 +1986,7 @@ function markInstanceReadyWithState(registry, slug, state, patch = {}) {
  *  override the generated values; record the instance as `external` (never
  *  auto-dropped). A destructive-leaning target needs a typed NON-ROLLBACKABLE
  *  confirm. Returns the env keys written. */
-async function executeExternalEnv({ targetDir, opts, log = console.log }) {
+async function executeExternalEnv({ targetDir, opts, conflictResolution = false, log = console.log }) {
   const ext = opts.external ?? {};
   // At least one external URL must be supplied to wire anything; an --infra=
   // external with no URLs simply skips bring-up (today's --no-infra behaviour).
@@ -1998,6 +1998,20 @@ async function executeExternalEnv({ targetDir, opts, log = console.log }) {
   }).filter(([, v]) => v != null);
 
   if (provided.length === 0) {
+    // When external was chosen TO RESOLVE a live port conflict, the local stack
+    // that holds the ports is UP — falling through to setup with the default
+    // localhost .env.local would migrate that CONFLICTING local DB. Refuse: the
+    // operator must point at an actual external DB (--db-url) or pick another
+    // resolution. (The no-conflict --no-infra path keeps its skip-bring-up
+    // behaviour — there the operator owns their own .env.local.)
+    if (conflictResolution) {
+      throw new Error(
+        "Refusing --infra=external as a conflict resolution with no external URLs: a local stack is " +
+          "holding the ports, so proceeding would point setup + migrations at that CONFLICTING local database. " +
+          "Pass --db-url (and --redis-url/--nango-url as needed) to target real external infra, or choose " +
+          "--on-conflict=isolated for a separate local stack.",
+      );
+    }
     log("- External infra (--infra=external): no --db-url/--redis-url/--nango-url/--graphiti-url given; " +
       "skipping infra bring-up only (ensure your external Postgres/Redis/Nango are reachable before setup).");
     return { wrote: [] };
@@ -2744,8 +2758,15 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
 
   // 5c. EXTERNAL infra (T13): wire the operator-supplied URLs into .env.local
   //     (sanitized-env guarded) and record the instance as `external`.
+  //     `conflictResolution` is true when external was chosen TO RESOLVE a live
+  //     port conflict (a real local stack is holding the ports): in that case
+  //     proceeding with NO external URLs would silently leave setup pointed at
+  //     the CONFLICTING local DB and migrate it — so executeExternalEnv aborts
+  //     unless a --db-url is supplied (review hardening: conflict-external must
+  //     not fall back to the occupied local DB).
   if (infraPlan === "external") {
-    await executeExternalEnv({ targetDir, opts, log });
+    const conflictResolution = resolution != null && resolution.infraPlan === "external";
+    await executeExternalEnv({ targetDir, opts, conflictResolution, log });
   }
 
   // 6. Bring up + wait for docker infra, per the resolved plan.
