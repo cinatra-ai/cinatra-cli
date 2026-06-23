@@ -94,6 +94,7 @@ describe("cinatra <subcommand> --help across matcher shapes", () => {
     [["db", "migrate", "--help"], "cinatra db migrate"], // command+mode, destructive
     [["clone", "prune", "--help"], "cinatra clone prune"], // command+mode, destructive
     [["dev", "refresh", "--help"], "cinatra dev refresh"], // command+mode, destructive
+    [["dev", "start", "--help"], "cinatra dev start"], // command+mode, spawns pnpm dev — must NOT run on --help
     [["backup", "import", "--help"], "cinatra backup import"], // command+mode, destructive
     [["reset", "dev", "--help"], "cinatra reset dev"], // command+mode, destructive
     [["mcp", "llm-access", "setup", "--help"], "cinatra mcp llm-access setup"], // command+mode+sub
