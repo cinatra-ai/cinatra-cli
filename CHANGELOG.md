@@ -4,6 +4,31 @@ All notable changes to `@cinatra-ai/cinatra` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `cinatra install` now detects an existing Cinatra instance whose ports are in
+  use and OFFERS + EXECUTES an isolation option instead of just aborting. On a
+  terminal it prompts {Isolated / Attach / Abort} and runs your choice; you can
+  also pick up front: `--on-conflict=isolated` (a second, fully separate
+  instance on a remapped port band + its own app port), `--on-conflict=stop-existing`
+  (stop the existing stack first, then install on the default ports),
+  `--on-conflict=attach` (re-use / update the existing checkout), or
+  `--infra=external` with `--db-url`/`--redis-url`/`--nango-url`/`--graphiti-url`
+  (point at your own services). Naming/sizing extras: `--instance <name>`,
+  `--app-port <n>`, `--port-offset auto|<n>`. Read-only views: `--list-instances`,
+  `--status`. Plus `--dry-run` and `--resume`. Stopping or wiping an existing
+  instance always asks for confirmation; `--yes` alone never deletes data.
+  Sharing one set of services between two instances (`co-use`,
+  `--infra=share`/`--on-conflict=co-use`) is gated for now: it fails loudly and
+  points you at `--on-conflict=isolated`. (#17)
+
+### Changed
+
+- Corrected the documented minimum Node.js version to 24 (the bootstrap already
+  requires it) in the README and `package.json` engines. (#17)
+
 ## [0.1.2] - 2026-06-22
 
 ### Changed

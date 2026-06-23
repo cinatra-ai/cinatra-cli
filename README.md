@@ -20,7 +20,7 @@ Or install globally (the command is then just `cinatra`):
 
     npm install -g @cinatra-ai/cinatra
 
-Requires Node.js >= 20.
+Requires Node.js >= 24.
 
 ## What you can do
 
@@ -34,6 +34,38 @@ Requires Node.js >= 20.
     cinatra create-extension <kind>  # scaffold a new extension to author
 
 Run `cinatra --help` for the full command list.
+
+## Running more than one instance
+
+If you already have a Cinatra instance running and `cinatra install` finds its
+ports in use, it does not just stop — it tells you who holds the ports and offers
+to set up a second instance for you. On a terminal it asks; you can also pick the
+option up front with a flag:
+
+    cinatra install --on-conflict=isolated   # a second, fully separate instance
+                                              # on its own ports + app port
+    cinatra install --on-conflict=stop-existing  # stop the existing one first,
+                                                  # then install on the default ports
+    cinatra install --on-conflict=attach     # re-use / update the existing checkout
+    cinatra install --infra=external \       # point at your own database/cache
+        --db-url <url> --redis-url <url> --nango-url <url> --graphiti-url <url>
+
+Useful extras:
+
+    cinatra install --instance <name>        # name the instance (default: the folder name)
+    cinatra install --app-port <n>           # pick the app port for an isolated instance
+    cinatra install --port-offset auto|<n>   # how far to shift an isolated instance's ports
+    cinatra install --dry-run                # show what would happen, change nothing
+    cinatra install --list-instances         # list the instances you have set up
+    cinatra install --status [--dir <path>]  # show one checkout's instance state
+    cinatra install --resume                 # finish an install that was interrupted
+
+`--list-instances` / `--status` are read-only. Stopping or wiping an existing
+instance always asks for confirmation first; `--yes` alone never deletes data.
+
+> Sharing one set of services between two instances (`co-use`) is not available
+> yet — `cinatra install` will tell you so and point you at `--on-conflict=isolated`,
+> which gives each instance its own services instead.
 
 ## Author an extension
 

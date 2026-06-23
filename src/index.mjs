@@ -283,6 +283,11 @@ Usage:
   cinatra install [--dir <path>] [--ref <main|tag|sha>] [--mode dev|prod]
                   [--repo-url <url>] [--yes] [--force] [--reset-env]
                   [--skip-dev-apps] [--no-infra] [--no-install] [--no-setup]
+                  [--on-conflict fail|prompt|isolated|stop-existing|attach|external]
+                  [--infra new|external] [--instance <slug>] [--app-port <n>]
+                  [--port-offset auto|<n>] [--db-url <url>] [--redis-url <url>]
+                  [--nango-url <url>] [--graphiti-url <url>] [--teardown-existing]
+                  [--resume] [--dry-run] [--status] [--list-instances]
   cinatra update [--ref <ref>] [--force] [--docker=auto|always|--no-docker]
   cinatra upgrade [--ref <ref>] [--force] [--docker=auto|always|--no-docker]
   cinatra setup dev [--skip-dev-apps] [--force-dev-apps]
@@ -357,6 +362,23 @@ Commands:
                     --no-infra        Do not start docker infra (point at external Postgres/Redis/Nango).
                     --no-install      Clone + env only; skip pnpm install and setup.
                     --no-setup        Clone + install only; skip running setup.
+                    When an EXISTING instance already holds the ports, install
+                    offers + executes an isolation option (prompts on a TTY):
+                    --on-conflict=isolated  Second FULL stack on remapped ports + own app port.
+                    --on-conflict=stop-existing  Stop the existing stack, then install on defaults.
+                    --on-conflict=attach    Converge on the existing checkout (no second stack).
+                    --infra=external        Point at external Postgres/Redis/Nango (--db-url/
+                                            --redis-url/--nango-url/--graphiti-url); no local infra.
+                    --instance <slug>       Name the instance (default: the install-dir basename).
+                    --app-port <n>          App port for an isolated instance.
+                    --port-offset auto|<n>  Host-port shift for an isolated instance's infra band.
+                    --teardown-existing     With stop-existing: also delete the old data volumes (typed confirm).
+                    --resume                Reconcile an interrupted (provisioning) install.
+                    --dry-run               Show the plan; make no changes.
+                    --status                Read-only: this checkout's instance state (registry/live = truth).
+                    --list-instances        Read-only: list all recorded instances.
+                    (Sharing infra between two instances — co-use / --infra=share —
+                     is gated; install fails loud and points at --on-conflict=isolated.)
   update            Move THIS checkout to a newer release, then reconcile deps +
   (alias: upgrade)  the dev database. Fetches origin --tags and fast-forwards the
                     checkout to the latest \`v*\` release tag (or --ref), then runs
