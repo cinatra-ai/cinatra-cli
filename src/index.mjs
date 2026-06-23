@@ -7521,6 +7521,11 @@ async function stopDevMainRuntime(repoRoot) {
   return { stopped: true };
 }
 
+// Returns the structured `{ stopped, reason? }` from stopDevMainRuntime so
+// callers (runDevRestart) can branch on the real outcome rather than a global
+// side-channel. Still owns the CLI-surface concerns: lock acquire/release,
+// the success/warn log line, and the `process.exitCode = 1` on a
+// could-not-confirm stop.
 async function runDevStop(argv) {
   rejectTailscaleAuthkeyFlag(argv);
   const { repoRoot } = resolveDevMainTarget();
@@ -7541,16 +7546,19 @@ async function runDevStop(argv) {
     console.warn(`Dev main: could not confirm it stopped (${stopResult.reason}). Investigate manually.`);
     process.exitCode = 1;
   }
+  return stopResult;
 }
 
 async function runDevRestart(argv) {
-  await runDevStop(argv);
-  // `runDevStop` sets `process.exitCode = 1` on a could-not-confirm-stop; a
-  // restart must NOT then start a second instance on top of a possibly-live
-  // one (the start would refuse on the not-ours guard anyway, but failing
-  // fast is clearer).
-  if (process.exitCode === 1) {
-    throw new Error("Dev main restart aborted: stop could not be confirmed (see warning above).");
+  // Branch on the structured stop RESULT, not the global `process.exitCode`
+  // side-channel: a restart must NOT start a second instance on top of a
+  // possibly-live one (the start would refuse on the not-ours guard anyway,
+  // but failing fast here is clearer and not coupled to exit-code convention).
+  const stopResult = await runDevStop(argv);
+  if (!stopResult.stopped) {
+    throw new Error(
+      `Dev main restart aborted: stop could not be confirmed (${stopResult.reason}).`,
+    );
   }
   await runDevStart(argv);
 }
