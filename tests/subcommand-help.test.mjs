@@ -104,6 +104,7 @@ describe("cinatra <subcommand> --help across matcher shapes", () => {
     [["mcp", "llm-access", "setup", "--help"], "cinatra mcp llm-access setup"], // command+mode+sub
     [["doctor", "--help"], "cinatra doctor"], // command (read-only, still must not run)
     [["status", "-h"], "cinatra status"], // command, -h alias
+    [["logs", "--help"], "cinatra logs"], // command, read-only — usage only, no log read/compose spawn
   ];
 
   it.each(cases)("`%j` prints usage, exits 0, no side effect", (args, token) => {
