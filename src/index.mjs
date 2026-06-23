@@ -283,6 +283,8 @@ Usage:
   cinatra install [--dir <path>] [--ref <main|tag|sha>] [--mode dev|prod]
                   [--repo-url <url>] [--yes] [--force] [--reset-env]
                   [--skip-dev-apps] [--no-infra] [--no-install] [--no-setup]
+  cinatra update [--ref <ref>] [--force] [--docker=auto|always|--no-docker]
+  cinatra upgrade [--ref <ref>] [--force] [--docker=auto|always|--no-docker]
   cinatra setup dev [--skip-dev-apps] [--force-dev-apps]
   cinatra setup prod
   cinatra setup nango
@@ -355,6 +357,18 @@ Commands:
                     --no-infra        Do not start docker infra (point at external Postgres/Redis/Nango).
                     --no-install      Clone + env only; skip pnpm install and setup.
                     --no-setup        Clone + install only; skip running setup.
+  update            Move THIS checkout to a newer release, then reconcile deps +
+  (alias: upgrade)  the dev database. Fetches origin --tags and fast-forwards the
+                    checkout to the latest \`v*\` release tag (or --ref), then runs
+                    the \`dev refresh\` reconcile. Dev mode only; refuses a dirty or
+                    divergent tree unless --force (which stashes / hard-resets,
+                    exactly like install). Production upgrades via release-tagged
+                    Docker images, never this command.
+                    --ref <ref>       Move to a specific branch/tag/sha (default: latest v* release).
+                    --force           Stash a dirty tree / hard-reset a divergent branch first.
+                    --docker=auto     (default) start the bundled docker stack only when owned.
+                    --docker=always   force docker compose up -d during the reconcile.
+                    --no-docker       skip the docker step of the reconcile.
   dev refresh       Reconcile your local dev environment (dependencies + dev
                     database schema) to the code you have checked out. Run it
                     after a git pull or branch switch. Dev mode only; it never
@@ -4124,6 +4138,175 @@ async function runDbMigrate(rest) {
       `${label} migrations (${schemaName}): ${down ? "reverted" : "applied"} ${result.ranNames.length} — ${result.ranNames.join(", ")}`,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Release update (`cinatra update` / `cinatra upgrade`) — cinatra-cli#11.
+// ---------------------------------------------------------------------------
+//
+// Unlike `dev refresh` (which reconciles deps + dev DB to the code ALREADY
+// checked out and never touches git) and unlike `install` (which bootstraps from
+// zero), `update` is the one command that MOVES an existing checkout forward: it
+// fetches origin --tags, fast-forwards the checkout to the latest published `v*`
+// release tag (reusing install.mjs's shared git-move helpers — the same fetch →
+// checkout → ff-only/reset logic install uses, exported as
+// fastForwardCheckoutToRef + resolveLatestReleaseTag), then runs the `dev
+// refresh` reconcile (deps + dev DB schema). The heavy git-move primitives are
+// lazy-imported from the dependency-light install.mjs (same pattern as the
+// install handler) so the thin-CLI core stays lean.
+//
+// Dev-only and never destructive to git history beyond an explicit --force
+// (which stashes a dirty tree / hard-resets a divergent branch, exactly like
+// install). Production instances ship as release-tagged Docker images, never
+// through this command (the dev-refresh guards below enforce that).
+
+// A git ref `update` is willing to move to via --ref: a branch/tag/sha name.
+// Mirrors install.mjs's SAFE_REF_RE (no whitespace, no leading dash → no
+// option-injection, no `..` refspec metacharacters).
+const UPDATE_SAFE_REF_RE = /^(?!-)[A-Za-z0-9._\/-]+$/;
+
+/** Parse `update` flags: `--ref <ref>` pins a target ref (default: the latest
+ *  `v*` release tag); `--force` stashes a dirty tree / hard-resets a divergent
+ *  branch; the remaining tokens (`--docker=…`, `--no-docker`) pass through to
+ *  the `dev refresh` reconcile. ALL flags (including the forwarded docker flags)
+ *  are validated HERE, before any git move, so a typo can never leave the
+ *  checkout moved but the deps/DB unreconciled. Unknown flags fail loudly. */
+function parseUpdateArgs(argv = []) {
+  let ref = null;
+  let force = false;
+  const refreshArgs = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--ref") {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith("--")) {
+        throw new Error(`--ref requires a value (got ${value === undefined ? "end of arguments" : `"${value}"`}).`);
+      }
+      if (!UPDATE_SAFE_REF_RE.test(value) || value.includes("..")) {
+        throw new Error(
+          `Invalid --ref "${value}". Use a branch, tag, or commit sha ` +
+            `(letters/digits/dot/dash/underscore/slash; no leading dash, no "..").`,
+        );
+      }
+      ref = value;
+      i += 1;
+      continue;
+    }
+    if (arg === "--force") {
+      force = true;
+      continue;
+    }
+    if (arg === "--no-docker" || arg.startsWith("--docker=")) {
+      refreshArgs.push(arg);
+      continue;
+    }
+    throw new Error(
+      `Unknown flag "${arg}" for cinatra update. Supported flags: --ref <ref>, --force, --docker=auto|always, --no-docker.`,
+    );
+  }
+  // Validate the forwarded docker flags NOW (parseDevRefreshFlags throws on a
+  // bad --docker= value) so we never move git and then fail the reconcile.
+  parseDevRefreshFlags(refreshArgs);
+  return { ref, force, refreshArgs };
+}
+
+async function runUpdate(rest) {
+  const { ref: pinnedRef, force, refreshArgs } = parseUpdateArgs(rest);
+
+  // Anchor on the operator's checkout (same resolution every other in-checkout
+  // command uses). update operates on an EXISTING checkout — getRepoRoot throws
+  // the actionable "must run from inside a cinatra checkout" message otherwise.
+  const repoRoot = getRepoRoot();
+
+  // Guard: update is dev-only, fail-closed — production updates ship as
+  // release-tagged Docker images, never through this command. Mirror the
+  // dev-refresh mode guard (the .env.local file value is authoritative; a shell
+  // override cannot loosen it).
+  const envPath = path.join(repoRoot, ".env.local");
+  if (!existsSync(envPath)) {
+    throw new Error(
+      "No .env.local found. `cinatra update` moves an existing dev checkout to a newer release — " +
+        "run `cinatra install` (or `make setup`) first.",
+    );
+  }
+  const fileEnv = parseEnvFile(envPath);
+  const fileMode = APP_RUNTIME_MODE_ENV_KEYS.map((key) =>
+    typeof fileEnv[key] === "string" ? fileEnv[key].trim() : "",
+  ).find((value) => value.length > 0);
+  if (!fileMode) {
+    throw new Error(
+      "No CINATRA_RUNTIME_MODE set in .env.local. `cinatra update` moves an existing dev checkout — " +
+        "run `cinatra install` first.",
+    );
+  }
+  const fileModeLower = fileMode.toLowerCase();
+  if (fileModeLower !== "development" && fileModeLower !== "dev") {
+    throw new Error(
+      `cinatra update is development-only, but .env.local has CINATRA_RUNTIME_MODE=${fileMode}. ` +
+        "Production instances upgrade via release-tagged Docker images, not this command.",
+    );
+  }
+
+  // Preflight the SAME shell-override guard `runDevRefresh` enforces, but BEFORE
+  // the git move — a `SUPABASE_DB_URL`/`SUPABASE_SCHEMA` shell export that
+  // differs from .env.local would make the post-move reconcile throw, leaving the
+  // checkout advanced but deps/DB unreconciled. Fail fast here so a known
+  // reconcile blocker never produces a half-applied update. (runDevRefresh
+  // re-checks it too, so this is belt-and-braces, not a behavior change.)
+  for (const key of ["SUPABASE_DB_URL", "SUPABASE_SCHEMA"]) {
+    const shellValue = process.env[key];
+    if (shellValue !== undefined && shellValue.trim() !== (fileEnv[key]?.trim() ?? "")) {
+      throw new Error(
+        `Refusing: ${key} is set in your shell environment and differs from .env.local. ` +
+          "cinatra update reconciles the .env.local dev database after moving git — unset the override " +
+          "(or run from a clean shell) and retry.",
+      );
+    }
+  }
+
+  // Lazy-import the dependency-light git-move helpers from install.mjs (same
+  // pattern as the install handler) — keeps the thin-CLI core lean.
+  const { resolveLatestReleaseTag, moveExistingCheckoutToRef } = await import("./install.mjs");
+
+  const currentSha = (() => {
+    try {
+      return execFileSync("git", ["-C", repoRoot, "rev-parse", "--short", "HEAD"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+    } catch {
+      return null;
+    }
+  })();
+  if (currentSha) console.log(`Current commit: ${currentSha}`);
+
+  // 1. Resolve the target: an explicit --ref (kind "ref" — auto-detect branch vs
+  //    tag/sha), else the latest `v*` release TAG read from origin via
+  //    `git ls-remote` (kind "tag" — moved to detached, immune to a tag/branch
+  //    name collision).
+  let targetRef = pinnedRef;
+  let moveKind = "ref";
+  if (targetRef) {
+    console.log(`- Target ref: ${targetRef} (--ref).`);
+  } else {
+    targetRef = await resolveLatestReleaseTag({ targetDir: repoRoot });
+    moveKind = "tag";
+    console.log(`- Latest release: ${targetRef}.`);
+  }
+
+  // 2. Move the checkout to the target. The helper fetches the EXACT ref,
+  //    resolves it to a concrete commit (NOT ambient FETCH_HEAD), and fast-
+  //    forwards (or, with --force, hard-resets) onto it. Returns the new HEAD sha.
+  const newSha = moveExistingCheckoutToRef({ targetDir: repoRoot, ref: targetRef, kind: moveKind, force });
+  console.log(`✓ Checkout moved to ${targetRef} (${newSha}).`);
+
+  // 3. Reconcile deps + dev DB schema to the freshly-moved code — exactly the
+  //    `dev refresh` flow (idempotent, non-destructive). Forward the (already
+  //    validated) docker flags through verbatim.
+  console.log("- Reconciling dependencies + dev database to the new release…");
+  await runDevRefresh(refreshArgs);
+
+  console.log(`\n✔ Updated to ${targetRef}. Restart your dev server: make dev`);
 }
 
 // ---------------------------------------------------------------------------
@@ -9355,6 +9538,15 @@ function buildHandlers() {
       const args = mode !== undefined ? [mode, ...rest] : rest;
       const { runInstall } = await import("./install.mjs");
       await runInstall(args);
+    },
+    // `update` / `upgrade` are command-only descriptors, so the dispatcher's
+    // `mode` slot (argv[1]) holds the FIRST option token (e.g. `--ref`) and is
+    // NOT in `rest`. Re-prepend it so all flags reach runUpdate's parser.
+    update: async (rest, mode) => {
+      await runUpdate(mode !== undefined ? [mode, ...rest] : rest);
+    },
+    upgrade: async (rest, mode) => {
+      await runUpdate(mode !== undefined ? [mode, ...rest] : rest);
     },
     login: async (rest, mode) => {
       // `login` is a command-only descriptor, so the dispatcher's `mode` slot

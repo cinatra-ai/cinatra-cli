@@ -57,6 +57,18 @@ export const COMMAND_DESCRIPTORS = [
     summary: "Bootstrap a Cinatra dev/prod instance from zero (clone, env, infra, setup).",
   },
   {
+    id: "update",
+    path: ["update"],
+    match: "command",
+    summary: "Move this checkout to the latest v* release, then reconcile deps + dev DB.",
+  },
+  {
+    id: "upgrade",
+    path: ["upgrade"],
+    match: "command",
+    summary: "Alias for `cinatra update`.",
+  },
+  {
     id: "login",
     path: ["login"],
     match: "command",

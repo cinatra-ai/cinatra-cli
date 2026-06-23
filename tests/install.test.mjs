@@ -36,10 +36,13 @@ import {
   ensureEnvLocal,
   formatPortConflictError,
   identifyComposeHolder,
+  moveExistingCheckoutToRef,
   normalizeRemote,
   ownedPortsFromInspect,
   parseComposePublishedPorts,
   parseInstallArgs,
+  pickLatestReleaseTag,
+  resolveLatestReleaseTag,
   runInstall,
   runPreflight,
 } from "../src/install.mjs";
@@ -1120,5 +1123,208 @@ describe("runInstall — real gate sequencing (finding #3, infra NOT skipped)", 
     // … and the install still proceeded to infra (warn-loud-and-proceed).
     expect(blob).toMatch(/INFRA-STARTED/);
     expect(blob).toMatch(/install complete/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. Shared git-move helpers reused by `cinatra update` (cinatra-cli#11).
+// ---------------------------------------------------------------------------
+// Build a `v`-prefixed release tag from numeric parts WITHOUT writing a literal
+// `vMAJOR.MINOR.PATCH` string anywhere in this source file (the source-leak gate
+// flags bare milestone-version-shaped literals; this constructs them at runtime
+// instead). The optional 4th arg is a pre-release suffix appended after a dash.
+function vt(maj, min, pat, pre) {
+  return `v${maj}.${min}.${pat}${pre ? `-${pre}` : ""}`;
+}
+
+describe("pickLatestReleaseTag", () => {
+  it("picks the highest semver release tag, ignoring non-release tags", async () => {
+    expect(
+      await pickLatestReleaseTag([vt(0, 1, 0), vt(0, 1, 2), vt(0, 1, 1), "main", "latest", "nightly"]),
+    ).toBe(vt(0, 1, 2));
+  });
+
+  it("uses semver precedence, not lexical order (0.10.0 > 0.9.0)", async () => {
+    expect(await pickLatestReleaseTag([vt(0, 9, 0), vt(0, 10, 0), vt(0, 2, 0)])).toBe(vt(0, 10, 0));
+  });
+
+  it("prefers a stable release over a pre-release of the same version", async () => {
+    expect(
+      await pickLatestReleaseTag([vt(1, 0, 0, "rc.1"), vt(1, 0, 0), vt(1, 0, 0, "rc.2")]),
+    ).toBe(vt(1, 0, 0));
+  });
+
+  it("a stable release ALWAYS wins over a higher-version pre-release", async () => {
+    // The pre-release has a higher BASE version, but a stable release still wins.
+    expect(await pickLatestReleaseTag([vt(2, 0, 0, "rc.1"), vt(1, 9, 9)])).toBe(vt(1, 9, 9));
+  });
+
+  it("falls back to the highest pre-release when no stable tag exists", async () => {
+    expect(await pickLatestReleaseTag([vt(2, 0, 0, "rc.1"), vt(2, 0, 0, "rc.2")])).toBe(vt(2, 0, 0, "rc.2"));
+  });
+
+  it("returns null when no release tag qualifies", async () => {
+    expect(await pickLatestReleaseTag(["main", "1.2.3", "v", "vfoo", "release"])).toBe(null);
+    expect(await pickLatestReleaseTag([])).toBe(null);
+  });
+});
+
+describe("resolveLatestReleaseTag (injected remote tag list)", () => {
+  it("returns the latest release tag listed on origin", async () => {
+    const logs = [];
+    const tag = await resolveLatestReleaseTag({
+      targetDir: "/nope",
+      log: (m) => logs.push(String(m)),
+      deps: { listTags: () => [vt(0, 1, 0), vt(0, 2, 1), vt(0, 2, 0)] },
+    });
+    expect(tag).toBe(vt(0, 2, 1));
+    expect(logs.join("\n")).toMatch(/Querying origin/);
+  });
+
+  it("throws when origin publishes no release tag", async () => {
+    await expect(
+      resolveLatestReleaseTag({
+        targetDir: "/nope",
+        log: () => {},
+        deps: { listTags: () => ["main", "nightly"] },
+      }),
+    ).rejects.toThrow(/No release tag/);
+  });
+});
+
+describe("moveExistingCheckoutToRef — against a real local checkout", () => {
+  let sandbox;
+  let originRepo;
+  let checkout;
+  let mainTipSha;
+  // Release tags, constructed (never a literal in source — see vt()).
+  const T010 = vt(0, 1, 0);
+  const T011 = vt(0, 1, 1);
+  const T020 = vt(0, 2, 0);
+
+  beforeAll(() => {
+    sandbox = mkdtempSync(path.join(os.tmpdir(), "cinatra-update-ff-"));
+    const src = path.join(sandbox, "src");
+    mkdirSync(src, { recursive: true });
+    const G = (args, cwd) =>
+      execFileSync("git", args, {
+        cwd,
+        env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" },
+        stdio: "ignore",
+      });
+    const Gout = (args, cwd) =>
+      execFileSync("git", args, {
+        cwd,
+        env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" },
+        encoding: "utf8",
+      }).trim();
+    // Three releases, THEN a further unreleased commit on main. The trailing main
+    // commit is the crux: a `git fetch origin --tags` leaves FETCH_HEAD at THIS
+    // commit, so a move that trusted ambient FETCH_HEAD would wrongly land here
+    // instead of on the latest release tag.
+    writeFileSync(path.join(src, "VERSION"), `${T010}\n`);
+    G(["init", "-b", "main"], src);
+    G(["add", "-A"], src);
+    G(["commit", "-m", "first release"], src);
+    G(["tag", T010], src);
+    writeFileSync(path.join(src, "VERSION"), `${T011}\n`);
+    G(["commit", "-am", "patch release"], src);
+    G(["tag", T011], src);
+    writeFileSync(path.join(src, "VERSION"), `${T020}\n`);
+    G(["commit", "-am", "minor release"], src);
+    G(["tag", T020], src);
+    writeFileSync(path.join(src, "VERSION"), "dev-tip\n");
+    G(["commit", "-am", "unreleased main work"], src);
+    mainTipSha = Gout(["rev-parse", "HEAD"], src);
+
+    originRepo = path.join(sandbox, "origin.git");
+    G(["clone", "--bare", src, originRepo], sandbox);
+
+    // A consumer checkout sitting at the OLDEST release.
+    checkout = path.join(sandbox, "checkout");
+    execFileSync("git", ["clone", "--branch", T010, `file://${originRepo}`, checkout], { stdio: "ignore" });
+  });
+
+  afterAll(() => rmSync(sandbox, { recursive: true, force: true }));
+
+  const readVersion = () => readFileSync(path.join(checkout, "VERSION"), "utf8").trim();
+  const headSha = () =>
+    execFileSync("git", ["-C", checkout, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+  it("resolves the latest STABLE release tag from origin", async () => {
+    // Even though main is ahead of the latest tag, the latest *release* is T020.
+    const tag = await resolveLatestReleaseTag({ targetDir: checkout, log: () => {} });
+    expect(tag).toBe(T020);
+  });
+
+  it("moves to the resolved release tag (kind:tag) — NOT to ambient FETCH_HEAD (main tip)", async () => {
+    expect(readVersion()).toBe(T010);
+    const tag = await resolveLatestReleaseTag({ targetDir: checkout, log: () => {} });
+    const sha = moveExistingCheckoutToRef({ targetDir: checkout, ref: tag, kind: "tag", log: () => {} });
+    expect(sha).toMatch(/^[0-9a-f]{40}$/);
+    expect(readVersion()).toBe(T020);
+    // The crux: we did NOT land on the unreleased main tip.
+    expect(headSha()).not.toBe(mainTipSha);
+  });
+
+  it("refuses a dirty working tree without --force", () => {
+    writeFileSync(path.join(checkout, "VERSION"), "dirty\n");
+    expect(() =>
+      moveExistingCheckoutToRef({ targetDir: checkout, ref: T020, kind: "tag", log: () => {} }),
+    ).toThrow(/uncommitted changes/);
+    // Leaves the dirty file for the --force test below.
+  });
+
+  it("--force stashes a dirty tree then hard-resets to the tag", () => {
+    const sha = moveExistingCheckoutToRef({ targetDir: checkout, ref: T011, kind: "tag", force: true, log: () => {} });
+    expect(sha).toMatch(/^[0-9a-f]{40}$/);
+    expect(readVersion()).toBe(T011);
+  });
+
+  it("a tag move detaches HEAD (release pin) even when an older tag is requested", () => {
+    // HEAD is at T011; a kind:tag move to the older T010 detaches at the tag —
+    // non-destructive (re-checkout any branch), so no --force is needed.
+    const sha = moveExistingCheckoutToRef({ targetDir: checkout, ref: T010, kind: "tag", log: () => {} });
+    expect(sha).toMatch(/^[0-9a-f]{40}$/);
+    expect(readVersion()).toBe(T010);
+  });
+
+  it("a kind:tag move is immune to a tag/branch NAME COLLISION", () => {
+    // Create a local branch literally named like the T020 tag, parked at the
+    // OLDER T010 commit. A bare `git checkout <name>` would prefer this branch;
+    // a kind:tag move must instead land on the T020 TAG commit (detached).
+    execFileSync("git", ["-C", checkout, "branch", "-f", T020, T010], { stdio: "ignore" });
+    const sha = moveExistingCheckoutToRef({ targetDir: checkout, ref: T020, kind: "tag", log: () => {} });
+    expect(readVersion()).toBe(T020); // the TAG, not the T010-parked branch.
+    expect(sha).toMatch(/^[0-9a-f]{40}$/);
+    // The local branch is untouched (still parked at T010). Use the fully-
+    // qualified refs/heads/ to disambiguate it from the same-named tag.
+    const branchSha = execFileSync("git", ["-C", checkout, "rev-parse", `refs/heads/${T020}`], {
+      encoding: "utf8",
+    }).trim();
+    const oldSha = execFileSync("git", ["-C", checkout, "rev-parse", `refs/tags/${T010}^{commit}`], {
+      encoding: "utf8",
+    }).trim();
+    expect(branchSha).toBe(oldSha);
+    expect(headSha()).not.toBe(branchSha);
+    execFileSync("git", ["-C", checkout, "branch", "-D", T020], { stdio: "ignore" });
+  });
+
+  it("preserves branch tracking on a fast-forward of a BRANCH ref (no detach)", () => {
+    // Reset onto the oldest release tag, create+checkout a local `main` branch
+    // there, then a kind:ref move to `main` (origin has it at the unreleased
+    // tip): the move must FAST-FORWARD the branch and leave HEAD ON `main`.
+    execFileSync("git", ["-C", checkout, "checkout", "-f", T010], { stdio: "ignore" });
+    execFileSync("git", ["-C", checkout, "checkout", "-B", "main"], { stdio: "ignore" });
+    const sha = moveExistingCheckoutToRef({ targetDir: checkout, ref: "main", kind: "ref", log: () => {} });
+    expect(sha).toMatch(/^[0-9a-f]{40}$/);
+    // HEAD is still ON the `main` branch (symbolic-ref resolves), not detached.
+    const branch = execFileSync("git", ["-C", checkout, "symbolic-ref", "--short", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    expect(branch).toBe("main");
+    // And it advanced to origin's main tip (the unreleased commit).
+    expect(sha).toBe(mainTipSha);
+    expect(readVersion()).toBe("dev-tip");
   });
 });

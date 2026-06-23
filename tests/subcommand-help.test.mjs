@@ -90,6 +90,8 @@ describe("cinatra <subcommand> --help across matcher shapes", () => {
   // [argv, expected usage token] — one per match kind plus more destructive cmds.
   const cases = [
     [["install", "--help"], "cinatra install"], // command, destructive
+    [["update", "--help"], "cinatra update"], // command, moves git + reconciles — must NOT run on --help
+    [["upgrade", "--help"], "cinatra upgrade"], // command, alias of update — same footgun guard
     [["setup", "dev", "--help"], "cinatra setup dev"], // command+mode (dev|prod alt), destructive
     [["db", "migrate", "--help"], "cinatra db migrate"], // command+mode, destructive
     [["clone", "prune", "--help"], "cinatra clone prune"], // command+mode, destructive
