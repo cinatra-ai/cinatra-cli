@@ -1997,21 +1997,27 @@ async function executeExternalEnv({ targetDir, opts, conflictResolution = false,
     GRAPHITI_URL: ext.graphitiUrl,
   }).filter(([, v]) => v != null);
 
+  // When external was chosen TO RESOLVE a live port conflict, the local stack
+  // that holds the ports is UP. The DATABASE is the mutation target (setup +
+  // migrations write to SUPABASE_DB_URL), so unless an explicit --db-url
+  // re-points it OFF the localhost default, setup would migrate that CONFLICTING
+  // local DB. Require --db-url SPECIFICALLY here — another external URL (e.g.
+  // only --redis-url) does NOT move the DB off localhost and must NOT satisfy the
+  // guard. (The no-conflict --no-infra path is unaffected — there the operator
+  // owns their own .env.local; see the no-URL skip below.)
+  if (conflictResolution && ext.dbUrl == null) {
+    throw new Error(
+      "Refusing --infra=external as a conflict resolution without --db-url: a local stack is holding the " +
+        "ports, so proceeding would point setup + migrations at that CONFLICTING local database (the default " +
+        "localhost SUPABASE_DB_URL). Pass --db-url to target a real external database (add --redis-url/--nango-url " +
+        "as needed), or choose --on-conflict=isolated for a separate local stack.",
+    );
+  }
+
   if (provided.length === 0) {
-    // When external was chosen TO RESOLVE a live port conflict, the local stack
-    // that holds the ports is UP — falling through to setup with the default
-    // localhost .env.local would migrate that CONFLICTING local DB. Refuse: the
-    // operator must point at an actual external DB (--db-url) or pick another
-    // resolution. (The no-conflict --no-infra path keeps its skip-bring-up
-    // behaviour — there the operator owns their own .env.local.)
-    if (conflictResolution) {
-      throw new Error(
-        "Refusing --infra=external as a conflict resolution with no external URLs: a local stack is " +
-          "holding the ports, so proceeding would point setup + migrations at that CONFLICTING local database. " +
-          "Pass --db-url (and --redis-url/--nango-url as needed) to target real external infra, or choose " +
-          "--on-conflict=isolated for a separate local stack.",
-      );
-    }
+    // No-conflict --no-infra / --infra=external with no URLs: skip bring-up only
+    // (the operator owns their own .env.local). The conflict path is already
+    // handled by the --db-url guard above, so this branch is the legacy case.
     log("- External infra (--infra=external): no --db-url/--redis-url/--nango-url/--graphiti-url given; " +
       "skipping infra bring-up only (ensure your external Postgres/Redis/Nango are reachable before setup).");
     return { wrote: [] };

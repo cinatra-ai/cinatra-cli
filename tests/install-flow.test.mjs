@@ -578,29 +578,39 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     expect(reg.registry.instances.ext.infraMode).toBe("external");
   });
 
-  it("T13c: --on-conflict=external with NO URLs REFUSES (won't migrate the conflicting local DB)", async () => {
-    // When external resolves a LIVE port conflict but no external URLs are given,
-    // proceeding would leave setup pointed at the default localhost .env.local —
-    // i.e. the CONFLICTING local DB — and migrate it. That must abort.
-    const installDir = path.join(sandbox, "ext-conflict-nourl");
+  it("T13c: --on-conflict=external resolving a conflict REQUIRES --db-url (won't migrate the conflicting local DB)", async () => {
+    // When external resolves a LIVE port conflict, the DATABASE is the mutation
+    // target: unless --db-url re-points SUPABASE_DB_URL off localhost, setup would
+    // migrate the CONFLICTING local DB. Both zero-URL AND a non-DB URL (e.g. only
+    // --redis-url, which leaves SUPABASE_DB_URL on localhost) must abort.
+    const conflictDeps = () =>
+      flowDeps({
+        detectPortConflicts: async (band) => {
+          const pg = (band ?? []).find((b) => b.service === "postgres" && b.port === 5434);
+          return pg ? [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }] : [];
+        },
+      });
+    // (a) no URLs at all.
     await expect(
       runInstall(
         [
-          "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
-          "--yes", "--no-install", "--on-conflict", "external",
+          "--dir", path.join(sandbox, "ext-conflict-nourl"), "--repo-url", `file://${originRepo}`,
+          "--ref", "main", "--yes", "--no-install", "--on-conflict", "external",
         ],
-        {
-          log: () => {},
-          deps: flowDeps({
-            // A live conflict on postgres:5434 → external must not silently fall back.
-            detectPortConflicts: async (band) => {
-              const pg = (band ?? []).find((b) => b.service === "postgres" && b.port === 5434);
-              return pg ? [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }] : [];
-            },
-          }),
-        },
+        { log: () => {}, deps: conflictDeps() },
       ),
-    ).rejects.toThrow(/Refusing --infra=external as a conflict resolution with no external URLs/);
+    ).rejects.toThrow(/Refusing --infra=external as a conflict resolution without --db-url/);
+    // (b) a non-DB external URL (redis only) does NOT move the DB off localhost.
+    await expect(
+      runInstall(
+        [
+          "--dir", path.join(sandbox, "ext-conflict-redisonly"), "--repo-url", `file://${originRepo}`,
+          "--ref", "main", "--yes", "--no-install", "--on-conflict", "external",
+          "--redis-url", "redis://cache.example:6379",
+        ],
+        { log: () => {}, deps: conflictDeps() },
+      ),
+    ).rejects.toThrow(/Refusing --infra=external as a conflict resolution without --db-url/);
   });
 
   it("T13b: a bare --yes does NOT silently arm an external --db-url (refuses without the disposable ack)", async () => {
