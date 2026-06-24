@@ -21,6 +21,9 @@ import { describe, it, expect } from "vitest";
 
 import {
   gatherDoctorReport,
+  planDoctorFixActions,
+  applyDoctorFix,
+  runDoctorCore,
   deriveConfiguredPublicMcpUrl,
   doctorAssertLlmMcpAccess,
   doctorAssertDevAppsPresence,
@@ -498,5 +501,342 @@ describe("gatherDoctorReport — full report", () => {
   it("DOCTOR_CMS_WRITE_TOOLS excludes LinkedIn publish tools", () => {
     expect(DOCTOR_CMS_WRITE_TOOLS).toContain("blog_post_publish_wordpress_start");
     expect(DOCTOR_CMS_WRITE_TOOLS).not.toContain("blog_post_publish_linkedin_start");
+  });
+});
+
+// =========================================================================
+// cinatra#14 — `cinatra doctor --fix` auto-remediation
+// =========================================================================
+
+// Minimal report builder keyed by assertion id → { verdict, detail }.
+function makeReport(byIdMap = {}) {
+  const assertions = Object.entries(byIdMap).map(([id, v]) => ({
+    id,
+    label: id,
+    verdict: v.verdict,
+    detail: v.detail ?? "",
+    remediation: null,
+  }));
+  const counts = { pass: 0, fail: 0, skip: 0 };
+  for (const a of assertions) counts[a.verdict] += 1;
+  return { assertions, counts };
+}
+
+describe("planDoctorFixActions — verdict → remediation mapping (pure)", () => {
+  it("no public MCP URL (llm-mcp-access FAIL) → ['tunnel'] only", () => {
+    const report = makeReport({
+      "llm-mcp-access": {
+        verdict: "fail",
+        detail: "1 provider(s) provisioned, but NO public MCP URL is set",
+      },
+      "public-reachability": {
+        verdict: "skip",
+        detail: "no public MCP URL configured (see the LLM-MCP-access assertion)",
+      },
+    });
+    expect(planDoctorFixActions(report)).toEqual(["tunnel"]);
+  });
+
+  it("missing provider creds → re-provision via 'setup'; with no URL also 'tunnel' (setup first)", () => {
+    const report = makeReport({
+      "llm-mcp-access": {
+        verdict: "fail",
+        detail: "no LLM provider credentials and no public MCP URL",
+      },
+    });
+    // 'setup' (creds) runs before 'tunnel' (URL re-establish then verify).
+    expect(planDoctorFixActions(report)).toEqual(["setup", "tunnel"]);
+  });
+
+  it("public endpoint REJECTS the Bearer (public-reachability FAIL) → ['setup'] only", () => {
+    const report = makeReport({
+      "llm-mcp-access": { verdict: "pass", detail: "ok" },
+      "public-reachability": {
+        verdict: "fail",
+        detail: "public tools/list returned HTTP 401",
+      },
+    });
+    expect(planDoctorFixActions(report)).toEqual(["setup"]);
+  });
+
+  it("all checks pass → no actions", () => {
+    const report = makeReport({
+      "llm-mcp-access": { verdict: "pass", detail: "ok" },
+      "public-reachability": { verdict: "pass", detail: "ok" },
+    });
+    expect(planDoctorFixActions(report)).toEqual([]);
+  });
+
+  it("only CMS / app-down SKIPs (no URL/creds issue) → no actions (CMS not auto-fixed)", () => {
+    const report = makeReport({
+      "llm-mcp-access": { verdict: "pass", detail: "ok" },
+      "public-reachability": {
+        verdict: "skip",
+        detail: "the configured public MCP URL is unreachable or timed out",
+      },
+      "wordpress-readiness": {
+        verdict: "skip",
+        detail: "WordPress dev container is not running",
+      },
+      "dev-apps-presence": { verdict: "fail", detail: "dev-app clone missing" },
+    });
+    expect(planDoctorFixActions(report)).toEqual([]);
+  });
+});
+
+describe("applyDoctorFix — runs planned remediations through injected seams", () => {
+  function recordingDeps() {
+    const calls = [];
+    return {
+      calls,
+      deps: {
+        runSetup: async (mode) => {
+          calls.push(`setup:${mode}`);
+        },
+        runDevTunnel: async (argv) => {
+          calls.push(`tunnel:${argv.join(" ")}`);
+        },
+      },
+    };
+  }
+
+  it("no-URL report → calls dev tunnel start, not setup", async () => {
+    const { calls, deps } = recordingDeps();
+    const report = makeReport({
+      "llm-mcp-access": {
+        verdict: "fail",
+        detail: "1 provider(s) provisioned, but NO public MCP URL is set",
+      },
+    });
+    const result = await applyDoctorFix({ report, deps });
+    expect(calls).toEqual(["tunnel:start"]);
+    expect(result.applied).toEqual(["tunnel"]);
+    expect(result.failed).toEqual([]);
+  });
+
+  it("missing-creds report → runs setup dev THEN dev tunnel start in order", async () => {
+    const { calls, deps } = recordingDeps();
+    const report = makeReport({
+      "llm-mcp-access": {
+        verdict: "fail",
+        detail: "no LLM provider credentials and no public MCP URL",
+      },
+    });
+    const result = await applyDoctorFix({ report, deps });
+    expect(calls).toEqual(["setup:dev", "tunnel:start"]);
+    expect(result.attempted).toEqual(["setup", "tunnel"]);
+    expect(result.applied).toEqual(["setup", "tunnel"]);
+  });
+
+  it("healthy report → no seam invoked", async () => {
+    const { calls, deps } = recordingDeps();
+    const report = makeReport({
+      "llm-mcp-access": { verdict: "pass", detail: "ok" },
+      "public-reachability": { verdict: "pass", detail: "ok" },
+    });
+    const result = await applyDoctorFix({ report, deps });
+    expect(calls).toEqual([]);
+    expect(result.attempted).toEqual([]);
+  });
+
+  it("a failed `setup` prerequisite ABORTS the dependent tunnel bring-up (fail-closed)", async () => {
+    // SECURITY: `tunnel` exposes the public MCP endpoint via Funnel; it must
+    // only run once `setup` (OAuth/JWKS/public-URL provisioning) succeeded. If
+    // setup fails we MUST NOT bring the Funnel up over an unprovisioned auth
+    // surface — the dependent action is aborted, never attempted.
+    const calls = [];
+    const deps = {
+      runSetup: async () => {
+        calls.push("setup");
+        throw new Error("provisioning blew up");
+      },
+      runDevTunnel: async (argv) => {
+        calls.push(`tunnel:${argv.join(" ")}`);
+      },
+    };
+    const report = makeReport({
+      "llm-mcp-access": {
+        verdict: "fail",
+        detail: "no LLM provider credentials and no public MCP URL",
+      },
+    });
+    const result = await applyDoctorFix({ report, deps });
+    // setup threw → tunnel is ABORTED, never invoked.
+    expect(calls).toEqual(["setup"]);
+    expect(calls).not.toContain("tunnel:start");
+    expect(result.failed).toEqual(["setup"]);
+    expect(result.aborted).toEqual(["tunnel"]);
+    expect(result.applied).toEqual([]);
+  });
+
+  it("a failed independent remediation does NOT abort the tunnel when setup succeeded", async () => {
+    // Guard the converse: only a FAILED PREREQUISITE gates the tunnel. When
+    // setup SUCCEEDS, the tunnel still runs as planned.
+    const calls = [];
+    const deps = {
+      runSetup: async () => {
+        calls.push("setup");
+      },
+      runDevTunnel: async (argv) => {
+        calls.push(`tunnel:${argv.join(" ")}`);
+      },
+    };
+    const report = makeReport({
+      "llm-mcp-access": {
+        verdict: "fail",
+        detail: "no LLM provider credentials and no public MCP URL",
+      },
+    });
+    const result = await applyDoctorFix({ report, deps });
+    expect(calls).toEqual(["setup", "tunnel:start"]);
+    expect(result.applied).toEqual(["setup", "tunnel"]);
+    expect(result.aborted).toEqual([]);
+    expect(result.failed).toEqual([]);
+  });
+
+  it("SECRET BOUNDARY: a thrown remediation error is NOT echoed to output", async () => {
+    // Assembled from fragments so no credential-shaped literal exists in source
+    // (the secret-scan gate flags a verbatim connection-string literal). At
+    // runtime this stands in for the kind of secret-bearing connection string a
+    // `setup`/`tunnel` error can carry; the gate-relevant property is that the
+    // applier never echoes the thrown message.
+    const SECRET = ["sentinel", "user", "DO-NOT-LOG-CREDENTIAL", "db.internal"].join("::");
+    const logs = [];
+    const origErr = console.error;
+    const origLog = console.log;
+    console.error = (...a) => logs.push(a.join(" "));
+    console.log = (...a) => logs.push(a.join(" "));
+    try {
+      const deps = {
+        runSetup: async () => {
+          throw new Error(`connection failed: ${SECRET}`);
+        },
+        runDevTunnel: async () => {},
+      };
+      const report = makeReport({
+        "llm-mcp-access": {
+          verdict: "fail",
+          detail: "no LLM provider credentials and no public MCP URL",
+        },
+      });
+      await applyDoctorFix({ report, deps });
+    } finally {
+      console.error = origErr;
+      console.log = origLog;
+    }
+    expect(logs.join("\n")).not.toContain("DO-NOT-LOG-CREDENTIAL");
+    expect(logs.join("\n")).not.toContain(SECRET);
+  });
+});
+
+describe("runDoctorCore — gather → remediate → fresh re-gather → gate", () => {
+  function failingThenHealthy() {
+    const reports = [
+      makeReport({
+        "llm-mcp-access": {
+          verdict: "fail",
+          detail: "1 provider(s) provisioned, but NO public MCP URL is set",
+        },
+      }),
+      makeReport({ "llm-mcp-access": { verdict: "pass", detail: "ok" } }),
+    ];
+    let i = 0;
+    const calls = [];
+    const gather = async () => {
+      calls.push("gather");
+      return reports[Math.min(i++, reports.length - 1)];
+    };
+    return { gather, calls };
+  }
+
+  it("without --fix: gathers ONCE, no remediation, gates on the (failing) report", async () => {
+    const { gather, calls } = failingThenHealthy();
+    let applied = false;
+    const res = await runDoctorCore({
+      strict: false,
+      fix: false,
+      gather,
+      applyFix: async () => {
+        applied = true;
+      },
+    });
+    expect(calls).toEqual(["gather"]);
+    expect(applied).toBe(false);
+    expect(res.fixed).toBe(false);
+    expect(res.exitNonZero).toBe(true); // first report had a FAIL
+  });
+
+  it("with --fix on a failing report: remediates, RE-GATHERS, gates on the post-fix report", async () => {
+    const { gather, calls } = failingThenHealthy();
+    let applied = false;
+    const res = await runDoctorCore({
+      strict: false,
+      fix: true,
+      gather,
+      applyFix: async () => {
+        applied = true;
+      },
+    });
+    expect(applied).toBe(true);
+    expect(calls).toEqual(["gather", "gather"]); // fresh re-gather after fix
+    expect(res.fixed).toBe(true);
+    expect(res.exitNonZero).toBe(false); // post-fix report PASSes → exit 0
+  });
+
+  it("with --fix when the fix does NOT stick: final (still-failing) report gates non-zero", async () => {
+    const stillFailing = makeReport({
+      "llm-mcp-access": {
+        verdict: "fail",
+        detail: "1 provider(s) provisioned, but NO public MCP URL is set",
+      },
+    });
+    const calls = [];
+    const res = await runDoctorCore({
+      strict: false,
+      fix: true,
+      gather: async () => {
+        calls.push("gather");
+        return stillFailing;
+      },
+      applyFix: async () => {},
+    });
+    expect(calls).toEqual(["gather", "gather"]);
+    expect(res.exitNonZero).toBe(true); // fix didn't help → still gates non-zero
+  });
+
+  it("with --fix on an already-healthy report: no remediation, no re-gather", async () => {
+    const healthy = makeReport({ "llm-mcp-access": { verdict: "pass", detail: "ok" } });
+    let applied = false;
+    const calls = [];
+    const res = await runDoctorCore({
+      strict: false,
+      fix: true,
+      gather: async () => {
+        calls.push("gather");
+        return healthy;
+      },
+      applyFix: async () => {
+        applied = true;
+      },
+    });
+    expect(applied).toBe(false);
+    expect(calls).toEqual(["gather"]); // no re-gather when nothing to fix
+    expect(res.exitNonZero).toBe(false);
+  });
+
+  it("--strict gates non-zero on a SKIP-only report (no --fix)", async () => {
+    const skipOnly = makeReport({
+      "public-reachability": {
+        verdict: "skip",
+        detail: "the configured public MCP URL is unreachable or timed out",
+      },
+    });
+    const res = await runDoctorCore({
+      strict: true,
+      fix: false,
+      gather: async () => skipOnly,
+      applyFix: async () => {},
+    });
+    expect(res.exitNonZero).toBe(true);
   });
 });
