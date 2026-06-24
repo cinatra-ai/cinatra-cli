@@ -31,12 +31,11 @@
 export const TAILSCALE_OAUTH_PROVIDER_CONFIG_KEY = "cinatra-tailscale-oauth";
 
 /**
- * Typed error for the OAuth proxy-mint path. A thrown `TailscaleProxyMintError`
- * means the mint FAILED in a way that must NOT silently fall back to the
- * API-key path (401/403/429/5xx/network/malformed) — the operator configured
- * OAuth and we must surface the failure rather than mask it. The ONLY
- * fall-back-eligible outcome (a confirmed-missing OAuth connection) is signalled
- * by a `null` return, never a throw.
+ * Typed error for the OAuth proxy-mint path. The mint either succeeds
+ * (`{ authKey }`) or throws this — there is NO fall-back-eligible return value.
+ * A throw means OAuth mode FAILS CLOSED (missing wiring, any non-2xx, network/
+ * timeout, malformed body); the operator configured OAuth, so we surface the
+ * failure rather than silently downgrade to the API-key path.
  *
  * Messages are static/sanitised — they never interpolate a secret, token,
  * key, or upstream body.
