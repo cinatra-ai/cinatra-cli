@@ -787,6 +787,20 @@ function normalizeOptionalUrl(value) {
   }
 }
 
+/**
+ * Refuse a destructive/mutating verb against a remote (non-loopback) target
+ * before any network call (eng#231). Delegates to the login module's
+ * target-origin guard via a lazy import (keeps the heavy module out of the
+ * top-level import graph). A null/loopback `appUrl` is allowed.
+ *
+ * @param {string|undefined} appUrl the raw `--app-url` value (pre-default)
+ * @param {string} verb a human label for the refused operation
+ */
+async function assertRemoteDestructiveRefused(appUrl, verb) {
+  const { assertDestructiveTargetAllowed } = await import("./login.mjs");
+  assertDestructiveTargetAllowed(appUrl, verb);
+}
+
 // True only for a real cinatra MONOREPO ROOT — a directory that carries the
 // pnpm workspace manifest AND the never-removed internal `@cinatra-ai/migrations`
 // package manifest. This is the sentinel that lets `getRepoRoot()` distinguish
@@ -9659,6 +9673,11 @@ async function runSkillsResetRepo(argv) {
     throw new Error('Pass --yes to confirm: cinatra skills reset-repo --yes\nThis will replace all content in the connected GitHub skills repo with the local store.');
   }
 
+  // eng#231: refuse a remote (non-loopback) target before any network call —
+  // `skills reset-repo` is a destructive force-push; remote-destructive stays
+  // gated on the operator security gate (eng#229).
+  await assertRemoteDestructiveRefused(readOptionValue(argv, "--app-url"), "skills reset-repo");
+
   const appUrl = normalizeOptionalUrl(readOptionValue(argv, "--app-url") ?? "http://localhost:3000");
   const endpoint = `${appUrl}/api/skills/reset-repo`;
 
@@ -9710,6 +9729,10 @@ async function runExtensionsPurge(argv) {
     );
   }
   const reason = readOptionValue(argv, "--reason");
+  // eng#231: refuse a remote (non-loopback) target before any network call —
+  // `extensions purge` is irreversible; remote-destructive stays gated on the
+  // operator security gate (eng#229).
+  await assertRemoteDestructiveRefused(readOptionValue(argv, "--app-url"), "extensions purge");
   const appUrl = normalizeOptionalUrl(
     readOptionValue(argv, "--app-url") ?? "http://localhost:3000",
   );
@@ -9956,13 +9979,38 @@ function readZipFilesCli(buf) {
 // ---------------------------------------------------------------------------
 
 async function runAgentExport(argv) {
+  const query = argv.find((a) => !a.startsWith("--"));
+  if (!query) throw new Error('Usage: cinatra agent export <id-or-name> [--file <output.zip>]');
+
+  // Remote path (eng#231): when a target is selected (--app-url or --profile),
+  // fetch the portable ZIP from the instance's authenticated
+  // /api/cli/agents/export (no DB connection string needed). The LOCAL
+  // direct-Postgres path below is the fallback for the in-repo dev workflow.
+  const appUrl = readOptionValue(argv, "--app-url");
+  const profile = readOptionValue(argv, "--profile");
+  if (appUrl || profile) {
+    const { cliApiGetBytes } = await import("./login.mjs");
+    const search = new URLSearchParams({ query });
+    const zipBytes = await cliApiGetBytes(
+      `/api/cli/agents/export?${search.toString()}`,
+      { appUrl, profile },
+    );
+    const outFile = readOptionValue(argv, "--file") ?? (() => {
+      const slug = query.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+      const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+      return path.join(DEFAULT_DOWNLOADS_DIRECTORY, `cinatra-agent-${slug}-${dateStr}.zip`);
+    })();
+    const outPath = path.isAbsolute(outFile) ? outFile : path.resolve(process.cwd(), outFile);
+    mkdirSync(path.dirname(outPath), { recursive: true });
+    writeFileSync(outPath, Buffer.from(zipBytes));
+    console.log(`Exported agent "${query}" → ${outPath}`);
+    return;
+  }
+
   const repoRoot = getRepoRoot();
   const env = collectEnvironment(repoRoot);
   const connectionString = requiredEnv(env, "SUPABASE_DB_URL");
   const schemaName = env.SUPABASE_SCHEMA?.trim() || "cinatra";
-
-  const query = argv.find((a) => !a.startsWith("--"));
-  if (!query) throw new Error('Usage: cinatra agent export <id-or-name> [--file <output.zip>]');
 
   const client = await createClient(connectionString);
   await client.connect();
@@ -10037,11 +10085,6 @@ async function runAgentExport(argv) {
 // ---------------------------------------------------------------------------
 
 async function runAgentImport(argv) {
-  const repoRoot = getRepoRoot();
-  const env = collectEnvironment(repoRoot);
-  const connectionString = requiredEnv(env, "SUPABASE_DB_URL");
-  const schemaName = env.SUPABASE_SCHEMA?.trim() || "cinatra";
-
   const filePath = argv.find((a) => !a.startsWith("--"));
   if (!filePath) throw new Error('Usage: cinatra agent import <file.zip> [--name <override-name>]');
 
@@ -10049,6 +10092,33 @@ async function runAgentImport(argv) {
   if (!existsSync(absPath)) throw new Error(`File not found: ${absPath}`);
 
   const zipBuf = readFileSync(absPath);
+
+  // Remote path (eng#231): when a target is selected, POST the ZIP body to the
+  // instance's authenticated /api/cli/agents/import (insert-only authoring).
+  // The LOCAL direct-Postgres path below is the in-repo dev fallback.
+  const appUrl = readOptionValue(argv, "--app-url");
+  const profile = readOptionValue(argv, "--profile");
+  if (appUrl || profile) {
+    const { cliApiPostBytes } = await import("./login.mjs");
+    const nameOverride = readOptionValue(argv, "--name");
+    const search = new URLSearchParams();
+    if (nameOverride) search.set("name", nameOverride);
+    const qs = search.toString();
+    const result = await cliApiPostBytes(
+      `/api/cli/agents/import${qs ? `?${qs}` : ""}`,
+      zipBuf,
+      { appUrl, profile, contentType: "application/zip" },
+    );
+    console.log(`Imported agent "${result.name}" → ID: ${result.id}`);
+    console.log(`View in app: ${result.viewInApp ?? `/agents/builder/${result.id}`}`);
+    return;
+  }
+
+  const repoRoot = getRepoRoot();
+  const env = collectEnvironment(repoRoot);
+  const connectionString = requiredEnv(env, "SUPABASE_DB_URL");
+  const schemaName = env.SUPABASE_SCHEMA?.trim() || "cinatra";
+
   const files = readZipFilesCli(zipBuf);
 
   const agentRaw = files.get("agent.json");
