@@ -41,18 +41,41 @@ import {
 } from "@modelcontextprotocol/sdk/client/auth.js";
 
 // The OAuth scopes the CLI requests. `mcp:connect` is the instance's admission
-// scope for the control plane; the rest are standard OIDC scopes for the token
-// + refresh. Authorization (role) is enforced SERVER-SIDE per endpoint — the
-// scope only admits.
+// scope for the control plane; the `cli:*` scopes (eng#231) admit the
+// authenticated `/api/cli/*` read/authoring control plane; the rest are
+// standard OIDC scopes for the token + refresh. Authorization (role) is
+// enforced SERVER-SIDE per endpoint from the verified subject — the scope only
+// admits ("scope admits, role authorizes").
 export const CLI_OAUTH_SCOPES = [
   "openid",
   "profile",
   "email",
   "offline_access",
   "mcp:connect",
+  "cli:status",
+  "cli:agent:read",
+  "cli:agent:write",
 ];
 
 const CLIENT_NAME = "Cinatra CLI";
+
+// eng#231: the dedicated RFC 8707 resource the CLI binds its token to. Passing
+// `resource=<origin>/api/cli` on authorize/exchange/refresh makes the AS mint a
+// JWT with `aud=<origin>/api/cli`, which the server's verified-Bearer resolver
+// JWKS-verifies as a remote Bearer — distinct from the `/api/mcp` audience.
+const CLI_RESOURCE_PATH = "/api/cli";
+
+/**
+ * The RFC 8707 `resource` URL for a target origin. Normalized from
+ * `URL.origin` (no trailing-slash / double-path drift) so the minted token's
+ * audience exactly matches the server's expected `/api/cli` audience.
+ *
+ * @param {string} origin a normalized instance origin (no path / trailing slash)
+ * @returns {URL}
+ */
+export function cliResourceFor(origin) {
+  return new URL(`${origin}${CLI_RESOURCE_PATH}`);
+}
 
 // ---------------------------------------------------------------------------
 // Credentials store
@@ -71,8 +94,33 @@ export function resolveCredentialsPath(env = process.env) {
 /** Loopback hostnames that may legitimately be served over plain HTTP in dev. */
 const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
-function isLoopbackHostname(hostname) {
-  return LOOPBACK_HOSTNAMES.has(hostname);
+/**
+ * True for a loopback hostname. Accepts `localhost`, the IPv6 loopback
+ * (`::1`/`[::1]`), and the ENTIRE IPv4 `127.0.0.0/8` block — and rejects
+ * lookalikes (`127.0.0.1.evil.com`, `0x7f.0.0.1`, `localhost.evil.com`). A
+ * non-loopback origin is the gate for refusing remote destructive operations
+ * and for requiring a token (eng#231).
+ */
+export function isLoopbackHostname(hostname) {
+  if (LOOPBACK_HOSTNAMES.has(hostname)) return true;
+  // Exact dotted-quad in 127.0.0.0/8 — each octet 0-255, no extra labels.
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname);
+  if (!m) return false;
+  const octets = m.slice(1).map((o) => Number(o));
+  if (octets.some((o) => o > 255)) return false;
+  return octets[0] === 127;
+}
+
+/**
+ * True when an origin/URL resolves to a loopback host. Returns false for any
+ * malformed URL (fail-closed — an unparseable target is treated as remote).
+ */
+export function isLoopbackOrigin(originOrUrl) {
+  try {
+    return isLoopbackHostname(new URL(originOrUrl).hostname);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -313,13 +361,17 @@ export async function runLogin(opts) {
       );
     }
 
-    // 4. Build the authorization URL (PKCE) and open the browser.
+    // 4. Build the authorization URL (PKCE) and open the browser. Bind the
+    //    token to the `/api/cli` resource (RFC 8707) so it is JWKS-verifiable
+    //    as a remote Bearer at the CLI control plane (eng#231).
+    const resource = cliResourceFor(origin);
     const { authorizationUrl, codeVerifier } = await startAuthorization(origin, {
       metadata,
       clientInformation,
       redirectUrl: listener.redirectUrl,
       scope: CLI_OAUTH_SCOPES.join(" "),
       state: expectedState,
+      resource,
     });
 
     log("Opening your browser to sign in …");
@@ -334,10 +386,19 @@ export async function runLogin(opts) {
       authorizationCode: code,
       codeVerifier,
       redirectUri: listener.redirectUrl,
+      // Same `resource` as the authorize request — the exchange must echo it so
+      // the minted token's audience is `<origin>/api/cli`.
+      resource,
     });
 
-    // 6. Persist the profile (tokens never logged).
-    const record = buildProfileRecord({ origin, clientInformation, tokens });
+    // 6. Persist the profile (tokens never logged). Persist `resource` so a
+    //    later refresh re-sends it and keeps the token audience-bound.
+    const record = buildProfileRecord({
+      origin,
+      clientInformation,
+      tokens,
+      resource: resource.href,
+    });
     await saveProfile(profileKey, record, { makeDefault: opts.makeDefault }, env);
 
     log(`Signed in. Saved profile "${profileKey}" → ${origin}.`);
@@ -348,7 +409,10 @@ export async function runLogin(opts) {
 }
 
 /** Shape a stored profile record from an issued token set. */
-export function buildProfileRecord({ origin, clientInformation, tokens }, now = Date.now()) {
+export function buildProfileRecord(
+  { origin, clientInformation, tokens, resource },
+  now = Date.now(),
+) {
   const expiresAt =
     typeof tokens.expires_in === "number"
       ? now + tokens.expires_in * 1000
@@ -361,6 +425,10 @@ export function buildProfileRecord({ origin, clientInformation, tokens }, now = 
     refreshToken: tokens.refresh_token ?? null,
     tokenType: tokens.token_type ?? "Bearer",
     scope: tokens.scope ?? CLI_OAUTH_SCOPES.join(" "),
+    // eng#231: the RFC 8707 resource the token is bound to (re-sent on refresh
+    // so the refreshed token keeps `aud=<origin>/api/cli`). Defaults to the
+    // origin's `/api/cli` resource when not explicitly supplied.
+    resource: resource ?? cliResourceFor(origin).href,
     expiresAt,
     obtainedAt: now,
   };
@@ -413,10 +481,17 @@ export async function resolveAccessToken(opts = {}) {
   if (!metadata) {
     throw new Error(`Could not discover OAuth metadata at ${record.origin} to refresh.`);
   }
+  // Re-send the stored RFC 8707 resource so the refreshed token keeps the
+  // `<origin>/api/cli` audience (eng#231). Fall back to the origin's resource
+  // for profiles persisted before `resource` was stored.
+  const refreshResource = record.resource
+    ? new URL(record.resource)
+    : cliResourceFor(record.origin);
   const tokens = await refreshAuthorization(record.origin, {
     metadata,
     clientInformation: { client_id: record.clientId },
     refreshToken: record.refreshToken,
+    resource: refreshResource,
   });
   const updated = buildProfileRecord(
     {
@@ -427,6 +502,7 @@ export async function resolveAccessToken(opts = {}) {
         // A refresh response may omit refresh_token — keep the existing one.
         refresh_token: tokens.refresh_token ?? record.refreshToken,
       },
+      resource: refreshResource.href,
     },
     now,
   );
@@ -503,6 +579,104 @@ async function httpError(res, accessToken) {
 /** `cinatra status` remote path — GET /api/cli/status. */
 export async function fetchRemoteStatus(opts = {}) {
   return await cliApiGet("/api/cli/status", opts);
+}
+
+// ---------------------------------------------------------------------------
+// Byte-body Class-A helpers — agent export (ZIP download) / import (ZIP upload)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the request origin + headers for a Class-A call (eng#231).
+ *
+ * LOOPBACK origins (a local dev box) skip `resolveAccessToken` and send NO
+ * Authorization header — the server's dev-admin loopback bypass authorizes
+ * them, so `--app-url http://localhost:3000` is zero-login. NON-loopback
+ * origins still require a cached token (https-only is enforced by
+ * `appUrlToProfileKey`).
+ *
+ * @returns {Promise<{ origin: string, headers: Record<string,string>, accessToken: string|null }>}
+ */
+async function resolveRequestContext({ appUrl, profile, env } = {}) {
+  // A loopback `--app-url` is the only zero-login remote path. When it is set,
+  // skip the token entirely and let the server's dev-bypass authorize.
+  if (appUrl && isLoopbackOrigin(appUrl)) {
+    return { origin: appUrlToProfileKey(appUrl), headers: {}, accessToken: null };
+  }
+  const { origin, accessToken } = await resolveTarget({ appUrl, profile, env });
+  return {
+    origin,
+    headers: { authorization: `Bearer ${accessToken}` },
+    accessToken,
+  };
+}
+
+/**
+ * Authenticated GET returning the raw response body as a Uint8Array (for the
+ * agent-export ZIP). Token-redacted errors; the bearer is never logged. Sends
+ * no Authorization header on a loopback target (server dev-bypass authorizes).
+ */
+export async function cliApiGetBytes(path, { appUrl, profile, env, fetchFn = fetch } = {}) {
+  const { origin, headers, accessToken } = await resolveRequestContext({
+    appUrl,
+    profile,
+    env,
+  });
+  const res = await fetchFn(`${origin}${path}`, {
+    method: "GET",
+    headers: { ...headers, accept: "application/zip, application/json" },
+  });
+  if (!res.ok) {
+    throw await httpError(res, accessToken);
+  }
+  const buf = await res.arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+/**
+ * Authenticated POST of a byte body (for the agent-import ZIP upload).
+ * Token-redacted errors; bearer never logged. Returns parsed JSON. Sends no
+ * Authorization header on a loopback target (server dev-bypass authorizes).
+ */
+export async function cliApiPostBytes(
+  path,
+  body,
+  { appUrl, profile, env, contentType = "application/octet-stream", fetchFn = fetch } = {},
+) {
+  const { origin, headers, accessToken } = await resolveRequestContext({
+    appUrl,
+    profile,
+    env,
+  });
+  const res = await fetchFn(`${origin}${path}`, {
+    method: "POST",
+    headers: { ...headers, "content-type": contentType, accept: "application/json" },
+    body,
+  });
+  if (!res.ok) {
+    throw await httpError(res, accessToken);
+  }
+  return await res.json();
+}
+
+/**
+ * Belt-and-suspenders guard (eng#231): refuse a destructive/mutating verb
+ * against a NON-loopback target BEFORE any network call. The server keeps the
+ * destructive surface gated on the operator security gate (eng#229); this CLI
+ * gate makes a remote-destructive call structurally impossible in the
+ * published bin. Loopback targets are allowed (authorized via the dev-bypass).
+ *
+ * @param {string|undefined} appUrl the resolved `--app-url` (undefined = local)
+ * @param {string} verb a human label for the refused operation
+ * @throws when `appUrl` is set and is NOT a loopback origin
+ */
+export function assertDestructiveTargetAllowed(appUrl, verb) {
+  if (!appUrl) return; // no remote target → local path, allowed
+  if (isLoopbackOrigin(appUrl)) return; // loopback dev box, allowed via bypass
+  throw new Error(
+    `Refusing "${verb}" against a remote instance (${appUrl}): remote ` +
+      "destructive operations are disabled by the operator security gate (eng#229). " +
+      "Run destructive commands locally (loopback) only.",
+  );
 }
 
 export { REFRESH_SKEW_MS };
