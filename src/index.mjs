@@ -90,6 +90,15 @@ import {
 // Manifest-driven dev-CLI module discovery (local leaf module — static import
 // is extension-empty safe; the actual extension reach stays a lazy import()).
 import { loadDevCliModule } from "./dev-cli-modules.mjs";
+// Tailscale OAuth-client (Design C) auth-key minting via the Nango Proxy. Local
+// leaf module (no `@cinatra-ai/*` reach — same minimal-dep doctrine as the
+// API-key read path); the worker receives only the minted auth-key, never the
+// OAuth client secret or the 1h access token. cinatra-ai/tailscale-connector#23.
+import {
+  mintTailscaleAuthKeyViaNangoProxy,
+  TailscaleProxyMintError,
+  TAILSCALE_OAUTH_PROVIDER_CONFIG_KEY,
+} from "./tailscale-nango.mjs";
 // Tailscale connector source lives in the gitignored `extensions/cinatra-ai/`
 // clone-back target, ABSENT on a fresh checkout until `cinatra dev setup dev`
 // populates it. `mintTailscaleAuthKey`, `TailscaleApiError`, and
@@ -1348,6 +1357,38 @@ async function discoverBootstrapNangoSettings(env, runtimeMode) {
   } finally {
     await client.end().catch(() => null);
   }
+}
+
+/**
+ * Resolve the Nango settings for the Tailscale OAuth (Design C) PROXY path.
+ *
+ * Distinct from `discoverBootstrapNangoSettings` on ONE security-critical point:
+ * the secret key is read from the environment ONLY (`NANGO_PROXY_SECRET_KEY`),
+ * and NEVER discovered from the local Nango database. The clone worker's OAuth
+ * mint must run under an `environment:proxy`-scoped key (no
+ * `connections:read_credentials`) — load-bearing, because a `read_credentials`
+ * call on the Tailscale `TWO_STEP` connection echoes the OAuth `clientSecret` in
+ * cleartext. Falling back to the DB-discovered admin secret (as the API-key path
+ * legitimately does) would silently hand the worker an over-scoped key and
+ * defeat the isolation. So OAuth mode FAILS CLOSED when this key is absent.
+ *
+ * The server URL is NOT a secret, so it reuses the normal non-DB discovery
+ * (env → local Nango `.env` → default).
+ *
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {{ serverUrl: string | null, secretKey: string | null }}
+ */
+function discoverProxyNangoSettings(env) {
+  // Dedicated proxy-scoped key only — no general NANGO_SECRET_KEY fallback, no
+  // DB lookup. Ops provisions this on the clone worker at activation.
+  const secretKey = String(env.NANGO_PROXY_SECRET_KEY ?? "").trim();
+  const localEnv = readEnvFileIfPresent("/tmp/nango/.env");
+  const serverUrl =
+    normalizeUrlOrNull(env.NANGO_SERVER_URL) ??
+    normalizeUrlOrNull(localEnv.NANGO_SERVER_URL) ??
+    normalizeUrlOrNull(localEnv.NANGO_PUBLIC_SERVER_URL) ??
+    normalizeUrlOrNull("http://localhost:3003");
+  return { serverUrl, secretKey: secretKey || null };
 }
 
 function getPostgresClientImage(env) {
@@ -7461,8 +7502,11 @@ async function runCloneStart(argv) {
           );
         }
       } catch (err) {
-        // Surface typed errors to the operator without leaking secrets.
-        if (TailscaleApiError && err instanceof TailscaleApiError) {
+        // Surface typed errors to the operator without leaking secrets. Both
+        // the connector's `TailscaleApiError` (API-key mint) and the OAuth
+        // proxy-mint's `TailscaleProxyMintError` (marked `err.tailscale`) carry
+        // a sanitised `.code`/`.message` (never a secret/token/key/body).
+        if ((TailscaleApiError && err instanceof TailscaleApiError) || err?.tailscale === true) {
           console.warn(
             `Tailscale auto-tunnel skipped: ${err.code} — ${err.message}`,
           );
@@ -8610,7 +8654,10 @@ async function runDevTunnel(argv) {
     try {
       mintedFromNango = await autoMintTailscaleAuthKeyFromNango(mainDbUrl);
     } catch (err) {
-      if (err instanceof TailscaleApiError) {
+      // Both the connector's `TailscaleApiError` (API-key mint) and the OAuth
+      // proxy-mint's `TailscaleProxyMintError` (marked `err.tailscale`) carry a
+      // sanitised `.code`/`.message` (never a secret/token/key/body).
+      if ((err instanceof TailscaleApiError) || err?.tailscale === true) {
         throw new Error(
           `No Tailscale auth-key: Nango mint failed (${err.code} — ${err.message}). ` +
             `Set TS_AUTHKEY or connect Tailscale at /connectors/tailscale.`,
@@ -8958,26 +9005,65 @@ async function readTailscaleCredentialFromNango() {
 }
 
 /**
- * Read the operator-configured Tailscale clone tag from the local
- * `connector_config:tailscale` row. Falls back
- * to `tag:cinatra-clone` when no value is stored (e.g. clone DB is fresh
- * or the operator never visited /connectors/tailscale).
+ * Read the operator-configured Tailscale auth config from the local
+ * `connector_config:tailscale` row.
+ *
+ * Returns the clone-tag (both auth modes) plus the OAuth-mode wiring the
+ * connector persists when the operator connects via the OAuth-client mode:
+ *   - `authMode`: `"oauth"` selects the Design-C proxy-mint path; anything else
+ *     (or a fresh/absent row) keeps the legacy `"api_key"` path.
+ *   - `oauthConnectionId`: the Nango-generated connection id (NOT a secret) the
+ *     proxy needs as its `Connection-Id`. The worker uses an
+ *     `environment:proxy`-scoped Nango key and so cannot list connections — the
+ *     connector persists this id here for the worker to read.
+ *   - `oauthProviderConfigKey` / `tailnet`: defaults `cinatra-tailscale-oauth`
+ *     and `-`.
+ *
+ * Every field independently falls back, so a partially-written or legacy row
+ * degrades safely to API-key mode. Never throws past this boundary, but it
+ * distinguishes a clean read (`readOk: true`, row present or absent) from a DB
+ * read FAILURE (`readOk: false`) so the caller can refuse to silently pick
+ * API-key mode on an OAuth-provisioned worker when the mode is unknowable.
  *
  * @param {string} cloneConnString
- * @returns {Promise<string>}
+ * @returns {Promise<{ readOk: boolean, cloneTag: string, authMode: "oauth" | "api_key", oauthConnectionId: string | null, oauthProviderConfigKey: string, tailnet: string }>}
  */
-async function readTailscaleCloneTagFromClone(cloneConnString) {
+async function readTailscaleAuthConfigFromClone(cloneConnString) {
+  const fallback = {
+    readOk: false,
+    cloneTag: "tag:cinatra-clone",
+    authMode: /** @type {"api_key"} */ ("api_key"),
+    oauthConnectionId: null,
+    oauthProviderConfigKey: TAILSCALE_OAUTH_PROVIDER_CONFIG_KEY,
+    tailnet: "-",
+  };
   const client = await createClient(cloneConnString);
   try {
     await client.connect();
     const raw = await readMetadataValue(client, "cinatra", "connector_config:tailscale", null);
-    if (raw && typeof raw === "object" && "cloneTag" in raw) {
-      const tag = (raw).cloneTag;
-      if (typeof tag === "string" && tag.startsWith("tag:")) return tag;
-    }
-    return "tag:cinatra-clone";
+    // A clean read with no row (or a non-object row) is a LEGITIMATE api_key /
+    // unconfigured state — readOk stays true (not a failure).
+    if (!raw || typeof raw !== "object") return { ...fallback, readOk: true };
+    const r = /** @type {Record<string, unknown>} */ (raw);
+    const cloneTag =
+      typeof r.cloneTag === "string" && r.cloneTag.startsWith("tag:")
+        ? r.cloneTag
+        : "tag:cinatra-clone";
+    const authMode = r.authMode === "oauth" ? "oauth" : "api_key";
+    const oauthConnectionId =
+      typeof r.oauthConnectionId === "string" && r.oauthConnectionId.trim()
+        ? r.oauthConnectionId.trim()
+        : null;
+    const oauthProviderConfigKey =
+      typeof r.oauthProviderConfigKey === "string" && r.oauthProviderConfigKey.trim()
+        ? r.oauthProviderConfigKey.trim()
+        : TAILSCALE_OAUTH_PROVIDER_CONFIG_KEY;
+    const tailnet =
+      typeof r.tailnet === "string" && r.tailnet.trim() ? r.tailnet.trim() : "-";
+    return { readOk: true, cloneTag, authMode, oauthConnectionId, oauthProviderConfigKey, tailnet };
   } catch {
-    return "tag:cinatra-clone";
+    // DB read FAILED — mode is unknowable. readOk:false (fallback default).
+    return fallback;
   } finally {
     try {
       await client.end();
@@ -9044,36 +9130,98 @@ async function resolveCloneTailscaleHostname({
 }
 
 /**
- * Auto-mint a Tailscale auth-key for THIS clone via the Nango-stored API
- * access token. Called from `runCloneStart` when `TS_AUTHKEY` env is unset.
+ * Auto-mint a Tailscale auth-key for THIS clone from Nango. Called from
+ * `runCloneStart` / `runDevTunnel` when `TS_AUTHKEY` env is unset.
  *
- * The API token is used directly as the Bearer for the Tailscale auth-key
- * endpoint — no OAuth token exchange. Tag is whatever the operator
- * configured at /connectors/tailscale (default `tag:cinatra-clone`).
+ * Two auth modes, selected by the local `connector_config:tailscale` row:
  *
- * Returns `null` when Nango doesn't have a Tailscale credential (caller
- * falls through to local-only mode). Throws on Tailscale API errors
- * (caller surfaces the typed error code to the operator).
+ *   - **OAuth-client mode (Design C)** — when `authMode === "oauth"` and an
+ *     `oauthConnectionId` is present: mint via the **Nango Proxy**
+ *     (`mintTailscaleAuthKeyViaNangoProxy`). The worker receives ONLY the
+ *     auth-key — never the OAuth client secret, never the 1h access token —
+ *     and reads NO credentials (its Nango key is `environment:proxy`-scoped).
+ *     A `null` return means the OAuth connection is confirmed-absent → we fall
+ *     through to the API-key path. A typed `TailscaleProxyMintError`
+ *     (401/403/429/5xx/network) PROPAGATES — we never silently downgrade a
+ *     real OAuth failure to the API-key path.
  *
- * @param {string} cloneConnString — used to read the clone-tag this
- *   operator configured. Pass the clone DB connection string from
- *   runCloneStart.
+ *   - **API-key mode (legacy, unchanged)** — the stored `tskey-api-…` token is
+ *     used directly as the Bearer for the Tailscale auth-key endpoint (no OAuth
+ *     exchange).
+ *
+ * Tag is whatever the operator configured (default `tag:cinatra-clone`).
+ * Returns `null` when neither mode yields a credential (caller falls through to
+ * local-only mode). Throws on mint errors (caller surfaces the typed code).
+ *
+ * @param {string} cloneConnString — clone DB conn string; reads the auth config.
  * @returns {Promise<string | null>} the minted `tskey-auth-…` value, or null
  */
 async function autoMintTailscaleAuthKeyFromNango(cloneConnString) {
+  const cfg = await readTailscaleAuthConfigFromClone(cloneConnString);
+
+  // Fail-closed guard for OAuth-PROVISIONED workers: if the clone-DB read of the
+  // auth config FAILED (mode unknowable) AND this worker carries an
+  // environment:proxy key (i.e. it was provisioned for OAuth), refuse to
+  // silently treat the worker as API-key mode — surface the error instead.
+  // API-key-only workers (no proxy key) keep their legacy resilience: an
+  // unreadable config degrades to the API-key path as before.
+  if (!cfg.readOk && String(process.env.NANGO_PROXY_SECRET_KEY ?? "").trim()) {
+    throw new TailscaleProxyMintError(
+      "tailscale.oauth_misconfigured",
+      "Could not read the local Tailscale auth config on an OAuth-provisioned worker " +
+        "(NANGO_PROXY_SECRET_KEY is set); refusing to fall back to API-key mode.",
+    );
+  }
+
+  // OAuth-client mode (Design C): mint via the Nango Proxy, and FAIL CLOSED.
+  // Once the operator has selected OAuth (`authMode === "oauth"`), there is NO
+  // runtime downgrade to the API-key path — every failure (no environment:proxy
+  // key, no persisted connection id, any non-2xx, network/timeout) THROWS.
+  // Nango's proxy exposes no reliable "connection absent" signal (probe: a
+  // missing connection is a bare 400 `server_error`), so there is nothing safe
+  // to treat as fall-back-eligible; mode selection lives upstream in the
+  // connector-persisted `authMode`, never in a proxy error. A broken OAuth
+  // setup must surface, not silently mint via a stale/over-scoped API key.
+  // cinatra-ai/tailscale-connector#23 (Codex-converged).
+  if (cfg.authMode === "oauth") {
+    const proxy = discoverProxyNangoSettings(process.env);
+    if (!proxy.serverUrl || !proxy.secretKey) {
+      throw new TailscaleProxyMintError(
+        "tailscale.oauth_misconfigured",
+        "Tailscale OAuth mode is selected but no environment:proxy Nango key is configured " +
+          "(set NANGO_PROXY_SECRET_KEY — scoped to environment:proxy — on the clone worker).",
+      );
+    }
+    if (!cfg.oauthConnectionId) {
+      throw new TailscaleProxyMintError(
+        "tailscale.oauth_misconfigured",
+        "Tailscale OAuth mode is selected but no OAuth connection id is persisted. " +
+          "Reconnect Tailscale (OAuth client) from the connector.",
+      );
+    }
+    const { authKey } = await mintTailscaleAuthKeyViaNangoProxy({
+      serverUrl: proxy.serverUrl,
+      secretKey: proxy.secretKey,
+      connectionId: cfg.oauthConnectionId,
+      providerConfigKey: cfg.oauthProviderConfigKey,
+      tailnet: cfg.tailnet,
+      tags: [cfg.cloneTag],
+    });
+    return authKey;
+  }
+
+  // API-key mode (legacy): the API token IS the Bearer — no OAuth exchange.
   const cred = await readTailscaleCredentialFromNango();
   if (!cred) return null;
-  const cloneTag = await readTailscaleCloneTagFromClone(cloneConnString);
   // Lazy-load the connector mint helper (present on this post-config path; the
   // early `return null` above avoids loading it when Nango has no credential).
   const { mintTailscaleAuthKey } = await loadTailscaleApiModule();
   const { authKey } = await mintTailscaleAuthKey({
-    // API key IS the Bearer for /api/v2/tailnet/-/keys — no exchange.
     accessToken: cred.apiKey,
     tailnet: cred.tailnet,
     // Operator-chosen tag for least-privilege scoping. The API token must
     // have been authorised for this tag in the operator's Tailscale ACL.
-    tags: [cloneTag],
+    tags: [cfg.cloneTag],
     ephemeral: true,
     preauthorized: true,
     reusable: false,
