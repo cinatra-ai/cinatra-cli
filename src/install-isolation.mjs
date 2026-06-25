@@ -39,20 +39,38 @@ function normHost(host) {
  * Build interface-aware owner maps from live inspect rows, keyed by the compose
  * `working_dir` label (review hardening #4 — a same-port stack on a DIFFERENT interface
  * must NOT be blamed for a conflict held elsewhere). Only TCP host ports.
- * Returns { byKey, byAllPort } where:
+ * Returns { byKey, byAllPort, cinatraByDir } where:
  *   - byKey:     Map<`host:port`, workingDir> for explicit-interface binds
  *   - byAllPort: Map<port(number), workingDir> for `0.0.0.0` binds (which own the
  *                port on ANY interface — `0.0.0.0:p` also holds `127.0.0.1:p`).
+ *   - cinatraByDir: Map<workingDir, {managed, kind, instance, project}> — the
+ *                `ai.cinatra.*` ownership labels a container carries (cinatra-cli#39:
+ *                POSITIVE proof a compose project IS a Cinatra stack, independent of
+ *                the registry). Only recorded for containers carrying
+ *                `ai.cinatra.managed === "true"`.
  * Pure.
  */
 function portOwnersFromInspect(inspectRows) {
   const byKey = new Map();
   const byAllPort = new Map();
-  if (!Array.isArray(inspectRows)) return { byKey, byAllPort };
+  const cinatraByDir = new Map();
+  if (!Array.isArray(inspectRows)) return { byKey, byAllPort, cinatraByDir };
   for (const row of inspectRows) {
     const labels = row?.Config?.Labels ?? {};
     const workingDir = labels["com.docker.compose.project.working_dir"];
     if (typeof workingDir !== "string" || workingDir.length === 0) continue;
+    // cinatra-cli#39: surface the `ai.cinatra.*` ownership labels per working_dir.
+    // These are written by generateIsolatedCompose for every isolated stack — a
+    // container carrying `ai.cinatra.managed:"true"` POSITIVELY proves the
+    // owning compose project is a Cinatra instance, even without a registry row.
+    if (labels["ai.cinatra.managed"] === "true" && !cinatraByDir.has(workingDir)) {
+      cinatraByDir.set(workingDir, {
+        managed: true,
+        kind: labels["ai.cinatra.kind"] ?? null,
+        instance: labels["ai.cinatra.instance"] ?? null,
+        project: labels["ai.cinatra.project"] ?? null,
+      });
+    }
     const portMap = row?.NetworkSettings?.Ports ?? {};
     for (const [spec, bindings] of Object.entries(portMap)) {
       if (!/\/tcp$/i.test(spec)) continue;
@@ -65,7 +83,7 @@ function portOwnersFromInspect(inspectRows) {
       }
     }
   }
-  return { byKey, byAllPort };
+  return { byKey, byAllPort, cinatraByDir };
 }
 
 /** Resolve the owning working_dir of a single conflict (interface-aware). A
@@ -95,8 +113,13 @@ function ownerOfConflict(owners, host, port) {
  * @param {object}  [args.instanceRegistry] parsed instances.json (or null)
  * @param {object}  [args.cloneRegistry]    parsed clones.json (or null)
  * @param {string}  [args.installDir]    the dir THIS install is targeting (for self-detection)
+ * @param {function} [args.readMarker]   `(dir) => { status, marker }` — reads the
+ *                                       per-checkout `.cinatra/instance.json` marker
+ *                                       (cinatra-cli#39). Injected so this pure module
+ *                                       stays import-light/hermetic; defaults to a
+ *                                       no-op "missing" reader (label-only proof).
  * @returns {{ kind: 'self-instance'|'other-cinatra'|'idempotent-rerun'|'mixed'|'unrelated',
- *             instance?: object, ownerDir?: string }}
+ *             instance?: object, ownerDir?: string, backfill?: object }}
  */
 export function classifyPortHolder({
   conflicts = null,
@@ -105,6 +128,7 @@ export function classifyPortHolder({
   instanceRegistry = null,
   cloneRegistry = null,
   installDir = null,
+  readMarker = () => ({ status: "missing", marker: null }),
 } = {}) {
   // Normalise the conflict set to `[{host, port}]`. A legacy port-only entry is
   // treated as an all-interfaces (0.0.0.0) probe so a `0.0.0.0` owner matches it.
@@ -167,12 +191,102 @@ export function classifyPortHolder({
   }
 
   // Proven to be a live compose project at a single dir, but the registry does
-  // NOT record it as a Cinatra instance. We did NOT positively prove it is
-  // Cinatra (compose `working_dir` alone is not Cinatra-proof — any compose
-  // project carries it). Treat as a possibly-Cinatra "self-instance" ONLY when
-  // it is our own target; otherwise it is unproven → `unrelated` (degraded
-  // honesty: never claim a stranger's compose project is a Cinatra instance).
+  // NOT record it as a Cinatra instance. cinatra-cli#39: compose `working_dir`
+  // alone is not Cinatra-proof (any compose project carries it), BUT the
+  // `ai.cinatra.*` labels we stamp on every isolated stack AND the per-checkout
+  // marker (`.cinatra/instance.json`) ARE positive proof. If EITHER is present
+  // for this owner dir, recognise it as `other-cinatra` (with a synthesized
+  // instance) and flag it for registry BACKFILL by the executor — so legacy /
+  // never-recorded instances are no longer mis-classified `unrelated`.
+  const proof = cinatraProofForDir(owners, ownerDir, readMarker);
+  if (proof) {
+    const instance = synthInstanceFromProof(ownerDir, proof);
+    return { kind: "other-cinatra", instance, ownerDir, backfill: instance };
+  }
+
+  // No positive Cinatra proof (no `ai.cinatra.*` label, no marker) → unproven
+  // → `unrelated` (degraded honesty: never claim a stranger's compose project is
+  // a Cinatra instance).
   return { kind: "unrelated", ownerDir };
+}
+
+/** cinatra-cli#39 — positive Cinatra proof for an owner dir from EITHER the live
+ *  `ai.cinatra.*` container labels OR the per-checkout marker. Returns a
+ *  normalized `{ source, slug, project, kind }` proof or null. The label is the
+ *  stronger signal (live container we stamped); the marker is the fallback (a
+ *  checkout that recorded itself but whose containers predate / lack labels, or a
+ *  default-stack checkout that has only a marker). Pure given `readMarker`.
+ *
+ *  HARDENING (codex #2): proof requires a STRUCTURALLY USEFUL identity — a
+ *  non-empty compose `project` AND a non-empty `slug`. `ai.cinatra.managed:"true"`
+ *  alone, or a marker with no `composeProject`/`slug`, is NOT enough to classify
+ *  a holder as `other-cinatra`: the executor would otherwise hold an instance
+ *  with `composeProject:null` and a destructive `stop-existing` could degrade to
+ *  a BARE `docker compose down` in that dir. An incomplete signal falls through
+ *  to `unrelated` (degraded honesty) — both our writers (generateIsolatedCompose
+ *  / writeMarker) always emit a project + slug, so this loses no legitimate
+ *  recognition while closing the false-positive destructive path. */
+function cinatraProofForDir(owners, ownerDir, readMarker) {
+  const label = owners?.cinatraByDir?.get(ownerDir) ?? null;
+  if (label && label.managed === true) {
+    const slug = typeof label.instance === "string" && label.instance.length ? label.instance : null;
+    const project = typeof label.project === "string" && label.project.length ? label.project : null;
+    if (slug && project) {
+      return {
+        source: "label",
+        slug,
+        project,
+        kind: typeof label.kind === "string" && label.kind.length ? label.kind : null,
+      };
+    }
+    // Managed label present but identity incomplete → not safe proof; fall through
+    // (try the marker, then `unrelated`).
+  }
+  let read;
+  try {
+    read = readMarker(ownerDir);
+  } catch {
+    read = null;
+  }
+  const marker = read && read.status === "ok" ? read.marker : null;
+  if (marker && typeof marker === "object") {
+    const slug = typeof marker.slug === "string" && marker.slug.length ? marker.slug : null;
+    const project =
+      typeof marker.composeProject === "string" && marker.composeProject.length ? marker.composeProject : null;
+    if (slug && project) {
+      return {
+        source: "marker",
+        slug,
+        project,
+        kind: typeof marker.mode === "string" && marker.mode.length ? marker.mode : null,
+        marker,
+      };
+    }
+  }
+  return null;
+}
+
+/** Build a minimal instance-shaped object from label/marker proof so the
+ *  conflict menu + stop/attach can name + (after backfill) act on it. `proof`
+ *  always carries a non-empty `slug` + `project` (guaranteed by cinatraProofForDir),
+ *  so the synthesized holder ALWAYS has a usable `composeProject` — never a
+ *  null-project holder that a bare `down` could act on. cinatra-cli#39. Pure. */
+function synthInstanceFromProof(ownerDir, proof) {
+  return {
+    slug: proof.slug,
+    installDir: ownerDir,
+    composeProject: proof.project,
+    // A marker records the exact compose files; a label-only proof does not, so
+    // default to the generated isolated compose (every `ai.cinatra.*`-labelled
+    // stack is brought up from it). The executor backfill / down path uses this.
+    composeFiles:
+      Array.isArray(proof?.marker?.composeFiles) && proof.marker.composeFiles.length
+        ? proof.marker.composeFiles
+        : [ISOLATED_COMPOSE_FILENAME],
+    appPort: proof?.marker?.appPort ?? null,
+    ports: null,
+    proofSource: proof.source,
+  };
 }
 
 // ── T7 — resolved-compose generator ─────────────────────────────────────────
@@ -392,6 +506,8 @@ export function writeIsolatedComposeFile(filePath, doc) {
 export const __test = {
   classifyPortHolder,
   portOwnersFromInspect,
+  cinatraProofForDir,
+  synthInstanceFromProof,
   isSecretEnvKey,
   scrubServiceEnv,
   remapServicePorts,

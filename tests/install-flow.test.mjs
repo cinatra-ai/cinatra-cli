@@ -773,6 +773,223 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     expect(reg.registry.instances["stop-ok"].state).toBe("ready");
   });
 
+  // ── cinatra-cli#39 — label/marker-proven holders are recognized + backfilled ──
+  it("#39: a label-proven holder (NOT in registry) is offered stop-existing + backfilled, not aborted", async () => {
+    // The holder dir owns 5434 and carries `ai.cinatra.*` labels but has NO
+    // registry row. Pre-#39 the classifier returned `unrelated`, so
+    // stop-existing refused; now it is recognized as other-cinatra.
+    const otherDir = path.join(sandbox, "p39-labelled-holder");
+    mkdirSync(otherDir, { recursive: true });
+    const installDir = path.join(sandbox, "p39-stop-labelled");
+    const downCalls = [];
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "stop-existing",
+      ],
+      {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+          // Live inspect proves the holder via the ai.cinatra.* labels (no registry row).
+          liveComposeInspect: () => [
+            {
+              Config: {
+                Labels: {
+                  "com.docker.compose.project.working_dir": otherDir,
+                  "ai.cinatra.managed": "true",
+                  "ai.cinatra.kind": "instance",
+                  "ai.cinatra.instance": "p39labelled",
+                  "ai.cinatra.project": "cinatra_p39labelled",
+                },
+              },
+              NetworkSettings: { Ports: { "5432/tcp": [{ HostIp: "127.0.0.1", HostPort: "5434" }] } },
+            },
+          ],
+          runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
+        }),
+      },
+    );
+    expect(res.infraPlan).toBe("default");
+    // Tore down the LABEL-DERIVED project (proof it was recognized as other-cinatra).
+    expect(downCalls.length).toBe(1);
+    expect(downCalls[0].dir).toBe(otherDir);
+    expect(downCalls[0].composeProject).toBe("cinatra_p39labelled");
+    expect(downCalls[0].volumes).toBe(false);
+    // The backfilled row was released by stop-existing; the new default row exists.
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances.p39labelled).toBeUndefined();
+    expect(reg.registry.instances["p39-stop-labelled"].state).toBe("ready");
+  });
+
+  it("#39: an isolated install beside a label-proven holder BACKFILLS the holder's registry row", async () => {
+    // Choose --on-conflict=isolated so the proven holder's backfilled row is NOT
+    // consumed (stop-existing would release it). After resolution the registry
+    // must now record the previously-unregistered, label-proven instance.
+    const otherDir = path.join(sandbox, "p39-backfill-holder");
+    mkdirSync(otherDir, { recursive: true });
+    const installDir = path.join(sandbox, "p39-backfill-self");
+    await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated",
+      ],
+      {
+        log: () => {},
+        deps: flowDeps({
+          // The DEFAULT band conflicts (5434 held); the remapped isolated band is free.
+          detectPortConflicts: async (band) => {
+            const pg = band.find((b) => b.service === "postgres");
+            if (pg && pg.port === 5434) return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+            return [];
+          },
+          liveComposeInspect: () => [
+            {
+              Config: {
+                Labels: {
+                  "com.docker.compose.project.working_dir": otherDir,
+                  "ai.cinatra.managed": "true",
+                  "ai.cinatra.kind": "instance",
+                  "ai.cinatra.instance": "p39backfill",
+                  "ai.cinatra.project": "cinatra_p39backfill",
+                },
+              },
+              NetworkSettings: { Ports: { "5432/tcp": [{ HostIp: "127.0.0.1", HostPort: "5434" }] } },
+            },
+          ],
+        }),
+      },
+    );
+    // The holder is now an AUTHORITATIVE registry row (subsequent runs resolve it
+    // from the registry, not just labels) — the issue's "backfill" requirement.
+    const reg = readInstanceRegistry(regPath);
+    const row = reg.registry.instances.p39backfill;
+    expect(row).toBeTruthy();
+    expect(row.installDir).toBe(otherDir);
+    expect(row.composeProject).toBe("cinatra_p39backfill");
+    expect(row.composeFiles).toContain("docker-compose.cinatra-isolated.yml");
+    expect(row.state).toBe("ready");
+  });
+
+  it("#39: a marker-proven holder (no labels, no registry row) is recognized + backfilled", async () => {
+    // The holder's containers carry NO ai.cinatra.* labels but a marker file
+    // exists at its dir — the marker reader is the production default seam.
+    const otherDir = path.join(sandbox, "p39-marker-holder");
+    mkdirSync(otherDir, { recursive: true });
+    const installDir = path.join(sandbox, "p39-marker-self");
+    await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated",
+      ],
+      {
+        log: () => {},
+        deps: flowDeps({
+          // The DEFAULT band conflicts (5434 held); the remapped isolated band is free.
+          detectPortConflicts: async (band) => {
+            const pg = band.find((b) => b.service === "postgres");
+            if (pg && pg.port === 5434) return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+            return [];
+          },
+          // Unlabelled container — proof must come from the marker.
+          liveComposeInspect: () => [
+            {
+              Config: { Labels: { "com.docker.compose.project.working_dir": otherDir } },
+              NetworkSettings: { Ports: { "5432/tcp": [{ HostIp: "127.0.0.1", HostPort: "5434" }] } },
+            },
+          ],
+          // Inject a marker reader resolving the holder dir's marker.
+          readMarker: (dir) =>
+            path.resolve(dir) === path.resolve(otherDir)
+              ? {
+                  status: "ok",
+                  marker: {
+                    slug: "p39marker",
+                    composeProject: "cinatra_p39marker",
+                    composeFiles: ["docker-compose.cinatra-isolated.yml"],
+                    appPort: 3300,
+                    mode: "dev",
+                  },
+                }
+              : { status: "missing", marker: null },
+        }),
+      },
+    );
+    const reg = readInstanceRegistry(regPath);
+    const row = reg.registry.instances.p39marker;
+    expect(row).toBeTruthy();
+    expect(row.installDir).toBe(otherDir);
+    expect(row.composeProject).toBe("cinatra_p39marker");
+    expect(row.state).toBe("ready");
+  });
+
+  it("#39 (hardening codex#1): stop-existing on a slug-COLLIDING label holder does NOT delete the unrelated row", async () => {
+    // An existing registry row "collide" maps to dirA. A DIFFERENT, label-proven
+    // holder at dirB carries ai.cinatra.instance:"collide" (slug collision).
+    // Backfill must SKIP (slug already maps to dirA); stop-existing tears down
+    // dirB's project but must NOT release the registry row that points at dirA.
+    const dirA = path.join(sandbox, "p39-collide-existing");
+    const dirB = path.join(sandbox, "p39-collide-holder");
+    mkdirSync(dirA, { recursive: true });
+    mkdirSync(dirB, { recursive: true });
+    const { writeInstanceRegistry, allocateInstance, markInstanceReady } = await import("../src/instance-registry.mjs");
+    let reg0 = allocateInstance({ version: 1, instances: {} }, "collide", {
+      mode: "dev",
+      installDir: dirA,
+      composeProject: "cinatra_collide",
+      composeFiles: ["docker-compose.cinatra-isolated.yml"],
+      ports: { postgres: [9999] }, // unrelated ports — NOT the conflicting 5434
+      appPort: 3399,
+      repoUrl: "x",
+      ref: "main",
+      sha: "s",
+      infraMode: "new",
+    }).registry;
+    reg0 = markInstanceReady(reg0, "collide");
+    writeInstanceRegistry(regPath, reg0);
+
+    const installDir = path.join(sandbox, "p39-collide-self");
+    const downCalls = [];
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "stop-existing",
+      ],
+      {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+          // dirB owns 5434 and its labels claim slug "collide" (collides with dirA's row).
+          liveComposeInspect: () => [
+            {
+              Config: {
+                Labels: {
+                  "com.docker.compose.project.working_dir": dirB,
+                  "ai.cinatra.managed": "true",
+                  "ai.cinatra.instance": "collide",
+                  "ai.cinatra.project": "cinatra_collide_b",
+                },
+              },
+              NetworkSettings: { Ports: { "5432/tcp": [{ HostIp: "127.0.0.1", HostPort: "5434" }] } },
+            },
+          ],
+          runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
+        }),
+      },
+    );
+    expect(res.infraPlan).toBe("default");
+    // Tore down dirB's project (the proven holder), NOT dirA.
+    expect(downCalls.length).toBe(1);
+    expect(downCalls[0].dir).toBe(dirB);
+    expect(downCalls[0].composeProject).toBe("cinatra_collide_b");
+    // CRITICAL: the unrelated registry row "collide" → dirA is INTACT (not deleted).
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances.collide).toBeTruthy();
+    expect(reg.registry.instances.collide.installDir).toBe(dirA);
+    // The new default install row for this checkout exists.
+    expect(reg.registry.instances["p39-collide-self"].state).toBe("ready");
+  });
+
   it("T12: --on-conflict=attach REFUSES when a DIFFERENT instance holds the ports (review hardening #2)", async () => {
     // Seed another instance owning 5434 at a different dir; attaching a FRESH
     // checkout to it must refuse (attach is only for your own checkout).
