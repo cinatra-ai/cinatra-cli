@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID, createHash } from "node:crypto";
-import { closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -3963,7 +3963,214 @@ function installAfterExtensionSync(repoRoot, syncResult, { failHard = false } = 
         `Re-run \`corepack pnpm install\` in ${repoRoot}, then start the app.\n`,
     );
     process.exitCode = 1;
+    return { ok: false };
   }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// cinatra-cli#41 — clone link invariant.
+//
+// The upstream extension-manifest generator emits a literal `import()` loader
+// for EVERY on-disk extension under `extensions/<scope>/<name>` that has a
+// `package.json` name (presence-based emission — `inventory.mjs listExtensions`).
+// Turbopack resolves those literal specifiers at COMPILE time, so an emitted
+// package that is NOT symlinked into the worktree root `node_modules` makes the
+// whole app fail to compile (every route 500s).
+//
+// pnpm only symlinks a workspace member into root `node_modules` when a
+// dependant declares it. The `cinatra.devExtensions` connectors are workspace
+// MEMBERS (matched by the `extensions/cinatra-ai/*-connector` glob) but no
+// dependant declares them, so a fresh `setup clone` that synced the full
+// devExtensions set leaves them on disk yet unlinked → manifest ⊃ linked set →
+// compile failure.
+//
+// We make the link invariant hold WITHOUT dirtying tracked files (no edits to
+// root package.json / lockfile — that would break `cinatra update`/diff on an
+// origin/main worktree). The repair creates the missing
+// `node_modules/<scope>/<pkg>` symlink directly to the workspace member dir,
+// which survives a later `pnpm install` (pnpm leaves an already-correct
+// workspace-member link in place; if it ever removes one, re-running the repair
+// (it runs on every warm setup) restores it). The durable upstream fix is a
+// resolution-aware generator (emit a loader ONLY when the package resolves from
+// node_modules) — tracked as a follow-up cinatra PR, OUT OF SCOPE here.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_LINK_FS = {
+  existsSync,
+  readdirSync,
+  readFileSync,
+  lstatSync,
+  mkdirSync,
+  symlinkSync,
+};
+
+// A package name is only used to build the `node_modules/<name>` link PATH, so it
+// MUST be a well-formed npm name (scoped or unscoped) with no path-traversal
+// segments — a malformed on-disk `package.json` name like `../../tracked-file`
+// must never let the repair `rmSync`/`symlinkSync` escape `node_modules` and
+// touch tracked files (codex#41). Mirrors npm's name grammar conservatively.
+const SAFE_LINK_PKG_NAME_RE = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
+function isSafeLinkPackageName(name) {
+  return (
+    typeof name === "string" &&
+    SAFE_LINK_PKG_NAME_RE.test(name) &&
+    !name.split("/").some((seg) => seg === "." || seg === "..")
+  );
+}
+
+// Enumerate the packages the generator WOULD emit (every on-disk extension with
+// a `package.json` name) paired with their on-disk source dir. Mirrors upstream
+// `inventory.mjs listExtensions` (scope dir → ext dir → package.json).
+function enumerateEmittedExtensionPackages(worktree, fs = DEFAULT_LINK_FS) {
+  const out = [];
+  const extRoot = path.join(worktree, "extensions");
+  if (!fs.existsSync(extRoot)) return out;
+  for (const scope of fs.readdirSync(extRoot, { withFileTypes: true })) {
+    if (!scope.isDirectory()) continue;
+    const scopeDir = path.join(extRoot, scope.name);
+    for (const ext of fs.readdirSync(scopeDir, { withFileTypes: true })) {
+      if (!ext.isDirectory()) continue;
+      const dir = path.join(scopeDir, ext.name);
+      const pkgPath = path.join(dir, "package.json");
+      if (!fs.existsSync(pkgPath)) continue;
+      let name;
+      try {
+        name = JSON.parse(fs.readFileSync(pkgPath, "utf8"))?.name;
+      } catch {
+        continue; // unparseable manifest — the generator wouldn't emit it either
+      }
+      if (typeof name !== "string" || name.length === 0) continue;
+      // The upstream generator emits by raw `package.json.name`, so this is the
+      // full emission universe. We carry an `unsafe` flag for a name that can't
+      // be a safe `node_modules/<name>` path segment (e.g. a `../`-traversal
+      // string): such a name can NEVER be safely linked, so the invariant must
+      // FAIL CLOSED on it (block regen) rather than silently treating the
+      // extension as not-emitted — the generator would still emit it (codex#41).
+      out.push({ name, dir, unsafe: !isSafeLinkPackageName(name) });
+    }
+  }
+  return out;
+}
+
+// True when `node_modules/<pkgName>` resolves from the worktree root. A symlink
+// (even one whose target is itself missing — caught by the package.json check)
+// counts only when the linked package manifest is readable.
+function isPackageLinkedFromRoot(worktree, pkgName, fs = DEFAULT_LINK_FS) {
+  const linkPath = path.join(worktree, "node_modules", pkgName);
+  if (!fs.existsSync(linkPath)) return false;
+  // existsSync follows symlinks, so a present link with a live target is enough;
+  // verify the linked dir actually carries a package.json so a stale/empty dir
+  // doesn't read as "linked" and let the manifest reference an empty module.
+  return fs.existsSync(path.join(linkPath, "package.json"));
+}
+
+// PURE invariant check (cinatra-cli#41 test seam): given a worktree (and an
+// injectable fs), return the set of emitted-but-unlinked package names — the
+// packages the manifest generator would emit a literal import for that do NOT
+// resolve from the worktree root `node_modules`. Empty ⇒ the manifest can be
+// safely regenerated; non-empty ⇒ regenerating would poison the build.
+function linkedSetMatchesEmittedSet(worktree, fs = DEFAULT_LINK_FS) {
+  const missing = [];
+  for (const { name, unsafe } of enumerateEmittedExtensionPackages(worktree, fs)) {
+    // An unsafe-named emitted extension can never be safely resolved from
+    // node_modules — count it as unlinked so the invariant fails closed.
+    if (unsafe || !isPackageLinkedFromRoot(worktree, name, fs)) missing.push(name);
+  }
+  missing.sort();
+  return missing;
+}
+
+// Non-destructively repair the workspace link for every emitted-but-unlinked
+// connector by creating `node_modules/<scope>/<pkg>` → the on-disk workspace
+// member dir. Never touches tracked files (root package.json / lockfile). Idempotent.
+// Returns { repaired:[], stillMissing:[] }.
+function repairWorkspaceConnectorLinks(worktree, { fs = DEFAULT_LINK_FS, log = console.log } = {}) {
+  const repaired = [];
+  const stillMissing = [];
+  const byName = new Map(enumerateEmittedExtensionPackages(worktree, fs).map((p) => [p.name, p]));
+  for (const name of linkedSetMatchesEmittedSet(worktree, fs)) {
+    const entry = byName.get(name);
+    if (!entry) {
+      stillMissing.push(name);
+      continue;
+    }
+    if (entry.unsafe) {
+      // The generator would emit this name but it can't be a safe node_modules
+      // path segment — refuse to link and keep it in stillMissing so the regen
+      // gate fails closed. The durable fix is the resolution-aware upstream
+      // generator (it would refuse to emit an unresolvable name).
+      log(`  ⚠ refusing to link ${name}: invalid package name (cannot be a safe node_modules path)`);
+      stillMissing.push(name);
+      continue;
+    }
+    const sourceDir = entry.dir;
+    const nodeModulesRoot = path.resolve(worktree, "node_modules");
+    const linkPath = path.resolve(nodeModulesRoot, name);
+    // Defense-in-depth (codex#41): never rm/symlink outside node_modules even if
+    // the name guard above is ever loosened. The link path must stay strictly
+    // under <worktree>/node_modules/.
+    if (linkPath !== nodeModulesRoot && !linkPath.startsWith(nodeModulesRoot + path.sep)) {
+      log(`  ⚠ refusing to link ${name}: resolved path escapes node_modules`);
+      stillMissing.push(name);
+      continue;
+    }
+    try {
+      // Clear a stale/broken link or empty dir at the target before relinking.
+      if (fs.lstatSync && safeLstatExists(fs, linkPath)) {
+        rmSync(linkPath, { recursive: true, force: true });
+      }
+      fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+      // Relative symlink so the link is portable if the worktree moves.
+      const rel = path.relative(path.dirname(linkPath), sourceDir);
+      fs.symlinkSync(rel, linkPath, "dir");
+      if (isPackageLinkedFromRoot(worktree, name, fs)) repaired.push(name);
+      else stillMissing.push(name);
+    } catch (err) {
+      log(`  ⚠ could not link ${name}: ${err && err.message ? err.message : err}`);
+      stillMissing.push(name);
+    }
+  }
+  return { repaired, stillMissing };
+}
+
+// lstat presence probe that tolerates an injected fs without lstatSync.
+function safeLstatExists(fs, p) {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Ensure every emitted on-disk extension is linked into the worktree root
+// node_modules BEFORE manifest regeneration. Verifies the invariant, repairs
+// non-destructively if it's violated, re-verifies, and returns whether the tree
+// is now safe to regenerate against. Loud-but-non-fatal: a residual violation
+// blocks the regen (the committed maps stay as-is) rather than poisoning the build.
+function ensureClonedExtensionsLinked(worktree, { log = console.log } = {}) {
+  const missingBefore = linkedSetMatchesEmittedSet(worktree);
+  if (missingBefore.length === 0) return { ok: true, repaired: [], stillMissing: [] };
+  log(
+    `- ${missingBefore.length} synced extension(s) on disk are not linked into node_modules ` +
+      `(${missingBefore.join(", ")}) — repairing the workspace links non-destructively…`,
+  );
+  const { repaired, stillMissing } = repairWorkspaceConnectorLinks(worktree, { log });
+  if (repaired.length > 0) {
+    log(`  Linked ${repaired.length} extension(s): ${repaired.join(", ")}`);
+  }
+  if (stillMissing.length > 0) {
+    console.error(
+      `\n⚠ ${stillMissing.length} extension(s) could not be linked into node_modules ` +
+        `(${stillMissing.join(", ")}). The extension manifest will NOT be regenerated against this tree ` +
+        `(regenerating would emit imports the build cannot resolve and 500 every route). ` +
+        `Re-run \`corepack pnpm install\` in ${worktree}, then re-run setup.\n`,
+    );
+    process.exitCode = 1;
+    return { ok: false, repaired, stillMissing };
+  }
+  return { ok: true, repaired, stillMissing };
 }
 
 // Regenerate src/lib/generated/* against the extension tree actually on disk
@@ -4334,7 +4541,12 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
       }
       // Re-link the freshly-cloned extensions into the workspace so their host
       // value-imports resolve at `pnpm dev` (guarded no-op on warm checkouts).
-      installAfterExtensionSync(repoRoot, extensionSync);
+      const devInstallResult = installAfterExtensionSync(repoRoot, extensionSync);
+      // cinatra-cli#41: guarantee every emitted on-disk extension is linked into
+      // node_modules (verify + non-destructive symlink repair) before regen, and
+      // gate the regen on it — see ensureClonedExtensionsLinked.
+      const devLinkState = ensureClonedExtensionsLinked(repoRoot);
+      const devLinkSafe = (devInstallResult ? devInstallResult.ok !== false : true) && devLinkState.ok;
       // Presence-aware regeneration of the generated extension maps
       // (cinatra#109/#110): the committed src/lib/generated/* maps are
       // byte-checked in CI against the synced extension set, but the companion
@@ -4343,10 +4555,10 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
       // `import("...")` specifiers that no longer resolve (Turbopack
       // module-not-found on /connectors). Regenerating right after the sync
       // keeps the maps matching the extension set actually on disk.
-      // Gated on a successful, non-skipped, non-empty sync — see
-      // regenerateExtensionManifestAfterSync.
+      // Gated on a successful, non-skipped, non-empty sync AND the #41 link
+      // invariant — see regenerateExtensionManifestAfterSync.
       regenerateExtensionManifestAfterSync(repoRoot, extensionSync, {
-        failed: extensionSyncFailed,
+        failed: extensionSyncFailed || !devLinkSafe,
       });
       // cinatra#386 — seed the on-disk first-party extensions into the LOCAL
       // bundled Verdaccio so they resolve + install out of the box (the fresh
@@ -5336,10 +5548,14 @@ async function runSetupBranch(argv) {
     console.error(`⚠ Dev extension sync FAILED: ${err && err.message ? err.message : err}`);
     process.exitCode = 1;
   }
+  // cinatra-cli#41: verify + non-destructively repair the link invariant before
+  // regen so the manifest never references an emitted-but-unlinked connector.
+  const branchLinkState = ensureClonedExtensionsLinked(worktreePath);
   // Keep THIS worktree's generated maps matching the extension set the sync
-  // just put on its disk (cinatra#109/#110) — same gating as `setup dev`.
+  // just put on its disk (cinatra#109/#110) — same gating as `setup dev`, plus
+  // the #41 link gate.
   regenerateExtensionManifestAfterSync(worktreePath, branchExtensionSync, {
-    failed: branchExtensionSyncFailed,
+    failed: branchExtensionSyncFailed || !branchLinkState.ok,
   });
 
   // 7. Print summary
@@ -6319,11 +6535,21 @@ async function runSetupClone(argv) {
   }
   // The deps install above runs BEFORE this sync, so the freshly-cloned
   // extensions would be unlinked — re-link them now (guarded no-op on warm runs).
-  installAfterExtensionSync(worktreePath, extensionSync);
+  const installResult = installAfterExtensionSync(worktreePath, extensionSync);
+  // cinatra-cli#41: `corepack pnpm install` only links a workspace member that a
+  // dependant declares — the synced devExtension connectors are members but
+  // undeclared, so they land on disk yet UNLINKED. The manifest generator emits
+  // a literal `import()` per on-disk connector, so an unlinked one makes
+  // Turbopack fail to compile (every route 500s). Guarantee the link invariant
+  // (verify + non-destructive symlink repair) BEFORE regenerating, and GATE the
+  // regen on it: never regenerate against a tree whose connectors aren't linked.
+  const linkState = ensureClonedExtensionsLinked(worktreePath);
+  const linkSafe = (installResult ? installResult.ok !== false : true) && linkState.ok;
   // Keep THIS worktree's generated maps matching the extension set the sync
-  // just put on its disk (cinatra#109/#110) — same gating as `setup dev`.
+  // just put on its disk (cinatra#109/#110) — same gating as `setup dev`, plus
+  // the #41 link gate (don't regen against an unlinked tree).
   regenerateExtensionManifestAfterSync(worktreePath, extensionSync, {
-    failed: extensionSyncFailed,
+    failed: extensionSyncFailed || !linkSafe,
   });
 
   // Summary.
@@ -10429,6 +10655,11 @@ export {
   NANGO_SETTINGS_KEY,
   seedMetadataScrubKeys,
   scrubSeedMetadata,
+  // cinatra-cli#41 — clone link-invariant seams (pure; injectable fs).
+  linkedSetMatchesEmittedSet,
+  enumerateEmittedExtensionPackages,
+  repairWorkspaceConnectorLinks,
+  ensureClonedExtensionsLinked,
 };
 
 /**
