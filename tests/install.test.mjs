@@ -392,6 +392,42 @@ describe("runInstall — from zero (local remote, --no-infra --no-setup)", () =>
     expect(logs.join("\n")).toMatch(/Existing cinatra checkout/);
   });
 
+  it("--dry-run on the default path performs NO side effects (cinatra-cli#37)", async () => {
+    // A fresh, never-touched target dir.
+    const dryDir = path.join(sandbox, "dry-default");
+    const logs = [];
+    const result = await runInstall(
+      [
+        "--dir", dryDir,
+        "--repo-url", `file://${originRepo}`,
+        "--ref", "main",
+        "--yes", "--no-infra", "--dry-run",
+      ],
+      { log: (m) => logs.push(String(m)) },
+    );
+
+    // (a) the target dir was NOT created (or, if it exists, stays empty) — no clone.
+    if (existsSync(dryDir)) {
+      expect(existsSync(path.join(dryDir, "pnpm-workspace.yaml"))).toBe(false);
+      expect(existsSync(path.join(dryDir, ".git"))).toBe(false);
+    }
+    // (b) no .env.local was written.
+    expect(existsSync(path.join(dryDir, ".env.local"))).toBe(false);
+    // (c) the plan lines were logged (and NO "install complete").
+    const out = logs.join("\n");
+    expect(out).toMatch(/Dry run — no changes made/);
+    expect(out).toMatch(/Directory:\s+.*dry-default/);
+    expect(out).toMatch(/Ref \/ commit:\s+main \([0-9a-f]{7,40}\)/); // ls-remote resolved a real sha
+    expect(out).toMatch(/Project name:\s+dry-default/);
+    expect(out).not.toMatch(/install complete/);
+    expect(out).not.toMatch(/Cinatra checked out at/);
+    // (d) the return carries dryRun:true and the resolved plan.
+    expect(result.dryRun).toBe(true);
+    expect(result.targetDir).toBe(path.resolve(dryDir));
+    expect(result.sha).toMatch(/^[0-9a-f]{40}$/);
+    expect(result.instance).toBe("dry-default");
+  });
+
   it("re-running with a DIFFERENT --repo-url is refused (origin mismatch)", async () => {
     // A second bare remote — same content, different path → different origin.
     const otherOrigin = path.join(sandbox, "other-origin.git");

@@ -243,6 +243,27 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     expect(readMarker(installDir).status).toBe("ok");
   });
 
+  it("#37: --dry-run on the default path never calls the bringUpInfra seam", async () => {
+    const installDir = path.join(sandbox, "dry-flow");
+    const upCalls = [];
+    const res = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--dry-run"],
+      {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [], // no conflict
+          bringUpInfra: (args) => upCalls.push(args),
+        }),
+      },
+    );
+    expect(res.dryRun).toBe(true);
+    // The infra seam was NOT invoked (no `docker compose up`).
+    expect(upCalls).toEqual([]);
+    // No clone happened → no marker, no .env.local.
+    expect(existsSync(path.join(installDir, ".env.local"))).toBe(false);
+    expect(existsSync(path.join(installDir, "pnpm-workspace.yaml"))).toBe(false);
+  });
+
   it("T8/T8b: --on-conflict=isolated brings up a remapped second stack + records it", async () => {
     const installDir = path.join(sandbox, "iso");
     const upCalls = [];
