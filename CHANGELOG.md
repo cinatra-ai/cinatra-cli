@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-06-25
+
 ### Changed
 
 - Namespaced the local host/monorepo bootstrap commands under `cinatra dev …`.
@@ -85,6 +87,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Initial public release of the thin, checkout-driven `cinatra` CLI, published
   as the scoped `@cinatra-ai/cinatra`. (#2)
 
+[0.1.3]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.3
 [0.1.2]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.2
 [0.1.1]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.1
 [0.1.0]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.0
