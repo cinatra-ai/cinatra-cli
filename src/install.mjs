@@ -31,6 +31,8 @@
 
 import { randomBytes } from "node:crypto";
 import {
+  accessSync,
+  constants as fsConstants,
   copyFileSync,
   existsSync,
   mkdirSync,
@@ -396,23 +398,31 @@ export function assertSafeRepoUrl(url) {
 // ---------------------------------------------------------------------------
 
 /** A non-null target dir's parent must be writable (the dir itself may not
- *  exist yet). Returns a remediation string on failure, else null. */
-function checkTargetWritable(targetDir) {
+ *  exist yet). Returns a remediation string on failure, else null.
+ *  Under `--dry-run` (`probe:false`) we must NOT touch the filesystem, so we
+ *  infer writability with a non-mutating `accessSync(W_OK)` instead of the
+ *  temp-file write/remove probe (cinatra-cli#37, finding #2). */
+function checkTargetWritable(targetDir, { probe = true } = {}) {
   const parent = path.dirname(path.resolve(targetDir));
   try {
     if (!existsSync(parent)) {
       return `Parent directory ${parent} does not exist — create it first (mkdir -p ${parent}).`;
     }
-    const probe = path.join(parent, `.cinatra-install-write-probe-${process.pid}`);
-    writeFileSync(probe, "");
-    spawnSync("rm", ["-f", probe]); // best-effort cleanup of the probe file.
+    if (!probe) {
+      // Read-only check: no temp file is written or removed.
+      accessSync(parent, fsConstants.W_OK);
+      return null;
+    }
+    const probePath = path.join(parent, `.cinatra-install-write-probe-${process.pid}`);
+    writeFileSync(probePath, "");
+    spawnSync("rm", ["-f", probePath]); // best-effort cleanup of the probe file.
     return null;
   } catch (err) {
     return `Cannot write into ${parent}: ${err.message}. Choose a --dir under a writable location.`;
   }
 }
 
-export function runPreflight({ mode = "dev", targetDir = null, noInfra = false, deps = {} } = {}) {
+export function runPreflight({ mode = "dev", targetDir = null, noInfra = false, dryRun = false, deps = {} } = {}) {
   const exists = deps.commandExists ?? commandExists;
   const nodeVersion = deps.nodeVersion ?? process.versions.node;
   const failures = [];
@@ -468,7 +478,10 @@ export function runPreflight({ mode = "dev", targetDir = null, noInfra = false, 
   }
 
   if (targetDir) {
-    const writableErr = (deps.checkTargetWritable ?? checkTargetWritable)(targetDir);
+    // Under --dry-run the writability check must not write a temp probe file
+    // (a filesystem side effect). Use the non-mutating access check instead
+    // (cinatra-cli#37, finding #2).
+    const writableErr = (deps.checkTargetWritable ?? checkTargetWritable)(targetDir, { probe: !dryRun });
     if (writableErr) failures.push(writableErr);
   }
 
@@ -2599,7 +2612,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
 
   // 2. PREFLIGHT FIRST — before any download. Fail fast with the full list.
   log("Checking requirements…");
-  const pre = preflight({ mode: opts.mode, targetDir, noInfra: opts.noInfra });
+  const pre = preflight({ mode: opts.mode, targetDir, noInfra: opts.noInfra, dryRun: opts.dryRun });
   for (const w of pre.warnings) log(`  ⚠ ${w}`);
   if (!pre.ok) {
     const lines = pre.failures.map((f) => `  ✗ ${f}`).join("\n");
@@ -2615,7 +2628,94 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   const targetExists = existsSync(targetDir);
   const alreadyCheckout = targetExists && isCinatraCheckout(targetDir);
 
-  // 3a. PRE-CLONE host-port guard (cinatra-cli#3): for a FRESH install of the
+  // 3a. Read-only target-exists guard (no filesystem writes) — runs BEFORE the
+  //     throwing port-conflict preflight + the dry-run short-circuit so a
+  //     non-empty foreign target still fails fast, and a --dry-run still
+  //     surfaces the same blocker as a plan rather than performing a clone.
+  if (targetExists && !isEmptyDir(targetDir) && !alreadyCheckout && !opts.force) {
+    throw new Error(
+      `Target ${targetDir} already exists and is not a cinatra checkout (and is not empty). ` +
+        `Choose another --dir, or pass --force only if you are certain (it will clone INTO it).`,
+    );
+  }
+
+  // 3b. --dry-run short-circuit (cinatra-cli#37): a "preview" flag must perform
+  //     NO clone / write / infra / setup AND must NEVER throw on a detected
+  //     conflict — it PREVIEWS it. Run this BEFORE the throwing pre-clone
+  //     port-conflict guard below (which would otherwise abort a default-band
+  //     dry-run before the preview is ever printed) and after the read-only
+  //     dir/ref resolution + the target-exists check above. The conflict probe
+  //     here is the SAME read-only port probe (detectPortConflicts on the
+  //     static default band); it reports — never aborts. The isolated/conflict
+  //     branches keep their own dry-run prints (they are only reached AFTER the
+  //     clone, which dry-run never performs, so this is the single early-out for
+  //     every default run). Writability was validated read-only in preflight
+  //     (no temp probe file under --dry-run); nothing here touches disk.
+  if (opts.dryRun) {
+    const cap = deps.capture ?? capture;
+    // Resolve the ref → sha WITHOUT cloning: `git ls-remote <repo> <ref>` is a
+    // read-only network query (no checkout, no disk write). Best-effort: if it
+    // can't resolve (offline / bad ref), report it as "<resolved at clone>".
+    let resolvedSha = "<resolved at clone>";
+    const lsRemote = cap("git", ["ls-remote", opts.repoUrl, opts.ref], { env: gitEnv() });
+    if (lsRemote) {
+      const sha = lsRemote.split(/\s+/)[0];
+      if (/^[0-9a-f]{7,40}$/.test(sha)) resolvedSha = sha;
+    }
+
+    // The computed default project / instance name (mirrors recordDefaultInstance).
+    const defaultSlug = opts.instance ?? deriveInstanceSlug(targetDir);
+
+    // Conflict classification on the default band — PORTS PROBED READ-ONLY only.
+    // (The AUTHORITATIVE post-clone band comes from the checkout's own compose
+    // config, which dry-run never has; the static default band is the best
+    // read-only signal.) Under --dry-run a conflict is REPORTED, never thrown.
+    let conflicts = [];
+    if (pre.infraWillStart && !opts.noInfra) {
+      conflicts = await probePorts(DEFAULT_DEV_HOST_PORTS);
+    }
+    const infraPlanIntent = opts.noInfra
+      ? "external"
+      : conflicts.length > 0
+        ? `default (port conflict detected on ${conflicts.map((c) => c.port).join(", ")} — would prompt/resolve)`
+        : "default";
+
+    log("");
+    log("✓ Dry run — no changes made (no clone, env, infra, or setup).");
+    log("  Plan:");
+    log(`    Directory:     ${targetDir}${alreadyCheckout ? " (existing cinatra checkout)" : ""}`);
+    log(`    Ref / commit:  ${opts.ref} (${resolvedSha})`);
+    log(`    Repo URL:      ${opts.repoUrl}`);
+    log(`    Mode:          ${opts.mode}`);
+    log(`    Infra plan:    ${infraPlanIntent}`);
+    log(`    Project name:  ${isValidSlug(defaultSlug) ? defaultSlug : "(unnamed — would not record)"}`);
+    log(`    App port:      ${DEFAULT_APP_PORT_FOR_RECORD}`);
+    if (conflicts.length > 0) {
+      for (const c of conflicts) {
+        log(`    conflict:      port ${c.port} held — install would prompt for resolution (suggest --on-conflict=isolated).`);
+      }
+      log(`    Conflicts:     ${conflicts.length} default-band port(s) in use — install would classify the holder and offer a resolution.`);
+    } else {
+      log("    Conflicts:     none detected on the default band (read-only probe).");
+    }
+    log("  Writability:   validated read-only (no temp probe written).");
+    log("  Would write:   the checkout, .env.local (fresh secret), then run infra/install/setup per the plan above.");
+    log("  Re-run without --dry-run to perform the install.");
+
+    return {
+      dryRun: true,
+      targetDir,
+      ref: opts.ref,
+      sha: resolvedSha,
+      mode: opts.mode,
+      instance: isValidSlug(defaultSlug) ? defaultSlug : null,
+      infraPlan: opts.noInfra ? "external" : "default",
+      appPort: DEFAULT_APP_PORT_FOR_RECORD,
+      conflicts: conflicts.map((c) => c.port),
+    };
+  }
+
+  // 3c. PRE-CLONE host-port guard (cinatra-cli#3): for a FRESH install of the
   //     DEFAULT repo at the DEFAULT ref that WILL bring up the dev stack, probe
   //     the known static default band BEFORE the `git clone` + `.env.local`
   //     side-effects, so an obvious port collision (e.g. another stack already
@@ -2649,84 +2749,6 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     if (conflicts.length > 0) {
       throw new Error(formatPortConflictError(conflicts, { phase: "preflight, before clone" }));
     }
-  }
-
-  if (targetExists && !isEmptyDir(targetDir) && !alreadyCheckout && !opts.force) {
-    throw new Error(
-      `Target ${targetDir} already exists and is not a cinatra checkout (and is not empty). ` +
-        `Choose another --dir, or pass --force only if you are certain (it will clone INTO it).`,
-    );
-  }
-
-  // 3b. --dry-run on the DEFAULT path (cinatra-cli#37): the per-branch dry-run
-  //     prints inside the isolation/conflict executors are honored, but the
-  //     MAIN flow used to fall through to a real clone + .env.local + infra +
-  //     setup. A "preview" flag with destructive side effects is a bug, so
-  //     short-circuit HERE — after preflight + dir/ref resolution + the
-  //     (read-only) conflict probe below — and BEFORE the clone. Compute and
-  //     print the plan from READ-ONLY signals only (no clone/write/daemon
-  //     start), then return. The isolated/conflict branches keep their own
-  //     dry-run prints (they are only reached AFTER the clone, which dry-run
-  //     never performs, so this is the single early-out for every default run).
-  if (opts.dryRun) {
-    const cap = deps.capture ?? capture;
-    // Resolve the ref → sha WITHOUT cloning: `git ls-remote <repo> <ref>` is a
-    // read-only network query (no checkout, no disk write). Best-effort: if it
-    // can't resolve (offline / bad ref), report it as "<resolved at clone>".
-    let resolvedSha = "<resolved at clone>";
-    const lsRemote = cap("git", ["ls-remote", opts.repoUrl, opts.ref], { env: gitEnv() });
-    if (lsRemote) {
-      const sha = lsRemote.split(/\s+/)[0];
-      if (/^[0-9a-f]{7,40}$/.test(sha)) resolvedSha = sha;
-    }
-
-    // The computed default project / instance name (mirrors recordDefaultInstance).
-    const defaultSlug = opts.instance ?? deriveInstanceSlug(targetDir);
-
-    // Conflict classification on the default band — PORTS PROBED READ-ONLY only.
-    // (The AUTHORITATIVE post-clone band comes from the checkout's own compose
-    // config, which dry-run never has; the static default band is the best
-    // read-only signal.)
-    let conflicts = [];
-    if (pre.infraWillStart && !opts.noInfra) {
-      const probePorts = deps.detectPortConflicts ?? detectPortConflicts;
-      conflicts = await probePorts(DEFAULT_DEV_HOST_PORTS);
-    }
-    const infraPlanIntent = opts.noInfra
-      ? "external"
-      : conflicts.length > 0
-        ? `default (port conflict detected on ${conflicts.map((c) => c.port).join(", ")} — would prompt/resolve)`
-        : "default";
-
-    log("");
-    log("✓ Dry run — no changes made (no clone, env, infra, or setup).");
-    log("  Plan:");
-    log(`    Directory:     ${targetDir}${alreadyCheckout ? " (existing cinatra checkout)" : ""}`);
-    log(`    Ref / commit:  ${opts.ref} (${resolvedSha})`);
-    log(`    Repo URL:      ${opts.repoUrl}`);
-    log(`    Mode:          ${opts.mode}`);
-    log(`    Infra plan:    ${infraPlanIntent}`);
-    log(`    Project name:  ${isValidSlug(defaultSlug) ? defaultSlug : "(unnamed — would not record)"}`);
-    log(`    App port:      ${DEFAULT_APP_PORT_FOR_RECORD}`);
-    if (conflicts.length > 0) {
-      log(`    Conflicts:     ${conflicts.length} default-band port(s) in use — install would classify the holder and offer a resolution.`);
-    } else {
-      log("    Conflicts:     none detected on the default band (read-only probe).");
-    }
-    log("  Would write:   the checkout, .env.local (fresh secret), then run infra/install/setup per the plan above.");
-    log("  Re-run without --dry-run to perform the install.");
-
-    return {
-      dryRun: true,
-      targetDir,
-      ref: opts.ref,
-      sha: resolvedSha,
-      mode: opts.mode,
-      instance: isValidSlug(defaultSlug) ? defaultSlug : null,
-      infraPlan: opts.noInfra ? "external" : "default",
-      appPort: DEFAULT_APP_PORT_FOR_RECORD,
-      conflicts: conflicts.map((c) => c.port),
-    };
   }
 
   // 4. Clone or update the host repo at --ref; record the resolved SHA.
