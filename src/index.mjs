@@ -281,6 +281,62 @@ const SELF_MCP_CLIENT_SCOPES = ["openid", "profile", "email", "offline_access", 
 const SELF_MCP_CLIENT_SCOPE = SELF_MCP_CLIENT_SCOPES.join(" ");
 const MCP_SETTINGS_KEY = "connector_config:mcp_server";
 const NANGO_SETTINGS_KEY = "connector_config:nango";
+
+// Source-instance `cinatra.metadata` rows that MUST be scrubbed from
+// `cinatra_seed` (and from any clone created off it) because their value is
+// bound to the SOURCE instance and is NOT valid in a clone.
+//
+// `cinatra.metadata` is intentionally NOT in SEED_SKIP_TABLES — operator
+// connector config carries forward by design (see the deliberate
+// publicBaseUrl-only clear at clone-create) — so the scrub is a NARROW,
+// per-key allowlist, NEVER a broad `connector_config:*` delete (that would
+// wipe config the CLI intentionally carries forward).
+//
+// `instance_identity`: the per-instance attach secret, encrypted under the
+// source instance's key. A clone gets its own key, so the inherited ciphertext
+// is undecryptable in the clone — the app re-mints a fresh identity on first
+// boot when the row is absent. Deleting it forces that re-mint instead of a
+// permanent boot-time decrypt failure. (This key is a defensive no-op against
+// the cinatra tree grounded here — the marketplace-attach / instance_identity
+// feature is not present in it — but is the correct, harmless scrub for the
+// general source-key carry-forward gap and for the feature once it lands.)
+const SEED_METADATA_SCRUB = [{ schema: "cinatra", key: "instance_identity" }];
+
+/**
+ * Pure helper: the narrow allowlist of `cinatra.metadata` rows scrubbed from
+ * the seed (and re-scrubbed at clone-create for old already-built seeds).
+ * Returned as a fresh array of `{ schema, key }` so callers cannot mutate the
+ * module constant. Tested directly: `instance_identity` IS in the list;
+ * intentionally-carried connector config (e.g. `connector_config:nango`) is
+ * NOT — a guard against over-deletion.
+ *
+ * @returns {Array<{ schema: string, key: string }>}
+ */
+function seedMetadataScrubKeys() {
+  return SEED_METADATA_SCRUB.map((row) => ({ ...row }));
+}
+
+/**
+ * DELETE the scrub-allowlist `cinatra.metadata` rows from a connected client,
+ * parameterized. Idempotent (a missing row is a no-op). Used by both
+ * `refresh-seed` (canonical scrub) and clone-create (idempotent guard for
+ * seeds built before this scrub existed). Returns the keys actually requested
+ * for scrubbing (for summary output); a DELETE of an absent row is harmless.
+ *
+ * @param {{ query: (sql: string, params?: unknown[]) => Promise<unknown> }} client
+ * @returns {Promise<string[]>} the metadata keys scrubbed
+ */
+async function scrubSeedMetadata(client) {
+  const scrubbed = [];
+  for (const { schema, key } of seedMetadataScrubKeys()) {
+    await client.query(
+      `DELETE FROM ${quoteIdentifier(schema)}.metadata WHERE key = $1`,
+      [key],
+    );
+    scrubbed.push(key);
+  }
+  return scrubbed;
+}
 const APP_RUNTIME_MODE_ENV_KEYS = ["CINATRA_RUNTIME_MODE", "APP_RUNTIME_MODE"];
 const DEFAULT_DATA_DIRECTORY = "data";
 const DEFAULT_BACKUP_DIRECTORY = path.join(DEFAULT_DATA_DIRECTORY, "backups");
@@ -5789,6 +5845,7 @@ async function runRefreshSeed(argv) {
   await seedClient.connect();
   const scrubbedOps = [];
   const scrubbedAuth = [];
+  let scrubbedMetadata = [];
   try {
     for (const table of SEED_SKIP_TABLES) {
       const present = await seedClient.query(
@@ -5814,6 +5871,13 @@ async function runRefreshSeed(argv) {
       );
       scrubbedAuth.push(table);
     }
+
+    // 3b. Scrub source-instance metadata rows that are bound to the SOURCE
+    //     instance's key (e.g. `instance_identity`) — see SEED_METADATA_SCRUB.
+    //     `cinatra.metadata` is NOT in SEED_SKIP_TABLES (operator config carries
+    //     forward by design), so this is a NARROW per-key delete, never a broad
+    //     `connector_config:*` wipe. Parameterized via the existing seedClient.
+    scrubbedMetadata = await scrubSeedMetadata(seedClient);
 
     // 4. Record seed provenance.
     let gitSha = "unknown";
@@ -5861,6 +5925,7 @@ async function runRefreshSeed(argv) {
   console.log(`  Source:          ${redactConnString(connectionString)}`);
   console.log(`  Scrubbed (ops):  ${scrubbedOps.join(", ") || "(none present)"}`);
   console.log(`  Scrubbed (auth): ${scrubbedAuth.join(", ") || "(none present)"}`);
+  console.log(`  Scrubbed (meta): ${scrubbedMetadata.join(", ") || "(none)"}`);
   console.log(`  Marked:          IS_TEMPLATE true, ALLOW_CONNECTIONS false`);
   const reg = readRegistry(defaultRegistryPath());
   const existingCount = reg.registry ? Object.keys(reg.registry.clones).length : 0;
@@ -6166,6 +6231,14 @@ async function runSetupClone(argv) {
       const current = await readMetadataValue(cloneClient, "cinatra", MCP_SETTINGS_KEY, {});
       const cleared = buildMcpPublicBaseUrlRow(current, null);
       await writeMetadataValue(cloneClient, "cinatra", MCP_SETTINGS_KEY, cleared);
+
+      // Idempotent guard: re-scrub source-instance metadata (e.g.
+      // `instance_identity`) in the clone DB. `refresh-seed` already scrubs
+      // these from new seeds, but a clone built from an OLD already-built
+      // `cinatra_seed` (predating that scrub) would still inherit them — so
+      // re-run the same narrow delete here, before the slot flips to "ready",
+      // protecting existing seeds without forcing a rebuild.
+      await scrubSeedMetadata(cloneClient);
     } finally {
       await cloneClient.end().catch(() => null);
     }
@@ -10353,6 +10426,9 @@ export {
   LLM_MCP_CLIENT_SCOPES,
   LLM_MCP_SETTINGS_KEY,
   MCP_SETTINGS_KEY,
+  NANGO_SETTINGS_KEY,
+  seedMetadataScrubKeys,
+  scrubSeedMetadata,
 };
 
 /**
