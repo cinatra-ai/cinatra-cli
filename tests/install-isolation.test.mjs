@@ -65,6 +65,211 @@ describe("classifyPortHolder (T4)", () => {
     expect(r.kind).toBe("unrelated");
   });
 
+  // cinatra-cli#39 — `ai.cinatra.*` labels + per-checkout markers are POSITIVE
+  // proof, so a labelled/markered checkout that is NOT a registry row is
+  // recognized as `other-cinatra` (not the old "degraded honesty" unrelated).
+  it("#39: other-cinatra when an unregistered owner carries ai.cinatra.* labels", () => {
+    // Same NOT-in-registry owner dir as the test above, but WITH the labels.
+    const labelledRow = {
+      Config: {
+        Labels: {
+          "com.docker.compose.project.working_dir": "/some/other/project",
+          "ai.cinatra.managed": "true",
+          "ai.cinatra.kind": "instance",
+          "ai.cinatra.instance": "legacy-iso",
+          "ai.cinatra.project": "cinatra_legacy_iso",
+        },
+      },
+      NetworkSettings: { Ports: { "5432/tcp": [{ HostIp: "127.0.0.1", HostPort: "5434" }] } },
+    };
+    const r = classifyPortHolder({
+      conflicts: [loop(5434)],
+      inspectRows: [labelledRow],
+      installDir: "/home/u/cinatra",
+      instanceRegistry,
+    });
+    expect(r.kind).toBe("other-cinatra");
+    // The instance is synthesized from the labels (slug + project) and flagged
+    // for executor backfill.
+    expect(r.instance.slug).toBe("legacy-iso");
+    expect(r.instance.composeProject).toBe("cinatra_legacy_iso");
+    expect(r.instance.installDir).toBe("/some/other/project");
+    expect(r.backfill).toBeTruthy();
+    expect(r.backfill.proofSource).toBe("label");
+  });
+
+  it("#39: other-cinatra when an unregistered, UNLABELLED owner has a marker present", () => {
+    // The container carries NO ai.cinatra.* labels (e.g. a default-stack or an
+    // old isolated stack predating the labels) but a marker exists at the dir.
+    const readMarker = (dir) =>
+      dir === "/some/other/project"
+        ? {
+            status: "ok",
+            marker: {
+              slug: "marked-inst",
+              composeProject: "cinatra_marked_inst",
+              composeFiles: ["docker-compose.cinatra-isolated.yml"],
+              appPort: 3300,
+              mode: "dev",
+            },
+          }
+        : { status: "missing", marker: null };
+    const r = classifyPortHolder({
+      conflicts: [loop(5434)],
+      inspectRows: [inspectRow("/some/other/project", 5434)], // no ai.cinatra.* labels
+      installDir: "/home/u/cinatra",
+      instanceRegistry,
+      readMarker,
+    });
+    expect(r.kind).toBe("other-cinatra");
+    expect(r.instance.slug).toBe("marked-inst");
+    expect(r.instance.composeProject).toBe("cinatra_marked_inst");
+    expect(r.instance.composeFiles).toEqual(["docker-compose.cinatra-isolated.yml"]);
+    expect(r.backfill.proofSource).toBe("marker");
+  });
+
+  it("#39: still unrelated when there is NO label AND NO marker (degraded honesty preserved)", () => {
+    const r = classifyPortHolder({
+      conflicts: [loop(5434)],
+      inspectRows: [inspectRow("/some/other/project", 5434)],
+      installDir: "/home/u/cinatra",
+      instanceRegistry,
+      readMarker: () => ({ status: "missing", marker: null }),
+    });
+    expect(r.kind).toBe("unrelated");
+    expect(r.backfill).toBeUndefined();
+  });
+
+  it("#39 (hardening): managed-label ALONE (no instance/project) is NOT proof → unrelated", () => {
+    // `ai.cinatra.managed:"true"` with no slug/project would synthesize a
+    // null-project holder a bare `down` could act on — refuse it (codex #2).
+    const partialLabel = {
+      Config: {
+        Labels: {
+          "com.docker.compose.project.working_dir": "/some/other/project",
+          "ai.cinatra.managed": "true",
+          // no ai.cinatra.instance / ai.cinatra.project
+        },
+      },
+      NetworkSettings: { Ports: { "5432/tcp": [{ HostIp: "127.0.0.1", HostPort: "5434" }] } },
+    };
+    const r = classifyPortHolder({
+      conflicts: [loop(5434)],
+      inspectRows: [partialLabel],
+      installDir: "/home/u/cinatra",
+      instanceRegistry,
+    });
+    expect(r.kind).toBe("unrelated");
+    expect(r.backfill).toBeUndefined();
+  });
+
+  it("#39 (hardening): a marker with no composeProject is NOT proof → unrelated", () => {
+    const readMarker = (dir) =>
+      dir === "/some/other/project"
+        ? { status: "ok", marker: { slug: "has-slug-no-project" } } // missing composeProject
+        : { status: "missing", marker: null };
+    const r = classifyPortHolder({
+      conflicts: [loop(5434)],
+      inspectRows: [inspectRow("/some/other/project", 5434)],
+      installDir: "/home/u/cinatra",
+      instanceRegistry,
+      readMarker,
+    });
+    expect(r.kind).toBe("unrelated");
+    expect(r.backfill).toBeUndefined();
+  });
+
+  it("#39: a label-proven holder ALWAYS yields a usable composeProject (never null)", () => {
+    const labelledRow = {
+      Config: {
+        Labels: {
+          "com.docker.compose.project.working_dir": "/some/other/project",
+          "ai.cinatra.managed": "true",
+          "ai.cinatra.instance": "legacy-iso",
+          "ai.cinatra.project": "cinatra_legacy_iso",
+        },
+      },
+      NetworkSettings: { Ports: { "5432/tcp": [{ HostIp: "127.0.0.1", HostPort: "5434" }] } },
+    };
+    const r = classifyPortHolder({
+      conflicts: [loop(5434)],
+      inspectRows: [labelledRow],
+      installDir: "/home/u/cinatra",
+      instanceRegistry,
+    });
+    expect(r.instance.composeProject).toBe("cinatra_legacy_iso");
+    expect(r.instance.composeFiles).toEqual(["docker-compose.cinatra-isolated.yml"]);
+  });
+
+  it("#39: a registry row STILL wins over labels (registry is authority)", () => {
+    // beta is recorded; even with labels naming a different slug, the registry
+    // row is returned (no synthesized backfill instance).
+    const labelledBeta = {
+      Config: {
+        Labels: {
+          "com.docker.compose.project.working_dir": "/home/u/beta",
+          "ai.cinatra.managed": "true",
+          "ai.cinatra.instance": "not-beta",
+          "ai.cinatra.project": "cinatra_not_beta",
+        },
+      },
+      NetworkSettings: { Ports: { "5432/tcp": [{ HostIp: "127.0.0.1", HostPort: "5434" }] } },
+    };
+    const r = classifyPortHolder({
+      conflicts: [loop(5434)],
+      inspectRows: [labelledBeta],
+      installDir: "/home/u/cinatra",
+      instanceRegistry,
+    });
+    expect(r.kind).toBe("other-cinatra");
+    expect(r.instance.slug).toBe("beta"); // registry row, not the label slug
+    expect(r.backfill).toBeUndefined();
+  });
+
+  it("#39: a labelled OWN checkout stays idempotent-rerun (self), never other-cinatra", () => {
+    const labelledSelf = {
+      Config: {
+        Labels: {
+          "com.docker.compose.project.working_dir": "/home/u/cinatra",
+          "ai.cinatra.managed": "true",
+          "ai.cinatra.instance": "cinatra",
+          "ai.cinatra.project": "cinatra_cinatra",
+        },
+      },
+      NetworkSettings: { Ports: { "5432/tcp": [{ HostIp: "127.0.0.1", HostPort: "5434" }] } },
+    };
+    const r = classifyPortHolder({
+      conflicts: [loop(5434)],
+      inspectRows: [labelledSelf],
+      installDir: "/home/u/cinatra",
+      instanceRegistry,
+    });
+    expect(r.kind).toBe("idempotent-rerun");
+    expect(r.backfill).toBeUndefined();
+  });
+
+  it("#39: labels do NOT rescue a MIXED conflict (a stranger port still poisons it)", () => {
+    // 5434 owned by a labelled Cinatra stack; 6379 owned by nobody (stranger).
+    const labelledRow = {
+      Config: {
+        Labels: {
+          "com.docker.compose.project.working_dir": "/some/other/project",
+          "ai.cinatra.managed": "true",
+          "ai.cinatra.instance": "legacy-iso",
+          "ai.cinatra.project": "cinatra_legacy_iso",
+        },
+      },
+      NetworkSettings: { Ports: { "5432/tcp": [{ HostIp: "127.0.0.1", HostPort: "5434" }] } },
+    };
+    const r = classifyPortHolder({
+      conflicts: [loop(5434), loop(6379)],
+      inspectRows: [labelledRow],
+      installDir: "/home/u/cinatra",
+      instanceRegistry,
+    });
+    expect(r.kind).toBe("mixed");
+  });
+
   it("MIXED when one port is Cinatra-owned and another is a stranger (review hardening #6)", () => {
     // 5434 owned by beta; 6379 owned by nothing (stranger).
     const r = classifyPortHolder({

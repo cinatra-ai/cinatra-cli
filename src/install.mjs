@@ -2549,6 +2549,91 @@ function parseEnvBody(body) {
   return out;
 }
 
+// ── cinatra-cli#39 — backfill a label/marker-proven instance row ────────────
+/**
+ * The classifier proved (via `ai.cinatra.*` labels or the per-checkout marker)
+ * that a holder dir is a Cinatra instance the REGISTRY does not record. Write an
+ * authoritative `ready` row for it so subsequent runs resolve it from the
+ * registry (the issue's "backfill" requirement). Done in the EXECUTOR, never the
+ * pure classifier, under the alloc lock the other registry writers use. Best-
+ * effort + idempotent: a failure or insufficient proof returns the synthesized
+ * instance unchanged so resolution still proceeds with label/marker metadata.
+ *
+ * @param {object} a.proven  the synthesized instance from classifyPortHolder.backfill
+ * @param {object} a.opts    the parsed install opts (for repoUrl/ref provenance)
+ * @returns {Promise<object>} the recorded row (registry-backed) or the `proven` input.
+ */
+async function backfillProvenInstance({ proven, opts = {}, log = console.log, deps = {} }) {
+  if (!proven || typeof proven !== "object") return proven;
+  const slug = proven.slug;
+  // allocateInstance refuses an invalid slug or a row with no compose project/
+  // files; a label-proven isolated stack always carries both (project from the
+  // `ai.cinatra.project` label, files = the generated isolated compose). If
+  // either is missing, skip the backfill but keep the synthesized metadata (the
+  // menu can still NAME the holder; stop/attach use the recorded row only).
+  const composeProject = proven.composeProject;
+  const composeFiles =
+    Array.isArray(proven.composeFiles) && proven.composeFiles.length
+      ? proven.composeFiles
+      : [ISOLATED_COMPOSE_FILENAME];
+  if (!isValidSlug(slug) || typeof composeProject !== "string" || composeProject.length === 0) {
+    log(
+      `  ⚠ Recognized a label/marker-proven Cinatra instance at ${proven.installDir} but cannot backfill a ` +
+        `registry row (insufficient proof: slug/project). It is still offered for stop/attach.`,
+    );
+    return proven;
+  }
+  // A marker records the install mode; a label-only proof has none → default dev.
+  const mode = proven.proofSource === "marker" && VALID_MODES.has(proven.kind) ? proven.kind : "dev";
+  const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
+  const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
+  let recorded = proven;
+  try {
+    await withAllocLock(lockPath, async () => {
+      const reg = requireUsableInstanceRegistry(registryPath);
+      const existing = getInstance(reg, slug);
+      if (existing) {
+        // A row already exists for this slug — if it maps elsewhere, do not alias.
+        if (path.resolve(existing.installDir) !== path.resolve(proven.installDir)) {
+          log(
+            `  ⚠ Cannot backfill "${slug}": the registry already maps it to ${existing.installDir} ` +
+              `(not ${proven.installDir}). Offering the proven holder without a backfill.`,
+          );
+          return;
+        }
+        recorded = existing;
+        return;
+      }
+      const { registry: allocated } = allocateInstance(reg, slug, {
+        mode,
+        installDir: proven.installDir,
+        composeProject,
+        composeFiles,
+        ports: proven.ports ?? {},
+        appPort: proven.appPort ?? null,
+        // The label/marker proof carries no repo provenance; the registry slot
+        // requires non-empty repoUrl/ref. Use the proof's own value when present
+        // (a marker may record it later), else this install's opts (always set:
+        // repoUrl defaults to DEFAULT_REPO_URL, ref to "main" in parseInstallArgs)
+        // — a reasonable provenance for a sibling Cinatra checkout.
+        repoUrl: proven.repoUrl ?? opts.repoUrl ?? DEFAULT_REPO_URL,
+        ref: proven.ref ?? opts.ref ?? "main",
+        sha: proven.sha ?? null,
+        infraMode: "new",
+        state: "provisioning",
+      });
+      const ready = markInstanceReady(allocated, slug);
+      writeInstanceRegistry(registryPath, ready);
+      recorded = getInstance(ready, slug) ?? proven;
+      log(`- Backfilled an authoritative registry row for the proven Cinatra instance "${slug}" (was ${proven.proofSource}-only).`);
+    });
+  } catch (err) {
+    log(`  ⚠ Could not backfill the proven instance "${slug}" (${err?.message ?? err}). Offering it without a backfill.`);
+    return proven;
+  }
+  return recorded;
+}
+
 // ── conflict resolution orchestrator (classify → offer + execute) ───────────
 /**
  * On a detected host-port conflict, CLASSIFY the holder then OFFER + EXECUTE an
@@ -2576,7 +2661,20 @@ async function resolveConflict({ targetDir, opts, conflicts, resolvedSha, log = 
     instanceRegistry,
     cloneRegistry,
     installDir: targetDir,
+    // cinatra-cli#39: let the classifier consult the per-checkout marker
+    // (`.cinatra/instance.json`) of a holder dir as positive Cinatra proof when
+    // no registry row + no `ai.cinatra.*` label is present.
+    readMarker: deps.readMarker ?? readMarker,
   });
+
+  // cinatra-cli#39: when a holder was proven a Cinatra instance ONLY via its
+  // labels/marker (no registry row), BACKFILL an authoritative registry row in
+  // the EXECUTOR (never the pure classifier) so subsequent runs resolve it from
+  // the registry. Best-effort: a backfill failure must never block resolution.
+  if (cls.kind === "other-cinatra" && cls.backfill) {
+    const backfilled = await backfillProvenInstance({ proven: cls.backfill, opts, log, deps });
+    if (backfilled) cls.instance = backfilled;
+  }
 
   // 1. Our OWN checkout owns the ports → idempotent re-run / attach.
   if (cls.kind === "idempotent-rerun" || cls.kind === "self-instance") {
@@ -2915,7 +3013,15 @@ async function executeStopExisting({ targetDir, opts, conflicts, classified, log
     } catch {
       reg = null;
     }
-    if (reg && getInstance(reg, holder.slug)) {
+    // cinatra-cli#39 (codex #1): release the slug's row ONLY when it still maps
+    // to the dir we actually tore down. A label/marker-proven holder whose slug
+    // COLLIDES with an unrelated registry row (backfill skipped, see
+    // backfillProvenInstance) must NOT cause us to delete that unrelated row —
+    // we tore down `holder.installDir`, so we may only release a row pointing
+    // there. (For a normal registry-backed holder the dirs match, so this is a
+    // no-op tightening.)
+    const existing = reg ? getInstance(reg, holder.slug) : null;
+    if (existing && path.resolve(existing.installDir) === path.resolve(holder.installDir)) {
       const { registry: next } = releaseInstance(reg, holder.slug);
       writeInstanceRegistry(registryPath, next);
     }
