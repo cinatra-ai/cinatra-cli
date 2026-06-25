@@ -1901,6 +1901,333 @@ function deriveInstanceSlug(targetDir) {
     .slice(0, 30);
 }
 
+// ── cinatra-cli#35 — explicit default Compose project name + ownership preflight ──
+//
+// The default `up` historically passed NO `-p`, so Docker derived the project
+// from the dir BASENAME. Two checkouts named `cinatra` ⇒ one shared project ⇒
+// shared named volumes ⇒ a hijack/recreate + cross-`down -v` data-loss. We now
+// compute an EXPLICIT, instance-scoped project name and pass it as `-p`, plus an
+// ownership preflight (running + STOPPED + volumes) that REFUSES when the
+// candidate project / named volumes already belong to a DIFFERENT checkout.
+
+/** The canonical NEW default Compose project name for a checkout:
+ *  `cinatra_<slug>` with the same slug the isolated path uses (explicit
+ *  --instance, else the sanitised dir basename). Pure. NOTE: two dirs BOTH named
+ *  `cinatra` still collapse to `cinatra_cinatra` here — naming alone is NOT the
+ *  safety guarantee; the ownership preflight is (cinatra-cli#35, codex A). */
+export function computeDefaultProject(opts, targetDir) {
+  const slug = opts?.instance ?? deriveInstanceSlug(targetDir);
+  return `cinatra_${slug.replace(/-/g, "_")}`;
+}
+
+/** The BARE basename Compose project a LEGACY default install (brought up under
+ *  the dir basename, no `-p`) would have used. Compose lowercases + strips to
+ *  `[a-z0-9_-]` and collapses other runs to `_`. Pure. */
+export function legacyBasenameProject(targetDir) {
+  const base = path.basename(path.resolve(targetDir));
+  return base
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/^[_-]+/, "");
+}
+
+/** Extract `{ project, workingDir }` ownership facts from a `docker ps -a`
+ *  inspect row (containers) — running OR stopped. Pure. */
+function containerProjectOwnership(row) {
+  const labels = row?.Config?.Labels ?? {};
+  const project = labels["com.docker.compose.project"] || null;
+  const workingDir = labels["com.docker.compose.project.working_dir"] || null;
+  return { project, workingDir };
+}
+
+/**
+ * Decide the default-path Compose project name + ownership verdict from injected
+ * inspect rows (pure — fully unit-testable). Resolution order (cinatra-cli#35):
+ *
+ *   1. LEGACY ADOPTION (codex B, mandatory). If a LEGACY basename project's
+ *      containers are ALL rooted at THIS targetDir, ADOPT that basename project
+ *      (keep volumes stable — a new `cinatra_<slug>` name would orphan the old
+ *      stack AND point at FRESH empty volumes, a worse data-surprise). If the
+ *      legacy project ALSO has a foreign/unknown owner, do NOT adopt — REFUSE
+ *      (codex blocker #3: a mixed-owner legacy project must not be silently
+ *      adopted).
+ *   2. OWNERSHIP REFUSE (codex C). Else, if the candidate `cinatra_<slug>`
+ *      project — or one of its named volumes — already exists and is NOT provably
+ *      ours, REFUSE: routing to --on-conflict=isolated / --instance. A volume may
+ *      carry only `com.docker.compose.project` (no working_dir, codex/risk #2);
+ *      an unknown-dir candidate volume is refused UNLESS ownership is PROVEN
+ *      (a same-target container, or `ownsCandidate` from a registry/marker row) —
+ *      codex blocker #2: a name-matching preserved volume from a DIFFERENT
+ *      checkout must never be silently reused.
+ *   3. Else USE the new `cinatra_<slug>` (brand-new install).
+ *
+ * @param {object} a
+ * @param {string} a.candidateProject  `cinatra_<slug>` (from computeDefaultProject)
+ * @param {string} a.legacyProject     the bare basename project
+ * @param {string} a.targetDir         this checkout's dir
+ * @param {Array}  [a.containerRows]   `docker ps -a` inspect rows (running+stopped)
+ * @param {Array}  [a.volumeRows]      `[{name, project, workingDir}]` named-volume facts
+ * @param {boolean} [a.ownsCandidate]  registry/marker proof THIS checkout owns the
+ *                                      candidate project (lets an own-but-unknown-dir
+ *                                      volume be reused; codex blocker #2).
+ * @returns {{ action:'adopt-legacy'|'use-default'|'refuse', project:string|null,
+ *             reason:string, conflictDir?:string }}
+ */
+export function decideDefaultProjectOwnership({
+  candidateProject,
+  legacyProject,
+  targetDir,
+  containerRows = [],
+  volumeRows = [],
+  ownsCandidate = false,
+} = {}) {
+  const wantDir = targetDir ? path.resolve(targetDir) : null;
+  const rows = Array.isArray(containerRows) ? containerRows : [];
+  const vols = Array.isArray(volumeRows) ? volumeRows : [];
+
+  // Per-project ownership facts gathered from the live containers.
+  // project -> Set<workingDir|null>  (null = a container of that project with no
+  // working_dir label — an UNKNOWN, un-attributable owner).
+  const projectDirs = new Map();
+  for (const r of rows) {
+    const { project, workingDir } = containerProjectOwnership(r);
+    if (!project) continue;
+    const dir = typeof workingDir === "string" && workingDir.length ? path.resolve(workingDir) : null;
+    if (!projectDirs.has(project)) projectDirs.set(project, new Set());
+    projectDirs.get(project).add(dir);
+  }
+
+  // Does a container of `candidateProject` prove THIS checkout owns it?
+  const candidateDirs = projectDirs.get(candidateProject) ?? new Set();
+  const candidateOwnedHere = wantDir != null && candidateDirs.has(wantDir);
+  const provenOurs = ownsCandidate || candidateOwnedHere;
+
+  // 1. Legacy adoption — the basename project is rooted (ONLY) at THIS dir.
+  if (legacyProject && legacyProject !== candidateProject && projectDirs.has(legacyProject)) {
+    const dirs = projectDirs.get(legacyProject);
+    const legacyForeign = [...dirs].filter((d) => d === null || d !== wantDir);
+    if (wantDir && dirs.has(wantDir) && legacyForeign.length === 0) {
+      // ALL legacy owners are us → safe to adopt (volumes stay stable).
+      return {
+        action: "adopt-legacy",
+        project: legacyProject,
+        reason:
+          `an existing legacy default stack (project "${legacyProject}") is rooted at this checkout — ` +
+          `adopting it keeps the named volumes stable`,
+      };
+    }
+    if (legacyForeign.length > 0) {
+      // The legacy basename project is shared with a foreign/unknown owner — never
+      // adopt it (codex blocker #3). REFUSE.
+      const conflictDir = [...dirs].find((d) => d !== null && d !== wantDir);
+      return {
+        action: "refuse",
+        project: null,
+        conflictDir: conflictDir ?? undefined,
+        reason:
+          `the legacy basename project "${legacyProject}" is owned by ` +
+          (conflictDir ? `a different checkout (${conflictDir})` : "another (unattributable) stack") +
+          ` — adopting it could hijack that stack`,
+      };
+    }
+  }
+
+  // 2. Ownership refuse — the candidate project exists and is NOT provably ours.
+  if (candidateProject && candidateDirs.size > 0) {
+    const foreign = [...candidateDirs].filter((d) => d !== null && d !== wantDir);
+    const hasUnknown = candidateDirs.has(null);
+    // Only us → idempotent re-run (safe). Otherwise a foreign or unknown owner is
+    // a conflict UNLESS proven ours by registry/marker (then an unknown-dir
+    // container is treated as our own ghost).
+    const onlyUs = [...candidateDirs].every((d) => d === wantDir);
+    if (!onlyUs && (foreign.length > 0 || (hasUnknown && !provenOurs))) {
+      const conflictDir = foreign.length > 0 ? foreign[0] : undefined;
+      return {
+        action: "refuse",
+        project: null,
+        conflictDir,
+        reason:
+          `the Compose project "${candidateProject}" already exists` +
+          (conflictDir ? ` and is owned by a different checkout (${conflictDir})` : " and is owned by another (unattributable) stack"),
+      };
+    }
+  }
+
+  // 2b. A named volume of the candidate project that is NOT provably ours (volume
+  //     labels may be project-name-only — risk #2). A volume rooted at a DIFFERENT
+  //     checkout, owned by a different project, OR with NO dir + not-proven-ours,
+  //     is a foreign-owned name collision (codex blocker #2: never reuse it).
+  for (const v of vols) {
+    if (!v || typeof v.name !== "string") continue;
+    const ownsByLabel = v.project === candidateProject;
+    const ownsByName = candidateProject && v.name.startsWith(`${candidateProject}_`);
+    if (!ownsByLabel && !ownsByName) continue;
+    const volDir = typeof v.workingDir === "string" && v.workingDir.length ? path.resolve(v.workingDir) : null;
+    if (volDir !== null && volDir === wantDir) continue; // provably ours by dir.
+    const foreignVolDir = volDir !== null && volDir !== wantDir;
+    const foreignVolProject = v.project && v.project !== candidateProject;
+    // An unknown-dir candidate volume is a conflict UNLESS proven ours.
+    const unknownAndUnproven = volDir === null && !foreignVolProject && !provenOurs;
+    if (foreignVolDir || foreignVolProject || unknownAndUnproven) {
+      return {
+        action: "refuse",
+        project: null,
+        conflictDir: volDir ?? undefined,
+        reason:
+          `a named volume ("${v.name}") of project "${candidateProject}" already exists and is owned by ` +
+          (volDir
+            ? `a different checkout (${volDir})`
+            : foreignVolProject
+              ? `a different project ("${v.project}")`
+              : "an unverifiable owner (cannot prove it is this checkout's — refusing to reuse it)"),
+      };
+    }
+  }
+
+  // 3. Brand-new install (or a proven idempotent re-run) — use the explicit
+  //    instance-scoped name.
+  return {
+    action: "use-default",
+    project: candidateProject,
+    reason: "no existing project/volume conflict — using an explicit instance-scoped project name",
+  };
+}
+
+/** Inspect Docker for a project's ownership across RUNNING + STOPPED containers
+ *  and its named volumes (cinatra-cli#35(d)). Returns
+ *  `{ containerRows, volumeRows }` for `decideDefaultProjectOwnership`. Injectable
+ *  via `deps.inspectProjectOwnership` for tests; the real path shells `docker`.
+ *  Best-effort: any docker error yields empty sets (never throws). */
+function inspectProjectOwnership(projectNames, deps = {}) {
+  if (typeof deps.inspectProjectOwnership === "function") {
+    return deps.inspectProjectOwnership(projectNames, deps);
+  }
+  const cap = deps.capture ?? capture;
+  const names = (Array.isArray(projectNames) ? projectNames : [projectNames]).filter(Boolean);
+  const containerRows = [];
+  const seen = new Set();
+  for (const name of names) {
+    // Running AND stopped containers of the project (the stopped-sibling blind
+    // spot — a stopped stack holds no ports but still owns the project+volumes).
+    const ids = cap("docker", ["ps", "-a", "--filter", `label=com.docker.compose.project=${name}`, "-q"]);
+    const idList = (ids ?? "").split("\n").map((s) => s.trim()).filter(Boolean);
+    if (idList.length === 0) continue;
+    const raw = cap("docker", ["inspect", ...idList]);
+    if (!raw) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = [];
+    }
+    for (const r of Array.isArray(parsed) ? parsed : []) {
+      const id = r?.Id ?? JSON.stringify(r);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      containerRows.push(r);
+    }
+  }
+  // Named volumes carrying a candidate-project label (volume labels may be
+  // project-name-only — risk #2). `docker volume ls --filter label=… -q` then
+  // inspect for the working_dir/project labels.
+  const volumeRows = [];
+  const volSeen = new Set();
+  for (const name of names) {
+    const vols = cap("docker", ["volume", "ls", "--filter", `label=com.docker.compose.project=${name}`, "-q"]);
+    const volList = (vols ?? "").split("\n").map((s) => s.trim()).filter(Boolean);
+    if (volList.length === 0) continue;
+    const raw = cap("docker", ["volume", "inspect", ...volList]);
+    if (!raw) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = [];
+    }
+    for (const v of Array.isArray(parsed) ? parsed : []) {
+      if (!v || typeof v.Name !== "string" || volSeen.has(v.Name)) continue;
+      volSeen.add(v.Name);
+      const labels = v.Labels ?? {};
+      volumeRows.push({
+        name: v.Name,
+        project: labels["com.docker.compose.project"] || null,
+        workingDir: labels["com.docker.compose.project.working_dir"] || null,
+      });
+    }
+  }
+  return { containerRows, volumeRows };
+}
+
+/** Best-effort proof that THIS checkout already brought up a DOCKER STACK under
+ *  `candidateProject` — used so an idempotent re-run can reuse its OWN named
+ *  volumes even when their working_dir label is absent, while a foreign checkout's
+ *  name-matching volume is still refused (review blocker: foreign-volume reuse).
+ *  Proof is ONLY a NON-EXTERNAL, READY registry row for this dir recording the
+ *  candidate project (review blocker: non-Docker-owning row false-proof): an
+ *  `external`/`--no-infra` row never started a stack, and
+ *  a `provisioning` row hasn't confirmed bring-up, so neither is Docker ownership;
+ *  the per-checkout MARKER is a hint (not authoritative) and is NOT counted. A
+ *  same-target LIVE container is proof too, but that is established directly in the
+ *  pure decision via `candidateOwnedHere` (a real working_dir label). Never throws. */
+function ownsCandidateProject(targetDir, candidateProject, deps = {}) {
+  const want = path.resolve(targetDir);
+  try {
+    const reg = deps.readInstanceRegistry
+      ? deps.readInstanceRegistry()
+      : requireUsableInstanceRegistry(deps.instanceRegistryPath ?? defaultInstanceRegistryPath());
+    const row = listInstances(reg).find((i) => path.resolve(i.installDir) === want);
+    if (
+      row &&
+      row.composeProject === candidateProject &&
+      row.infraMode !== "external" &&
+      row.state === "ready"
+    ) {
+      return true;
+    }
+  } catch {
+    /* best-effort */
+  }
+  return false;
+}
+
+/** Resolve the default-path Compose project (legacy-adopt / refuse / use-new)
+ *  via the injectable inspector + the pure decision. Throws on REFUSE with an
+ *  accurate message routing to isolated/--instance. Returns the resolved project
+ *  name to pass as `-p`. cinatra-cli#35(b)(c)(d). */
+function resolveDefaultProject({ targetDir, opts, log = console.log, deps = {} }) {
+  const candidateProject = computeDefaultProject(opts, targetDir);
+  const legacyProject = legacyBasenameProject(targetDir);
+  const { containerRows, volumeRows } = inspectProjectOwnership(
+    [candidateProject, legacyProject],
+    deps,
+  );
+  // codex blocker #2: registry/marker proof that THIS checkout owns the candidate
+  // project — lets an own-but-unknown-dir volume be reused on a re-run, while a
+  // name-matching volume from a DIFFERENT checkout is still refused. Best-effort.
+  const ownsCandidate = ownsCandidateProject(targetDir, candidateProject, deps);
+  const decision = decideDefaultProjectOwnership({
+    candidateProject,
+    legacyProject,
+    targetDir,
+    containerRows,
+    volumeRows,
+    ownsCandidate,
+  });
+  if (decision.action === "refuse") {
+    throw new Error(
+      `Refusing the default install: ${decision.reason}.\n` +
+        `  Bringing up the default stack here would HIJACK / recreate that stack's containers and operate on its\n` +
+        `  named volumes (a \`docker compose down -v\` from EITHER checkout could then destroy the OTHER's data).\n` +
+        `  Re-run with --on-conflict=isolated for a fully-separate second stack, ` +
+        `or --instance <slug> for a distinct project name.`,
+    );
+  }
+  if (decision.action === "adopt-legacy") {
+    log(`- Adopting the existing legacy default stack (project "${decision.project}") for this checkout — ${decision.reason}.`);
+  }
+  return decision.project;
+}
+
 // ── T8c — record the DEFAULT (non-conflict) install ─────────────────────────
 /** Record a registry provisioning→ready row + marker for a plain default
  *  install (default band, base compose pair, no generated file). Default
@@ -1908,12 +2235,17 @@ function deriveInstanceSlug(targetDir) {
  *  injected label-only file — that would change the most-trodden default `up`
  *  invocation; accepted this lower-risk choice; documented in the PR).
  *  Returns the slug recorded, or null when the registry is unavailable. */
-async function recordDefaultInstance({ targetDir, opts, resolvedSha, state, log = console.log, deps = {} }) {
+async function recordDefaultInstance({ targetDir, opts, resolvedSha, state, composeProject: composeProjectArg = null, log = console.log, deps = {} }) {
   const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
   const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
   const slug = opts.instance ?? deriveInstanceSlug(targetDir);
   if (!isValidSlug(slug)) return null;
-  const composeProject = "cinatra"; // the default compose project (dir basename / no -p).
+  // cinatra-cli#35: record the EXPLICIT instance-scoped project name that the
+  // default `up` actually used (legacy-adopted basename or new `cinatra_<slug>`),
+  // NOT the hardcoded "cinatra" literal that was wrong for any non-`cinatra` dir
+  // and collided for any two `cinatra` dirs. Falls back to the computed name when
+  // a caller omits it (e.g. the external-record path, which has no live stack).
+  const composeProject = composeProjectArg ?? computeDefaultProject(opts, targetDir);
   const composeFiles = ["docker-compose.yml", "docker-compose.dev.yml"];
   // The default infra band as a per-service ports map.
   const ports = {};
@@ -2358,14 +2690,42 @@ async function runExecuteMenu({ conflicts, classified, opts, log = console.log }
   return "abort";
 }
 
+/** True iff a registry/marker row records an ISOLATED instance (its own
+ *  generated compose file + remapped band), as opposed to a DEFAULT-stack row.
+ *  cinatra-cli#35(e): the old `composeProject === "cinatra"` sentinel no longer
+ *  discriminates — a DEFAULT row now also carries an explicit
+ *  `cinatra_<slug>` project name. The robust signal is the SOLE generated
+ *  isolated compose file (`docker-compose.cinatra-isolated.yml`); a default row
+ *  records the base `docker-compose.yml`/`.dev.yml` pair. External rows are
+ *  never isolated (no local stack). */
+function isIsolatedRow(row) {
+  if (!row || row.infraMode === "external") return false;
+  const files = Array.isArray(row.composeFiles) ? row.composeFiles : [];
+  return files.includes(ISOLATED_COMPOSE_FILENAME);
+}
+
+/** The `-p` Compose project value to use for a recorded row, or null to OMIT it
+ *  (compose then derives the project from the dir basename — the LEGACY default
+ *  behavior). cinatra-cli#35(e): a row recorded by the new code carries the
+ *  EXPLICIT project the `up` used (default or isolated) → always pass it. An OLD
+ *  row written before #35 records the literal `"cinatra"` sentinel even when
+ *  compose actually used a different basename — for those we OMIT `-p` so down/
+ *  attach fall back to the same basename derivation the old `up` used (never a
+ *  wrong `-p cinatra` that targets nothing). */
+function composeProjectArgForRow(row) {
+  const proj = row?.composeProject;
+  if (!proj || proj === "cinatra") return null;
+  return proj;
+}
+
 /** Read the instance-registry row that records THIS checkout AS an ISOLATED
- *  instance (its own compose project, not the default `cinatra`). Returns the
- *  row or null. Best-effort (a malformed/missing registry → null). */
+ *  instance (its own generated compose file + remapped band). Returns the row or
+ *  null. Best-effort (a malformed/missing registry → null). */
 function lookupOwnIsolatedRow(targetDir) {
   try {
     const reg = requireUsableInstanceRegistry(defaultInstanceRegistryPath());
     const row = listInstances(reg).find((i) => path.resolve(i.installDir) === path.resolve(targetDir)) ?? null;
-    if (row && row.composeProject && row.composeProject !== "cinatra" && row.infraMode !== "external") {
+    if (isIsolatedRow(row)) {
       return row;
     }
   } catch {
@@ -2455,16 +2815,19 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
   let broughtUp = false;
   if (!opts.dryRun) {
     const composeFiles = row?.composeFiles ?? null;
-    const composeProject = row?.composeProject && row.composeProject !== "cinatra" ? row.composeProject : null;
-    // When attaching to an ISOLATED instance (its own compose project), the
-    // recorded compose is the generated file whose secrets are scrubbed to
-    // `${VAR}`; re-point the env at the recorded remapped ports and bring up WITH
-    // `--env-file .env.local` so those placeholders resolve (parity with the
-    // primary isolated `up`). A default-stack attach keeps compose's normal `.env`
-    // discovery (no env-file), byte-identical to before.
-    const isIsolatedRow = composeProject != null && row?.infraMode !== "external";
+    // cinatra-cli#35(e): pass the recorded explicit `-p` (default OR isolated);
+    // OMIT only for a pre-#35 legacy "cinatra" sentinel row (basename fallback).
+    const composeProject = composeProjectArgForRow(row);
+    // When attaching to an ISOLATED instance (its own generated compose file),
+    // the recorded compose's secrets are scrubbed to `${VAR}`; re-point the env
+    // at the recorded remapped ports and bring up WITH `--env-file .env.local` so
+    // those placeholders resolve (parity with the primary isolated `up`). A
+    // DEFAULT-stack attach keeps compose's normal `.env` discovery (no env-file),
+    // byte-identical to before — discriminated by the generated isolated compose
+    // file, NOT by the project name (a default row now also has an explicit one).
+    const attachingIsolated = isIsolatedRow(row);
     let attachEnvFile = null;
-    if (isIsolatedRow) {
+    if (attachingIsolated) {
       ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: row.ports ?? {}, log });
       const envCandidate = path.join(targetDir, ".env.local");
       attachEnvFile = existsSync(envCandidate) ? envCandidate : null;
@@ -2536,9 +2899,11 @@ async function executeStopExisting({ targetDir, opts, conflicts, classified, log
   }
 
   // Tear down the RECORDED project + files (never a bare dir `down`).
+  // cinatra-cli#35(e): use the recorded EXPLICIT `-p` (default OR isolated); a
+  // pre-#35 legacy "cinatra" sentinel row falls back to basename derivation.
   runCompose(holder.installDir, {
     composeFiles: holder.composeFiles,
-    composeProject: holder.composeProject && holder.composeProject !== "cinatra" ? holder.composeProject : null,
+    composeProject: composeProjectArgForRow(holder),
     volumes: withVolumes,
   });
 
@@ -2665,6 +3030,9 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
 
     // The computed default project / instance name (mirrors recordDefaultInstance).
     const defaultSlug = opts.instance ?? deriveInstanceSlug(targetDir);
+    // cinatra-cli#35: the EXPLICIT instance-scoped Compose project name the
+    // default `up` would pass as `-p` (no longer the dir basename).
+    const defaultComposeProject = computeDefaultProject(opts, targetDir);
 
     // Conflict classification on the default band — PORTS PROBED READ-ONLY only.
     // (The AUTHORITATIVE post-clone band comes from the checkout's own compose
@@ -2689,6 +3057,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     log(`    Mode:          ${opts.mode}`);
     log(`    Infra plan:    ${infraPlanIntent}`);
     log(`    Project name:  ${isValidSlug(defaultSlug) ? defaultSlug : "(unnamed — would not record)"}`);
+    log(`    Compose -p:    ${defaultComposeProject} (explicit; ownership preflight runs at install)`);
     log(`    App port:      ${DEFAULT_APP_PORT_FOR_RECORD}`);
     if (conflicts.length > 0) {
       for (const c of conflicts) {
@@ -2871,19 +3240,41 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     await executeExternalEnv({ targetDir, opts, conflictResolution, log });
   }
 
-  // 6. Bring up + wait for docker infra, per the resolved plan.
+  // 5d + 6. cinatra-cli#35 — resolve the EXPLICIT default Compose project name +
+  //     OWNERSHIP PREFLIGHT, THEN bring the default stack up — all UNDER ONE
+  //     HELD ALLOC LOCK. Historically the default `up` passed no `-p`, so Docker
+  //     derived the project from the dir BASENAME — two checkouts named `cinatra`
+  //     shared one project + its named volumes (a hijack/recreate + cross-`down
+  //     -v` data-loss). We now compute an explicit instance-scoped `-p`, ADOPT a
+  //     legacy basename stack already rooted here (so volumes stay stable), and
+  //     REFUSE when the candidate project / its named volumes already belong to a
+  //     DIFFERENT checkout (independent of held ports — this catches the
+  //     STOPPED-sibling blind spot the port preflight misses).
+  //     The lock is HELD ACROSS the bring-up (codex blocker #1): releasing it
+  //     after the preflight but before `up` would let two same-name installs both
+  //     see "no project", release, and race into the SAME `-p` — re-introducing
+  //     the very hijack this fix prevents. Holding it through `up` serialises
+  //     them, so the second observes the first's now-existing project and refuses.
+  let defaultProject = null;
+  if (infraPlan === "default") {
+    const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
+    defaultProject = await withAllocLock(lockPath, async () => {
+      const resolved = resolveDefaultProject({ targetDir, opts, log, deps });
+      startInfra({ targetDir, log, composeProject: resolved });
+      return resolved;
+    });
+  }
+
+  // 6. Log the non-default infra plans (the default bring-up already ran above
+  //    under the held lock).
   //    - "isolated"/"attach": already provisioned during conflict resolution.
   //    - "external": no local infra to start.
-  //    - "default": bring up the base stack (no conflict, or conflict resolved
-  //      to default via stop-existing's teardown).
   if (infraPlan === "external") {
     log("- Skipping local infrastructure startup (external infra). Ensure Postgres/Redis/Nango are reachable before setup.");
   } else if (infraPlan === "isolated") {
     log(`- Isolated instance "${resolution?.instance?.slug}" infra is up (project ${resolution?.instance?.composeProject}).`);
   } else if (infraPlan === "attach") {
     log("- Attached to the existing instance's infra (no second stack started).");
-  } else {
-    startInfra({ targetDir, log });
   }
 
   // 7. Clone ONLY the declared companion repos, THEN install, THEN setup.
@@ -2943,6 +3334,10 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
       opts,
       resolvedSha,
       state: infraPlan === "external" ? "external" : "ready",
+      // cinatra-cli#35: record the SAME explicit project the default `up` used
+      // (null for external — recordDefaultInstance falls back to the computed
+      // instance-scoped name so the row is still accurate for --status/--down).
+      composeProject: defaultProject,
       log,
       deps,
     });
