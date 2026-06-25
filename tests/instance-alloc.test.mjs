@@ -13,6 +13,7 @@ import {
   allocateAppPort,
   allocateBandOffset,
   validateAppPort,
+  assertAppPortFree,
   validatePortOffset,
   withAllocLock,
   defaultAllocLockPath,
@@ -81,6 +82,65 @@ describe("allocateAppPort", () => {
     }
     expect(() => allocateAppPort({ instanceRegistry: { instances } })).toThrow(/No free instance app port/);
   });
+
+  it("skips ports in the `exclude` set (cinatra-cli#38 auto-bump on a live-busy port)", () => {
+    // 3300 + 3301 proven busy by a live probe → next free is 3302.
+    const p = allocateAppPort({ exclude: new Set([3300, 3301]) });
+    expect(p).toBe(3302);
+  });
+});
+
+// ── cinatra-cli#38 — explicit --app-port reserved-set + live-availability ─────
+describe("assertAppPortFree", () => {
+  const freeProbe = async () => true; // every port reports FREE
+  const busyProbe = async () => false; // every port reports BUSY
+
+  it("rejects the DEFAULT app port (3000) — reserved, before any probe", async () => {
+    const reserved = reservedPorts(); // includes 3000/3010 + clone bands
+    await expect(
+      assertAppPortFree({ appPort: 3000, reserved, probe: freeProbe }),
+    ).rejects.toThrow(/reserved.*DEFAULT stack app port \(3000\)/s);
+  });
+
+  it("rejects the DEFAULT WayFlow port (3010) — reserved", async () => {
+    const reserved = reservedPorts();
+    await expect(
+      assertAppPortFree({ appPort: 3010, reserved, probe: freeProbe }),
+    ).rejects.toThrow(/reserved.*DEFAULT stack app port \(3010\)/s);
+  });
+
+  it("rejects a clone-band port (3105) — reserved", async () => {
+    const reserved = reservedPorts();
+    await expect(
+      assertAppPortFree({ appPort: 3105, reserved, probe: freeProbe }),
+    ).rejects.toThrow(/reserved.*static clone band.*3100-3119/s);
+  });
+
+  it("rejects a live-busy port even when it is outside the reserved set", async () => {
+    const reserved = reservedPorts();
+    await expect(
+      assertAppPortFree({ appPort: 3400, reserved, probe: busyProbe }),
+    ).rejects.toThrow(/already in use.*3400/s);
+  });
+
+  it("rejects a port reserved by a live instance reservation", async () => {
+    const instanceRegistry = { instances: { x: { appPort: 3400, ports: {} } } };
+    const reserved = reservedPorts({ instanceRegistry });
+    await expect(
+      assertAppPortFree({ appPort: 3400, reserved, probe: freeProbe }),
+    ).rejects.toThrow(/reserved/);
+  });
+
+  it("accepts a free, non-reserved port", async () => {
+    const reserved = reservedPorts();
+    await expect(assertAppPortFree({ appPort: 3400, reserved, probe: freeProbe })).resolves.toBe(3400);
+  });
+
+  it("checks the reserved set even with NO probe (shape-independent of live state)", async () => {
+    const reserved = reservedPorts();
+    await expect(assertAppPortFree({ appPort: 3000, reserved })).rejects.toThrow(/reserved/);
+    await expect(assertAppPortFree({ appPort: 3400, reserved })).resolves.toBe(3400);
+  });
 });
 
 describe("allocateBandOffset — cross-registry no-overlap", () => {
@@ -106,6 +166,17 @@ describe("allocateBandOffset — cross-registry no-overlap", () => {
 
   it("throws on an empty band", () => {
     expect(() => allocateBandOffset({ band: [] })).toThrow(/non-empty band/);
+  });
+
+  it("routes the band around the instance's own app port via extraReserved (cinatra-cli#38)", () => {
+    // An explicit --app-port of 15434 would otherwise collide with postgres
+    // (5434) at the default offset 10000 — the instance's OWN compose port lands
+    // on its OWN app port. Reserving the app port forces a bump to offset 20000.
+    const { offset } = allocateBandOffset({ band: DEFAULT_BAND, extraReserved: 15434 });
+    expect(offset).toBe(20000);
+    // A Set of extra reservations works too.
+    const { offset: o2 } = allocateBandOffset({ band: DEFAULT_BAND, extraReserved: new Set([15434]) });
+    expect(o2).toBe(20000);
   });
 });
 

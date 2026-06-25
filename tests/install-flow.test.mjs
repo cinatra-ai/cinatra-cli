@@ -603,6 +603,151 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     expect(env).toMatch(/^NANGO_DATABASE_URL=postgresql:\/\/127\.0\.0\.1:15435\//m);
   });
 
+  // ── cinatra-cli#38 — isolated app port live-probe + reserved-set validate ───
+  // The app port (Next.js PORT) is NOT a compose-published port, so it bypassed
+  // the infra band's live probe. Distinguish the app-port probe from the band
+  // probe by its synthetic service name "app".
+  const isAppProbe = (band) => Array.isArray(band) && band.some((b) => b.service === "app");
+
+  it("#38: explicit --app-port 3000 (a DEFAULT app port) REJECTS before clone/infra", async () => {
+    const installDir = path.join(sandbox, "p38-reserved");
+    const upCalls = [];
+    await expect(
+      runInstall(
+        [
+          "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+          "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "p38res", "--app-port", "3000",
+        ],
+        {
+          log: () => {},
+          deps: flowDeps({
+            // Force the isolated branch (the default band conflicts on 5434);
+            // any app/remapped probe reports FREE — so the ONLY failure is the
+            // reserved-set rejection on the explicit 3000.
+            detectPortConflicts: async (band) => {
+              const pg = band.find((b) => b.service === "postgres");
+              if (pg && pg.port === 5434) return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+              return [];
+            },
+            bringUpInfra: (args) => upCalls.push(args),
+          }),
+        },
+      ),
+    ).rejects.toThrow(/--app-port 3000 is reserved.*DEFAULT stack app port/s);
+    // HARD proof: nothing was brought up; no ready row was recorded.
+    expect(upCalls).toEqual([]);
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances.p38res).toBeUndefined();
+  });
+
+  it("#38: explicit --app-port on a LIVE-BUSY socket REJECTS before clone/infra", async () => {
+    const installDir = path.join(sandbox, "p38-busy");
+    const upCalls = [];
+    await expect(
+      runInstall(
+        [
+          "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+          "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "p38busy", "--app-port", "3400",
+        ],
+        {
+          log: () => {},
+          deps: flowDeps({
+            detectPortConflicts: async (band) => {
+              // The app-port probe reports 3400 BUSY; the default band conflicts
+              // on 5434 (forces isolated); the remapped band is free.
+              if (isAppProbe(band)) return [{ service: "app", host: "0.0.0.0", port: 3400, holder: null }];
+              const pg = band.find((b) => b.service === "postgres");
+              if (pg && pg.port === 5434) return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+              return [];
+            },
+            bringUpInfra: (args) => upCalls.push(args),
+          }),
+        },
+      ),
+    ).rejects.toThrow(/--app-port 3400 is already in use/);
+    expect(upCalls).toEqual([]);
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances.p38busy).toBeUndefined();
+  });
+
+  it("#38: an AUTO app port that probes BUSY BUMPS to the next free port", async () => {
+    const installDir = path.join(sandbox, "p38-bump");
+    const upCalls = [];
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "p38bump",
+      ],
+      {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async (band) => {
+            // The first auto-allocated app port (3300) is BUSY → must bump to 3301.
+            if (isAppProbe(band)) {
+              return band[0].port === 3300
+                ? [{ service: "app", host: "0.0.0.0", port: 3300, holder: null }]
+                : [];
+            }
+            const pg = band.find((b) => b.service === "postgres");
+            if (pg && pg.port === 5434) return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+            return [];
+          },
+          bringUpInfra: (args) => upCalls.push(args),
+        }),
+      },
+    );
+    expect(res.infraPlan).toBe("isolated");
+    // Bumped past the busy 3300 → recorded + env-written with 3301.
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances.p38bump.appPort).toBe(3301);
+    const env = readFileSync(path.join(installDir, ".env.local"), "utf8");
+    expect(env).toMatch(/^PORT=3301$/m);
+    // The stack DID come up (bump succeeds, not rejects).
+    expect(upCalls.length).toBe(1);
+  });
+
+  it("#38: explicit --app-port in the infra band range does NOT self-collide (band routes around it)", async () => {
+    // --app-port 15434 is FREE and not in the reserved set, so it passes the
+    // app-port checks. But the default auto offset (10000) maps postgres
+    // 5434→15434 — the instance's own compose would own its own app port. The
+    // band must reserve the app port and bump to a higher offset so the recorded
+    // postgres host port is NOT 15434.
+    const installDir = path.join(sandbox, "p38-selfcollide");
+    const upCalls = [];
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "p38sc", "--app-port", "15434",
+      ],
+      {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async (band) => {
+            // App-port probe + every remapped band reports FREE; only the default
+            // band conflicts (forces isolated).
+            if (isAppProbe(band)) return [];
+            const pg = band.find((b) => b.service === "postgres");
+            if (pg && pg.port === 5434) return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+            return [];
+          },
+          bringUpInfra: (args) => upCalls.push(args),
+        }),
+      },
+    );
+    expect(res.infraPlan).toBe("isolated");
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances.p38sc.appPort).toBe(15434);
+    // NO recorded infra host port (across every service) may equal the app port
+    // — that is the self-collision the band reservation prevents.
+    const allInfraPorts = Object.values(reg.registry.instances.p38sc.ports ?? {}).flat();
+    expect(allInfraPorts).not.toContain(15434);
+    // Concretely, postgres bumped past the default offset (15434 → 25434+).
+    const pgPorts = reg.registry.instances.p38sc.ports.postgres ?? [];
+    expect(pgPorts.length).toBe(1);
+    expect(pgPorts[0]).toBeGreaterThanOrEqual(25434);
+    expect(upCalls.length).toBe(1);
+  });
+
   it("isolated install REFUSES when an infra URL is EXPORTED in the shell (review hardening #3)", async () => {
     const installDir = path.join(sandbox, "iso-exported");
     const prev = process.env.SUPABASE_DB_URL;
