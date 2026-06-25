@@ -18,6 +18,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -171,6 +172,57 @@ describe("runPreflight", () => {
     });
     expect(res.ok).toBe(false);
     expect(res.failures.join("\n")).toMatch(/Cannot write into \/whatever/);
+  });
+
+  it("#37: under dryRun the REAL writability check writes NO temp probe file", () => {
+    // Finding #2: checkTargetWritable() used to writeFileSync + rm a temp probe
+    // even under --dry-run — a filesystem side effect. With dryRun:true the
+    // check must be non-mutating (accessSync), leaving the parent dir untouched.
+    const dir = mkdtempSync(path.join(os.tmpdir(), "cin-dry-probe-"));
+    try {
+      const targetDir = path.join(dir, "would-install-here");
+      const before = readdirSync(dir);
+      const res = runPreflight({
+        mode: "dev",
+        targetDir,
+        dryRun: true,
+        deps: {
+          nodeVersion: "24.0.0",
+          commandExists: (cmd) => ["git", "corepack", "docker", "curl"].includes(cmd),
+          composeAvailable: () => true,
+          // NOTE: the REAL checkTargetWritable runs (no seam) so we exercise the
+          // dryRun → non-writing path.
+        },
+      });
+      expect(res.ok).toBe(true);
+      // The parent dir is byte-for-byte unchanged: no probe file appeared, and
+      // none was created-then-removed (we just assert no leftover + same listing).
+      const after = readdirSync(dir);
+      expect(after).toEqual(before);
+      expect(after.filter((n) => n.startsWith(".cinatra-install-write-probe"))).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("#37: WITHOUT dryRun the real writability check still validates (probe path)", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "cin-probe-"));
+    try {
+      const res = runPreflight({
+        mode: "dev",
+        targetDir: path.join(dir, "x"),
+        deps: {
+          nodeVersion: "24.0.0",
+          commandExists: (cmd) => ["git", "corepack", "docker", "curl"].includes(cmd),
+          composeAvailable: () => true,
+        },
+      });
+      expect(res.ok).toBe(true);
+      // The probe is cleaned up best-effort, so no leftover should remain.
+      expect(readdirSync(dir).filter((n) => n.startsWith(".cinatra-install-write-probe"))).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("--no-infra downgrades a missing Docker to a WARNING (not a hard failure)", () => {
@@ -390,6 +442,42 @@ describe("runInstall — from zero (local remote, --no-infra --no-setup)", () =>
     );
     expect(result.sha).toMatch(/^[0-9a-f]{40}$/);
     expect(logs.join("\n")).toMatch(/Existing cinatra checkout/);
+  });
+
+  it("--dry-run on the default path performs NO side effects (cinatra-cli#37)", async () => {
+    // A fresh, never-touched target dir.
+    const dryDir = path.join(sandbox, "dry-default");
+    const logs = [];
+    const result = await runInstall(
+      [
+        "--dir", dryDir,
+        "--repo-url", `file://${originRepo}`,
+        "--ref", "main",
+        "--yes", "--no-infra", "--dry-run",
+      ],
+      { log: (m) => logs.push(String(m)) },
+    );
+
+    // (a) the target dir was NOT created (or, if it exists, stays empty) — no clone.
+    if (existsSync(dryDir)) {
+      expect(existsSync(path.join(dryDir, "pnpm-workspace.yaml"))).toBe(false);
+      expect(existsSync(path.join(dryDir, ".git"))).toBe(false);
+    }
+    // (b) no .env.local was written.
+    expect(existsSync(path.join(dryDir, ".env.local"))).toBe(false);
+    // (c) the plan lines were logged (and NO "install complete").
+    const out = logs.join("\n");
+    expect(out).toMatch(/Dry run — no changes made/);
+    expect(out).toMatch(/Directory:\s+.*dry-default/);
+    expect(out).toMatch(/Ref \/ commit:\s+main \([0-9a-f]{7,40}\)/); // ls-remote resolved a real sha
+    expect(out).toMatch(/Project name:\s+dry-default/);
+    expect(out).not.toMatch(/install complete/);
+    expect(out).not.toMatch(/Cinatra checked out at/);
+    // (d) the return carries dryRun:true and the resolved plan.
+    expect(result.dryRun).toBe(true);
+    expect(result.targetDir).toBe(path.resolve(dryDir));
+    expect(result.sha).toMatch(/^[0-9a-f]{40}$/);
+    expect(result.instance).toBe("dry-default");
   });
 
   it("re-running with a DIFFERENT --repo-url is refused (origin mismatch)", async () => {

@@ -5,13 +5,13 @@
 // no live daemon / Postgres needed.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { parseInstallArgs, runInstall } from "../src/install.mjs";
+import { DEFAULT_REPO_URL, parseInstallArgs, runInstall } from "../src/install.mjs";
 import { readInstanceRegistry } from "../src/instance-registry.mjs";
 import { readMarker } from "../src/instance-marker.mjs";
 
@@ -241,6 +241,117 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     expect(reg.registry.instances["default-ok"].composeProject).toBe("cinatra");
     // marker written + reconcilable.
     expect(readMarker(installDir).status).toBe("ok");
+  });
+
+  it("#37: --dry-run on the default path never calls the bringUpInfra seam", async () => {
+    const installDir = path.join(sandbox, "dry-flow");
+    const upCalls = [];
+    const res = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--dry-run"],
+      {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [], // no conflict
+          bringUpInfra: (args) => upCalls.push(args),
+        }),
+      },
+    );
+    expect(res.dryRun).toBe(true);
+    // The infra seam was NOT invoked (no `docker compose up`).
+    expect(upCalls).toEqual([]);
+    // No clone happened → no marker, no .env.local.
+    expect(existsSync(path.join(installDir, ".env.local"))).toBe(false);
+    expect(existsSync(path.join(installDir, "pnpm-workspace.yaml"))).toBe(false);
+  });
+
+  it("#37 (codex re-review): --dry-run PREVIEWS a default-band port conflict instead of THROWING", async () => {
+    // Regression for the codex blocker: the pre-clone port-conflict guard
+    // threw before the dry-run short-circuit, so a --dry-run with a default-band
+    // conflict aborted before the preview was ever produced. The fix relocates
+    // the dry-run early-return AHEAD of the throwing guard AND the writable
+    // temp-probe, so a conflict is REPORTED (never thrown) and ZERO filesystem
+    // side effects occur.
+    const installDir = path.join(sandbox, "dry-conflict");
+    const upCalls = [];
+    const probedBands = [];
+    const logs = [];
+    let res;
+    await expect(
+      (async () => {
+        res = await runInstall(
+          ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--dry-run"],
+          {
+            log: (m) => logs.push(String(m)),
+            deps: flowDeps({
+              // The default band is in conflict (someone holds postgres 5434).
+              detectPortConflicts: async (band) => {
+                probedBands.push(band);
+                return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+              },
+              bringUpInfra: (args) => upCalls.push(args),
+            }),
+          },
+        );
+      })(),
+    ).resolves.toBeUndefined(); // (a) it did NOT throw on the conflict.
+
+    // (b) the preview returned dryRun:true.
+    expect(res.dryRun).toBe(true);
+    // (c) the conflict is carried in BOTH the returned plan and the log output.
+    expect(res.conflicts).toEqual([5434]);
+    const out = logs.join("\n");
+    expect(out).toMatch(/conflict:\s+port 5434 held/);
+    expect(out).toMatch(/Infra plan:\s+default \(port conflict detected on 5434/);
+    // The read-only port probe DID run (proving the dry-run block, not the
+    // throwing guard, performed the conflict classification).
+    expect(probedBands.length).toBeGreaterThan(0);
+    // (d) infra was NOT brought up.
+    expect(upCalls).toEqual([]);
+    // (e) no files were created — no clone, no .env.local, and no leftover
+    //     writable temp-probe file in the parent dir.
+    expect(existsSync(path.join(installDir, ".env.local"))).toBe(false);
+    expect(existsSync(path.join(installDir, "pnpm-workspace.yaml"))).toBe(false);
+    const parent = path.dirname(installDir);
+    const probeLeftovers = existsSync(parent)
+      ? readdirSync(parent).filter((n) => n.startsWith(".cinatra-install-write-probe"))
+      : [];
+    expect(probeLeftovers).toEqual([]);
+  });
+
+  it("#37 (codex re-review): --dry-run on the DEFAULT repo+ref does NOT hit the throwing pre-clone guard", async () => {
+    // The HARD regression for finding #1: with the DEFAULT repo URL + ref the
+    // `usesDefaultBand` pre-clone guard is ARMED — under the old ordering it
+    // threw on a default-band conflict BEFORE the dry-run preview. The fix puts
+    // the dry-run early-return AHEAD of that guard, so a default-band dry-run
+    // PREVIEWS the conflict instead of aborting. `capture` is stubbed so no
+    // real `git ls-remote` network call is made.
+    const installDir = path.join(sandbox, "dry-default-band");
+    const upCalls = [];
+    let res;
+    await expect(
+      (async () => {
+        res = await runInstall(
+          ["--dir", installDir, "--repo-url", DEFAULT_REPO_URL, "--ref", "main", "--yes", "--dry-run"],
+          {
+            log: () => {},
+            deps: flowDeps({
+              // ls-remote stub → a deterministic sha (no network).
+              capture: () => "abc1234abc1234abc1234abc1234abc1234abc12\tHEAD",
+              // Default band conflicts — the guard WOULD throw if it were reached.
+              detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+              bringUpInfra: (args) => upCalls.push(args),
+            }),
+          },
+        );
+      })(),
+    ).resolves.toBeUndefined(); // did NOT throw via formatPortConflictError.
+
+    expect(res.dryRun).toBe(true);
+    expect(res.conflicts).toEqual([5434]);
+    expect(res.sha).toBe("abc1234abc1234abc1234abc1234abc1234abc12");
+    expect(upCalls).toEqual([]);
+    expect(existsSync(path.join(installDir, ".env.local"))).toBe(false);
+    expect(existsSync(path.join(installDir, "pnpm-workspace.yaml"))).toBe(false);
   });
 
   it("T8/T8b: --on-conflict=isolated brings up a remapped second stack + records it", async () => {
