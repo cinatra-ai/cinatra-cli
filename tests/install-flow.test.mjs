@@ -220,6 +220,10 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
       readCloneRegistry: () => null,
       bringUpInfra: () => {},
       runComposeDown: () => {},
+      // cinatra-cli#35: default-path ownership preflight inspector — no existing
+      // project/volume conflict by default (brand-new install). Per-test overrides
+      // inject foreign/legacy rows.
+      inspectProjectOwnership: () => ({ containerRows: [], volumeRows: [] }),
       ...extra,
     };
   }
@@ -238,9 +242,197 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     const reg = readInstanceRegistry(regPath);
     expect(reg.status).toBe("ok");
     expect(reg.registry.instances["default-ok"].state).toBe("ready");
-    expect(reg.registry.instances["default-ok"].composeProject).toBe("cinatra");
+    // cinatra-cli#35: the default row records the EXPLICIT instance-scoped
+    // Compose project name (`cinatra_<slug>`), NOT the old hardcoded "cinatra"
+    // literal that collided for two dirs both named `cinatra`.
+    expect(reg.registry.instances["default-ok"].composeProject).toBe("cinatra_default_ok");
     // marker written + reconcilable.
     expect(readMarker(installDir).status).toBe("ok");
+  });
+
+  // ── cinatra-cli#35 — default project name + ownership preflight ─────────────
+  it("#35: the default `up` is invoked with the computed instance-scoped `-p`", async () => {
+    const installDir = path.join(sandbox, "p35-default");
+    const upCalls = [];
+    const res = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [], // no conflict
+          bringUpInfra: (args) => upCalls.push(args),
+        }),
+      },
+    );
+    expect(res.infraPlan).toBe("default");
+    // The default `up` passed an EXPLICIT `-p cinatra_<slug>` (never the bare
+    // dir basename) — the core data-risk fix.
+    expect(upCalls.length).toBe(1);
+    expect(upCalls[0].composeProject).toBe("cinatra_p35_default");
+    // …and the SAME name is recorded.
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances["p35-default"].composeProject).toBe("cinatra_p35_default");
+  });
+
+  it("#35: a mismatched-working_dir inspect row REJECTS before `up` (no bringUpInfra)", async () => {
+    const installDir = path.join(sandbox, "p35-hijack");
+    const otherDir = path.join(sandbox, "p35-other-checkout");
+    const upCalls = [];
+    await expect(
+      runInstall(
+        ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+        {
+          log: () => {},
+          deps: flowDeps({
+            detectPortConflicts: async () => [], // ports are FREE (the sibling is stopped)
+            bringUpInfra: (args) => upCalls.push(args),
+            // The candidate project already exists, owned by a DIFFERENT checkout.
+            inspectProjectOwnership: () => ({
+              containerRows: [
+                {
+                  Config: {
+                    Labels: {
+                      "com.docker.compose.project": "cinatra_p35_hijack",
+                      "com.docker.compose.project.working_dir": otherDir,
+                    },
+                  },
+                },
+              ],
+              volumeRows: [],
+            }),
+          }),
+        },
+      ),
+    ).rejects.toThrow(/Refusing the default install.*different checkout/s);
+    // HARD proof: infra was NEVER brought up (no hijack/recreate).
+    expect(upCalls).toEqual([]);
+    // No registry row recorded for the rejected install.
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances["p35-hijack"]).toBeUndefined();
+  });
+
+  it("#35: a STOPPED sibling at a different dir (ps -a row) refuses (the port preflight misses it)", async () => {
+    const installDir = path.join(sandbox, "p35-stopped");
+    const otherDir = path.join(sandbox, "p35-stopped-other");
+    const upCalls = [];
+    await expect(
+      runInstall(
+        ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+        {
+          log: () => {},
+          deps: flowDeps({
+            // The sibling is STOPPED → it holds NO ports → the port probe is clean.
+            detectPortConflicts: async () => [],
+            bringUpInfra: (args) => upCalls.push(args),
+            // …but `docker ps -a` still finds its (stopped) container's labels.
+            inspectProjectOwnership: () => ({
+              containerRows: [
+                {
+                  Config: {
+                    Labels: {
+                      "com.docker.compose.project": "cinatra_p35_stopped",
+                      "com.docker.compose.project.working_dir": otherDir,
+                    },
+                  },
+                },
+              ],
+              volumeRows: [],
+            }),
+          }),
+        },
+      ),
+    ).rejects.toThrow(/Refusing the default install/);
+    expect(upCalls).toEqual([]);
+  });
+
+  it("#35: a legacy basename project rooted at THIS dir is ADOPTED (keeps `-p <basename>`)", async () => {
+    // Install into a dir whose basename is `cinatra` (the collision case) — an
+    // existing legacy `cinatra` stack rooted HERE must be adopted (volumes stay
+    // stable), NOT renamed to `cinatra_cinatra` (which would orphan it + point at
+    // fresh empty volumes).
+    const parent = mkdtempSync(path.join(sandbox, "legacy-"));
+    const installDir = path.join(parent, "cinatra"); // basename = cinatra
+    const upCalls = [];
+    const res = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [],
+          bringUpInfra: (args) => upCalls.push(args),
+          // A legacy `cinatra` (basename) stack rooted at THIS checkout.
+          inspectProjectOwnership: () => ({
+            containerRows: [
+              {
+                Config: {
+                  Labels: {
+                    "com.docker.compose.project": "cinatra",
+                    "com.docker.compose.project.working_dir": path.resolve(installDir),
+                  },
+                },
+              },
+            ],
+            volumeRows: [],
+          }),
+        }),
+      },
+    );
+    expect(res.infraPlan).toBe("default");
+    // ADOPTED: the up kept the legacy `-p cinatra` (basename), not `cinatra_cinatra`.
+    expect(upCalls.length).toBe(1);
+    expect(upCalls[0].composeProject).toBe("cinatra");
+    // …and the adopted name is what gets recorded.
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances["cinatra"].composeProject).toBe("cinatra");
+  });
+
+  it("#35: a prior EXTERNAL/--no-infra row at this dir does NOT prove Docker ownership of a foreign volume", async () => {
+    // Review blocker (non-Docker-owning row false-proof): `recordDefaultInstance`
+    // records `composeProject` even for an `external` (`--no-infra`) install that
+    // never started a Docker stack.
+    // That row must NOT count as proof we own the named volumes — otherwise a
+    // foreign checkout's name-matching (unknown-working_dir) volume would be
+    // silently reused. Stage such an external row, then run a DEFAULT install at
+    // the SAME dir while a foreign candidate volume (no working_dir) exists → the
+    // ownership preflight must still REFUSE.
+    const { writeInstanceRegistry, allocateInstance } = await import("../src/instance-registry.mjs");
+    const installDir = path.join(sandbox, "p35-extrow");
+    // Pre-seed an EXTERNAL ready-ish row recording the candidate project for this dir.
+    let reg0 = allocateInstance({ version: 1, instances: {} }, "p35-extrow", {
+      mode: "dev",
+      installDir,
+      composeProject: "cinatra_p35_extrow",
+      composeFiles: ["docker-compose.yml", "docker-compose.dev.yml"],
+      ports: {},
+      appPort: 3000,
+      repoUrl: "x",
+      ref: "main",
+      sha: "s",
+      infraMode: "external",
+      state: "external",
+    }).registry;
+    writeInstanceRegistry(regPath, reg0);
+
+    const upCalls = [];
+    await expect(
+      runInstall(
+        ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+        {
+          log: () => {},
+          deps: flowDeps({
+            detectPortConflicts: async () => [],
+            bringUpInfra: (args) => upCalls.push(args),
+            // A foreign candidate-labelled volume with NO working_dir (project-name
+            // only) — must NOT be reused on the strength of the external row.
+            inspectProjectOwnership: () => ({
+              containerRows: [],
+              volumeRows: [{ name: "cinatra_p35_extrow_postgres", project: "cinatra_p35_extrow", workingDir: null }],
+            }),
+          }),
+        },
+      ),
+    ).rejects.toThrow(/Refusing the default install.*unverifiable owner/s);
+    expect(upCalls).toEqual([]);
   });
 
   it("#37: --dry-run on the default path never calls the bringUpInfra seam", async () => {
