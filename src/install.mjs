@@ -69,6 +69,8 @@ import {
   allocateAppPort,
   allocateBandOffset,
   validateAppPort,
+  assertAppPortFree,
+  reservedPorts,
   validatePortOffset,
 } from "./instance-alloc.mjs";
 import {
@@ -1565,18 +1567,64 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       return { slot: existing, generatedFile: existing.composeFiles?.[0], idempotent: true };
     }
 
-    // App port: explicit --app-port, else allocate.
-    const appPort =
-      opts.appPort ?? allocateAppPort({ cloneRegistry, instanceRegistry });
+    // App port: explicit --app-port, else allocate (cinatra-cli#38).
+    // The app port (Next.js `PORT`) is the host port `pnpm dev` binds — it is
+    // NOT a compose-published port, so unlike the infra band (probed below) it
+    // was historically validated for numeric RANGE only and never checked for
+    // RESERVED-set membership or LIVE availability. Both are checked here, under
+    // the alloc lock, against the SAME consistent reserved snapshot the band
+    // allocator uses and with the SAME socket probe the infra band uses.
+    // (WayFlow's 3010 is a compose service in the band → already remapped+probed.)
+    const probeAppPort = async (port, host = "0.0.0.0") => {
+      const conflicts = await probePorts([{ service: "app", host, port }]);
+      return conflicts.length === 0;
+    };
+    let appPort;
+    if (opts.appPort != null) {
+      // Explicit --app-port: REJECT on a reserved-set OR live conflict — never
+      // silently record a port that collides with the default stack / a clone
+      // band / a live reservation / an occupied socket.
+      const reserved = reservedPorts({ cloneRegistry, instanceRegistry });
+      await assertAppPortFree({
+        appPort: opts.appPort,
+        reserved,
+        host: "0.0.0.0", // match the interface probeAppPort binds (error text honesty)
+        probe: (host, port) => probeAppPort(port, host),
+      });
+      appPort = opts.appPort;
+    } else {
+      // Auto: allocateAppPort already excludes the reserved set; additionally
+      // live-probe and, on a stranger-held socket, bump to the next free port
+      // (excluding every probed-busy port). Bounded so a pathological host can't
+      // spin forever.
+      const busy = new Set();
+      let attempts = 0;
+      while (true) {
+        appPort = allocateAppPort({ cloneRegistry, instanceRegistry, exclude: busy });
+        if (await probeAppPort(appPort)) break;
+        busy.add(appPort);
+        attempts += 1;
+        if (attempts >= 16) {
+          throw new Error(
+            `Could not find a live-free instance app port after ${attempts} attempts ` +
+              `(last tried ${appPort}, all probed busy). ` +
+              `Free a port or pass --app-port <n> with one you know is free.`,
+          );
+        }
+      }
+    }
 
     // Offset: explicit numeric --port-offset, else auto. Then RE-PROBE the
     // remapped band; on a stranger, bump to the next free offset (auto only).
+    // The chosen app port is reserved against the band so no remapped infra
+    // host port can land on this instance's own app port (cinatra-cli#38 — a
+    // self-collision the band's live probe could not catch pre-bring-up).
     let offset;
     let remapped;
     if (typeof opts.portOffset === "number") {
-      ({ offset, remapped } = pickFixedOffset(baseBand, opts.portOffset, cloneRegistry, instanceRegistry));
+      ({ offset, remapped } = pickFixedOffset(baseBand, opts.portOffset, cloneRegistry, instanceRegistry, appPort));
     } else {
-      ({ offset, remapped } = allocateBandOffset({ band: baseBand, cloneRegistry, instanceRegistry }));
+      ({ offset, remapped } = allocateBandOffset({ band: baseBand, cloneRegistry, instanceRegistry, extraReserved: appPort }));
     }
 
     // Re-probe the remapped band (auto-bump loop). The band's host bindings are
@@ -1598,6 +1646,7 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
         band: baseBand,
         cloneRegistry,
         instanceRegistry,
+        extraReserved: appPort,
         min: offset + 10000,
       }));
     }
@@ -1772,14 +1821,17 @@ function assertNoOverridingInfraEnv(ports = {}, env = process.env) {
 }
 
 /** Pick a FIXED operator-supplied offset, verifying the remapped band does not
- *  collide with reserved ports (else throw — never silently shift it). */
-function pickFixedOffset(band, offset, cloneRegistry, instanceRegistry) {
+ *  collide with reserved ports (else throw — never silently shift it).
+ *  `extraReserved` carries the instance's own chosen app port so a fixed offset
+ *  is rejected if it would land an infra port on it (cinatra-cli#38). */
+function pickFixedOffset(band, offset, cloneRegistry, instanceRegistry, extraReserved = null) {
   // Reuse the allocator's reservation set by trying a single-candidate window.
   try {
     return allocateBandOffset({
       band,
       cloneRegistry,
       instanceRegistry,
+      extraReserved,
       min: offset,
       max: offset,
       step: 1,

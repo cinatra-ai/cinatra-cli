@@ -119,17 +119,21 @@ export function reservedPorts({ cloneRegistry = null, instanceRegistry = null } 
 /**
  * Allocate the lowest free instance APP port in [min,max], skipping the default
  * app ports, the full static clone band, and every live reservation. Pure.
+ * `exclude` is an extra Set of ports to skip (e.g. ports a live probe just
+ * proved busy — used by the isolated-executor auto-bump loop, cinatra-cli#38).
  * Throws when the window is exhausted.
  */
 export function allocateAppPort({
   cloneRegistry = null,
   instanceRegistry = null,
+  exclude = null,
   min = INSTANCE_APP_PORT_MIN,
   max = INSTANCE_APP_PORT_MAX,
 } = {}) {
   const reserved = reservedPorts({ cloneRegistry, instanceRegistry });
+  const skip = exclude instanceof Set ? exclude : new Set();
   for (let p = min; p <= max; p += 1) {
-    if (!reserved.has(p)) return p;
+    if (!reserved.has(p) && !skip.has(p)) return p;
   }
   throw new Error(
     `No free instance app port in ${min}-${max} (all reserved by the default stack, clones, or other instances). ` +
@@ -149,6 +153,7 @@ export function allocateBandOffset({
   band,
   cloneRegistry = null,
   instanceRegistry = null,
+  extraReserved = null,
   step = BAND_OFFSET_STEP,
   min = BAND_OFFSET_MIN,
   max = BAND_OFFSET_MAX,
@@ -157,6 +162,15 @@ export function allocateBandOffset({
     throw new Error("allocateBandOffset requires a non-empty band.");
   }
   const reserved = reservedPorts({ cloneRegistry, instanceRegistry });
+  // The isolated instance's OWN chosen app port (cinatra-cli#38): the remapped
+  // infra band must never land a service host port ON this instance's app port
+  // (e.g. --app-port 15434 + auto offset 10000 → postgres 5434→15434 would
+  // self-collide at `pnpm dev`). Reserve it so band allocation routes around it.
+  if (extraReserved instanceof Set) {
+    for (const p of extraReserved) if (Number.isInteger(p)) reserved.add(p);
+  } else if (Number.isInteger(extraReserved)) {
+    reserved.add(extraReserved);
+  }
   for (let offset = min; offset <= max; offset += step) {
     let ok = true;
     for (const entry of band) {
@@ -197,13 +211,63 @@ export async function withAllocLock(lockPath, fn) {
   return withRegistryLock(base, fn);
 }
 
-/** Validate an explicit `--app-port` value (operator-supplied). */
+/** Validate an explicit `--app-port` value (operator-supplied) for SHAPE only —
+ *  the numeric range. Reserved-set + live-availability are a SEPARATE concern
+ *  (assertAppPortFree), checked at the call site under the alloc lock where the
+ *  registries (and a consistent reserved snapshot) are in scope. */
 export function validateAppPort(value) {
   const n = Number.parseInt(String(value), 10);
   if (!Number.isInteger(n) || n < 1024 || n > 65535) {
     throw new Error(`Invalid --app-port "${value}". Must be an integer between 1024 and 65535.`);
   }
   return n;
+}
+
+/**
+ * Assert an EXPLICIT operator-supplied `--app-port` is usable: it must be
+ * (a) outside the RESERVED set — the default app ports (3000/3010), the static
+ * clone bands (3100-3119 / 3200-3219), and every live clone/instance
+ * reservation — and (b) live-FREE on the host (cinatra-cli#38). Pure: the
+ * reserved set and the probe are injected; the probe is the SAME socket probe
+ * the infra band uses. Returns the port when free; throws an accurate,
+ * actionable error otherwise.
+ *
+ * @param {object} args
+ * @param {number}  args.appPort   the explicit app port to check
+ * @param {Set<number>} args.reserved   the reserved-port snapshot (reservedPorts(...))
+ * @param {(host:string, port:number) => (boolean|Promise<boolean>)} [args.probe]
+ *        returns true when the port is FREE (mirrors detectPortConflicts' probe);
+ *        omit to skip the live check (validates the reserved set only)
+ * @param {string} [args.host]   the interface to probe (default 127.0.0.1 — the
+ *        host `pnpm dev`/Next.js binds the app port on)
+ */
+export async function assertAppPortFree({ appPort, reserved, probe = null, host = "127.0.0.1" } = {}) {
+  if (!Number.isInteger(appPort)) {
+    throw new Error(`assertAppPortFree requires an integer appPort (got ${appPort}).`);
+  }
+  const reservedSet = reserved instanceof Set ? reserved : new Set();
+  if (reservedSet.has(appPort)) {
+    let why = "the reserved set (default app ports, clone bands, or a live instance/clone reservation)";
+    if (appPort === DEFAULT_APP_PORT || appPort === DEFAULT_WAYFLOW_PORT) {
+      why = `a DEFAULT stack app port (${appPort})`;
+    } else if (staticCloneBandPorts().has(appPort)) {
+      why = `the static clone band (${appPort} is in 3100-3119 / 3200-3219)`;
+    }
+    throw new Error(
+      `--app-port ${appPort} is reserved: it collides with ${why}. ` +
+        `Pick a free port outside the reserved set, or omit --app-port to auto-allocate.`,
+    );
+  }
+  if (typeof probe === "function") {
+    const free = await probe(host, appPort);
+    if (!free) {
+      throw new Error(
+        `--app-port ${appPort} is already in use on ${host}:${appPort} (an isolated instance would fail to bind at \`pnpm dev\`). ` +
+          `Pick a free port, or omit --app-port to auto-allocate one that is probed free.`,
+      );
+    }
+  }
+  return appPort;
 }
 
 /** Validate an explicit `--port-offset` value (must be a positive multiple of
@@ -233,6 +297,7 @@ export const __test = {
   allocateBandOffset,
   withAllocLock,
   validateAppPort,
+  assertAppPortFree,
   validatePortOffset,
   isValidSlug,
 };
