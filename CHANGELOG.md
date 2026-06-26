@@ -6,6 +6,24 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `cinatra install --on-conflict=co-use` / `--infra=share` now IMPLEMENTS the
+  shared-infra co-use path (previously gated to a loud refusal). A co-use install
+  runs a second instance against a donor instance's already-running services — its
+  own app port and its own `cinatra_inst_<slug>` database (templated from the
+  seed), but the SAME Postgres server, Redis, and Nango (no second Docker stack).
+  Isolation is real where it must be: a separate database, a distinct
+  `BULLMQ_QUEUE_NAME`, and a per-instance `BETTER_AUTH_COOKIE_PREFIX`. Because two
+  instances on `localhost` otherwise share login cookies (the cookie domain is
+  port-blind), co-use is **enabled only when the installed app isolates cookies
+  per instance** — it probes the donor checkout and, if that support is absent,
+  refuses with the exact app change needed and points you at
+  `--on-conflict=isolated`. Sharing a donor Graphiti (org-scoped, not
+  per-instance) requires the explicit `--allow-shared-graphiti`. Provisioning is
+  transactional: a failure rolls back, dropping only the database this run just
+  created (a name-shape + created-this-run guard). (#40)
+
 ## [0.1.3] - 2026-06-25
 
 ### Changed

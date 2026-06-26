@@ -61,7 +61,16 @@ const REGISTRY_VERSION = 1;
 export const INSTANCE_STATES = new Set(["provisioning", "ready", "external"]);
 
 const VALID_MODES = new Set(["dev", "prod"]);
-const VALID_INFRA_MODES = new Set(["new", "external"]);
+// infraMode:
+//   - "new"      → an install-owned Docker stack (default / isolated).
+//   - "external" → operator-supplied infra; resources are not install-owned.
+//   - "co-use"   → SHARES a donor instance's running infra (no stack of its own);
+//                  its only owned resource is the separate `cinatra_inst_<slug>`
+//                  Postgres database. A co-use row records the DONOR's compose
+//                  project (it has no project of its own), so — unlike "new" /
+//                  "external" rows — co-use rows are EXEMPT from the cross-row
+//                  composeProject-uniqueness rule (cinatra-cli#40).
+const VALID_INFRA_MODES = new Set(["new", "external", "co-use"]);
 
 export function defaultInstanceRegistryPath() {
   // CINATRA_INSTANCE_REGISTRY redirects the registry (parity with how the clone
@@ -117,11 +126,15 @@ function isValidInstanceSlot(slug, slot) {
   return true;
 }
 
-// Validate every instance entry AND cross-entry uniqueness on the three keys
-// that MUST be unique across instances: slug (the map key, by construction),
-// appPort (two instances cannot publish the same host app port), and
-// composeProject (two instances cannot share a compose project name — that
-// would cross-wire their containers/volumes).
+// Validate every instance entry AND cross-entry uniqueness on the keys that MUST
+// be unique across instances: slug (the map key, by construction), appPort (two
+// instances cannot publish the same host app port), and composeProject (two
+// instances cannot share a compose project name — that would cross-wire their
+// containers/volumes). EXCEPTION (cinatra-cli#40): a "co-use" row records the
+// DONOR's compose project (it owns no stack of its own), so co-use rows are
+// exempt from the composeProject-uniqueness check — multiple co-use instances
+// plus the donor legitimately share one project. appPort uniqueness still holds
+// for co-use rows (each co-use instance binds its OWN app port).
 function areRegistryEntriesValid(instances) {
   const seenAppPorts = new Set();
   const seenProjects = new Set();
@@ -131,8 +144,10 @@ function areRegistryEntriesValid(instances) {
       if (seenAppPorts.has(slot.appPort)) return false;
       seenAppPorts.add(slot.appPort);
     }
-    if (seenProjects.has(slot.composeProject)) return false;
-    seenProjects.add(slot.composeProject);
+    if (slot.infraMode !== "co-use") {
+      if (seenProjects.has(slot.composeProject)) return false;
+      seenProjects.add(slot.composeProject);
+    }
   }
   return true;
 }
@@ -265,7 +280,7 @@ export function allocateInstance(registry, slug, fields) {
   }
   if (!VALID_INFRA_MODES.has(infraMode)) {
     throw new Error(
-      `allocateInstance requires infraMode "new" or "external" (got ${JSON.stringify(infraMode)}).`,
+      `allocateInstance requires infraMode "new", "external", or "co-use" (got ${JSON.stringify(infraMode)}).`,
     );
   }
   if (!INSTANCE_STATES.has(state)) {
@@ -283,7 +298,12 @@ export function allocateInstance(registry, slug, fields) {
     return { registry: cloneRegistryObject(registry), slot: existing };
   }
 
-  // Cross-row uniqueness on appPort + composeProject (different slug).
+  // Cross-row uniqueness on appPort + composeProject (different slug). A co-use
+  // row shares the DONOR's compose project by design (cinatra-cli#40), so the
+  // composeProject collision check is SKIPPED when EITHER side is a co-use row —
+  // a co-use instance and its donor (or two co-use siblings) legitimately share
+  // one project. appPort uniqueness is always enforced (each instance binds its
+  // own app port).
   for (const [otherSlug, other] of Object.entries(registry.instances)) {
     if (otherSlug === slug) continue;
     if (appPort != null && other.appPort === appPort) {
@@ -291,7 +311,8 @@ export function allocateInstance(registry, slug, fields) {
         `App port ${appPort} is already recorded for instance "${otherSlug}". Choose another --app-port.`,
       );
     }
-    if (other.composeProject === composeProject) {
+    const eitherCoUse = infraMode === "co-use" || other.infraMode === "co-use";
+    if (!eitherCoUse && other.composeProject === composeProject) {
       throw new Error(
         `Compose project "${composeProject}" is already recorded for instance "${otherSlug}". ` +
           `Choose a distinct --instance slug.`,
