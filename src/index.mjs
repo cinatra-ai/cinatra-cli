@@ -352,12 +352,12 @@ Usage:
   cinatra install [--dir <path>] [--ref <main|tag|sha>] [--mode dev|prod]
                   [--repo-url <url>] [--yes] [--force] [--reset-env]
                   [--skip-dev-apps] [--no-infra] [--no-install] [--no-setup]
-                  [--on-conflict fail|prompt|isolated|stop-existing|attach|external]
-                  [--infra new|external] [--instance <slug>] [--app-port <n>]
+                  [--on-conflict fail|prompt|isolated|stop-existing|attach|external|co-use]
+                  [--infra new|external|share] [--instance <slug>] [--app-port <n>]
                   [--port-offset auto|<n>] [--db-url <url>] [--redis-url <url>]
                   [--nango-url <url>] [--graphiti-url <url>] [--teardown-existing]
-                  [--external-db-disposable] [--resume] [--dry-run] [--status]
-                  [--list-instances]
+                  [--allow-shared-graphiti] [--external-db-disposable] [--resume]
+                  [--dry-run] [--status] [--list-instances]
   cinatra update [--ref <ref>] [--force] [--docker=auto|always|--no-docker]
   cinatra upgrade [--ref <ref>] [--force] [--docker=auto|always|--no-docker]
   cinatra login --app-url <https://instance> [--profile <name>] [--default]
@@ -412,10 +412,16 @@ Commands:
                     --on-conflict=isolated  Second FULL stack on remapped ports + own app port.
                     --on-conflict=stop-existing  Stop the existing stack, then install on defaults.
                     --on-conflict=attach    Converge on the existing checkout (no second stack).
+                    --on-conflict=co-use    Share the running instance's services (separate DB +
+                     (--infra=share)        queue; no second stack). Enabled only when the app
+                                            isolates login cookies per instance (else it refuses
+                                            with the app change needed, pointing at isolated).
                     --infra=external        Point at external Postgres/Redis/Nango (--db-url/
                                             --redis-url/--nango-url/--graphiti-url); no local infra.
                     --external-db-disposable Acknowledge an external --db-url target is disposable
                                             (REQUIRED non-interactively; a bare --yes won't arm it).
+                    --allow-shared-graphiti With co-use: accept sharing the donor's Graphiti/Neo4j
+                                            (org-scoped, not per-instance).
                     --instance <slug>       Name the instance (default: the install-dir basename).
                     --app-port <n>          App port for an isolated instance.
                     --port-offset auto|<n>  Host-port shift for an isolated instance's infra band.
@@ -424,8 +430,6 @@ Commands:
                     --dry-run               Show the plan; make no changes.
                     --status                Read-only: this checkout's instance state (registry/live = truth).
                     --list-instances        Read-only: list all recorded instances.
-                    (Sharing infra between two instances — co-use / --infra=share —
-                     is gated; install fails loud and points at --on-conflict=isolated.)
   update            Move THIS checkout to a newer release, then reconcile deps +
   (alias: upgrade)  the dev database. Fetches origin --tags and fast-forwards the
                     checkout to the latest \`v*\` release tag (or --ref), then runs

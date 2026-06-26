@@ -92,29 +92,27 @@ describe("parseInstallArgs — cinatra-cli#17 surface", () => {
 });
 
 // ---------------------------------------------------------------------------
-// T5b — gated co-use fails LOUD before any side effect.
+// cinatra-cli#40 — co-use fail-CLOSED capability gate before any side effect.
+//   The old flat "not yet available" refusal is replaced by the executor's
+//   capability probe: against a donor app build WITHOUT per-instance cookie
+//   isolation (the real state today), co-use is REFUSED — but now with the
+//   precise upstream pointer, still BEFORE any clone/write. The probe defaults
+//   (no deps) read a (missing) donor src/lib/auth.ts → unsupported → refuse.
 // ---------------------------------------------------------------------------
-describe("runInstall — gated co-use loud-fail (T5b)", () => {
-  it("--infra=share exits with a co-use-not-available error (no side effects)", async () => {
-    await expect(runInstall(["--infra", "share", "--yes"], { log: () => {} })).rejects.toThrow(
-      /Co-use .* NOT yet available/s,
-    );
+describe("runInstall — co-use fail-closed capability gate (cinatra-cli#40)", () => {
+  const couseRefuse = /Co-use is refused: the donor Cinatra app build does NOT isolate auth cookies/s;
+  it("--infra=share refuses (no cookie-prefix support) before any side effect", async () => {
+    await expect(runInstall(["--infra", "share", "--yes"], { log: () => {} })).rejects.toThrow(couseRefuse);
   });
-  it("--on-conflict=co-use exits with the same loud failure", async () => {
-    await expect(runInstall(["--on-conflict", "co-use", "--yes"], { log: () => {} })).rejects.toThrow(
-      /Co-use .* NOT yet available/s,
-    );
+  it("--on-conflict=co-use refuses with the same fail-closed message", async () => {
+    await expect(runInstall(["--on-conflict", "co-use", "--yes"], { log: () => {} })).rejects.toThrow(couseRefuse);
   });
   it("gates co-use through the INLINE `=` form too (the documented spelling)", async () => {
     // Regression: the `=` form must gate BEFORE any side effect, exactly like the
     // space form — otherwise `cinatra install --infra=share` proceeds to clone +
     // bring up infra (co-use NOT actually gated).
-    await expect(runInstall(["--infra=share", "--yes"], { log: () => {} })).rejects.toThrow(
-      /Co-use .* NOT yet available/s,
-    );
-    await expect(runInstall(["--on-conflict=co-use", "--yes"], { log: () => {} })).rejects.toThrow(
-      /Co-use .* NOT yet available/s,
-    );
+    await expect(runInstall(["--infra=share", "--yes"], { log: () => {} })).rejects.toThrow(couseRefuse);
+    await expect(runInstall(["--on-conflict=co-use", "--yes"], { log: () => {} })).rejects.toThrow(couseRefuse);
   });
 });
 
@@ -1464,5 +1462,223 @@ describe("runInstall --status / --list-instances (T6)", () => {
     const blob = logs.join("\n");
     expect(blob).toMatch(/This checkout/);
     expect(blob).toMatch(/reconciled:/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cinatra-cli#40 — co-use (shared-infra) executor: capability gate (fail
+// closed), the success path (separate DB + env + record, NO second stack), and
+// transaction-style rollback. All I/O is injected via deps (no live PG/Docker).
+// ---------------------------------------------------------------------------
+describe("runInstall — co-use executor (cinatra-cli#40)", () => {
+  let sandbox;
+  let originRepo;
+
+  beforeAll(() => {
+    sandbox = mkdtempSync(path.join(os.tmpdir(), "cin-couse-"));
+    originRepo = buildFixtureOrigin(sandbox);
+  });
+  afterAll(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+    delete process.env.CINATRA_INSTANCE_REGISTRY;
+    delete process.env.CINATRA_ALLOC_LOCK;
+  });
+
+  let regPath;
+  beforeEach(() => {
+    const d = mkdtempSync(path.join(sandbox, "home-"));
+    regPath = path.join(d, "instances.json");
+    process.env.CINATRA_INSTANCE_REGISTRY = regPath;
+    process.env.CINATRA_ALLOC_LOCK = path.join(d, "alloc.lock");
+  });
+
+  // A donor .env.local supplying the shared-infra endpoints + the DB url against
+  // whose server the co-use database is created.
+  const DONOR_ENV = {
+    SUPABASE_DB_URL: "postgresql://u:p@127.0.0.1:5434/postgres",
+    REDIS_URL: "redis://127.0.0.1:6379",
+    NANGO_SERVER_URL: "http://127.0.0.1:3003",
+    BETTER_AUTH_SECRET: "donor-secret",
+    CINATRA_ENCRYPTION_KEY: "donor-enc",
+  };
+
+  // Base deps: preflight ok, docker/compose present, NO infra bring-up needed.
+  // The capability probe + donor env + DB ops + setup are injected per test.
+  function couseDeps(extra = {}) {
+    return {
+      ...dockerPresentDeps(),
+      detectPortConflicts: async () => [], // co-use app port is free
+      readCloneRegistry: () => null,
+      readDonorEnv: () => ({ ...DONOR_ENV }),
+      // capability TRUE by default (the executor success path); per-test false.
+      probeCookiePrefixSupport: () => true,
+      // never bring up a stack in co-use.
+      bringUpInfra: () => {
+        throw new Error("co-use must NOT bring up an infra stack");
+      },
+      runSetup: () => {}, // stub setup (no real pnpm/migrations)
+      skipCoUseInstall: true, // skip pnpm install in the test
+      ...extra,
+    };
+  }
+
+  const baseArgs = (installDir) => [
+    "--dir", installDir,
+    "--repo-url", `file://${originRepo}`,
+    "--ref", "main",
+    "--on-conflict=co-use",
+    "--no-install",
+    "--no-setup",
+    "--yes",
+  ];
+
+  it("REFUSES (fail closed) when the donor app build lacks cookie-prefix support — before any DB create", async () => {
+    const installDir = path.join(sandbox, "refuse");
+    const dbCreates = [];
+    await expect(
+      runInstall(baseArgs(installDir), {
+        log: () => {},
+        deps: couseDeps({
+          probeCookiePrefixSupport: () => false, // current app state
+          coUseDbOps: {
+            createCoUseDb: async (a) => {
+              dbCreates.push(a);
+              return { created: true };
+            },
+            dropDbCreatedByThisRun: async () => {},
+          },
+        }),
+      }),
+    ).rejects.toThrow(/does NOT isolate auth cookies per instance/);
+    // The pre-clone gate fired — NO database was created.
+    expect(dbCreates).toEqual([]);
+  });
+
+  it("SUCCESS path: creates cinatra_inst_<slug>, writes the co-use env, records infraMode co-use, NO bring-up", async () => {
+    const installDir = path.join(sandbox, "myinst");
+    const dbCreates = [];
+    const res = await runInstall(baseArgs(installDir).filter((a) => a !== "--no-setup"), {
+      log: () => {},
+      deps: couseDeps({
+        coUseDbOps: {
+          createCoUseDb: async (a) => {
+            dbCreates.push(a);
+            return { created: true };
+          },
+          dropDbCreatedByThisRun: async () => {
+            throw new Error("should not drop on success");
+          },
+        },
+        runSetup: () => {}, // assert it is called (no throw)
+      }),
+    });
+    expect(res.infraPlan).toBe("co-use");
+    expect(res.instance).toBe("myinst");
+    // The separate DB was created with the right name against the donor server.
+    expect(dbCreates).toHaveLength(1);
+    expect(dbCreates[0].dbName).toBe("cinatra_inst_myinst");
+    // The co-use .env.local carries the isolation values.
+    const envBody = readFileSync(path.join(installDir, ".env.local"), "utf8");
+    expect(envBody).toMatch(/SUPABASE_DB_URL=.*\/cinatra_inst_myinst/);
+    expect(envBody).toMatch(/BULLMQ_QUEUE_NAME=cinatra-inst-myinst/);
+    expect(envBody).toMatch(/BETTER_AUTH_COOKIE_PREFIX=cinatra-myinst/);
+    expect(envBody).toMatch(/CINATRA_REDIS_PREFIX=cinatra:myinst/);
+    // Shared infra inherited.
+    expect(envBody).toMatch(/REDIS_URL=redis:\/\/127\.0\.0\.1:6379/);
+    // Registry row: infraMode co-use, ready.
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.status).toBe("ok");
+    expect(reg.registry.instances.myinst.infraMode).toBe("co-use");
+    expect(reg.registry.instances.myinst.state).toBe("ready");
+    expect(reg.registry.instances.myinst.createdResources).toContain("db:cinatra_inst_myinst");
+  });
+
+  it("ROLLBACK: a setup failure drops the created DB EXACTLY once (owned-drop) + releases the slot", async () => {
+    const installDir = path.join(sandbox, "rollback");
+    const drops = [];
+    await expect(
+      runInstall(baseArgs(installDir).filter((a) => a !== "--no-setup"), {
+        log: () => {},
+        deps: couseDeps({
+          coUseDbOps: {
+            createCoUseDb: async () => ({ created: true }),
+            dropDbCreatedByThisRun: async (a) => {
+              drops.push(a);
+            },
+          },
+          runSetup: () => {
+            throw new Error("boom: setup failed");
+          },
+        }),
+      }),
+    ).rejects.toThrow(/boom: setup failed/);
+    // The created DB was dropped exactly once, via the owned-drop guard.
+    expect(drops).toHaveLength(1);
+    expect(drops[0]).toMatchObject({ dbName: "cinatra_inst_rollback", createdThisRun: true });
+    // The provisioning slot was released (no orphan row).
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances.rollback).toBeUndefined();
+  });
+
+  it("ROLLBACK does NOT drop a DB it did not create this run", async () => {
+    const installDir = path.join(sandbox, "noreuse");
+    const drops = [];
+    await expect(
+      runInstall(baseArgs(installDir).filter((a) => a !== "--no-setup"), {
+        log: () => {},
+        deps: couseDeps({
+          coUseDbOps: {
+            createCoUseDb: async () => ({ created: false }), // pre-existing DB
+            dropDbCreatedByThisRun: async (a) => {
+              drops.push(a);
+            },
+          },
+          runSetup: () => {
+            throw new Error("boom");
+          },
+        }),
+      }),
+    ).rejects.toThrow(/boom/);
+    expect(drops).toEqual([]); // never drop a DB this run did not create
+  });
+
+  it("REFUSES shared Graphiti without --allow-shared-graphiti, ACCEPTS with it", async () => {
+    const installDir = path.join(sandbox, "graphiti");
+    const donorWithGraphiti = { ...DONOR_ENV, GRAPHITI_URL: "http://127.0.0.1:8000" };
+    // Without the flag → refuse (before any DB create).
+    const dbCreates = [];
+    await expect(
+      runInstall(baseArgs(installDir).filter((a) => a !== "--no-setup"), {
+        log: () => {},
+        deps: couseDeps({
+          readDonorEnv: () => ({ ...donorWithGraphiti }),
+          coUseDbOps: {
+            createCoUseDb: async (a) => {
+              dbCreates.push(a);
+              return { created: true };
+            },
+            dropDbCreatedByThisRun: async () => {},
+          },
+        }),
+      }),
+    ).rejects.toThrow(/Graphiti\/Neo4j is NOT instance-namespaced/);
+    expect(dbCreates).toEqual([]);
+
+    // With the eyes-open flag → proceeds (DB created).
+    const installDir2 = path.join(sandbox, "graphiti-ok");
+    const res = await runInstall(
+      [...baseArgs(installDir2).filter((a) => a !== "--no-setup"), "--allow-shared-graphiti"],
+      {
+        log: () => {},
+        deps: couseDeps({
+          readDonorEnv: () => ({ ...donorWithGraphiti }),
+          coUseDbOps: {
+            createCoUseDb: async () => ({ created: true }),
+            dropDbCreatedByThisRun: async () => {},
+          },
+        }),
+      },
+    );
+    expect(res.infraPlan).toBe("co-use");
   });
 });

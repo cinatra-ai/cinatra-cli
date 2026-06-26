@@ -79,6 +79,17 @@ import {
   writeIsolatedComposeFile,
   ISOLATED_COMPOSE_FILENAME,
 } from "./install-isolation.mjs";
+import {
+  deriveCoUseSlug,
+  coUseDbName,
+  isCoUseDbNameShape,
+  coUseQueueName,
+  coUseCookiePrefix,
+  parseAuthCookiePrefixSupport,
+  assertCoUsePrereqs,
+  buildCoUseEnv,
+  coUseRollbackPlan,
+} from "./install-couse.mjs";
 
 // Absolute path to THIS published `cinatra` CLI's own bin entry. After the
 // monorepo's `packages/cli` is removed (cinatra#402, P2), the freshly-cloned
@@ -349,6 +360,10 @@ export function parseInstallArgs(argv = []) {
     portOffset, // null | "auto" | <number>
     appPort, // null | <number>
     dryRun: argv.includes("--dry-run"),
+    // cinatra-cli#40: eyes-open acknowledgement that a co-use instance may SHARE
+    // the donor's Graphiti/Neo4j (org-scoped, not instance-scoped) — required to
+    // proceed when the donor sets GRAPHITI_URL (else co-use refuses to share it).
+    allowSharedGraphiti: argv.includes("--allow-shared-graphiti"),
     resume: argv.includes("--resume"),
     status: argv.includes("--status"),
     listInstances: argv.includes("--list-instances"),
@@ -1445,19 +1460,378 @@ function assertExternalUrl(flag, value, allowedProtocols) {
   return value;
 }
 
-// ── T5b — gated co-use loud-fail ────────────────────────────────────────────
-/** Throw the explicit "co-use not yet available" error when any gated co-use
- *  signal is present. Called BEFORE any side effect. Never a silent no-op — we
- *  do not advertise a public surface that does nothing (cinatra-cli#17 T5b). */
-function refuseCoUseIfRequested(opts) {
-  if (!opts.couseRequested) return;
-  throw new Error(
-    "Co-use (--infra=share / --on-conflict=co-use) is NOT yet available in this release.\n" +
-      "  Co-use lets a second instance SHARE one infra stack (separate DB + Redis namespace + Nango env).\n" +
-      "  It is gated on per-instance Redis-prefix, Better-Auth cookie-prefix, and Nango-environment support\n" +
-      "  that is still landing — shipping it now would silently cross-clobber sessions/data on the same host.\n" +
-      "  Use --on-conflict=isolated for a fully-separate second stack today (tracking cinatra-cli#17 follow-up).",
-  );
+// ── co-use (shared-infra) executor (cinatra-cli#40, #17 option B) ────────────
+//
+// Co-use runs a SECOND app instance against a DONOR instance's already-running
+// infra (one Postgres server, one Redis, one Nango/Graphiti) — with NO second
+// Docker stack. Its only install-owned resource is a SEPARATE `cinatra_inst_*`
+// Postgres database. The headline safety gate is the per-instance Better-Auth
+// cookie prefix (localhost cookies are port-blind): co-use is enabled ONLY when
+// the donor app build advertises `advanced.cookiePrefix` support; otherwise it
+// fails CLOSED (assertCoUsePrereqs throws the precise upstream pointer). See
+// install-couse.mjs for the pure derivations + the capability gate.
+
+/** The default location of the donor checkout: an explicit `--reuse-from`, else
+ *  the conventional sibling default install dir next to the co-use target. */
+function resolveDonorDir(opts, targetDir) {
+  if (opts.couseSidecar?.reuseFrom) return path.resolve(opts.couseSidecar.reuseFrom);
+  // Convention: the donor is the default install (a `cinatra` dir next to the
+  // co-use checkout's parent). Best-effort — the executor validates it exists.
+  return path.resolve(path.dirname(path.resolve(targetDir)), DEFAULT_INSTALL_DIRNAME);
+}
+
+/** Read a donor checkout's `.env.local` into a { KEY: value } map (best-effort —
+ *  returns {} when absent/unreadable). The executor uses it as the source env for
+ *  buildCoUseEnv (inherit shared-infra endpoints + crypto secrets). */
+function readDonorEnv(donorDir) {
+  try {
+    const p = path.join(donorDir, ".env.local");
+    if (!existsSync(p)) return {};
+    return parseEnvBody(readFileSync(p, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+/** The capability probe (cinatra-cli#40 §3.4): does the donor app build isolate
+ *  auth cookies per instance? Reads the donor's checked-out `src/lib/auth.ts` and
+ *  parses it. Fails CLOSED — an absent/unreadable source ⇒ unsupported ⇒ co-use
+ *  refuses. Pure logic lives in install-couse.parseAuthCookiePrefixSupport. */
+function probeDonorCookiePrefixSupport(donorDir) {
+  try {
+    const p = path.join(donorDir, "src", "lib", "auth.ts");
+    if (!existsSync(p)) return false;
+    return parseAuthCookiePrefixSupport(readFileSync(p, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
+/** Lazy-import the pg Client (install.mjs stays import-light — pg is native +
+ *  costly; only the co-use DB path needs it). */
+async function loadPgClient(connectionString) {
+  const mod = await import("pg");
+  const ns = mod.default ?? mod;
+  const Client = ns.Client ?? mod.Client;
+  if (!Client) throw new Error("cinatra: failed to load the pg Client constructor for co-use.");
+  return new Client({ connectionString });
+}
+
+/** Force the database path of a postgresql:// URL to `name` (the executor targets
+ *  a specific DB without depending on index.mjs's non-exported connStringForDatabase). */
+function connStringForDatabase(connectionString, name) {
+  const u = new URL(connectionString);
+  u.pathname = `/${name}`;
+  return u.toString();
+}
+
+/** Quote a Postgres identifier for a CREATE/DROP DATABASE statement (double the
+ *  inner double-quotes). The db NAME is also shape-validated (isCoUseDbNameShape)
+ *  before it ever reaches here, so this is defence-in-depth. */
+function quoteIdent(name) {
+  return `"${String(name).replace(/"/g, '""')}"`;
+}
+
+/** Default real DB operations for co-use (injectable via deps for tests). All run
+ *  against the DONOR's Postgres SERVER (admin/maintenance DB) so CREATE/DROP never
+ *  run while connected to the DB being mutated. */
+function defaultCoUseDbOps() {
+  return {
+    // Idempotent create: SELECT 1 then CREATE … TEMPLATE cinatra_seed. Returns
+    // { created: boolean } so rollback only drops a DB THIS run created.
+    async createCoUseDb({ adminUrl, dbName }) {
+      if (!isCoUseDbNameShape(dbName)) {
+        throw new Error(`Refusing to create a non-co-use-shaped database ${JSON.stringify(dbName)}.`);
+      }
+      const client = await loadPgClient(connStringForDatabase(adminUrl, "postgres"));
+      await client.connect();
+      try {
+        const exists = await client.query("SELECT 1 FROM pg_database WHERE datname = $1", [dbName]);
+        if (exists.rowCount > 0) return { created: false };
+        await client.query(`CREATE DATABASE ${quoteIdent(dbName)} TEMPLATE ${quoteIdent("cinatra_seed")}`);
+        return { created: true };
+      } finally {
+        await client.end().catch(() => {});
+      }
+    },
+    // INSTALL-OWNED drop for rollback ONLY: drops a `cinatra_inst_<slug>` DB that
+    // (a) is shaped exactly like the computed name, (b) was created THIS run, and
+    // (c) carries no foreign owner (we only ever drop a DB our own run just made).
+    // This is the controlled bypass of isProtectedDbName's `cinatra_inst_*`
+    // protection (cinatra-cli#40 §3.2, codex Q3) — never a generic override.
+    async dropDbCreatedByThisRun({ adminUrl, dbName, createdThisRun }) {
+      if (createdThisRun !== true) {
+        throw new Error("dropDbCreatedByThisRun refuses to drop a DB not created by this run.");
+      }
+      if (!isCoUseDbNameShape(dbName)) {
+        throw new Error(`dropDbCreatedByThisRun refuses a non-co-use-shaped name ${JSON.stringify(dbName)}.`);
+      }
+      const client = await loadPgClient(connStringForDatabase(adminUrl, "postgres"));
+      await client.connect();
+      try {
+        await client.query(`DROP DATABASE IF EXISTS ${quoteIdent(dbName)} WITH (FORCE)`);
+      } finally {
+        await client.end().catch(() => {});
+      }
+    },
+  };
+}
+
+/**
+ * Execute a co-use (shared-infra) install. Replaces the old loud refusal: it now
+ * PROBES the donor app's cookie-prefix capability and only proceeds when it is
+ * present (fail-closed otherwise — against today's app, that means it still
+ * refuses, with a precise pointer to the one app change needed). All I/O is
+ * injectable via `deps` so the full provisioning path is unit-tested without a
+ * live Postgres.
+ *
+ * @returns {Promise<{ infraPlan:"co-use", instance:object }>}
+ */
+async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, deps = {} }) {
+  const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
+  const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
+  const probePorts = deps.detectPortConflicts ?? detectPortConflicts;
+  const readClone = deps.readCloneRegistry ?? (() => null);
+  const dbOps = deps.coUseDbOps ?? defaultCoUseDbOps();
+  const probeCapability = deps.probeCookiePrefixSupport ?? probeDonorCookiePrefixSupport;
+  const readDonor = deps.readDonorEnv ?? readDonorEnv;
+
+  // Slug + names (pure).
+  const slug = deriveCoUseSlug(targetDir, opts);
+  if (!isValidSlug(slug)) {
+    throw new Error(
+      `Could not derive a valid co-use instance slug from ${targetDir}. Pass --instance <slug> ` +
+        `(/^[a-z0-9][a-z0-9-]{0,29}$/).`,
+    );
+  }
+  const dbName = coUseDbName(slug);
+
+  // 1. Resolve the donor + its env (the shared infra source).
+  const donorDir = resolveDonorDir(opts, targetDir);
+  const donorEnv = readDonor(donorDir);
+  const adminUrl = donorEnv.SUPABASE_DB_URL ?? null;
+
+  // 2. Capability probe → assertCoUsePrereqs. THE upstream gate (fail closed):
+  //    co-use must never silently cross-clobber sessions on a shared host.
+  const cookiePrefixSupported = !!probeCapability(donorDir);
+  const graphitiShared = typeof donorEnv.GRAPHITI_URL === "string" && donorEnv.GRAPHITI_URL.length > 0;
+  assertCoUsePrereqs({
+    cookiePrefixSupported,
+    graphitiShared,
+    allowSharedGraphiti: opts.allowSharedGraphiti === true,
+  });
+
+  // Beyond the capability gate, we need a usable donor DB URL to create the
+  // separate co-use database against the SAME server.
+  if (!adminUrl) {
+    throw new Error(
+      `Co-use needs the donor's SUPABASE_DB_URL to create a separate database on its Postgres server, ` +
+        `but ${path.join(donorDir, ".env.local")} has none. Pass --reuse-from <donor-checkout> or ensure the ` +
+        `donor is installed first.`,
+    );
+  }
+
+  log(`- Co-use: provisioning instance "${slug}" against the donor at ${donorDir} (separate DB ${dbName}).`);
+
+  if (opts.dryRun) {
+    log(`  [dry-run] would create database ${dbName} (TEMPLATE cinatra_seed) on the donor Postgres,`);
+    log(`  [dry-run] write a co-use .env.local (cookie-prefix ${coUseCookiePrefix(slug)}, queue ${coUseQueueName(slug)}),`);
+    log("  [dry-run] and run setup with --no-infra (no second Docker stack). No changes made.");
+    return { infraPlan: "co-use", instance: { slug, dbName, dryRun: true }, dryRun: true };
+  }
+
+  // 3. Allocate app port + reserve the registry slot under the alloc lock (the
+  //    co-use row records the donor's compose project — it owns no stack — and is
+  //    EXEMPT from composeProject-uniqueness; see instance-registry).
+  let createdDb = false;
+  const donorProject = donorEnv.__couseDonorProject ?? `cinatra_couse_${slug.replace(/-/g, "_")}`;
+  const persisted = await withAllocLock(lockPath, async () => {
+    const cloneRegistry = (() => {
+      try {
+        return readClone();
+      } catch {
+        return null;
+      }
+    })();
+    const instanceRegistry = requireUsableInstanceRegistry(registryPath);
+
+    // Idempotent re-run: an existing READY co-use row for this dir → converge.
+    const existing = getInstance(instanceRegistry, slug);
+    if (existing && path.resolve(existing.installDir) === path.resolve(targetDir) && existing.state === "ready") {
+      log(`  Co-use instance "${slug}" already recorded ready — converging (idempotent).`);
+      return { slot: existing, idempotent: true, appPort: existing.appPort };
+    }
+
+    // App port: explicit --app-port (reject reserved/live conflict) or auto.
+    const probeAppPort = async (port, host = "0.0.0.0") =>
+      (await probePorts([{ service: "app", host, port }])).length === 0;
+    let appPort;
+    if (opts.appPort != null) {
+      const reserved = reservedPorts({ cloneRegistry, instanceRegistry });
+      await assertAppPortFree({
+        appPort: opts.appPort,
+        reserved,
+        host: "0.0.0.0",
+        probe: (host, port) => probeAppPort(port, host),
+      });
+      appPort = opts.appPort;
+    } else {
+      const busy = new Set();
+      let attempts = 0;
+      while (true) {
+        appPort = allocateAppPort({ cloneRegistry, instanceRegistry, exclude: busy });
+        if (await probeAppPort(appPort)) break;
+        busy.add(appPort);
+        if (++attempts >= 16) {
+          throw new Error(
+            `Could not find a live-free co-use app port after ${attempts} attempts (last tried ${appPort}). ` +
+              `Free a port or pass --app-port <n>.`,
+          );
+        }
+      }
+    }
+
+    const { registry: next, slot } = allocateInstance(instanceRegistry, slug, {
+      mode: opts.mode,
+      installDir: targetDir,
+      // A co-use row records the donor's project (no stack of its own) + the
+      // donor's compose files so --status/--down read a coherent row; the
+      // uniqueness exemption lets it share the donor's project name.
+      composeProject: donorProject,
+      composeFiles: ["docker-compose.yml", "docker-compose.dev.yml"],
+      ports: {},
+      appPort,
+      repoUrl: opts.repoUrl,
+      ref: opts.ref,
+      sha: resolvedSha,
+      infraMode: "co-use",
+      createdResources: [`db:${dbName}`],
+      state: "provisioning",
+    });
+    writeInstanceRegistry(registryPath, next);
+    writeMarker(targetDir, {
+      slug,
+      id: slot.id,
+      mode: opts.mode,
+      composeProject: donorProject,
+      composeFiles: ["docker-compose.yml", "docker-compose.dev.yml"],
+      appPort,
+      ref: opts.ref,
+      sha: resolvedSha,
+      infraMode: "co-use",
+      state: "provisioning",
+    });
+    return { slot, appPort };
+  });
+
+  if (persisted.idempotent) {
+    return { infraPlan: "co-use", instance: persisted.slot, idempotent: true };
+  }
+  const appPort = persisted.appPort;
+
+  // 4-7. Clone companion extensions + install deps, then create the separate DB,
+  //      write env, run setup --no-infra. ALL wrapped in a transaction-style
+  //      try/catch that rolls back (drops the created DB if any + releases the
+  //      slot) on any failure (cinatra-cli#40 §3.2). The extension-sync + install
+  //      run BEFORE setup (which needs the installed deps); a failure there
+  //      rolls back the (DB-less) provisioning slot rather than orphaning it.
+  try {
+    if (opts.mode === "dev" && deps.skipCoUseInstall !== true) {
+      log("- Cloning declared companion extension repos (cinatra.devExtensions)…");
+      const extResult = await syncCinatraDevExtensions({
+        repoRoot: targetDir,
+        targetRoot: targetDir,
+        argv: [],
+        env: process.env,
+        log,
+      });
+      if (extResult?.skipped) log(`  Dev extensions: skipped (${extResult.reason}).`);
+    }
+    if (!opts.noInstall && deps.skipCoUseInstall !== true) {
+      const usePnpm = !commandExists("corepack", ["--version"]) && commandExists("pnpm", ["--version"]);
+      pnpmInstall({ targetDir, usePnpmDirect: usePnpm, log });
+    }
+
+    const { created } = await dbOps.createCoUseDb({ adminUrl, dbName });
+    createdDb = created;
+    log(`  ${created ? "Created" : "Reusing existing"} co-use database ${dbName}.`);
+
+    // Build + write the co-use .env.local (0600). Separate DB URL on the donor
+    // server; inherit shared-infra endpoints + crypto secrets from the donor.
+    const dbUrl = connStringForDatabase(adminUrl, dbName);
+    const envMap = buildCoUseEnv({ sourceEnv: donorEnv, slug, appPort, dbUrl });
+    writeCoUseEnv({ targetDir, envMap, log });
+
+    // Run setup with NO infra bring-up (the donor's stack is the backing infra).
+    if (!opts.noSetup && deps.runSetup !== false) {
+      const runSetup = deps.runSetup ?? ((d) => runSetupInTarget({ ...d }));
+      runSetup({ targetDir, mode: opts.mode, skipDevApps: opts.skipDevApps, log });
+    }
+
+    // Mark ready under the lock.
+    await withAllocLock(lockPath, async () => {
+      const reg = requireUsableInstanceRegistry(registryPath);
+      if (getInstance(reg, slug)) {
+        writeInstanceRegistry(registryPath, markInstanceReady(reg, slug, { sha: resolvedSha }));
+      }
+    });
+    writeMarker(targetDir, {
+      slug,
+      id: persisted.slot.id,
+      mode: opts.mode,
+      composeProject: donorProject,
+      composeFiles: ["docker-compose.yml", "docker-compose.dev.yml"],
+      appPort,
+      ref: opts.ref,
+      sha: resolvedSha,
+      infraMode: "co-use",
+      state: "ready",
+    });
+    log(`  ✓ Co-use instance "${slug}" ready: app http://localhost:${appPort}, DB ${dbName}, cookie-prefix ${coUseCookiePrefix(slug)}.`);
+    return { infraPlan: "co-use", instance: { ...persisted.slot, state: "ready", appPort, dbName } };
+  } catch (err) {
+    log(`  ✗ Co-use provisioning failed — rolling back instance "${slug}".`);
+    const plan = coUseRollbackPlan({ createdDb, dbName, runtimeDir: null });
+    for (const stepObj of plan) {
+      try {
+        if (stepObj.step === "dropDatabase") {
+          await dbOps.dropDbCreatedByThisRun({ adminUrl, dbName: stepObj.dbName, createdThisRun: true });
+          log(`    rolled back: dropped ${stepObj.dbName}.`);
+        } else if (stepObj.step === "releaseInstanceSlot") {
+          await withAllocLock(lockPath, async () => {
+            const reg = requireUsableInstanceRegistry(registryPath);
+            const row = getInstance(reg, slug);
+            if (row && path.resolve(row.installDir) === path.resolve(targetDir) && row.state !== "ready") {
+              const { registry: rel } = releaseInstance(reg, slug);
+              writeInstanceRegistry(registryPath, rel);
+            }
+          });
+        }
+      } catch (e) {
+        log(`    ⚠ rollback step "${stepObj.step}" best-effort error: ${e.message}`);
+      }
+    }
+    throw err;
+  }
+}
+
+/** Write a co-use `.env.local` (mode 0600): start from the donor's env body (so
+ *  inherited keys carry through verbatim) then upsert the co-use overrides. */
+function writeCoUseEnv({ targetDir, envMap, log = console.log }) {
+  const envPath = path.join(targetDir, ".env.local");
+  // Seed from the donor's body if present, else start empty.
+  let body = existsSync(envPath) ? readFileSync(envPath, "utf8") : "";
+  for (const [k, v] of Object.entries(envMap)) {
+    body = upsertEnvKey(body, k, v);
+  }
+  writeFileSync(envPath, body, { mode: 0o600 });
+  try {
+    // Tighten perms even if the file pre-existed with a looser mode.
+    spawnSync("chmod", ["600", envPath]);
+  } catch {
+    /* best-effort */
+  }
+  log(`  Wrote co-use .env.local (separate DB + cookie-prefix + queue) at ${envPath}.`);
 }
 
 // ── T6 — read-only --status / --list-instances ──────────────────────────────
@@ -2769,6 +3143,21 @@ async function resolveConflict({ targetDir, opts, conflicts, resolvedSha, log = 
   let choice = opts.onConflict;
   if (!choice && opts.infra === "external") choice = "external";
 
+  // cinatra-cli#40: the menu offers co-use ONLY when the conflicting holder is a
+  // single proven Cinatra instance (the donor) AND its checkout's app build
+  // advertises per-instance cookie isolation. The donor dir is the holder's
+  // recorded installDir; the capability probe reads its source (fail closed).
+  const couseAvailable = (() => {
+    const holderDir = cls.kind === "other-cinatra" && cls.instance?.installDir;
+    if (!holderDir) return false;
+    const probeCapability = deps.probeCookiePrefixSupport ?? probeDonorCookiePrefixSupport;
+    try {
+      return !!probeCapability(holderDir);
+    } catch {
+      return false;
+    }
+  })();
+
   // 2/3. No explicit choice.
   if (!choice) {
     const interactive = process.stdin.isTTY && process.stdout.isTTY;
@@ -2779,7 +3168,7 @@ async function resolveConflict({ targetDir, opts, conflicts, resolvedSha, log = 
           `\n  (non-interactive: pass an explicit --on-conflict=… or --infra=external to proceed.)`,
       );
     }
-    choice = await runExecuteMenu({ conflicts, classified: cls, opts, log });
+    choice = await runExecuteMenu({ conflicts, classified: cls, opts, couseAvailable, log });
   }
 
   switch (choice) {
@@ -2789,7 +3178,7 @@ async function resolveConflict({ targetDir, opts, conflicts, resolvedSha, log = 
       // interactive; reaching here with "prompt" means an explicit
       // --on-conflict=prompt — run the menu now.
       if (choice === "prompt") {
-        const sub = await runExecuteMenu({ conflicts, classified: cls, opts, log });
+        const sub = await runExecuteMenu({ conflicts, classified: cls, opts, couseAvailable, log });
         return dispatchChoice({ choice: sub, targetDir, opts, conflicts, resolvedSha, classified: cls, log, deps });
       }
       return dispatchChoice({ choice: "isolated", targetDir, opts, conflicts, resolvedSha, classified: cls, log, deps });
@@ -2817,6 +3206,11 @@ async function dispatchChoice({ choice, targetDir, opts, conflicts, resolvedSha,
       return executeAttach({ targetDir, opts, resolvedSha, classified, log, deps });
     case "stop-existing":
       return executeStopExisting({ targetDir, opts, conflicts, classified, log, deps });
+    case "co-use":
+      // cinatra-cli#40: the menu offered co-use (capability proven). executeCoUse
+      // owns the capability re-probe + DB/env/setup; it returns an infraPlan the
+      // caller treats as terminal (no default bring-up).
+      return executeCoUse({ targetDir, opts, resolvedSha, log, deps });
     case "fail":
     case "abort":
       throw new Error(formatPortConflictError(conflicts, { phase: "before bringing up infra", owner: classified.kind }));
@@ -2828,12 +3222,14 @@ async function dispatchChoice({ choice, targetDir, opts, conflicts, resolvedSha,
 /** T8b — the interactive execute-menu. Returns the chosen action string. The
  *  options offered mirror the flag surface 1:1 (acceptance: each option is
  *  selectable interactively AND via flags): Isolated / Attach / Stop-existing /
- *  External / Abort. Stop-existing is only OFFERED for a single proven
+ *  External / Co-use / Abort. Stop-existing is only OFFERED for a single proven
  *  `other-cinatra` holder (it refuses an unrelated/mixed holder at execution, so
- *  offering it elsewhere would be a dead option). Co-use is GATED → it is named
- *  as unavailable, never offered. `--yes` does NOT silently pick a destructive
+ *  offering it elsewhere would be a dead option). Co-use is OFFERED only when the
+ *  donor app build advertises per-instance cookie isolation (cinatra-cli#40
+ *  `couseAvailable`); otherwise it is named as unavailable with the upstream
+ *  pointer, never selectable. `--yes` does NOT silently pick a destructive
  *  option; it only pre-accepts the SAFE default (Isolated). */
-async function runExecuteMenu({ conflicts, classified, opts, log = console.log }) {
+async function runExecuteMenu({ conflicts, classified, opts, couseAvailable = false, log = console.log }) {
   const isSingleCinatra = classified.kind === "other-cinatra" && classified.instance;
   const owner = isSingleCinatra
     ? `another Cinatra instance${classified.instance?.slug ? ` ("${classified.instance.slug}")` : ""}`
@@ -2854,19 +3250,26 @@ async function runExecuteMenu({ conflicts, classified, opts, log = console.log }
     log(`  [s] Stop      — stop the existing instance "${classified.instance.slug}" first, then install on the default ports`);
   }
   log("  [e] External  — point this install at external Postgres/Redis/Nango (pass --db-url/--redis-url/… ; no local infra)");
+  if (couseAvailable) {
+    log("  [c] Co-use    — share the existing instance's infra (separate DB + queue; no second stack)");
+  }
   log("  [x] Abort     — stop and let me free the ports myself");
-  log("  (Co-use / sharing one infra stack between two instances is not yet available — use Isolated.)");
+  if (!couseAvailable) {
+    log("  (Co-use / sharing one infra stack is unavailable: the app build does not isolate auth cookies per instance — use Isolated.)");
+  }
   // --yes pre-accepts the SAFE default only (never a destructive Stop).
   if (opts.yes) {
     log("  (--yes: choosing Isolated, the safe default.)");
     return "isolated";
   }
-  const hint = isSingleCinatra ? "[i/a/s/e/x]" : "[i/a/e/x]";
+  const hint =
+    `[i/a/${isSingleCinatra ? "s/" : ""}e/${couseAvailable ? "c/" : ""}x]`;
   const answer = (await promptLine(`Choice ${hint}: `, "x")).trim().toLowerCase();
   if (answer === "i" || answer === "isolated") return "isolated";
   if (answer === "a" || answer === "attach") return "attach";
   if (isSingleCinatra && (answer === "s" || answer === "stop" || answer === "stop-existing")) return "stop-existing";
   if (answer === "e" || answer === "external") return "external";
+  if (couseAvailable && (answer === "c" || answer === "co-use" || answer === "couse")) return "co-use";
   return "abort";
 }
 
@@ -3127,9 +3530,25 @@ async function executeStopExisting({ targetDir, opts, conflicts, classified, log
 export async function runInstall(argv = [], { log = console.log, deps = {} } = {}) {
   const opts = parseInstallArgs(argv);
 
-  // T5b — gated co-use signals fail LOUD BEFORE any side effect (never a silent
-  // no-op surface). cinatra-cli#17.
-  refuseCoUseIfRequested(opts);
+  // cinatra-cli#40: co-use (shared-infra) signals route to the executeCoUse path
+  // (no longer a flat refusal). The HARD safety gate — the donor app must isolate
+  // auth cookies per instance — is enforced by a CHEAP pre-clone capability probe
+  // here (fail closed before any side effect) AND again inside executeCoUse. The
+  // pre-clone probe reads the DONOR checkout's source, so a co-use request against
+  // an app build without cookie-prefix support still fails fast + cheap (no clone),
+  // exactly like the old refusal did.
+  if (opts.couseRequested && deps.skipCoUsePreGate !== true) {
+    const probeCapability = deps.probeCookiePrefixSupport ?? probeDonorCookiePrefixSupport;
+    const readDonor = deps.readDonorEnv ?? readDonorEnv;
+    const preTargetDir = path.resolve(opts.dir ?? path.resolve(process.cwd(), DEFAULT_INSTALL_DIRNAME));
+    const donorDir = resolveDonorDir(opts, preTargetDir);
+    const donorEnv = readDonor(donorDir);
+    assertCoUsePrereqs({
+      cookiePrefixSupported: !!probeCapability(donorDir),
+      graphitiShared: typeof donorEnv.GRAPHITI_URL === "string" && donorEnv.GRAPHITI_URL.length > 0,
+      allowSharedGraphiti: opts.allowSharedGraphiti === true,
+    });
+  }
 
   // T6 — read-only --status / --list-instances short-circuit (no side effects).
   if (opts.status || opts.listInstances) {
@@ -3333,6 +3752,44 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   // needs no change to the cinatra repo). cinatra-cli#17.
   ensureMarkerIgnored(targetDir);
 
+  // cinatra-cli#40 — co-use (shared-infra): this checkout runs against a DONOR
+  // instance's already-running infra (no second Docker stack), with its OWN app
+  // port + a SEPARATE `cinatra_inst_<slug>` database. executeCoUse owns the whole
+  // tail (capability re-probe, DB create, env write, setup --no-infra, record),
+  // so route here and return — bypassing the default/conflict/infra machinery.
+  if (opts.couseRequested) {
+    // executeCoUse owns the WHOLE tail — companion dev-extensions clone, deps
+    // install, capability re-probe, DB create, env write, setup --no-infra, and
+    // record. The ONLY thing co-use skips vs a normal install is the second infra
+    // stack. (The interactive menu pick routes through the same executeCoUse so
+    // both entry points install deps before setup.)
+    const couse = await executeCoUse({ targetDir, opts, resolvedSha, log, deps });
+    log("");
+    if (couse.dryRun) {
+      log("✓ Co-use dry run — no changes made.");
+    } else {
+      log("✓ Cinatra co-use install complete.");
+      log(`  Directory:     ${targetDir}`);
+      log(`  Ref / commit:  ${opts.ref} (${resolvedSha})`);
+      log(`  Mode:          ${opts.mode}`);
+      log(`  Instance:      ${couse.instance?.slug} (co-use — shares the donor's infra; separate DB ${couse.instance?.dbName ?? coUseDbName(deriveCoUseSlug(targetDir, opts))})`);
+      log("");
+      log("  Next:");
+      log(`    cd ${targetDir}`);
+      log(`    pnpm dev        # start this co-use instance at http://localhost:${couse.instance?.appPort}`);
+    }
+    return {
+      targetDir,
+      ref: opts.ref,
+      sha: resolvedSha,
+      mode: opts.mode,
+      instance: couse.instance?.slug ?? null,
+      infraPlan: "co-use",
+      appPort: couse.instance?.appPort ?? null,
+      dryRun: couse.dryRun === true,
+    };
+  }
+
   let infraPlan = opts.noInfra ? "external" : "default";
   let resolution = null;
 
@@ -3396,6 +3853,27 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
         infraPlan = resolution.infraPlan;
       }
     }
+  }
+
+  // cinatra-cli#40: the interactive menu can pick co-use (capability proven).
+  // executeCoUse already owns the WHOLE tail (DB create, env write, setup
+  // --no-infra, record) — so it is TERMINAL: return here, never falling through
+  // to the default env/infra/install/setup steps (which would double-run setup).
+  if (infraPlan === "co-use") {
+    log("");
+    log("✓ Cinatra co-use install complete.");
+    log(`  Directory:     ${targetDir}`);
+    log(`  Instance:      ${resolution?.instance?.slug} (co-use — shares the donor's infra)`);
+    log(`    cd ${targetDir} && pnpm dev   # http://localhost:${resolution?.instance?.appPort}`);
+    return {
+      targetDir,
+      ref: opts.ref,
+      sha: resolvedSha,
+      mode: opts.mode,
+      instance: resolution?.instance?.slug ?? null,
+      infraPlan: "co-use",
+      appPort: resolution?.instance?.appPort ?? null,
+    };
   }
 
   // 5. Create/reconcile the env (BEFORE infra so a mode mismatch fails fast).

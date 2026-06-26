@@ -62,6 +62,8 @@ option up front with a flag:
     cinatra install --on-conflict=stop-existing  # stop the existing one first,
                                                   # then install on the default ports
     cinatra install --on-conflict=attach     # re-use / update the existing checkout
+    cinatra install --on-conflict=co-use     # share the running instance's services
+                                             # (separate database + queue; no 2nd stack)
     cinatra install --infra=external \       # point at your own database/cache
         --db-url <url> --redis-url <url> --nango-url <url> --graphiti-url <url> \
         --external-db-disposable             # confirm the external DB is disposable
@@ -83,9 +85,15 @@ instance always asks for confirmation first; `--yes` alone never deletes data
 the explicit `--external-db-disposable` acknowledgement — a bare `--yes` won't do
 it, because setup can write to that database).
 
-> Sharing one set of services between two instances (`co-use`) is not available
-> yet — `cinatra install` will tell you so and point you at `--on-conflict=isolated`,
-> which gives each instance its own services instead.
+> **Co-use (sharing one set of services).** `--on-conflict=co-use` /
+> `--infra=share` runs a second instance against the first one's running services
+> — its own app port and its own database, but the same Postgres server, Redis,
+> and Nango (no second Docker stack). It is enabled only when the installed app
+> isolates login cookies per instance (otherwise two instances on `localhost`
+> would share a session, so `cinatra install` refuses with the exact app change
+> needed and points you at `--on-conflict=isolated`). When the donor sets a
+> Graphiti URL, add `--allow-shared-graphiti` to accept sharing it (it is
+> org-scoped, not per-instance).
 
 ## Author an extension
 
