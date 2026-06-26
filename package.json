@@ -27,7 +27,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "lint:skills": "node scripts/lint-skills.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
