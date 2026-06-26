@@ -435,6 +435,124 @@ describe("generateIsolatedCompose (T7)", () => {
     const yaml = renderIsolatedComposeYaml(doc);
     expect(() => JSON.parse(yaml)).not.toThrow();
   });
+
+  // ── cinatra-cli#57 — env-file-AWARE scrub (the real fix) ────────────────────
+  // The bug: the generator scrubbed EVERY secret to `${VAR}`, including the
+  // compose-baked infra-init DEFAULTS (POSTGRES_PASSWORD: postgres, …) that
+  // nothing supplies at `up` time → they resolved BLANK and postgres/nango-db
+  // failed on fresh volumes; and because several services hardcode the SAME key
+  // (`POSTGRES_PASSWORD`) with DIFFERENT values, a flat `${VAR}` also collapsed
+  // them. The fix: scrub a secret ONLY when the instance env-file supplies its
+  // key (`envFileKeys`); a compose default stays LITERAL — resolves AND keeps its
+  // distinct per-service value.
+  describe("cinatra-cli#57 — env-file-aware scrub keeps infra defaults literal, scrubs operator secrets", () => {
+    // Mirrors the REAL cinatra compose: postgres + nango-db both hardcode
+    // POSTGRES_PASSWORD but with DIFFERENT values (postgres vs nango); operator
+    // secrets (OPENAI_API_KEY, the NEO4J password) come from .env.local.
+    const infraConfig = {
+      name: "cinatra",
+      services: {
+        postgres: {
+          image: "postgres:16",
+          environment: { POSTGRES_PASSWORD: "postgres", POSTGRES_USER: "postgres", OPENAI_API_KEY: "sk-leaked" },
+          ports: [{ published: "5434", target: 5432, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+        },
+        "nango-db": {
+          image: "postgres:16",
+          environment: { POSTGRES_PASSWORD: "nango", NANGO_DB_PASSWORD: "nango" },
+          ports: [{ published: "5435", target: 5432, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+        },
+        neo4j: {
+          image: "neo4j",
+          environment: { "DATABASE__PROVIDERS__NEO4J__PASSWORD": "cinatra-local" },
+          ports: [{ published: "7687", target: 7687, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+        },
+      },
+      networks: { default: { name: "cinatra_default" } },
+      volumes: {},
+    };
+    // The instance's .env.local supplies ONLY the genuine operator secrets — NOT
+    // the compose-baked infra-init defaults.
+    const envFileKeys = new Set(["OPENAI_API_KEY", "DATABASE__PROVIDERS__NEO4J__PASSWORD", "BETTER_AUTH_SECRET"]);
+
+    it("leaves a compose-default infra password as its LITERAL (it would otherwise resolve blank)", () => {
+      const { doc } = generateIsolatedCompose({
+        resolvedConfig: infraConfig, offset: 10000, projectName: "cinatra_beta", slug: "beta", envFileKeys,
+      });
+      // POSTGRES_PASSWORD / NANGO_DB_PASSWORD are NOT in .env.local → stay literal.
+      expect(doc.services.postgres.environment.POSTGRES_PASSWORD).toBe("postgres");
+      expect(doc.services["nango-db"].environment.POSTGRES_PASSWORD).toBe("nango");
+      expect(doc.services["nango-db"].environment.NANGO_DB_PASSWORD).toBe("nango");
+    });
+
+    it("does NOT collapse the same key's DIFFERENT per-service values (postgres vs nango)", () => {
+      const { doc } = generateIsolatedCompose({
+        resolvedConfig: infraConfig, offset: 10000, projectName: "cinatra_beta", slug: "beta", envFileKeys,
+      });
+      // Each service keeps its OWN POSTGRES_PASSWORD — never one flattened value.
+      expect(doc.services.postgres.environment.POSTGRES_PASSWORD).not.toBe(
+        doc.services["nango-db"].environment.POSTGRES_PASSWORD,
+      );
+    });
+
+    it("STILL scrubs a genuine operator secret that .env.local supplies (no plaintext leak)", () => {
+      const { doc, scrubbedKeys } = generateIsolatedCompose({
+        resolvedConfig: infraConfig, offset: 10000, projectName: "cinatra_beta", slug: "beta", envFileKeys,
+      });
+      // OPENAI_API_KEY + the neo4j password ARE in .env.local → re-symbolised.
+      expect(doc.services.postgres.environment.OPENAI_API_KEY).toBe("${OPENAI_API_KEY}");
+      expect(doc.services.neo4j.environment["DATABASE__PROVIDERS__NEO4J__PASSWORD"]).toBe(
+        "${DATABASE__PROVIDERS__NEO4J__PASSWORD}",
+      );
+      // No leaked plaintext operator secret anywhere in the rendered file.
+      const yaml = renderIsolatedComposeYaml(doc);
+      expect(yaml).not.toContain("sk-leaked");
+      // scrubbedKeys reports ONLY the env-file-supplied keys it re-symbolised.
+      expect(new Set(scrubbedKeys)).toEqual(new Set(["OPENAI_API_KEY", "DATABASE__PROVIDERS__NEO4J__PASSWORD"]));
+    });
+
+    it("INVARIANT: every `${VAR}` the generator introduces is on the envFileKeys allowlist (none resolves blank)", () => {
+      const { doc, scrubbedKeys } = generateIsolatedCompose({
+        resolvedConfig: infraConfig, offset: 10000, projectName: "cinatra_beta", slug: "beta", envFileKeys,
+      });
+      const placeholderKeys = new Set();
+      for (const svc of Object.values(doc.services)) {
+        for (const value of Object.values(svc.environment ?? {})) {
+          const m = typeof value === "string" ? value.match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/) : null;
+          if (m) placeholderKeys.add(m[1]);
+        }
+      }
+      // Every introduced placeholder is a key .env.local supplies → resolves.
+      for (const key of placeholderKeys) expect(envFileKeys.has(key)).toBe(true);
+      // And scrubbedKeys matches exactly the introduced placeholder set.
+      expect(new Set(scrubbedKeys)).toEqual(placeholderKeys);
+    });
+
+    it("with NO envFileKeys (legacy/hermetic callers) scrubs EVERY secret (back-compat)", () => {
+      const { doc } = generateIsolatedCompose({
+        resolvedConfig: infraConfig, offset: 10000, projectName: "cinatra_legacy", slug: "legacy",
+      });
+      // No allowlist → the prior unconditional behaviour: all secrets symbolic.
+      expect(doc.services.postgres.environment.POSTGRES_PASSWORD).toBe("${POSTGRES_PASSWORD}");
+      expect(doc.services.postgres.environment.OPENAI_API_KEY).toBe("${OPENAI_API_KEY}");
+    });
+  });
+});
+
+describe("scrubServiceEnv env-file allowlist (cinatra-cli#57)", () => {
+  it("scrubs a secret ONLY when its key is in the env-file Set; a default stays literal", () => {
+    const keys = new Set(["OPENAI_API_KEY"]);
+    const out = scrubServiceEnv({ OPENAI_API_KEY: "sk-real", POSTGRES_PASSWORD: "postgres", PUBLIC: "x" }, keys);
+    expect(out.OPENAI_API_KEY).toBe("${OPENAI_API_KEY}"); // supplied → scrubbed
+    expect(out.POSTGRES_PASSWORD).toBe("postgres"); // NOT supplied → literal default
+    expect(out.PUBLIC).toBe("x"); // non-secret → untouched
+  });
+
+  it("a null/absent env-file Set scrubs every secret (legacy behaviour preserved)", () => {
+    const out = scrubServiceEnv({ POSTGRES_PASSWORD: "postgres", PUBLIC: "x" });
+    expect(out.POSTGRES_PASSWORD).toBe("${POSTGRES_PASSWORD}");
+    expect(out.PUBLIC).toBe("x");
+  });
 });
 
 describe("secret-key + port helpers", () => {
