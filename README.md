@@ -102,6 +102,99 @@ as an optional peer; nothing is installed for you. Run `cinatra create-extension
 > This replaces the standalone `npx create-cinatra-extension` scaffolder, which
 > is retired.
 
+## Repo structure
+
+```
+bin/              Entry-point script (cinatra.mjs)
+src/              CLI source modules
+  authoring/      Extension scaffolding core (create-extension)
+templates/        Scaffold templates for each extension kind
+  agent/
+  artifact/
+  connector/
+  skill/
+  workflow/
+  _shared/        Shared files copied into every generated extension
+tests/            Vitest test suite
+```
+
+This repo is the **thin CLI** only. It carries no `@cinatra-ai/*` runtime
+dependencies — those are resolved from the operator's Cinatra checkout at
+runtime. The migration runner, dev-app manifests, and first-party SDK packages
+all come from the checkout, not from this package.
+
+## Development
+
+Clone the repo and install dependencies:
+
+    git clone https://github.com/cinatra-ai/cinatra-cli.git
+    cd cinatra-cli
+    npm ci
+
+Run the test suite:
+
+    npm test
+
+The suite is run by [Vitest](https://vitest.dev/) and covers install flows,
+clone/registry logic, extension scaffolding, command dispatch, and startup
+contracts. Tests that need a Cinatra checkout use a synthetic fake checkout
+provided by `tests/helpers/setup-fake-checkout.mjs`; no real instance is
+needed to run the tests.
+
+Smoke-check the CLI locally:
+
+    node bin/cinatra.mjs --help
+    node bin/cinatra.mjs --version
+
+The CI pipeline (`.github/workflows/ci.yml`) runs these same steps on every
+pull request: dependency assertions, the full Vitest suite, the two smoke
+checks, and a dry-run pack to validate the publish payload.
+
+When contributing, keep the thin-CLI constraint in mind: do not add
+`@cinatra-ai/*` packages to `dependencies`, `devDependencies`, or
+`peerDependencies`. CI will reject the PR if any first-party package appears
+in the manifest or the resolved dependency tree.
+
+## Troubleshooting
+
+**`cinatra: command not found` after global install**
+Check that npm's global `bin` directory is on your `PATH`:
+
+    npm prefix -g       # prints the global prefix (e.g. /usr/local)
+    echo $PATH          # verify <prefix>/bin appears here
+
+If it is missing, add `$(npm prefix -g)/bin` to your shell profile
+(e.g. `~/.zshrc` or `~/.bashrc`).
+
+**`cinatra install` says ports are in use**
+Another Cinatra instance (or another service) is already using the default
+ports. Use `--list-instances` to see what is running:
+
+    cinatra install --list-instances
+
+Then pick a resolution: `--on-conflict=isolated` starts a second instance on
+its own port band, `--on-conflict=attach` re-attaches to the existing checkout,
+or `--on-conflict=stop-existing` stops the existing stack before installing.
+
+**Deprecated command warnings**
+Commands like `cinatra setup dev` or `cinatra db migrate` print a deprecation
+hint pointing at their `cinatra dev …` equivalents. Update your scripts to the
+namespaced forms (e.g. `cinatra dev setup dev`, `cinatra dev db migrate`) —
+the old bare forms will be removed in a future minor release. To suppress the
+warnings temporarily while you migrate, set `CINATRA_SUPPRESS_DEPRECATION=1`.
+
+**`cinatra doctor` for diagnosing a broken instance**
+If your instance is misbehaving, `cinatra doctor` checks your local setup and
+reports what is wrong. Run it first before filing an issue.
+
+**Node.js version errors**
+The CLI requires Node.js 24 or later. Check your version with `node --version`
+and upgrade if needed.
+
+## Changelog
+
+See [CHANGELOG.md](./CHANGELOG.md) for a full history of releases.
+
 ## License
 
 [Apache-2.0](./LICENSE)
