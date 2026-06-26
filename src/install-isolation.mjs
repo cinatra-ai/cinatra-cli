@@ -343,16 +343,49 @@ function hasInlineUrlCredentials(value) {
  *  Compose `config` emits `environment` as an object (key→value). A value that
  *  is already `${...}` or empty is left alone. A `*_URL`/`*_DSN`/connection-string
  *  whose value embeds `user:pass@` is also re-symbolised (review hardening #5). Returns a
- *  NEW map. */
-function scrubServiceEnv(environment) {
+ *  NEW map.
+ *
+ *  cinatra-cli#57 — re-symbolising to `${KEY}` only resolves if SOMETHING supplies
+ *  `KEY` at `docker compose up` time. The isolated `up` runs with
+ *  `--env-file .env.local`, so we re-symbolise a secret value ONLY when the
+ *  instance's env-file actually defines that key (`envFileKeys`). When it does
+ *  NOT, the value is an infra-init DEFAULT baked into the donor's compose
+ *  (`POSTGRES_PASSWORD: postgres`, `NANGO_DB_PASSWORD: nango`,
+ *  `NANGO_DASHBOARD_PASSWORD: cinatra-local`, …) — those are PUBLIC, already in
+ *  the donor's git, and DIFFER per service (postgres=`postgres` vs
+ *  nango-db=`nango`). Re-symbolising them to a single flat `${POSTGRES_PASSWORD}`
+ *  would (a) resolve to a BLANK string (nothing supplies them — the #57 bug) AND
+ *  (b) COLLAPSE the per-service values into one (breaking nango-db / twenty /
+ *  plane, which each hardcode a different `POSTGRES_PASSWORD`). So a
+ *  compose-default secret is left as its LITERAL — it resolves correctly and
+ *  stays self-contained. We still scrub the genuine operator secrets
+ *  (`OPENAI_API_KEY`, `NANGO_ENCRYPTION_KEY`, `BETTER_AUTH_SECRET`, the
+ *  `${NEO4J_PASSWORD}`-sourced neo4j password, …) — those ARE in `.env.local`, so
+ *  they both resolve AND never get persisted as plaintext in the generated file.
+ *
+ *  `envFileKeys` is a Set of the keys the instance's env-file supplies; when it
+ *  is null (legacy / hermetic callers), every secret-shaped value is scrubbed
+ *  (the prior behaviour) so existing tests + the credential-URL hardening hold.
+ *  We NEVER log a value here. */
+function scrubServiceEnv(environment, envFileKeys = null) {
   if (!environment || typeof environment !== "object" || Array.isArray(environment)) {
     return environment;
   }
+  const supplies = (key) => {
+    // No env-file context → preserve the legacy "scrub every secret" behaviour.
+    if (!(envFileKeys instanceof Set)) return true;
+    return envFileKeys.has(key);
+  };
   const out = {};
   for (const [key, value] of Object.entries(environment)) {
     const isPlainSecret = isSecretEnvKey(key);
     const isCredUrl = URL_KEY_RE.test(key) && hasInlineUrlCredentials(value);
-    if ((isPlainSecret || isCredUrl) && typeof value === "string" && value.length > 0 && !/^\$\{.*\}$/.test(value)) {
+    const scrubbable =
+      (isPlainSecret || isCredUrl) && typeof value === "string" && value.length > 0 && !/^\$\{.*\}$/.test(value);
+    // Only re-symbolise when the env-file WILL supply this key (so `${KEY}`
+    // resolves). A scrubbable value whose key is NOT in the env-file is an
+    // infra-init compose DEFAULT → keep the literal (resolves; never collapses).
+    if (scrubbable && supplies(key)) {
       out[key] = `\${${key}}`;
     } else {
       out[key] = value;
@@ -390,11 +423,20 @@ function remapServicePorts(ports, offset) {
  * @param {string} args.projectName     the isolated compose project (e.g. cinatra_<slug>)
  * @param {string} args.slug            the instance slug (for labels)
  * @param {number} [args.appPort]       the host app port (recorded in a label)
- * @returns {{ doc: object, ports: object }}
+ * @param {Set<string>} [args.envFileKeys] the keys the instance's env-file
+ *   (`.env.local`) supplies. A secret value is re-symbolised to `${KEY}` ONLY
+ *   when this Set contains its key — so every `${VAR}` the generator introduces
+ *   resolves at `up` time (cinatra-cli#57). A secret-shaped value NOT in the
+ *   env-file is a compose-baked infra-init DEFAULT and is left as its literal
+ *   (resolves correctly; per-service values are never collapsed). When omitted,
+ *   every secret-shaped value is scrubbed (legacy behaviour).
+ * @returns {{ doc: object, ports: object, scrubbedKeys: string[] }}
  *   - doc:   the rewritten compose document (valid YAML as JSON)
  *   - ports: `{ <service>: [hostPort, …] }` the FULL remapped published-port set
+ *   - scrubbedKeys: the env-file-supplied keys re-symbolised to `${KEY}` (NAMES
+ *     only — never values; for transparency / the executor's invariant check).
  */
-export function generateIsolatedCompose({ resolvedConfig, offset, projectName, slug, appPort = null }) {
+export function generateIsolatedCompose({ resolvedConfig, offset, projectName, slug, appPort = null, envFileKeys = null }) {
   if (!resolvedConfig || typeof resolvedConfig !== "object") {
     throw new Error("generateIsolatedCompose requires a parsed resolvedConfig object.");
   }
@@ -443,6 +485,11 @@ export function generateIsolatedCompose({ resolvedConfig, offset, projectName, s
     }
   }
 
+  // cinatra-cli#57: record which env-file-supplied KEYS we re-symbolised (names
+  // only — never values) so the executor can assert the resolution invariant.
+  const scrubbedKeys = new Set();
+  const keySet = envFileKeys instanceof Set ? envFileKeys : null;
+
   // Services: remap ports, scrub secret env, add labels, rewrite container_name.
   if (doc.services && typeof doc.services === "object") {
     for (const [svcName, svc] of Object.entries(doc.services)) {
@@ -465,8 +512,16 @@ export function generateIsolatedCompose({ resolvedConfig, offset, projectName, s
         if (collected.length) remappedPorts[svcName] = collected;
       }
 
-      // (4) Scrub interpolated secret env values back to ${VAR}.
-      if (svc.environment) svc.environment = scrubServiceEnv(svc.environment);
+      // (4) Scrub interpolated secret env values back to ${VAR} — but ONLY for
+      // keys the instance's env-file supplies (so the placeholder resolves; a
+      // compose-baked infra-init default is left literal). cinatra-cli#57.
+      if (svc.environment) {
+        const before = svc.environment;
+        svc.environment = scrubServiceEnv(before, keySet);
+        for (const [k, v] of Object.entries(svc.environment)) {
+          if (typeof v === "string" && v === `\${${k}}` && before[k] !== v) scrubbedKeys.add(k);
+        }
+      }
 
       // (3) Ownership labels. `config` emits labels as an object.
       const existing =
@@ -475,7 +530,7 @@ export function generateIsolatedCompose({ resolvedConfig, offset, projectName, s
     }
   }
 
-  return { doc, ports: remappedPorts };
+  return { doc, ports: remappedPorts, scrubbedKeys: [...scrubbedKeys] };
 }
 
 /**

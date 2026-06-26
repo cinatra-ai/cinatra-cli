@@ -32,6 +32,7 @@
 import { randomBytes } from "node:crypto";
 import {
   accessSync,
+  chmodSync,
   constants as fsConstants,
   copyFileSync,
   existsSync,
@@ -1146,9 +1147,26 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
   body = upsertEnvKey(body, "NANGO_ENCRYPTION_KEY", nangoEncryptionKey);
   body = upsertEnvKey(body, "CINATRA_BRIDGE_TOKEN", bridgeToken);
   body = upsertEnvKey(body, "CINATRA_RUNTIME_MODE", wantMode);
-  writeFileSync(envPath, body);
+  writeFileSync(envPath, body, { mode: 0o600 });
+  // `.env.local` holds minted secrets (and, for an isolated instance, the infra
+  // secret surface the generated compose resolves) — keep it owner-only. `mode`
+  // applies on creation; copyFileSync above may have inherited a wider example
+  // mode, so chmod explicitly (best-effort on platforms without chmod semantics).
+  tightenEnvLocalPerms(envPath);
   log(`  .env.local created from .env.example with fresh BETTER_AUTH_SECRET, NANGO_ENCRYPTION_KEY, CINATRA_BRIDGE_TOKEN, and CINATRA_RUNTIME_MODE=${wantMode}.`);
   return { created: true, envPath };
+}
+
+/** Best-effort tighten `.env.local` to 0600 (owner-only). It carries minted
+ *  secrets + (for isolated installs) the infra-secret surface the generated
+ *  compose resolves, so it must never be world/group-readable. No-op if the file
+ *  is absent or chmod is unsupported. */
+function tightenEnvLocalPerms(envPath) {
+  try {
+    if (existsSync(envPath)) chmodSync(envPath, 0o600);
+  } catch {
+    /* best-effort on platforms without chmod semantics */
+  }
 }
 
 /** Replace the value of `KEY=` in-place if the key line exists, else append. */
@@ -1345,14 +1363,26 @@ async function typedConfirm(question, phrase) {
 
 /** Run `docker compose config --format json` for an explicit file set and return
  *  the parsed document (or null when compose can't model it). Used by the
- *  ISOLATED path to resolve the band it then remaps. Injectable for tests. */
+ *  ISOLATED path to resolve the band it then remaps. Injectable for tests.
+ *
+ *  cinatra-cli#57: when the checkout has a `.env.local`, pass it via `--env-file`
+ *  so `config` interpolates every `${VAR}` from the SAME env-file the isolated
+ *  `up` later reads (compose's default discovery reads `.env`, NOT `.env.local`).
+ *  Without it, a `${OPERATOR_SECRET:-}` resolves to its empty default here, and
+ *  the generator (which only re-symbolises env-file-supplied keys with a non-empty
+ *  resolved value) would leave it blank — so the operator secret would never reach
+ *  the isolated container. Reading from `.env.local` makes the resolved config
+ *  carry the real operator values, which the generator then re-symbolises back to
+ *  `${KEY}` (resolved again from `.env.local` at up-time): end-to-end consistent. */
 function composeConfigForFiles(targetDir, composeFiles, deps = {}) {
   const cap = deps.capture ?? capture;
   const fileArgs = (composeFiles && composeFiles.length
     ? composeFiles
     : ["docker-compose.yml", "docker-compose.dev.yml"]
   ).flatMap((f) => ["-f", f]);
-  const raw = cap("docker", ["compose", ...fileArgs, "config", "--format", "json"], { cwd: targetDir });
+  const envLocal = path.join(targetDir, ".env.local");
+  const envArgs = existsSync(envLocal) ? ["--env-file", ".env.local"] : [];
+  const raw = cap("docker", ["compose", ...envArgs, ...fileArgs, "config", "--format", "json"], { cwd: targetDir });
   if (!raw) return null;
   try {
     return JSON.parse(raw);
@@ -1908,6 +1938,18 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
   }
   const composeProject = `cinatra_${slug.replace(/-/g, "_")}`;
 
+  // cinatra-cli#57: ensure `.env.local` exists (with the minted operator secrets)
+  // BEFORE resolving the compose config, so `docker compose config` interpolates
+  // every `${VAR}` from the REAL instance env-file (not a blank/default). The
+  // generated compose then re-symbolises exactly those env-file-supplied keys
+  // back to `${KEY}`, and the isolated `up`'s `--env-file .env.local` resolves
+  // them — end-to-end consistent. A dry-run writes nothing; an idempotent re-run
+  // preserves the existing file (ensureEnvLocal is non-destructive without
+  // --reset-env).
+  if (!opts.dryRun) {
+    ensureEnvLocal({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, log });
+  }
+
   // Resolve the base band from the checkout's own compose config.
   const resolvedConfig = getConfig(targetDir, ["docker-compose.yml", "docker-compose.dev.yml"], deps);
   if (!resolvedConfig) {
@@ -2025,13 +2067,30 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       }));
     }
 
-    // Render the resolved isolated compose for the FINAL offset.
-    const { doc, ports } = generateIsolatedCompose({
+    // cinatra-cli#57: the isolated `up` runs with `--env-file .env.local`, so a
+    // secret in the generated compose may be re-symbolised to `${KEY}` ONLY when
+    // `.env.local` actually supplies that key (with a non-empty value) — else it
+    // resolves to a BLANK string (the bug). `.env.local` is already created above
+    // (before `getConfig`); derive the scrub-allowlist from its keys. A
+    // compose-baked infra-init DEFAULT (`POSTGRES_PASSWORD: postgres`, etc.) is
+    // NOT in `.env.local`, so it is left as its literal — which both resolves AND
+    // preserves the distinct per-service values (postgres=`postgres` vs
+    // nango-db=`nango`) a flat `${VAR}` would collapse. The host-remapped infra
+    // URL keys are EXCLUDED from the allowlist: their `.env.local` values point at
+    // host ports (for the host-side app/CLI), which would be wrong inside the
+    // compose network — the container envs keep their literal service-DNS URLs.
+    const envFileKeys = computeIsolatedScrubAllowlist(targetDir);
+
+    // Render the resolved isolated compose for the FINAL offset. `scrubbedKeys`
+    // is the set of env-file-supplied keys re-symbolised to `${KEY}` (NAMES only)
+    // — used by the post-write invariant check.
+    const { doc, ports, scrubbedKeys } = generateIsolatedCompose({
       resolvedConfig,
       offset,
       projectName: composeProject,
       slug,
       appPort,
+      envFileKeys,
     });
 
     if (opts.dryRun) {
@@ -2039,6 +2098,13 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       log(`  [dry-run] would record instance "${slug}" project ${composeProject} app:${appPort} offset:${offset}`);
       return { slot: null, generatedFile: null, dryRun: true, appPort, ports, offset };
     }
+
+    // cinatra-cli#57 invariant: EVERY `${VAR}` the generator just introduced must
+    // be supplied by `.env.local` (so none resolves blank at `up`). The generator
+    // only scrubs allowlisted keys, so this holds by construction — assert it
+    // defensively so a future regression fails loud at install time, not as a
+    // silent blank-password DB crash.
+    assertScrubbedKeysSupplied(targetDir, scrubbedKeys);
 
     // Persist the generated compose + provisioning row + marker (recording the
     // generated SOLE file as composeFiles[]).
@@ -2165,6 +2231,64 @@ function ensureIsolatedEnv({ targetDir, mode, resetEnv = false, appPort, ports =
   ensureEnvLocal({ targetDir, mode, resetEnv, log });
   assertNoOverridingInfraEnv(ports);
   writeIsolatedAppEnv({ targetDir, appPort, ports, log });
+}
+
+/** cinatra-cli#57 — the keys a generated isolated compose secret may be
+ *  re-symbolised to `${KEY}` against: ONLY keys the instance's `.env.local`
+ *  actually supplies (so `${KEY}` resolves at `up` time, never a blank string).
+ *
+ *  Derived from the keys present in the (already-created) `.env.local`, MINUS the
+ *  host-remapped infra-URL keys: those keys carry a HOST 127.0.0.1:<remapped>
+ *  value (for the host-side app/CLI), which is wrong INSIDE the compose network —
+ *  a container env referencing such a URL must keep its literal service-DNS value
+ *  (the in-network `postgresql://<svc>:5432/<db>` form), so those keys must NOT
+ *  be on the scrub allowlist. The result is the genuine operator-secret surface
+ *  (OPENAI_API_KEY, NANGO_ENCRYPTION_KEY, BETTER_AUTH_SECRET, the
+ *  ${NEO4J_PASSWORD}-sourced neo4j password, …) — the values that are identical
+ *  host-side and container-side and that we must NOT persist as plaintext.
+ *
+ *  Returns a Set (empty when `.env.local` is absent → the generator then scrubs
+ *  nothing, leaving every infra default literal: the stack still starts). */
+function computeIsolatedScrubAllowlist(targetDir) {
+  const envPath = path.join(targetDir, ".env.local");
+  if (!existsSync(envPath)) return new Set();
+  let parsed;
+  try {
+    parsed = parseEnvBody(readFileSync(envPath, "utf8"));
+  } catch {
+    return new Set();
+  }
+  const excluded = new Set(ISOLATED_INFRA_ENV_KEYS);
+  // A key is on the allowlist ONLY when `.env.local` gives it a NON-EMPTY value:
+  // a declared-but-empty key (e.g. an unset `OPENAI_API_KEY=` carried from
+  // `.env.example`) does NOT supply a value, so re-symbolising the compose's
+  // literal to `${KEY}` would resolve BLANK — leave such a value as its literal.
+  return new Set(
+    Object.entries(parsed)
+      .filter(([k, v]) => !excluded.has(k) && typeof v === "string" && v.length > 0)
+      .map(([k]) => k),
+  );
+}
+
+/** cinatra-cli#57 invariant guard. Every `${VAR}` the generator introduced must
+ *  be supplied by `.env.local` with a NON-EMPTY value — otherwise `docker compose
+ *  up` resolves it to a blank string and a fresh postgres/nango-db refuses to
+ *  initialise (the exact bug). The generator only scrubs allowlisted keys, so
+ *  this holds by construction; assert it so a regression fails loud HERE (a clear
+ *  install-time error) instead of as an opaque DB-init crash. `scrubbedKeys` are
+ *  NAMES only; we never log a value. */
+function assertScrubbedKeysSupplied(targetDir, scrubbedKeys = []) {
+  if (!Array.isArray(scrubbedKeys) || scrubbedKeys.length === 0) return;
+  const envPath = path.join(targetDir, ".env.local");
+  const env = existsSync(envPath) ? parseEnvBody(readFileSync(envPath, "utf8")) : {};
+  const blank = scrubbedKeys.filter((k) => typeof env[k] !== "string" || env[k].length === 0);
+  if (blank.length > 0) {
+    throw new Error(
+      `Isolated compose generation re-symbolised ${blank.length} key(s) that .env.local does not supply ` +
+        `(${blank.join(", ")}) — they would resolve to a BLANK string at \`docker compose up\` and break the ` +
+        `infra DBs (cinatra-cli#57). This is an internal invariant violation; please report it.`,
+    );
+  }
 }
 
 // The infra-URL env keys an isolated install writes; an EXPORTED value for any
@@ -2974,7 +3098,8 @@ function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = console.log
   const neo4jBoltPort = neo4jPorts.length ? Math.max(...neo4jPorts) : null;
   if (neo4jBoltPort) body = upsertEnvKey(body, "NEO4J_URI", rewriteUrlPort(cur.NEO4J_URI, neo4jBoltPort, "bolt", ""));
 
-  writeFileSync(envPath, body);
+  writeFileSync(envPath, body, { mode: 0o600 });
+  tightenEnvLocalPerms(envPath); // keep the secret-bearing env-file owner-only (cinatra-cli#57)
   const remapped = [
     pgPort && `db:${pgPort}`,
     redisPort && `redis:${redisPort}`,

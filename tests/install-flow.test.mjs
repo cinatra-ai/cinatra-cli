@@ -582,6 +582,13 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     const body = readFileSync(gen, "utf8");
     expect(body).not.toContain('"5434"');
     expect(body).toContain('"15434"');
+    // cinatra-cli#57: POSTGRES_PASSWORD is a compose-baked default NOT supplied by
+    // .env.local, so the generated compose keeps its LITERAL value — it must NOT
+    // be re-symbolised to a `${POSTGRES_PASSWORD}` that nothing supplies (which
+    // would resolve BLANK at `up` and break a fresh postgres on its own volume).
+    const genDoc = JSON.parse(body);
+    expect(genDoc.services.postgres.environment.POSTGRES_PASSWORD).toBe("secret-plain");
+    expect(body).not.toContain("${POSTGRES_PASSWORD}");
     // Registry row recorded ready with the isolated project + app port.
     const reg = readInstanceRegistry(regPath);
     expect(reg.registry.instances.iso.state).toBe("ready");

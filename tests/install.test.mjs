@@ -20,6 +20,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
@@ -312,6 +313,12 @@ describe("ensureEnvLocal", () => {
     expect(body).toMatch(/^OTHER=keepme$/m); // other keys preserved.
   });
 
+  it("creates .env.local with 0600 perms (it holds minted secrets — cinatra-cli#57)", () => {
+    // The file was just created by the prior test; assert it is owner-only.
+    const mode = statSync(path.join(dir, ".env.local")).mode & 0o777;
+    expect(mode).toBe(0o600);
+  });
+
   it("preserves an existing .env.local (same mode) without rewriting the secret", () => {
     const before = readFileSync(path.join(dir, ".env.local"), "utf8");
     const r = ensureEnvLocal({ targetDir: dir, mode: "dev", log: () => {} });
@@ -335,6 +342,7 @@ describe("ensureEnvLocal", () => {
     expect(after).not.toBe(before);
   });
 });
+
 
 // ---------------------------------------------------------------------------
 // 5. End-to-end from zero against a local file:// "cinatra" repo.
