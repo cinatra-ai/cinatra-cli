@@ -23,7 +23,7 @@ import { resolveTeardownNames } from "./teardown-config.mjs";
 import { importFromCheckout } from "./checkout-resolve.mjs";
 import { syncDevApps, readDevAppsConfig } from "./dev-apps.mjs";
 import { deriveKindFromName, syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
-import { seedLocalRegistryExtensions } from "./seed-local-registry.mjs";
+import { LOCAL_REGISTRY_URL, seedLocalRegistryExtensions } from "./seed-local-registry.mjs";
 import { parseDevRefreshFlags, describeDockerDecision } from "./dev-refresh.mjs";
 import {
   SEED_DB_NAME,
@@ -4568,7 +4568,13 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
       // setup, never publishes at a remote/production registry. See
       // seed-local-registry.mjs for the full guardrail set.
       try {
-        await seedLocalRegistryExtensions({ repoRoot });
+        // cinatra-cli#36: honor the instance's CINATRA_AGENT_REGISTRY_URL (set by
+        // the isolated installer in this repoRoot's .env.local) so an isolated
+        // instance seeds into its OWN Verdaccio — not a live donor's default
+        // :4873. `env` already merges .env.local + process.env (process.env
+        // wins). seedLocalRegistryExtensions keeps the loopback-only guard.
+        const seedRegistryUrl = env.CINATRA_AGENT_REGISTRY_URL?.trim() || LOCAL_REGISTRY_URL;
+        await seedLocalRegistryExtensions({ repoRoot, registryUrl: seedRegistryUrl });
       } catch (err) {
         // Defensive: the helper is already loud-but-non-fatal, but never let an
         // unexpected escape undo the completed setup.

@@ -1804,6 +1804,14 @@ const ISOLATED_INFRA_ENV_KEYS = [
   "NANGO_DATABASE_URL",
   "NANGO_DB_URL",
   "GRAPHITI_URL",
+  // cinatra-cli#36: the Verdaccio registry-client + Neo4j-client URLs are now
+  // rewritten too — an exported stale value (e.g. a donor's …:4873 / …:7687)
+  // would otherwise win over the isolated .env.local (collectEnvironment lets
+  // process.env override) and re-route the isolated instance's registry seed /
+  // Neo4j client back at the donor, defeating isolation.
+  "CINATRA_AGENT_REGISTRY_URL",
+  "CINATRA_AGENT_REGISTRY_UI_URL",
+  "NEO4J_URI",
 ];
 
 function assertNoOverridingInfraEnv(ports = {}, env = process.env) {
@@ -2571,6 +2579,26 @@ function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = console.log
   }
   const graphitiPort = first("graphiti");
   if (graphitiPort) body = upsertEnvKey(body, "GRAPHITI_URL", rewriteUrlPort(cur.GRAPHITI_URL, graphitiPort, "http", ""));
+  // cinatra-cli#36: the registry CLIENT (Verdaccio) is env-overridable via
+  // CINATRA_AGENT_REGISTRY_URL / _UI_URL (default …:4873). Without re-pointing
+  // them, an isolated install run beside a live donor publishes/installs into the
+  // DONOR's Verdaccio. Re-point both at the isolated Verdaccio host port. The UI
+  // port is the same published port (verdaccio serves both the registry + web UI).
+  const verdaccioPort = first("verdaccio");
+  if (verdaccioPort) {
+    const registryUrl = `http://127.0.0.1:${verdaccioPort}`;
+    body = upsertEnvKey(body, "CINATRA_AGENT_REGISTRY_URL", registryUrl);
+    body = upsertEnvKey(body, "CINATRA_AGENT_REGISTRY_UI_URL", registryUrl);
+  }
+  // cinatra-cli#36: the Neo4j client URL (NEO4J_URI, default bolt://…:7687) is
+  // not in the rewrite set, so an isolated instance's Neo4j client + the
+  // post-install `check:services` probe reach the DONOR's Neo4j. neo4j publishes
+  // 7474 (http UI) AND 7687 (bolt); the CLIENT speaks BOLT. Every neo4j port is
+  // shifted by the SAME band offset, so bolt (7687+offset) is always the HIGHER
+  // of the two — pick the max rather than relying on compose port order.
+  const neo4jPorts = Array.isArray(ports?.neo4j) ? ports.neo4j.filter((n) => Number.isInteger(n) && n > 0) : [];
+  const neo4jBoltPort = neo4jPorts.length ? Math.max(...neo4jPorts) : null;
+  if (neo4jBoltPort) body = upsertEnvKey(body, "NEO4J_URI", rewriteUrlPort(cur.NEO4J_URI, neo4jBoltPort, "bolt", ""));
 
   writeFileSync(envPath, body);
   const remapped = [
@@ -2579,6 +2607,8 @@ function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = console.log
     nangoPort && `nango:${nangoPort}`,
     nangoDbPort && `nango-db:${nangoDbPort}`,
     graphitiPort && `graphiti:${graphitiPort}`,
+    verdaccioPort && `verdaccio:${verdaccioPort}`,
+    neo4jBoltPort && `neo4j:${neo4jBoltPort}`,
   ]
     .filter(Boolean)
     .join(" ");
