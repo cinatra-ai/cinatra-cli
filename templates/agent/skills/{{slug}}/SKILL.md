@@ -1,6 +1,6 @@
 ---
-name: {{slug}}
-description: System prompt for the {{displayName}} agent. The bridge discovers this SKILL.md by agent_id and uses it as the system prompt for the agent's ApiNode. Replace the recipe below with your agent's real instructions.
+name: "{{slug}}"
+description: "System prompt for the {{displayName}} agent. The bridge discovers this SKILL.md by agent_id and uses it as the system prompt for the agent's ApiNode. Edit the recipe below to your agent's real instructions."
 ---
 
 # {{displayName}}
@@ -19,7 +19,7 @@ Confirm `input` is present and well-formed. If not, return a short error envelop
 
 ### Step 2 — Do the work
 
-Replace this step with the actual reasoning/tool-use your agent performs.
+Edit this step to the actual reasoning/tool-use your agent performs.
 
 ### Step 3 — Return the result
 
