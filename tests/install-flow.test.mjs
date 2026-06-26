@@ -603,6 +603,65 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     expect(env).toMatch(/^NANGO_DATABASE_URL=postgresql:\/\/127\.0\.0\.1:15435\//m);
   });
 
+  // ── cinatra-cli#36 — isolated registry (Verdaccio) + Neo4j client URLs ───────
+  // The Verdaccio registry client (CINATRA_AGENT_REGISTRY_URL / _UI_URL, default
+  // …:4873) and the Neo4j client (NEO4J_URI, default bolt://…:7687) are NOT in
+  // the isolated env-rewrite set, so an isolated install beside a live donor
+  // publishes/probes into the DONOR's Verdaccio + Neo4j. Assert both are now
+  // re-pointed at the isolated band's remapped host ports.
+  it("#36: isolated .env.local re-points Verdaccio + Neo4j client URLs at remapped ports", async () => {
+    const installDir = path.join(sandbox, "iso36");
+    // A resolved compose that ALSO publishes verdaccio (4873) and neo4j
+    // (7474 http UI + 7687 bolt) on the default band.
+    const CONFIG_WITH_REGISTRY = {
+      ...RESOLVED_CONFIG,
+      services: {
+        ...RESOLVED_CONFIG.services,
+        verdaccio: {
+          image: "verdaccio/verdaccio",
+          ports: [{ published: "4873", target: 4873, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+        },
+        neo4j: {
+          image: "neo4j",
+          ports: [
+            { published: "7474", target: 7474, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" },
+            { published: "7687", target: 7687, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" },
+          ],
+        },
+      },
+    };
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso36",
+      ],
+      {
+        log: () => {},
+        deps: flowDeps({
+          composeConfigForFiles: () => CONFIG_WITH_REGISTRY,
+          // The default band conflicts on 5434 (forces isolated); remapped is free.
+          detectPortConflicts: async (band) => {
+            const pg = band.find((b) => b.service === "postgres");
+            if (pg && pg.port === 5434) return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+            return [];
+          },
+          bringUpInfra: () => {},
+        }),
+      },
+    );
+    expect(res.infraPlan).toBe("isolated");
+    const env = readFileSync(path.join(installDir, ".env.local"), "utf8");
+    // Verdaccio 4873 → 14873 (offset 10000); registry + UI URLs both point there.
+    expect(env).toMatch(/^CINATRA_AGENT_REGISTRY_URL=http:\/\/127\.0\.0\.1:14873$/m);
+    expect(env).toMatch(/^CINATRA_AGENT_REGISTRY_UI_URL=http:\/\/127\.0\.0\.1:14873$/m);
+    // Neo4j: the CLIENT speaks BOLT (7687 → 17687), NOT the http UI (7474 → 17474).
+    expect(env).toMatch(/^NEO4J_URI=bolt:\/\/127\.0\.0\.1:17687$/m);
+    expect(env).not.toMatch(/^NEO4J_URI=.*:17474/m);
+    // Donor defaults must NOT survive in the isolated env.
+    expect(env).not.toMatch(/^CINATRA_AGENT_REGISTRY_URL=.*:4873$/m);
+    expect(env).not.toMatch(/^NEO4J_URI=.*:7687$/m);
+  });
+
   // ── cinatra-cli#38 — isolated app port live-probe + reserved-set validate ───
   // The app port (Next.js PORT) is NOT a compose-published port, so it bypassed
   // the infra band's live probe. Distinguish the app-port probe from the band
@@ -774,6 +833,44 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     } finally {
       if (prev === undefined) delete process.env.SUPABASE_DB_URL;
       else process.env.SUPABASE_DB_URL = prev;
+    }
+  });
+
+  // cinatra-cli#36: the registry/Neo4j client URLs join the exported-env guard —
+  // an exported stale CINATRA_AGENT_REGISTRY_URL (e.g. a donor's …:4873) would
+  // otherwise win over the isolated .env.local (collectEnvironment precedence)
+  // and re-route the isolated instance's registry seed back at the donor.
+  it("#36: isolated install REFUSES when CINATRA_AGENT_REGISTRY_URL / NEO4J_URI is EXPORTED", async () => {
+    for (const { key, val } of [
+      { key: "CINATRA_AGENT_REGISTRY_URL", val: "http://127.0.0.1:4873" },
+      { key: "NEO4J_URI", val: "bolt://127.0.0.1:7687" },
+    ]) {
+      const installDir = path.join(sandbox, `iso36-exp-${key}`);
+      const prev = process.env[key];
+      process.env[key] = val;
+      try {
+        await expect(
+          runInstall(
+            [
+              "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+              "--yes", "--no-install", "--on-conflict", "isolated", "--instance", `iso36e${key.length}`,
+            ],
+            {
+              log: () => {},
+              deps: flowDeps({
+                detectPortConflicts: async (band) => {
+                  const pg = band.find((b) => b.service === "postgres");
+                  if (pg && pg.port === 5434) return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+                  return [];
+                },
+              }),
+            },
+          ),
+        ).rejects.toThrow(new RegExp(`Refusing an isolated install while these infra vars are EXPORTED[\\s\\S]*${key}`));
+      } finally {
+        if (prev === undefined) delete process.env[key];
+        else process.env[key] = prev;
+      }
     }
   });
 
