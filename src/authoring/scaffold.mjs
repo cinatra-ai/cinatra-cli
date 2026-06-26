@@ -76,10 +76,23 @@ export function resolveInputs({ kind, name, scope, displayName, description, tar
   const base = baseOf(slug, kind);
   const pkgName = packageName(bareScope, slug);
   const dn = displayName && displayName.trim() ? displayName.trim() : titleize(base);
+  // `displayName` is interpolated INSIDE double-quoted SKILL.md frontmatter
+  // (`description: "...the {{displayName}}..."`). Reject characters that would
+  // either break that quoting (`"`, `\`, a newline/CR) or be rejected by the
+  // skills validator (`<`, `>`) — otherwise a generated SKILL.md could fail to
+  // parse or fail validation. The default (titleized slug) never contains these.
+  const badDisplayChars = [...new Set(dn.match(/["\\<>\r\n]/g) || [])];
+  if (badDisplayChars.length) {
+    errors.push(
+      `displayName must not contain ${JSON.stringify(badDisplayChars.join(""))} ` +
+        `(it is embedded in SKILL.md frontmatter and the skills validator rejects < and >)`,
+    );
+  }
   const desc =
     description && description.trim()
       ? description.trim()
       : `A Cinatra ${kind} extension: ${dn}.`;
+  if (errors.length) return { ok: false, errors, slug, scope: bareScope, kind };
 
   // capability id used by skill templates: <base>.<base> namespaced, kebab→dot
   const capabilityId = `${base.replace(/-/g, ".")}.run`;

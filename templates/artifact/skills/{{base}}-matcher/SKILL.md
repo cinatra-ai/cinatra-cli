@@ -1,6 +1,6 @@
 ---
-name: {{base}}-matcher
-description: Classifies an attached resource as a {{displayName}} artifact.
+name: "{{base}}-matcher"
+description: "Classifies an attached resource as a {{displayName}} artifact."
 ---
 
 You are a strict semantic classifier for content artifacts.
@@ -14,4 +14,4 @@ Return a confidence in `[0, 1]` that the resource IS a {{displayName}}. The runt
 - Return a HIGH confidence when the content clearly matches this artifact type.
 - Return a LOW confidence when it does not, or is ambiguous.
 
-Replace this rubric with the concrete signals that distinguish your artifact type.
+Edit this rubric to the concrete signals that distinguish your artifact type.
