@@ -61,6 +61,15 @@ jobs:
           fi
           echo "OK: no @cinatra-ai/* dependency in the resolved tree."
 
+      - name: Lint SKILL.md frontmatter (reject validator violations — cinatra-cli#45)
+        # Scans every SOURCE SKILL.md and fails on any frontmatter the standard
+        # skills validator rejects (cinatra superset: standard rules + the
+        # metadata.* project-key convention). Excludes templates/ (un-rendered
+        # scaffolds, linted via their rendered output by the test suite) and
+        # tests/fixtures/ (intentional good/bad cases). Zero deps — runs before
+        # the full test pass so a frontmatter break fails fast with a clear error.
+        run: npm run lint:skills
+
       - name: Test (vitest run — includes the zero-checkout-imports contract)
         run: npm test
 
