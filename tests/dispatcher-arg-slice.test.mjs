@@ -4,9 +4,9 @@
 //   routedTokens = argv.slice(0, descriptor.path.length)
 //   rest         = argv.slice(descriptor.path.length)
 // so a handler reads its routed mode token from `routedTokens` and its trailing
-// flags/positionals from `rest`. A canonical `dev …` form and its deprecated
-// bare alias each slice off THEIR OWN path length, so the shared handler
-// receives an IDENTICAL `rest`.
+// flags/positionals from `rest`. A canonical `instance …` form (cinatra-cli#61)
+// and its deprecated bare alias each slice off THEIR OWN path length, so the
+// shared handler receives an IDENTICAL `rest`.
 //
 // Part 1 asserts that contract directly against the matcher (pure, no handler
 // side effects). Part 2 spawns the real bin to assert the STDERR deprecation
@@ -37,40 +37,40 @@ function dispatchSlice(argv) {
 }
 
 describe("dispatcher arg-slice contract", () => {
-  it("`dev db migrate --down` delivers rest === ['--down']", () => {
-    const s = dispatchSlice(["dev", "db", "migrate", "--down"]);
+  it("`instance db migrate --down` delivers rest === ['--down']", () => {
+    const s = dispatchSlice(["instance", "db", "migrate", "--down"]);
     expect(s.id).toBe("db.migrate");
-    expect(s.routedTokens).toEqual(["dev", "db", "migrate"]);
+    expect(s.routedTokens).toEqual(["instance", "db", "migrate"]);
     expect(s.rest).toEqual(["--down"]);
   });
 
   it("the alias `db migrate --down` delivers the SAME rest as the canonical form", () => {
-    const canonical = dispatchSlice(["dev", "db", "migrate", "--down"]);
+    const canonical = dispatchSlice(["instance", "db", "migrate", "--down"]);
     const alias = dispatchSlice(["db", "migrate", "--down"]);
     expect(alias.id).toBe(canonical.id);
-    expect(alias.deprecated).toBe("dev db migrate");
+    expect(alias.deprecated).toBe("instance db migrate");
     expect(alias.rest).toEqual(canonical.rest); // identical handler args.
     expect(alias.routedTokens).toEqual(["db", "migrate"]); // alias own path.
   });
 
-  it("`dev setup prod --foo` routes the mode in routedTokens, flags in rest", () => {
-    const s = dispatchSlice(["dev", "setup", "prod", "--foo"]);
+  it("`instance setup prod --foo` routes the mode in routedTokens, flags in rest", () => {
+    const s = dispatchSlice(["instance", "setup", "prod", "--foo"]);
     expect(s.id).toBe("setup.dev|prod");
-    expect(s.routedTokens).toEqual(["dev", "setup", "prod"]);
+    expect(s.routedTokens).toEqual(["instance", "setup", "prod"]);
     expect(s.routedTokens[s.routedTokens.length - 1]).toBe("prod");
     expect(s.rest).toEqual(["--foo"]);
   });
 
   it("the alias `setup prod --foo` delivers the same rest + mode as canonical", () => {
-    const canonical = dispatchSlice(["dev", "setup", "prod", "--foo"]);
+    const canonical = dispatchSlice(["instance", "setup", "prod", "--foo"]);
     const alias = dispatchSlice(["setup", "prod", "--foo"]);
     expect(alias.id).toBe(canonical.id);
     expect(alias.rest).toEqual(canonical.rest);
     expect(alias.routedTokens[alias.routedTokens.length - 1]).toBe("prod");
   });
 
-  it("`dev clone refresh-seed --source-env x` delivers rest === ['--source-env','x']", () => {
-    const s = dispatchSlice(["dev", "clone", "refresh-seed", "--source-env", "x"]);
+  it("`instance clone refresh-seed --source-env x` delivers rest === ['--source-env','x']", () => {
+    const s = dispatchSlice(["instance", "clone", "refresh-seed", "--source-env", "x"]);
     expect(s.id).toBe("clone.refresh-seed");
     expect(s.rest).toEqual(["--source-env", "x"]);
   });
@@ -110,19 +110,19 @@ describe("deprecation notice (live stderr)", () => {
     try {
       const res = runAlias(["clone", "list"], { home });
       expect(res.stderr).toMatch(
-        /"cinatra clone list" is now "cinatra dev clone list" — the old form still works this release\./,
+        /"cinatra clone list" is now "cinatra instance clone list" — the old form still works this release\./,
       );
       // The notice never pollutes stdout (script-safe).
-      expect(res.stdout).not.toMatch(/is now "cinatra dev/);
+      expect(res.stdout).not.toMatch(/is now "cinatra instance/);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
   });
 
-  it("the canonical `dev clone list` form prints NO notice", () => {
+  it("the canonical `instance clone list` form prints NO notice", () => {
     const home = tmpHome();
     try {
-      const res = runAlias(["dev", "clone", "list"], { home });
+      const res = runAlias(["instance", "clone", "list"], { home });
       expect(res.stderr).not.toMatch(/is now "cinatra/);
     } finally {
       rmSync(home, { recursive: true, force: true });

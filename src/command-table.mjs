@@ -19,10 +19,10 @@
 //   * Selection is LONGEST-MATCH-WINS, not first-match-wins. `matchDescriptor`
 //     collects every descriptor whose `path` prefix-matches the leading argv
 //     tokens and returns the one with the LONGEST `path`. This is required
-//     because namespacing under `dev` introduces variable-depth paths under one
-//     head (`["dev","setup"]` vs `["dev","setup","dev|prod"]` vs
-//     `["dev","setup","nango"]`), where a shorter group/no-mode entry must NOT
-//     shadow a longer, more-specific one. Array ORDER is no longer load-bearing
+//     because namespacing under `instance` introduces variable-depth paths under
+//     one head (`["instance","setup"]` vs `["instance","setup","dev|prod"]` vs
+//     `["instance","setup","nango"]`), where a shorter group/no-mode entry must
+//     NOT shadow a longer, more-specific one. Array ORDER is no longer load-bearing
 //     for selection; a `validateCommandTable` assertion at module load fails the
 //     build loudly on any ambiguous tie, so ordering can never be relied upon.
 //   * Match kinds are sugar over path-length prefix-matching:
@@ -31,16 +31,16 @@
 //                               (e.g. `status`, `doctor`).
 //       - "command+mode"      : pure prefix-match on `path` (length 2).
 //       - "command+mode+sub"  : pure prefix-match on `path` (length 3).
-//       - "group"             : a help-only head (`["dev"]`). Routes ONLY when
-//                               argv is EXACTLY the head with no further routable
-//                               subcommand (length-exact, like no-mode), so a
-//                               longer `dev …` descriptor always wins. Has NO
-//                               handler; `runCli` dispatches it specially to
-//                               group help.
+//       - "group"             : a help-only head (`["instance"]`). Routes ONLY
+//                               when argv is EXACTLY the head with no further
+//                               routable subcommand (length-exact, like no-mode),
+//                               so a longer `instance …` descriptor always wins.
+//                               Has NO handler; `runCli` dispatches it specially
+//                               to group help.
 //       - "command-no-mode"   : NOT pure prefix-match. Matches ONLY when
 //                               `argv.length === path.length` (no trailing
 //                               routable token), mirroring the original
-//                               `!mode` guard so `dev setup bogus` (and the
+//                               `!mode` guard so `instance setup bogus` (and the
 //                               alias `setup bogus`) route to UNKNOWN, never to
 //                               the env-driven setup.
 //   * A `deprecated` descriptor (an OLD bare path kept as a hidden alias for one
@@ -56,7 +56,7 @@
 //     the shared handler because each slices off its own path length.
 //   * `hidden: true` marks dispatch-only descriptors with no standalone help row
 //     (the env-driven no-mode entries, the removed `mcp tunnel` stub, every
-//     deprecated alias, and the `dev` group head). The dispatcher still routes
+//     deprecated alias, and the `instance` group head). The dispatcher still routes
 //     them; `buildHelpIndex` does not advertise them.
 // ---------------------------------------------------------------------------
 
@@ -215,308 +215,316 @@ export const COMMAND_DESCRIPTORS = [
     summary: "Import an agent template from a ZIP archive created by `agent export`.",
   },
 
-  // ----- Class-C local host/monorepo bootstrap — namespaced under `cinatra dev …` (eng#232) -----
+  // ----- Class-C local host/monorepo bootstrap — namespaced under `cinatra instance …` (eng#232; cinatra-cli#61) -----
+  // The `instance …` head (cinatra-cli#61): these manage a local Cinatra
+  // *instance* and several take an explicit `dev|prod` mode, so a `dev` head was
+  // misleading (`cinatra dev setup prod` was self-contradictory). The old `dev …`
+  // head is REMOVED with no back-compat alias — `cinatra dev …` no longer resolves.
+  // (The bare-path aliases below are a SEPARATE eng#232 deprecation lane and now
+  // point at the `instance …` canonical forms.)
   {
-    id: "dev",
-    path: ["dev"],
+    id: "instance",
+    path: ["instance"],
     match: "group",
-    hidden: true, // Help-only head — `cinatra dev` / `cinatra dev --help` print the group banner.
-    summary: "Local host/monorepo bootstrap commands (run `cinatra dev --help`).",
+    hidden: true, // Help-only head — `cinatra instance` / `cinatra instance --help` print the group banner.
+    summary: "Local host/monorepo bootstrap commands (run `cinatra instance --help`).",
   },
   {
     id: "setup",
-    path: ["dev", "setup"],
+    path: ["instance", "setup"],
     match: "command-no-mode", // ONLY when no mode token follows (env-driven dev|prod).
     hidden: true, // No standalone help row.
   },
   {
     id: "setup.dev|prod",
-    path: ["dev", "setup", "dev|prod"],
+    path: ["instance", "setup", "dev|prod"],
     match: "command+mode+sub",
     summary: "Prepare Better Auth, schema, Nango, MCP server, and OAuth clients.",
   },
   {
     id: "setup.nango",
-    path: ["dev", "setup", "nango"],
+    path: ["instance", "setup", "nango"],
     match: "command+mode+sub",
     summary: "Configure Nango administration only.",
   },
   {
     id: "setup.branch",
-    path: ["dev", "setup", "branch"],
+    path: ["instance", "setup", "branch"],
     match: "command+mode+sub",
     summary: "Provision an isolated dev environment for the current git worktree.",
   },
   {
     id: "teardown.branch",
-    path: ["dev", "teardown", "branch"],
+    path: ["instance", "teardown", "branch"],
     match: "command+mode+sub",
     summary: "Remove the isolated Postgres schema for the current git worktree.",
   },
   {
     id: "setup.clone",
-    path: ["dev", "clone", "new"],
+    path: ["instance", "clone", "new"],
     match: "command+mode+sub",
     summary: "Create + provision a dormant deep-fork clone.",
   },
   {
     id: "clone.refresh-seed",
-    path: ["dev", "clone", "refresh-seed"],
+    path: ["instance", "clone", "refresh-seed"],
     match: "command+mode+sub",
     summary: "(Re)build the cinatra_seed template database.",
   },
   {
     id: "clone.prune",
-    path: ["dev", "clone", "prune"],
+    path: ["instance", "clone", "prune"],
     match: "command+mode+sub",
     summary: "Destroy a clone (drops its DB, cleans Redis, releases the slot).",
   },
   {
     id: "clone.list",
-    path: ["dev", "clone", "list"],
+    path: ["instance", "clone", "list"],
     match: "command+mode+sub",
     summary: "List registered clones (slug, ports, database, state, worktree).",
   },
   {
     id: "clone.start",
-    path: ["dev", "clone", "start"],
+    path: ["instance", "clone", "start"],
     match: "command+mode+sub",
     summary: "Start a registered clone.",
   },
   {
     id: "clone.stop",
-    path: ["dev", "clone", "stop"],
+    path: ["instance", "clone", "stop"],
     match: "command+mode+sub",
     summary: "Stop a registered clone.",
   },
   {
     id: "clone.status",
-    path: ["dev", "clone", "status"],
+    path: ["instance", "clone", "status"],
     match: "command+mode+sub",
     summary: "Show a clone's predicted-vs-registered runtime status.",
   },
   {
     id: "clone.slug-for-worktree",
-    path: ["dev", "clone", "slug-for-worktree"],
+    path: ["instance", "clone", "slug-for-worktree"],
     match: "command+mode+sub",
     summary: "Registry lookup for shell hooks (resolve a worktree to its slug).",
   },
   {
     id: "db.migrate",
-    path: ["dev", "db", "migrate"],
+    path: ["instance", "db", "migrate"],
     match: "command+mode+sub",
     summary: "Apply the additive bootstrap + versioned core migration chain (server-down-safe).",
   },
   {
     id: "dev.refresh",
-    path: ["dev", "refresh"],
+    path: ["instance", "refresh"],
     match: "command+mode",
     summary: "Reconcile your local dev environment (deps + dev DB schema).",
   },
   {
     id: "dev.tunnel",
-    path: ["dev", "tunnel"],
+    path: ["instance", "tunnel"],
     match: "command+mode",
     summary: "Manage the dev-main Tailscale Funnel (start|stop|status).",
   },
   {
     id: "dev.start",
-    path: ["dev", "start"],
+    path: ["instance", "start"],
     match: "command+mode",
     summary: "Start the local dev main instance (host-native `pnpm dev` on port 3000).",
   },
   {
     id: "dev.stop",
-    path: ["dev", "stop"],
+    path: ["instance", "stop"],
     match: "command+mode",
-    summary: "Stop the local dev main instance started by `dev start`.",
+    summary: "Stop the local dev main instance started by `instance start`.",
   },
   {
     id: "dev.restart",
-    path: ["dev", "restart"],
+    path: ["instance", "restart"],
     match: "command+mode",
-    summary: "Restart the local dev main instance (`dev stop` then `dev start`).",
+    summary: "Restart the local dev main instance (`instance stop` then `instance start`).",
   },
   {
     id: "dev.wordpress",
-    path: ["dev", "wordpress"],
+    path: ["instance", "wordpress"],
     match: "command+mode",
     summary: "Manage the WordPress CMS dev container (start|stop) via the compose `wordpress` profile.",
   },
   {
     id: "dev.drupal",
-    path: ["dev", "drupal"],
+    path: ["instance", "drupal"],
     match: "command+mode",
     summary: "Manage the Drupal CMS dev container (start|stop) via the compose `drupal` profile.",
   },
   {
     id: "reset.dev",
-    path: ["dev", "reset"],
+    path: ["instance", "reset"],
     match: "command+mode",
     summary: "Reset the development environment (requires --yes; dev only).",
   },
   {
     id: "backup.create",
-    path: ["dev", "backup", "create"],
+    path: ["instance", "backup", "create"],
     match: "command+mode+sub",
     summary: "Export a full backup bundle to data/backups/.",
   },
   {
     id: "backup.import",
-    path: ["dev", "backup", "import"],
+    path: ["instance", "backup", "import"],
     match: "command+mode+sub",
     summary: "Import a backup bundle (destructive — requires --yes).",
   },
   {
     id: "backup.export-api-configs",
-    path: ["dev", "backup", "export-api-configs"],
+    path: ["instance", "backup", "export-api-configs"],
     match: "command+mode+sub",
     summary: "Export connector_config:* + openai_connection metadata to JSON.",
   },
   {
     id: "backup.import-api-configs",
-    path: ["dev", "backup", "import-api-configs"],
+    path: ["instance", "backup", "import-api-configs"],
     match: "command+mode+sub",
     summary: "Import API configs from an export-api-configs JSON file.",
   },
 
-  // ----- Deprecated LOCAL aliases (one minor) — old bare paths → their `dev …` forms -----
+  // ----- Deprecated LOCAL aliases (one minor) — old bare paths → their `instance …` forms -----
   // Each REUSES the canonical id, is `hidden`, and carries `deprecated:"<new>"`.
   // They reserve the old bare token paths LOCAL during the deprecation window
   // (OD-1(A)): a future Class-A remote/admin variant of `db migrate` /
   // `agent …` (eng#231) must take a DISTINCT `admin …` head, never these tokens.
+  // cinatra-cli#61: their targets now point at the `instance …` canonical forms
+  // (the `dev …` namespace they used to alias no longer exists).
   {
     id: "setup",
     path: ["setup"],
     match: "command-no-mode",
     hidden: true,
-    deprecated: "dev setup",
+    deprecated: "instance setup",
   },
   {
     id: "setup.dev|prod",
     path: ["setup", "dev|prod"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev setup",
+    deprecated: "instance setup",
   },
   {
     id: "setup.nango",
     path: ["setup", "nango"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev setup nango",
+    deprecated: "instance setup nango",
   },
   {
     id: "setup.branch",
     path: ["setup", "branch"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev setup branch",
+    deprecated: "instance setup branch",
   },
   {
     id: "teardown.branch",
     path: ["teardown", "branch"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev teardown branch",
+    deprecated: "instance teardown branch",
   },
   {
     id: "setup.clone",
     path: ["setup", "clone"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev clone new",
+    deprecated: "instance clone new",
   },
   {
     id: "clone.refresh-seed",
     path: ["clone", "refresh-seed"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev clone refresh-seed",
+    deprecated: "instance clone refresh-seed",
   },
   {
     id: "clone.prune",
     path: ["clone", "prune"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev clone prune",
+    deprecated: "instance clone prune",
   },
   {
     id: "clone.list",
     path: ["clone", "list"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev clone list",
+    deprecated: "instance clone list",
   },
   {
     id: "clone.start",
     path: ["clone", "start"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev clone start",
+    deprecated: "instance clone start",
   },
   {
     id: "clone.stop",
     path: ["clone", "stop"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev clone stop",
+    deprecated: "instance clone stop",
   },
   {
     id: "clone.status",
     path: ["clone", "status"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev clone status",
+    deprecated: "instance clone status",
   },
   {
     id: "clone.slug-for-worktree",
     path: ["clone", "slug-for-worktree"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev clone slug-for-worktree",
+    deprecated: "instance clone slug-for-worktree",
   },
   {
     id: "db.migrate",
     path: ["db", "migrate"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev db migrate",
+    deprecated: "instance db migrate",
   },
   {
     id: "reset.dev",
     path: ["reset", "dev"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev reset",
+    deprecated: "instance reset",
   },
   {
     id: "backup.create",
     path: ["backup", "create"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev backup create",
+    deprecated: "instance backup create",
   },
   {
     id: "backup.import",
     path: ["backup", "import"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev backup import",
+    deprecated: "instance backup import",
   },
   {
     id: "backup.export-api-configs",
     path: ["backup", "export-api-configs"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev backup export-api-configs",
+    deprecated: "instance backup export-api-configs",
   },
   {
     id: "backup.import-api-configs",
     path: ["backup", "import-api-configs"],
     match: "command+mode",
     hidden: true,
-    deprecated: "dev backup import-api-configs",
+    deprecated: "instance backup import-api-configs",
   },
 ];
 
@@ -535,8 +543,8 @@ function expandToken(token) {
  * A single path token matches an argv slot. For a plain token, the slot must
  * equal it. For an `a|b` alternation token, the slot must be one of the EXPANDED
  * alternatives — never the literal `"a|b"` string. This mirrors the original
- * `mode === "dev" || mode === "prod"` guard exactly: `cinatra dev setup dev` and
- * `cinatra dev setup prod` route, but a literal `"dev|prod"` slot does NOT.
+ * `mode === "dev" || mode === "prod"` guard exactly: `cinatra instance setup dev`
+ * and `cinatra instance setup prod` route, but a literal `"dev|prod"` slot does NOT.
  *
  * @param {string} token
  * @param {string|undefined} slot
@@ -695,8 +703,8 @@ export function validateCommandTable(descriptors) {
   // (1) Tie detection among canonical descriptors at EQUAL effective length AND
   //     (1b) strict-PREFIX shadowing: a shorter PLAIN-prefix leaf (NOT group,
   //     NOT command-no-mode) that is a strict prefix of a longer descriptor
-  //     would steal the longer descriptor's argv (e.g. plain `["dev"]` shadowing
-  //     `["dev","setup"]` for `dev typo`). Length-exact shorter forms are the
+  //     would steal the longer descriptor's argv (e.g. plain `["instance"]` shadowing
+  //     `["instance","setup"]` for `instance typo`). Length-exact shorter forms are the
   //     ONLY allowed strict-prefix case (codex MUST-FIX).
   for (let i = 0; i < canonical.length; i++) {
     for (let j = i + 1; j < canonical.length; j++) {
@@ -814,7 +822,7 @@ validateCommandTable(COMMAND_DESCRIPTORS);
 /**
  * A deterministic, human-readable index of the (visible) command surface,
  * derived purely from the descriptors. The drift test snapshots this and
- * asserts the union of `printHelp` + `printGroupHelp("dev")` covers every
+ * asserts the union of `printHelp` + `printGroupHelp("instance")` covers every
  * visible command (and vice-versa), so the dispatcher and the banner can never
  * silently diverge.
  *

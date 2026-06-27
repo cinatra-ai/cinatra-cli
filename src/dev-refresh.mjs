@@ -1,6 +1,6 @@
-// Pure, side-effect-free decision helpers for `cinatra dev refresh`.
+// Pure, side-effect-free decision helpers for `cinatra instance refresh`.
 //
-// `cinatra dev refresh` reconciles a contributor's local dev environment
+// `cinatra instance refresh` reconciles a contributor's local dev environment
 // (dependencies + dev database schema) to the code they have checked out. It is
 // the idempotent, non-destructive subset of `scripts/setup.sh` minus .env.local
 // creation: the human owns git (pull / checkout), the command never touches it.
@@ -15,7 +15,7 @@ const DEFAULT_QUEUE = "cinatra-background-jobs";
 const DOCKER_FLAG_PREFIX = "--docker=";
 
 /**
- * Parse `dev refresh` flags into a normalized docker mode.
+ * Parse `instance refresh` flags into a normalized docker mode.
  * - `--no-docker`            → "off" (takes precedence over --docker=)
  * - `--docker=always`        → "always"
  * - `--docker=auto` / absent → "auto"
@@ -30,7 +30,7 @@ export function parseDevRefreshFlags(argv = []) {
       continue;
     }
     throw new Error(
-      `Unknown flag "${arg}" for cinatra dev refresh. Supported flags: --docker=auto|always, --no-docker.`,
+      `Unknown flag "${arg}" for cinatra instance refresh. Supported flags: --docker=auto|always, --no-docker.`,
     );
   }
 
@@ -80,7 +80,7 @@ export function looksLikeBundledStack(env = {}) {
  * True when this checkout is an isolated worktree/clone that borrows the shared
  * main docker stack rather than owning it. Bringing the bundled compose stack up
  * from such a checkout would port-conflict with the main dev server, so `auto`
- * mode must skip docker here. Detected via the markers `cinatra dev setup branch` /
+ * mode must skip docker here. Detected via the markers `cinatra instance setup branch` /
  * `setup clone` write into the worktree `.env.local`.
  */
 export function isIsolatedWorktree(env = {}) {
@@ -93,7 +93,7 @@ export function isIsolatedWorktree(env = {}) {
 }
 
 /**
- * Decide whether `dev refresh` should run `docker compose up -d`, and why.
+ * Decide whether `instance refresh` should run `docker compose up -d`, and why.
  * Returns `{ run, reason }` so the orchestrator can print an explanation either way.
  * - off    → never
  * - always → always (forced; the orchestrator treats failure as fatal)

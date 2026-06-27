@@ -10,12 +10,12 @@
 //      added/removed command or a re-pathing shows up as a snapshot diff a
 //      reviewer must consciously accept.
 //   2. ROUTING — `matchDescriptor` returns the SAME id for every command across
-//      the new `dev …` namespace, the deprecated bare aliases, and the tricky
-//      longest-match / no-mode edges.
+//      the `instance …` namespace (cinatra-cli#61), the deprecated bare aliases,
+//      and the tricky longest-match / no-mode edges.
 //   3. TABLE VALIDITY — `validateCommandTable` accepts the real table and
 //      rejects ambiguous ties / alias-shadows / dangling alias targets.
 //   4. HELP EQUIVALENCE — the UNION of `printHelp` (top-level) and
-//      `printGroupHelp("dev")` (the Class-C group) covers every VISIBLE
+//      `printGroupHelp("instance")` (the Class-C group) covers every VISIBLE
 //      descriptor, split correctly between the two banners.
 
 import { readFileSync } from "node:fs";
@@ -203,189 +203,189 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode",
         },
         {
-          "command": "dev",
+          "command": "instance",
           "deprecated": null,
           "hidden": true,
-          "id": "dev",
+          "id": "instance",
           "match": "group",
         },
         {
-          "command": "dev setup",
+          "command": "instance setup",
           "deprecated": null,
           "hidden": true,
           "id": "setup",
           "match": "command-no-mode",
         },
         {
-          "command": "dev setup dev|prod",
+          "command": "instance setup dev|prod",
           "deprecated": null,
           "hidden": false,
           "id": "setup.dev|prod",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev setup nango",
+          "command": "instance setup nango",
           "deprecated": null,
           "hidden": false,
           "id": "setup.nango",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev setup branch",
+          "command": "instance setup branch",
           "deprecated": null,
           "hidden": false,
           "id": "setup.branch",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev teardown branch",
+          "command": "instance teardown branch",
           "deprecated": null,
           "hidden": false,
           "id": "teardown.branch",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev clone new",
+          "command": "instance clone new",
           "deprecated": null,
           "hidden": false,
           "id": "setup.clone",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev clone refresh-seed",
+          "command": "instance clone refresh-seed",
           "deprecated": null,
           "hidden": false,
           "id": "clone.refresh-seed",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev clone prune",
+          "command": "instance clone prune",
           "deprecated": null,
           "hidden": false,
           "id": "clone.prune",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev clone list",
+          "command": "instance clone list",
           "deprecated": null,
           "hidden": false,
           "id": "clone.list",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev clone start",
+          "command": "instance clone start",
           "deprecated": null,
           "hidden": false,
           "id": "clone.start",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev clone stop",
+          "command": "instance clone stop",
           "deprecated": null,
           "hidden": false,
           "id": "clone.stop",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev clone status",
+          "command": "instance clone status",
           "deprecated": null,
           "hidden": false,
           "id": "clone.status",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev clone slug-for-worktree",
+          "command": "instance clone slug-for-worktree",
           "deprecated": null,
           "hidden": false,
           "id": "clone.slug-for-worktree",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev db migrate",
+          "command": "instance db migrate",
           "deprecated": null,
           "hidden": false,
           "id": "db.migrate",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev refresh",
+          "command": "instance refresh",
           "deprecated": null,
           "hidden": false,
           "id": "dev.refresh",
           "match": "command+mode",
         },
         {
-          "command": "dev tunnel",
+          "command": "instance tunnel",
           "deprecated": null,
           "hidden": false,
           "id": "dev.tunnel",
           "match": "command+mode",
         },
         {
-          "command": "dev start",
+          "command": "instance start",
           "deprecated": null,
           "hidden": false,
           "id": "dev.start",
           "match": "command+mode",
         },
         {
-          "command": "dev stop",
+          "command": "instance stop",
           "deprecated": null,
           "hidden": false,
           "id": "dev.stop",
           "match": "command+mode",
         },
         {
-          "command": "dev restart",
+          "command": "instance restart",
           "deprecated": null,
           "hidden": false,
           "id": "dev.restart",
           "match": "command+mode",
         },
         {
-          "command": "dev wordpress",
+          "command": "instance wordpress",
           "deprecated": null,
           "hidden": false,
           "id": "dev.wordpress",
           "match": "command+mode",
         },
         {
-          "command": "dev drupal",
+          "command": "instance drupal",
           "deprecated": null,
           "hidden": false,
           "id": "dev.drupal",
           "match": "command+mode",
         },
         {
-          "command": "dev reset",
+          "command": "instance reset",
           "deprecated": null,
           "hidden": false,
           "id": "reset.dev",
           "match": "command+mode",
         },
         {
-          "command": "dev backup create",
+          "command": "instance backup create",
           "deprecated": null,
           "hidden": false,
           "id": "backup.create",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev backup import",
+          "command": "instance backup import",
           "deprecated": null,
           "hidden": false,
           "id": "backup.import",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev backup export-api-configs",
+          "command": "instance backup export-api-configs",
           "deprecated": null,
           "hidden": false,
           "id": "backup.export-api-configs",
           "match": "command+mode+sub",
         },
         {
-          "command": "dev backup import-api-configs",
+          "command": "instance backup import-api-configs",
           "deprecated": null,
           "hidden": false,
           "id": "backup.import-api-configs",
@@ -393,133 +393,133 @@ describe("command table — descriptor snapshot", () => {
         },
         {
           "command": "setup",
-          "deprecated": "dev setup",
+          "deprecated": "instance setup",
           "hidden": true,
           "id": "setup",
           "match": "command-no-mode",
         },
         {
           "command": "setup dev|prod",
-          "deprecated": "dev setup",
+          "deprecated": "instance setup",
           "hidden": true,
           "id": "setup.dev|prod",
           "match": "command+mode",
         },
         {
           "command": "setup nango",
-          "deprecated": "dev setup nango",
+          "deprecated": "instance setup nango",
           "hidden": true,
           "id": "setup.nango",
           "match": "command+mode",
         },
         {
           "command": "setup branch",
-          "deprecated": "dev setup branch",
+          "deprecated": "instance setup branch",
           "hidden": true,
           "id": "setup.branch",
           "match": "command+mode",
         },
         {
           "command": "teardown branch",
-          "deprecated": "dev teardown branch",
+          "deprecated": "instance teardown branch",
           "hidden": true,
           "id": "teardown.branch",
           "match": "command+mode",
         },
         {
           "command": "setup clone",
-          "deprecated": "dev clone new",
+          "deprecated": "instance clone new",
           "hidden": true,
           "id": "setup.clone",
           "match": "command+mode",
         },
         {
           "command": "clone refresh-seed",
-          "deprecated": "dev clone refresh-seed",
+          "deprecated": "instance clone refresh-seed",
           "hidden": true,
           "id": "clone.refresh-seed",
           "match": "command+mode",
         },
         {
           "command": "clone prune",
-          "deprecated": "dev clone prune",
+          "deprecated": "instance clone prune",
           "hidden": true,
           "id": "clone.prune",
           "match": "command+mode",
         },
         {
           "command": "clone list",
-          "deprecated": "dev clone list",
+          "deprecated": "instance clone list",
           "hidden": true,
           "id": "clone.list",
           "match": "command+mode",
         },
         {
           "command": "clone start",
-          "deprecated": "dev clone start",
+          "deprecated": "instance clone start",
           "hidden": true,
           "id": "clone.start",
           "match": "command+mode",
         },
         {
           "command": "clone stop",
-          "deprecated": "dev clone stop",
+          "deprecated": "instance clone stop",
           "hidden": true,
           "id": "clone.stop",
           "match": "command+mode",
         },
         {
           "command": "clone status",
-          "deprecated": "dev clone status",
+          "deprecated": "instance clone status",
           "hidden": true,
           "id": "clone.status",
           "match": "command+mode",
         },
         {
           "command": "clone slug-for-worktree",
-          "deprecated": "dev clone slug-for-worktree",
+          "deprecated": "instance clone slug-for-worktree",
           "hidden": true,
           "id": "clone.slug-for-worktree",
           "match": "command+mode",
         },
         {
           "command": "db migrate",
-          "deprecated": "dev db migrate",
+          "deprecated": "instance db migrate",
           "hidden": true,
           "id": "db.migrate",
           "match": "command+mode",
         },
         {
           "command": "reset dev",
-          "deprecated": "dev reset",
+          "deprecated": "instance reset",
           "hidden": true,
           "id": "reset.dev",
           "match": "command+mode",
         },
         {
           "command": "backup create",
-          "deprecated": "dev backup create",
+          "deprecated": "instance backup create",
           "hidden": true,
           "id": "backup.create",
           "match": "command+mode",
         },
         {
           "command": "backup import",
-          "deprecated": "dev backup import",
+          "deprecated": "instance backup import",
           "hidden": true,
           "id": "backup.import",
           "match": "command+mode",
         },
         {
           "command": "backup export-api-configs",
-          "deprecated": "dev backup export-api-configs",
+          "deprecated": "instance backup export-api-configs",
           "hidden": true,
           "id": "backup.export-api-configs",
           "match": "command+mode",
         },
         {
           "command": "backup import-api-configs",
-          "deprecated": "dev backup import-api-configs",
+          "deprecated": "instance backup import-api-configs",
           "hidden": true,
           "id": "backup.import-api-configs",
           "match": "command+mode",
@@ -550,9 +550,9 @@ describe("command table — descriptor snapshot", () => {
   });
 
   it("every routable id has a matching index.mjs handler (HANDLERS key)", () => {
-    // The id-keyed handler map lives in `buildHandlers()` in index.mjs. The `dev`
-    // GROUP head has NO handler (it is dispatched specially to group help), so it
-    // is exempt. Alias ids are covered by their canonical twin (same id).
+    // The id-keyed handler map lives in `buildHandlers()` in index.mjs. The
+    // `instance` GROUP head has NO handler (it is dispatched specially to group
+    // help), so it is exempt. Alias ids are covered by their canonical twin (same id).
     for (const { id, match } of COMMAND_DESCRIPTORS) {
       if (match === "group") continue; // group head has no handler.
       const quoted = INDEX_SRC.includes(`"${id}":`);
@@ -561,12 +561,25 @@ describe("command table — descriptor snapshot", () => {
     }
   });
 
-  it("the `dev` group head has NO handler key (dispatched specially)", () => {
-    expect(INDEX_SRC.includes('"dev":')).toBe(false);
-    // A bare `dev:` handler would be a separate concern; assert the group is not
-    // wired as a normal handler. (The id `"dev"` only appears as a descriptor.)
+  it("the `instance` group head has NO handler key (dispatched specially)", () => {
+    expect(INDEX_SRC.includes('"instance":')).toBe(false);
+    // A bare `instance:` handler would be a separate concern; assert the group is
+    // not wired as a normal handler. (The id `"instance"` only appears as a descriptor.)
     const groupDesc = COMMAND_DESCRIPTORS.find((d) => d.match === "group");
-    expect(groupDesc?.id).toBe("dev");
+    expect(groupDesc?.id).toBe("instance");
+  });
+
+  it("cinatra-cli#61: the `dev` namespace is fully removed (no descriptor uses it)", () => {
+    const usesDevHead = COMMAND_DESCRIPTORS.filter((d) => d.path[0] === "dev");
+    expect(
+      usesDevHead.map((d) => d.path.join(" ")),
+      "no canonical or alias descriptor may live under a `dev` head",
+    ).toEqual([]);
+    // And no deprecated alias may still target a `dev …` form.
+    const aliasesTargetingDev = COMMAND_DESCRIPTORS.filter(
+      (d) => d.deprecated && d.deprecated.split(" ")[0] === "dev",
+    );
+    expect(aliasesTargetingDev).toEqual([]);
   });
 });
 
@@ -605,40 +618,50 @@ describe("command table — routing (longest-match + aliases)", () => {
     [["agent", "export"], "agent.export"],
     [["agent", "import"], "agent.import"],
 
-    // Class-C canonical namespace — longest-match across variable depth.
-    [["dev", "setup"], "setup"], // no-mode group form
-    [["dev", "setup", "dev"], "setup.dev|prod"],
-    [["dev", "setup", "prod"], "setup.dev|prod"],
-    [["dev", "setup", "nango"], "setup.nango"],
-    [["dev", "setup", "branch"], "setup.branch"],
-    [["dev", "teardown", "branch"], "teardown.branch"],
-    [["dev", "clone", "new"], "setup.clone"],
-    [["dev", "clone", "refresh-seed"], "clone.refresh-seed"],
-    [["dev", "clone", "prune"], "clone.prune"],
-    [["dev", "clone", "list"], "clone.list"],
-    [["dev", "clone", "start"], "clone.start"],
-    [["dev", "clone", "stop"], "clone.stop"],
-    [["dev", "clone", "status"], "clone.status"],
-    [["dev", "clone", "slug-for-worktree"], "clone.slug-for-worktree"],
-    [["dev", "db", "migrate"], "db.migrate"],
-    [["dev", "db", "migrate", "--down"], "db.migrate"],
-    [["dev", "refresh"], "dev.refresh"],
-    [["dev", "tunnel"], "dev.tunnel"],
-    [["dev", "tunnel", "start"], "dev.tunnel"],
-    [["dev", "start"], "dev.start"],
-    [["dev", "stop"], "dev.stop"],
-    [["dev", "restart"], "dev.restart"],
-    [["dev", "wordpress"], "dev.wordpress"],
-    [["dev", "wordpress", "start"], "dev.wordpress"],
-    [["dev", "drupal", "stop"], "dev.drupal"],
-    [["dev", "reset"], "reset.dev"],
-    [["dev", "backup", "create"], "backup.create"],
-    [["dev", "backup", "import"], "backup.import"],
-    [["dev", "backup", "export-api-configs"], "backup.export-api-configs"],
-    [["dev", "backup", "import-api-configs"], "backup.import-api-configs"],
+    // Class-C canonical namespace (`instance …`, renamed cinatra-cli#61) —
+    // longest-match across variable depth.
+    [["instance", "setup"], "setup"], // no-mode group form
+    [["instance", "setup", "dev"], "setup.dev|prod"],
+    [["instance", "setup", "prod"], "setup.dev|prod"],
+    [["instance", "setup", "nango"], "setup.nango"],
+    [["instance", "setup", "branch"], "setup.branch"],
+    [["instance", "teardown", "branch"], "teardown.branch"],
+    [["instance", "clone", "new"], "setup.clone"],
+    [["instance", "clone", "refresh-seed"], "clone.refresh-seed"],
+    [["instance", "clone", "prune"], "clone.prune"],
+    [["instance", "clone", "list"], "clone.list"],
+    [["instance", "clone", "start"], "clone.start"],
+    [["instance", "clone", "stop"], "clone.stop"],
+    [["instance", "clone", "status"], "clone.status"],
+    [["instance", "clone", "slug-for-worktree"], "clone.slug-for-worktree"],
+    [["instance", "db", "migrate"], "db.migrate"],
+    [["instance", "db", "migrate", "--down"], "db.migrate"],
+    [["instance", "refresh"], "dev.refresh"],
+    [["instance", "tunnel"], "dev.tunnel"],
+    [["instance", "tunnel", "start"], "dev.tunnel"],
+    [["instance", "start"], "dev.start"],
+    [["instance", "stop"], "dev.stop"],
+    [["instance", "restart"], "dev.restart"],
+    [["instance", "wordpress"], "dev.wordpress"],
+    [["instance", "wordpress", "start"], "dev.wordpress"],
+    [["instance", "drupal", "stop"], "dev.drupal"],
+    [["instance", "reset"], "reset.dev"],
+    [["instance", "backup", "create"], "backup.create"],
+    [["instance", "backup", "import"], "backup.import"],
+    [["instance", "backup", "export-api-configs"], "backup.export-api-configs"],
+    [["instance", "backup", "import-api-configs"], "backup.import-api-configs"],
 
-    // The `dev` group head routes ONLY on the bare head (length-exact).
-    [["dev"], "dev"],
+    // The `instance` group head routes ONLY on the bare head (length-exact).
+    [["instance"], "instance"],
+
+    // cinatra-cli#61: the old `dev …` namespace is fully removed — no alias, no
+    // resolution. Every former `dev …` form (and the bare `dev` head) is UNKNOWN.
+    [["dev"], null],
+    [["dev", "setup"], null],
+    [["dev", "setup", "prod"], null],
+    [["dev", "db", "migrate"], null],
+    [["dev", "clone", "list"], null],
+    [["dev", "tunnel", "start"], null],
 
     // Deprecated bare aliases route to the SAME id as the canonical twin.
     [["setup"], "setup"],
@@ -661,16 +684,16 @@ describe("command table — routing (longest-match + aliases)", () => {
     [["backup", "import"], "backup.import"],
 
     // No-mode-exact + unknowns: a trailing non-mode token routes to UNKNOWN.
-    [["dev", "setup", "bogus"], null],
+    [["instance", "setup", "bogus"], null],
     [["setup", "bogus"], null],
-    [["dev", "clone"], null], // no `dev clone` subgroup — unknown (points at `dev --help`).
+    [["instance", "clone"], null], // no `instance clone` subgroup — unknown (points at `instance --help`).
     [["agents"], null],
     [["agents", "bogus"], null],
     [["mcp", "llm-access", "bogus"], null],
     [["mcp"], null],
     [["bogus"], null],
     // A LITERAL `"dev|prod"` arg must NOT match the alternation token.
-    [["dev", "setup", "dev|prod"], null],
+    [["instance", "setup", "dev|prod"], null],
     [["setup", "dev|prod"], null],
   ];
 
@@ -679,9 +702,9 @@ describe("command table — routing (longest-match + aliases)", () => {
     expect(d ? d.id : null).toBe(expectedId);
   });
 
-  it("longest-match: `dev setup prod` selects the 3-token mode descriptor, not the no-mode group", () => {
-    const noMode = matchDescriptor(COMMAND_DESCRIPTORS, ["dev", "setup"]);
-    const withMode = matchDescriptor(COMMAND_DESCRIPTORS, ["dev", "setup", "prod"]);
+  it("longest-match: `instance setup prod` selects the 3-token mode descriptor, not the no-mode group", () => {
+    const noMode = matchDescriptor(COMMAND_DESCRIPTORS, ["instance", "setup"]);
+    const withMode = matchDescriptor(COMMAND_DESCRIPTORS, ["instance", "setup", "prod"]);
     expect(noMode.match).toBe("command-no-mode");
     expect(withMode.id).toBe("setup.dev|prod");
     expect(withMode.path.length).toBeGreaterThan(noMode.path.length);
@@ -689,9 +712,9 @@ describe("command table — routing (longest-match + aliases)", () => {
 
   it("a deprecated alias and its canonical form resolve to the same handler id", () => {
     const alias = matchDescriptor(COMMAND_DESCRIPTORS, ["db", "migrate"]);
-    const canonical = matchDescriptor(COMMAND_DESCRIPTORS, ["dev", "db", "migrate"]);
+    const canonical = matchDescriptor(COMMAND_DESCRIPTORS, ["instance", "db", "migrate"]);
     expect(alias.id).toBe(canonical.id);
-    expect(alias.deprecated).toBe("dev db migrate");
+    expect(alias.deprecated).toBe("instance db migrate");
     expect(canonical.deprecated).toBeUndefined();
   });
 });
@@ -711,16 +734,16 @@ describe("command table — Class-A control plane stays bare", () => {
     ["extensions", "purge"],
   ];
 
-  it.each(bareClassA)("`%j` routes at its BARE path (not under dev) with no alias", (...argv) => {
+  it.each(bareClassA)("`%j` routes at its BARE path (not under instance) with no alias", (...argv) => {
     const d = matchDescriptor(COMMAND_DESCRIPTORS, argv);
     expect(d, `${argv.join(" ")} must route`).not.toBeNull();
-    expect(d.path[0]).not.toBe("dev");
+    expect(d.path[0]).not.toBe("instance");
     expect(d.deprecated).toBeUndefined();
-    // It also has no namespaced `dev …` canonical form (the id is not re-pathed).
-    const underDev = COMMAND_DESCRIPTORS.filter(
-      (x) => x.id === d.id && x.path[0] === "dev",
+    // It also has no namespaced `instance …` canonical form (the id is not re-pathed).
+    const underInstance = COMMAND_DESCRIPTORS.filter(
+      (x) => x.id === d.id && x.path[0] === "instance",
     );
-    expect(underDev.length).toBe(0);
+    expect(underInstance.length).toBe(0);
   });
 });
 
@@ -840,24 +863,25 @@ describe("command table — validateCommandTable", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. Help equivalence — printHelp (top-level) ∪ printGroupHelp("dev") covers all.
+// 4. Help equivalence — printHelp (top-level) ∪ printGroupHelp("instance")
+//    covers all.
 // ---------------------------------------------------------------------------
 describe("command table — docs↔surface drift (printHelp ∪ printGroupHelp)", () => {
   const helpIndex = buildHelpIndex(COMMAND_DESCRIPTORS);
-  // The two Usage blocks: printHelp's (top-level) and printGroupHelp("dev")'s.
+  // The two Usage blocks: printHelp's (top-level) and printGroupHelp("instance")'s.
   const topUsage = extractUsageBlock(INDEX_SRC, "function printHelp()");
-  const devUsage = extractUsageBlock(INDEX_SRC, "function printGroupHelp(");
+  const instanceUsage = extractUsageBlock(INDEX_SRC, "function printGroupHelp(");
 
   it("both Usage blocks exist and are non-trivial", () => {
     expect(topUsage.length).toBeGreaterThan(200);
-    expect(devUsage.length).toBeGreaterThan(200);
+    expect(instanceUsage.length).toBeGreaterThan(200);
   });
 
   it("forward: every visible descriptor appears in the correct banner", () => {
     for (const { command } of helpIndex) {
       const variants = expandPipeAlternatives(command);
-      const block = command.startsWith("dev ") ? devUsage : topUsage;
-      const label = command.startsWith("dev ") ? "printGroupHelp(dev)" : "printHelp";
+      const block = command.startsWith("instance ") ? instanceUsage : topUsage;
+      const label = command.startsWith("instance ") ? "printGroupHelp(instance)" : "printHelp";
       for (const v of variants) {
         expect(
           block.includes(`cinatra ${v}`),
@@ -870,7 +894,7 @@ describe("command table — docs↔surface drift (printHelp ∪ printGroupHelp)"
   it("reverse: every `cinatra <cmd>` Usage line in either banner maps to a descriptor", () => {
     const lines = [
       ...extractUsageCommands(topUsage),
-      ...extractUsageCommands(devUsage),
+      ...extractUsageCommands(instanceUsage),
     ];
     expect(lines.length).toBeGreaterThan(30);
     for (const tokens of lines) {
@@ -885,9 +909,9 @@ describe("command table — docs↔surface drift (printHelp ∪ printGroupHelp)"
   it("hidden + deprecated descriptors are excluded from the help index", () => {
     const ids = new Set(helpIndex.map((e) => e.command));
     expect(ids.has("setup")).toBe(false); // bare alias
-    expect(ids.has("dev setup")).toBe(false); // no-mode form (hidden)
+    expect(ids.has("instance setup")).toBe(false); // no-mode form (hidden)
     expect(ids.has("mcp tunnel")).toBe(false); // removed feature
-    expect(ids.has("dev")).toBe(false); // group head
+    expect(ids.has("instance")).toBe(false); // group head
     expect(ids.has("db migrate")).toBe(false); // bare alias
   });
 
