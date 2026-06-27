@@ -388,20 +388,25 @@ Usage:
   cinatra agents uninstall <name> [--lockfile <path>] [--keep-db|--keep-lockfile]
 
   Local host/monorepo bootstrap commands live under \`cinatra instance …\`
-  (setup, db migrate, clone/worktree, refresh/tunnel/start, backups, reset).
-  Run \`cinatra instance --help\` for the full local-bootstrap command list.
+  (db migrate, clone/worktree, branch setup/teardown, refresh/tunnel/start,
+  backups, reset). Run \`cinatra instance --help\` for the full list.
 
 Commands:
-  install           Bootstrap a Cinatra instance FROM ZERO — the only command
-                    that runs before any checkout exists (npx cinatra install).
-                    Checks requirements FIRST (Node 24+, git, pnpm via Corepack,
-                    Docker + Compose), then clones the cinatra repo at --ref
-                    (default main; the resolved commit SHA is recorded), clones
-                    ONLY the repos declared in cinatra.devExtensions (never an
-                    org-wide enumeration), creates .env.local, brings up the
-                    docker infra, runs pnpm install, and runs setup inside the
-                    target. Idempotent: re-running updates an existing checkout;
-                    a dirty checkout is refused unless --force (which stashes).
+  install           The SINGLE idempotent "make this instance exist / make it
+                    healthy" command (cinatra-cli#62) — bootstrap FROM ZERO and
+                    re-runnable RECONCILE in one entrypoint. It is the only
+                    command that runs before any checkout exists (npx cinatra
+                    install) AND the documented way to re-provision an existing
+                    one. Checks requirements FIRST (Node 24+, git, pnpm via
+                    Corepack, Docker + Compose), then clones the cinatra repo at
+                    --ref (default main; the resolved commit SHA is recorded),
+                    clones ONLY the repos declared in cinatra.devExtensions
+                    (never an org-wide enumeration), creates .env.local, brings
+                    up the docker infra, runs pnpm install, and runs the in-repo
+                    setup/reconcile phase inside the target. Idempotent:
+                    re-running on an existing checkout SKIPS the fresh clone
+                    (updates in place) and just re-runs the setup/reconcile
+                    phase; a dirty checkout is refused unless --force (stashes).
                     --dir <path>      Install location (default: ./cinatra; prompts on a TTY).
                     --ref <ref>       Branch, tag, or commit to install (default: main).
                     --mode dev|prod   Install mode (default: dev).
@@ -544,15 +549,15 @@ Commands:
                     check that cannot prove itself because a dependency is down
                     (app, CMS container, public URL) is SKIPPED, never passed —
                     re-run after \`pnpm dev\` is up. This is the authoritative
-                    post-boot gate. It also runs (non-fatal) at the tail of
-                    \`cinatra instance setup dev\`.
+                    post-boot gate. It also runs (non-fatal) at the tail of the
+                    in-repo provisioning phase (\`cinatra install --mode dev\`).
                     --strict          Exit non-zero on any SKIP (default: only FAIL).
                     --fix             Opt-in: before reporting, run SAFE idempotent
                                       remediations for the common FAILs (set the public
-                                      MCP URL via \`instance tunnel start\`; re-run \`setup dev\`
-                                      provisioning), then re-check. Dev-only; CMS/clone
-                                      checks are not auto-fixed. The post-fix report
-                                      still gates the exit code.
+                                      MCP URL via \`instance tunnel start\`; re-run the dev
+                                      provisioning/reconcile phase), then re-check. Dev-only;
+                                      CMS/clone checks are not auto-fixed. The post-fix
+                                      report still gates the exit code.
 
   agent export <id-or-name>
                     Export an agent template to a portable ZIP archive.
@@ -614,17 +619,19 @@ function printGroupHelp(group) {
   console.log(`Cinatra instance — local host/monorepo bootstrap commands
 
 These run from inside a cinatra checkout and manage a local Cinatra instance
-(dev or prod). The DB-touching commands (\`instance setup\`, \`instance db migrate\`)
-work even when the app server is down.
+(dev or prod). The DB-touching commands (\`instance db migrate\`) work even when
+the app server is down.
+
+To create OR reconcile an instance, use the single idempotent bootstrap command:
+  cinatra install --mode dev|prod   (from-zero OR re-runnable reconcile)
+The in-repo provisioning phase (\`setup\`) is now folded into \`install\`; the
+commands below manage an EXISTING instance / env slice.
 
 Usage:
-  cinatra instance setup dev [--skip-dev-apps] [--force-dev-apps]
-  cinatra instance setup prod
-  cinatra instance setup nango
-  cinatra instance setup branch [--worktree-path <path>] [--slug <slug>] [--port <port>]
+  cinatra instance branch setup [--worktree-path <path>] [--slug <slug>] [--port <port>]
                                 [--source-env <path>] [--force]
                                 [--skip-dev-apps] [--force-dev-apps]
-  cinatra instance teardown branch [--worktree-path <path>] [--slug <slug>] --yes
+  cinatra instance branch teardown [--worktree-path <path>] [--slug <slug>] --yes
   cinatra instance clone refresh-seed [--source-env <path>]
   cinatra instance clone new [<name>] [--slug <name>] [--worktree-path <path>] [--source-env <path>] [--force]
                              [--skip-dev-apps] [--force-dev-apps]
@@ -655,17 +662,11 @@ Usage:
                          [--purge-app-data|--keep-app-data] [--file <path>]
 
 Commands:
-  instance setup dev|prod  Prepare Better Auth, workspace schema, Nango
-                      administration, MCP server, and OAuth clients. LLM MCP
-                      access is provisioned in dev mode only. In dev mode, also
-                      clones/fast-forwards the WordPress plugin + Drupal module
-                      (cinatra.devApps).
-  instance setup nango Configure Nango administration only.
-  instance setup branch
+  instance branch setup
                       Provision an isolated dev environment for the current git
                       worktree (.env.local + cinatra_<slug> schema), behind a
                       worktree-name collision guard.
-  instance teardown branch
+  instance branch teardown
                       Drop the isolated cinatra_<slug> schema. Requires --yes.
   instance clone refresh-seed
                       (Re)build the cinatra_seed template database that
@@ -772,10 +773,35 @@ Examples:
   cinatra create-extension skill pdf-tools --scope anthropics`,
 };
 
+// cinatra-cli#62: the in-repo provisioning phase ids that are now folded into
+// `cinatra install --mode dev|prod`. Their `--help` must NOT advertise the
+// internal `setup` path (it is no longer a documented top-level command) — it
+// steers the operator to the single idempotent bootstrap/reconcile entrypoint.
+const SETUP_PHASE_IDS = new Set(["setup", "setup.dev|prod", "setup.nango"]);
+
+function printSetupPhaseHelp() {
+  console.log(
+    `\`cinatra setup …\` was folded into the single idempotent bootstrap command (cinatra-cli#62).\n\n` +
+      `Usage: cinatra install --mode dev|prod\n\n` +
+      `  Bootstrap a new instance FROM ZERO, or re-run on an existing checkout to\n` +
+      `  RECONCILE it (it skips the fresh clone and re-runs the in-repo setup phase).\n\n` +
+      `Run "cinatra install --help" for the full flag list, or "cinatra --help" for everything.`,
+  );
+}
+
 function printCommandHelp(descriptor) {
+  // cinatra-cli#62: `--help` for any folded setup phase (hidden canonical OR its
+  // deprecated bare alias) steers to `cinatra install --mode dev|prod` instead of
+  // advertising the now-internal `setup` path. Checked FIRST so both the hidden
+  // canonical and the deprecated-alias branches below route here.
+  if (SETUP_PHASE_IDS.has(descriptor.id)) {
+    printSetupPhaseHelp();
+    return;
+  }
   // A deprecated alias (hidden) resolves to its canonical twin's synopsis so
-  // `cinatra setup dev --help` still prints useful help (exit 0, no side
-  // effect — the footgun guard) AND steers the user to the canonical form.
+  // `cinatra instance setup branch --help` still prints useful help (exit 0, no
+  // side effect — the footgun guard) AND steers the user to the canonical form
+  // (`cinatra instance branch setup`).
   if (descriptor.deprecated) {
     const canonical =
       COMMAND_DESCRIPTORS.find(
@@ -5424,7 +5450,7 @@ async function runSetupBranch(argv) {
     }
     if (mainRepoRoot === worktreePath) {
       throw new Error(
-        "Refusing to run setup branch on the main repo root — this would overwrite the source .env.local.",
+        "Refusing to run branch setup on the main repo root — this would overwrite the source .env.local.",
       );
     }
     sourcePath = path.join(mainRepoRoot, ".env.local");
@@ -5477,7 +5503,7 @@ async function runSetupBranch(argv) {
   const { runCollisionCheck, makeDefaultGitImpl, formatResult } = await import(
     "./worktree-collision-guard.mjs"
   );
-  // Self-context — if `cinatra instance setup branch` is re-running inside the
+  // Self-context — if `cinatra instance branch setup` is re-running inside the
   // already-provisioned worktree, that's not a collision.
   let selfBranch = null;
   try {
@@ -5557,7 +5583,7 @@ async function runSetupBranch(argv) {
   const outPath = path.join(worktreePath, ".env.local");
   if (existsSync(outPath) && !argv.includes("--force")) {
     // .env.local exists — read it to get the schema this worktree is already wired to,
-    // then skip to migrations + seeding so re-running setup branch is always safe.
+    // then skip to migrations + seeding so re-running branch setup is always safe.
     const { values: existingEnv } = readEnvFileOrdered(outPath);
     const existingSchema = existingEnv.SUPABASE_SCHEMA?.trim();
     if (!existingSchema) {
@@ -5794,7 +5820,7 @@ async function runTeardownBranch(argv) {
 
   // 2. Require --yes (destructive-action gate; checked BEFORE any git / DB work)
   if (!argv.includes("--yes")) {
-    throw new Error("cinatra instance teardown branch is destructive. Re-run with --yes to confirm.");
+    throw new Error("cinatra instance branch teardown is destructive. Re-run with --yes to confirm.");
   }
 
   // 3. Derive slug — prefer --slug, else read git branch
@@ -6121,7 +6147,7 @@ function resolveRedisCliRunner(redisUrl, target) {
 //   cinatra instance clone list           — list registered clones
 //
 // A "clone" is a deep fork: a SEPARATE Postgres database `cinatra_clone_<slug>`
-// (vs the light `cinatra instance setup branch`, which is a `cinatra_<slug>` *schema* in
+// (vs the light `cinatra instance branch setup`, which is a `cinatra_<slug>` *schema* in
 // the shared `postgres` DB). Pure registry/slug/port logic lives in
 // `./clone-registry.mjs`; this file owns the DB + filesystem side effects.
 // ===========================================================================
@@ -9968,7 +9994,7 @@ async function runCloneStatus(argv) {
 //
 // Prints the slug to stdout (exit 0). Prints nothing + exit 1 if no clone
 // is registered for the given path. Used by the ExitWorktree hook so it
-// can decide between `clone stop` (clone mode) vs `teardown branch`
+// can decide between `clone stop` (clone mode) vs `branch teardown`
 // (light branch mode). The lookup falls back to abs-normalised string-eq when
 // realpath fails, which is required for the typical ExitWorktree-after-removal
 // scenario.

@@ -8,12 +8,29 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Consolidated `cinatra setup` into `cinatra install --mode dev|prod`** as the
+  single idempotent "make this instance exist / make it healthy" command. `install`
+  is the only documented bootstrap AND reconcile entrypoint: from a clean machine it
+  clones + provisions from zero (`npx cinatra install`); re-run on an existing
+  checkout it skips the fresh clone and just re-runs the in-repo setup/reconcile
+  phase. The standalone `setup` provisioning phase is **demoted to an internal
+  phase** — it is dropped from the documented top-level command surface (no help
+  row for `instance setup dev|prod` or `instance setup nango`), but it still runs
+  (install invokes it, `cinatra doctor --fix` self-heals through it, and the
+  `pnpm setup:dev` dev hook still works). Running `cinatra instance setup … --help`
+  now steers you to `cinatra install --mode dev|prod`. The branch lifecycle stays
+  separate (it manages an existing env slice, not a from-zero install) and is
+  **renamed** to `cinatra instance branch setup` / `cinatra instance branch teardown`;
+  the old `cinatra instance setup branch` / `cinatra instance teardown branch` forms
+  (and the bare `cinatra setup branch` / `cinatra teardown branch`) still work this
+  release as deprecated aliases that print a one-line stderr rename hint. (#62)
 - **BREAKING:** Renamed the `cinatra dev …` command group to `cinatra instance …`.
   The Class-C local host/monorepo bootstrap commands manage a local Cinatra
   *instance* — and several take an explicit `dev|prod` mode — so the `dev` head was
   misleading (`cinatra dev setup prod` was self-contradictory). Every subcommand
-  moved verbatim under the new head: `cinatra instance setup dev|prod|nango|branch`,
-  `cinatra instance teardown branch`, `cinatra instance db migrate`, the
+  moved verbatim under the new head: the in-repo provisioning phase (folded into
+  `cinatra install` by #62), `cinatra instance branch setup|teardown`,
+  `cinatra instance db migrate`, the
   `cinatra instance clone …` worktree/seed commands, `cinatra instance refresh`,
   `cinatra instance tunnel`, `cinatra instance start|stop|restart`,
   `cinatra instance wordpress|drupal`, `cinatra instance reset`, and the
