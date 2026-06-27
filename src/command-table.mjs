@@ -86,7 +86,7 @@ export const COMMAND_DESCRIPTORS = [
     id: "install",
     path: ["install"],
     match: "command",
-    summary: "Bootstrap a Cinatra dev/prod instance from zero (clone, env, infra, setup).",
+    summary: "Bootstrap OR reconcile a Cinatra dev/prod instance — the single idempotent entrypoint.",
   },
   {
     id: "update",
@@ -235,27 +235,37 @@ export const COMMAND_DESCRIPTORS = [
     match: "command-no-mode", // ONLY when no mode token follows (env-driven dev|prod).
     hidden: true, // No standalone help row.
   },
+  // cinatra-cli#62: the in-repo provisioning phase (`setup dev|prod`, `setup
+  // nango`) is DEMOTED to an INTERNAL phase. It still ROUTES (install runs it,
+  // `doctor --fix` re-runs `instance setup dev`, the `pnpm setup:dev` hook calls
+  // it), but it is `hidden` (no help row, no summary) so the DOCUMENTED bootstrap/
+  // reconcile surface is the single idempotent `cinatra install --mode dev|prod`.
   {
     id: "setup.dev|prod",
     path: ["instance", "setup", "dev|prod"],
     match: "command+mode+sub",
-    summary: "Prepare Better Auth, schema, Nango, MCP server, and OAuth clients.",
+    hidden: true, // Internal phase — bootstrap/reconcile is `cinatra install --mode dev|prod`.
   },
   {
     id: "setup.nango",
     path: ["instance", "setup", "nango"],
     match: "command+mode+sub",
-    summary: "Configure Nango administration only.",
+    hidden: true, // Internal phase of install — no bare top-level `setup nango`.
   },
+  // cinatra-cli#62: branch lifecycle commands manage an existing env slice (NOT a
+  // from-zero install), so they stay SEPARATE from `install` and are renamed for
+  // clarity to the `branch …` head: `instance branch setup` / `instance branch
+  // teardown`. The old `instance setup branch` / `instance teardown branch` forms
+  // are kept as hidden deprecated aliases (one minor) further down.
   {
     id: "setup.branch",
-    path: ["instance", "setup", "branch"],
+    path: ["instance", "branch", "setup"],
     match: "command+mode+sub",
     summary: "Provision an isolated dev environment for the current git worktree.",
   },
   {
     id: "teardown.branch",
-    path: ["instance", "teardown", "branch"],
+    path: ["instance", "branch", "teardown"],
     match: "command+mode+sub",
     summary: "Remove the isolated Postgres schema for the current git worktree.",
   },
@@ -407,26 +417,41 @@ export const COMMAND_DESCRIPTORS = [
     hidden: true,
     deprecated: "instance setup",
   },
+  // cinatra-cli#62: there is NO bare `setup nango` alias — `setup nango` was
+  // never a documented standalone operator command; Nango is provisioned as an
+  // internal phase of `cinatra install`. (The hidden `instance setup nango`
+  // descriptor above is kept ONLY so install's internal invocation routes.)
+  // cinatra-cli#62: the OLD `instance setup branch` / `instance teardown branch`
+  // forms (renamed to `instance branch setup` / `instance branch teardown`) are
+  // kept as hidden deprecated aliases for one minor, alongside the original bare
+  // aliases (now re-pointed at the `branch …` canonical forms).
   {
-    id: "setup.nango",
-    path: ["setup", "nango"],
-    match: "command+mode",
+    id: "setup.branch",
+    path: ["instance", "setup", "branch"],
+    match: "command+mode+sub",
     hidden: true,
-    deprecated: "instance setup nango",
+    deprecated: "instance branch setup",
+  },
+  {
+    id: "teardown.branch",
+    path: ["instance", "teardown", "branch"],
+    match: "command+mode+sub",
+    hidden: true,
+    deprecated: "instance branch teardown",
   },
   {
     id: "setup.branch",
     path: ["setup", "branch"],
     match: "command+mode",
     hidden: true,
-    deprecated: "instance setup branch",
+    deprecated: "instance branch setup",
   },
   {
     id: "teardown.branch",
     path: ["teardown", "branch"],
     match: "command+mode",
     hidden: true,
-    deprecated: "instance teardown branch",
+    deprecated: "instance branch teardown",
   },
   {
     id: "setup.clone",

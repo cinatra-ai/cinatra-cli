@@ -219,26 +219,26 @@ describe("command table — descriptor snapshot", () => {
         {
           "command": "instance setup dev|prod",
           "deprecated": null,
-          "hidden": false,
+          "hidden": true,
           "id": "setup.dev|prod",
           "match": "command+mode+sub",
         },
         {
           "command": "instance setup nango",
           "deprecated": null,
-          "hidden": false,
+          "hidden": true,
           "id": "setup.nango",
           "match": "command+mode+sub",
         },
         {
-          "command": "instance setup branch",
+          "command": "instance branch setup",
           "deprecated": null,
           "hidden": false,
           "id": "setup.branch",
           "match": "command+mode+sub",
         },
         {
-          "command": "instance teardown branch",
+          "command": "instance branch teardown",
           "deprecated": null,
           "hidden": false,
           "id": "teardown.branch",
@@ -406,22 +406,29 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode",
         },
         {
-          "command": "setup nango",
-          "deprecated": "instance setup nango",
+          "command": "instance setup branch",
+          "deprecated": "instance branch setup",
           "hidden": true,
-          "id": "setup.nango",
-          "match": "command+mode",
+          "id": "setup.branch",
+          "match": "command+mode+sub",
+        },
+        {
+          "command": "instance teardown branch",
+          "deprecated": "instance branch teardown",
+          "hidden": true,
+          "id": "teardown.branch",
+          "match": "command+mode+sub",
         },
         {
           "command": "setup branch",
-          "deprecated": "instance setup branch",
+          "deprecated": "instance branch setup",
           "hidden": true,
           "id": "setup.branch",
           "match": "command+mode",
         },
         {
           "command": "teardown branch",
-          "deprecated": "instance teardown branch",
+          "deprecated": "instance branch teardown",
           "hidden": true,
           "id": "teardown.branch",
           "match": "command+mode",
@@ -620,10 +627,15 @@ describe("command table — routing (longest-match + aliases)", () => {
 
     // Class-C canonical namespace (`instance …`, renamed cinatra-cli#61) —
     // longest-match across variable depth.
-    [["instance", "setup"], "setup"], // no-mode group form
-    [["instance", "setup", "dev"], "setup.dev|prod"],
-    [["instance", "setup", "prod"], "setup.dev|prod"],
-    [["instance", "setup", "nango"], "setup.nango"],
+    [["instance", "setup"], "setup"], // no-mode group form (hidden internal phase)
+    [["instance", "setup", "dev"], "setup.dev|prod"], // hidden internal phase (cinatra-cli#62)
+    [["instance", "setup", "prod"], "setup.dev|prod"], // hidden internal phase
+    [["instance", "setup", "nango"], "setup.nango"], // hidden internal phase
+    // cinatra-cli#62: branch lifecycle renamed to `instance branch setup|teardown`.
+    [["instance", "branch", "setup"], "setup.branch"],
+    [["instance", "branch", "teardown"], "teardown.branch"],
+    // The old `instance setup branch` / `instance teardown branch` forms still
+    // route (as deprecated aliases) to the same handler id.
     [["instance", "setup", "branch"], "setup.branch"],
     [["instance", "teardown", "branch"], "teardown.branch"],
     [["instance", "clone", "new"], "setup.clone"],
@@ -667,7 +679,7 @@ describe("command table — routing (longest-match + aliases)", () => {
     [["setup"], "setup"],
     [["setup", "dev"], "setup.dev|prod"],
     [["setup", "prod"], "setup.dev|prod"],
-    [["setup", "nango"], "setup.nango"],
+    // cinatra-cli#62: branch bare aliases re-point at the renamed `branch …` forms.
     [["setup", "branch"], "setup.branch"],
     [["teardown", "branch"], "teardown.branch"],
     [["setup", "clone"], "setup.clone"],
@@ -686,6 +698,8 @@ describe("command table — routing (longest-match + aliases)", () => {
     // No-mode-exact + unknowns: a trailing non-mode token routes to UNKNOWN.
     [["instance", "setup", "bogus"], null],
     [["setup", "bogus"], null],
+    // cinatra-cli#62: there is no bare `setup nango` (acceptance item 4) — UNKNOWN.
+    [["setup", "nango"], null],
     [["instance", "clone"], null], // no `instance clone` subgroup — unknown (points at `instance --help`).
     [["agents"], null],
     [["agents", "bogus"], null],

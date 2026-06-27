@@ -93,8 +93,11 @@ describe("cinatra <subcommand> --help across matcher shapes", () => {
     [["update", "--help"], "cinatra update"], // command, moves git + reconciles — must NOT run on --help
     [["upgrade", "--help"], "cinatra upgrade"], // command, alias of update — same footgun guard
     // The command-routing contract (renamed cinatra-cli#61): Class-C bootstrap
-    // commands are namespaced under `cinatra instance …`.
-    [["instance", "setup", "dev", "--help"], "cinatra instance setup"], // command+mode+sub (dev|prod alt), destructive
+    // commands are namespaced under `cinatra instance …`. cinatra-cli#62: the
+    // branch lifecycle was renamed to `instance branch setup|teardown` (the
+    // `command+mode+sub` shape here).
+    [["instance", "branch", "setup", "--help"], "cinatra instance branch setup"], // command+mode+sub, destructive
+    [["instance", "branch", "teardown", "--help"], "cinatra instance branch teardown"], // command+mode+sub, destructive
     [["instance", "db", "migrate", "--help"], "cinatra instance db migrate"], // command+mode+sub, destructive
     [["instance", "clone", "prune", "--help"], "cinatra instance clone prune"], // command+mode+sub, destructive
     [["instance", "refresh", "--help"], "cinatra instance refresh"], // command+mode, destructive
@@ -132,9 +135,19 @@ describe("cinatra <subcommand> --help edge cases", () => {
     assertNoSideEffect();
   });
 
-  it("a hidden descriptor (`setup` no-mode) with --help shows the full banner, not a synopsis", () => {
-    // `setup --help` matches the hidden `command-no-mode` descriptor; printCommandHelp
+  it("a hidden descriptor (the removed `mcp tunnel` stub) with --help shows the full banner, not a synopsis", () => {
+    // A hidden, summary-less descriptor has no public synopsis; printCommandHelp
     // falls back to the full banner rather than advertise a hidden entry.
+    const res = runHelp(["mcp", "tunnel", "--help"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain("Cinatra setup CLI");
+    assertNoSideEffect();
+  });
+
+  it("the bare no-mode `setup --help` routes no descriptor and falls back to the full banner", () => {
+    // `["setup","--help"]` matches nothing (the no-mode `setup` form is
+    // length-exact), so runCli falls through to the global banner. A trailing
+    // routable token (`setup dev --help`) is what steers to `cinatra install`.
     const res = runHelp(["setup", "--help"]);
     expect(res.status).toBe(0);
     expect(res.stdout).toContain("Cinatra setup CLI");
@@ -157,16 +170,21 @@ describe("cinatra <subcommand> --help edge cases", () => {
     expect(res.stdout).not.toMatch(/^Usage: cinatra install$/m);
   });
 
-  // The command-routing contract (renamed cinatra-cli#61): a DEPRECATED bare alias (`setup dev`,
-  // `db migrate`, …) with --help must still short-circuit (footgun guard: exit 0,
+  // The command-routing contract (renamed cinatra-cli#61): a DEPRECATED bare alias
+  // (`db migrate`, …) with --help must still short-circuit (footgun guard: exit 0,
   // NO side effect) and resolve to the CANONICAL `instance …` synopsis, steering
-  // the user to the new form.
+  // the user to the new form. cinatra-cli#62: the `instance setup branch` /
+  // `instance teardown branch` forms were renamed; their bare aliases now resolve
+  // to the new `instance branch setup|teardown` canonical.
   const aliasHelpCases = [
-    [["setup", "dev", "--help"], "cinatra instance setup"],
     [["db", "migrate", "--help"], "cinatra instance db migrate"],
     [["clone", "prune", "--help"], "cinatra instance clone prune"],
     [["reset", "dev", "--help"], "cinatra instance reset"],
     [["backup", "import", "--help"], "cinatra instance backup import"],
+    [["setup", "branch", "--help"], "cinatra instance branch setup"],
+    [["teardown", "branch", "--help"], "cinatra instance branch teardown"],
+    [["instance", "setup", "branch", "--help"], "cinatra instance branch setup"],
+    [["instance", "teardown", "branch", "--help"], "cinatra instance branch teardown"],
   ];
 
   it.each(aliasHelpCases)(
@@ -177,6 +195,34 @@ describe("cinatra <subcommand> --help edge cases", () => {
       expect(res.stdout).toContain(canonicalToken);
       expect(res.stdout).toMatch(/deprecated form/i);
       expect(res.stdout).toMatch(/Usage:/i);
+      assertNoSideEffect();
+    },
+  );
+
+  // cinatra-cli#62: the in-repo provisioning phase (`setup dev|prod`, `setup
+  // nango`) is FOLDED into `cinatra install --mode dev|prod`. Its `--help` (canonical
+  // hidden form AND the deprecated bare alias) must short-circuit (exit 0, no side
+  // effect) and STEER to `cinatra install` — never advertise the internal setup path.
+  // NOTE: the bare no-mode `setup --help` does NOT route a help descriptor (the
+  // no-mode form is length-exact, so `["setup","--help"]` matches nothing) and
+  // falls back to the full banner — asserted separately below. The forms here all
+  // carry a routable trailing token, so they resolve to the folded setup phase.
+  const setupPhaseHelpCases = [
+    [["instance", "setup", "dev", "--help"]],
+    [["instance", "setup", "prod", "--help"]],
+    [["instance", "setup", "nango", "--help"]], // hidden internal phase (still routes)
+    [["setup", "dev", "--help"]], // deprecated bare alias
+  ];
+
+  it.each(setupPhaseHelpCases)(
+    "folded setup phase `%j --help` exits 0, steers to `cinatra install`, no side effect",
+    (args) => {
+      const res = runHelp(args);
+      expect(res.status, `stderr: ${res.stderr}`).toBe(0);
+      expect(res.stdout).toContain("cinatra install --mode dev|prod");
+      expect(res.stdout).toMatch(/folded into the single idempotent/i);
+      // It must NOT advertise the now-internal `instance setup` path as a command.
+      expect(res.stdout).not.toMatch(/Usage: cinatra instance setup/i);
       assertNoSideEffect();
     },
   );

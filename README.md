@@ -24,18 +24,25 @@ Requires Node.js >= 24.
 
 ## What you can do
 
-    cinatra install                  # set up a new Cinatra instance from scratch
+    cinatra install --mode dev       # set up OR reconcile a dev instance (single entrypoint)
+    cinatra install --mode prod      # set up OR reconcile a production instance
     cinatra status                   # check an instance's status
     cinatra doctor                   # diagnose your local setup
     cinatra agents install <name>    # add an agent to your instance
     cinatra create-extension <kind>  # scaffold a new extension to author
 
-The local host/monorepo bootstrap commands you run from inside a Cinatra
-checkout now live under `cinatra instance …`:
+`cinatra install --mode dev|prod` is the single idempotent command to make an
+instance exist or make it healthy: run it on a clean machine to bootstrap from
+scratch, or re-run it on an existing checkout to reconcile it (it skips the clone
+and just re-runs the in-repo provisioning phase — there is no separate `setup`
+command to remember).
 
-    cinatra instance setup dev            # provision a local development instance
-    cinatra instance setup prod           # provision a production instance
+The other local host/monorepo bootstrap commands you run from inside a Cinatra
+checkout live under `cinatra instance …`:
+
     cinatra instance db migrate           # apply schema updates (works when the app is down)
+    cinatra instance branch setup         # provision an isolated env for the current worktree
+    cinatra instance branch teardown --yes  # drop that worktree's isolated schema
     cinatra instance clone new <name>     # create an isolated deep-fork clone
     cinatra instance refresh              # reconcile deps + dev DB to your checkout
     cinatra instance tunnel start         # manage the dev Tailscale Funnel
@@ -45,10 +52,14 @@ checkout now live under `cinatra instance …`:
 Run `cinatra --help` for the top-level command list, or `cinatra instance --help`
 for the full local-bootstrap command list.
 
-> The old bare forms (`cinatra setup dev`, `cinatra db migrate`, `cinatra clone …`,
-> `cinatra reset dev`, `cinatra backup …`) still work this release but are
-> deprecated — they print a one-line hint pointing at the new `cinatra instance …`
-> form. Update your scripts to the namespaced commands.
+> The old bare forms (`cinatra db migrate`, `cinatra clone …`, `cinatra reset dev`,
+> `cinatra backup …`, and the renamed `cinatra teardown branch`) still work this
+> release but are deprecated — they print a one-line hint pointing at their
+> `cinatra instance …` form. Update your scripts to the canonical commands.
+>
+> The in-repo provisioning phase (`cinatra setup dev|prod`) is folded into
+> `cinatra install --mode dev|prod` — there is no standalone `setup` command to
+> run; re-run `cinatra install` to reconcile an existing instance.
 
 ## Running more than one instance
 
@@ -185,11 +196,13 @@ its own port band, `--on-conflict=attach` re-attaches to the existing checkout,
 or `--on-conflict=stop-existing` stops the existing stack before installing.
 
 **Deprecated command warnings**
-Commands like `cinatra setup dev` or `cinatra db migrate` print a deprecation
-hint pointing at their `cinatra instance …` equivalents. Update your scripts to the
-namespaced forms (e.g. `cinatra instance setup dev`, `cinatra instance db migrate`) —
-the old bare forms will be removed in a future minor release. To suppress the
-warnings temporarily while you migrate, set `CINATRA_SUPPRESS_DEPRECATION=1`.
+Commands like `cinatra db migrate` or `cinatra teardown branch` print a deprecation
+hint pointing at their canonical equivalents. Update your scripts to the canonical
+forms (e.g. `cinatra instance db migrate`, `cinatra instance branch teardown`) — the
+old bare forms will be removed in a future minor release. The in-repo provisioning
+phase (`cinatra setup dev|prod`) was folded into `cinatra install --mode dev|prod`;
+re-run `cinatra install` to reconcile an existing instance. To suppress the warnings
+temporarily while you migrate, set `CINATRA_SUPPRESS_DEPRECATION=1`.
 
 **`cinatra doctor` for diagnosing a broken instance**
 If your instance is misbehaving, `cinatra doctor` checks your local setup and

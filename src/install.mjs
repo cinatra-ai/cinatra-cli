@@ -4008,7 +4008,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   // 5b. For an ISOLATED instance, point the HOST app at its own port + URLs
   //     (review hardening #3: compose isolation only covers INFRA ports; the
   //     app uses PORT/BETTER_AUTH_URL/NEXT_PUBLIC_BETTER_AUTH_URL — mirror what
-  //     `setup branch`/clone write, else `pnpm dev` still collides on 3000).
+  //     `branch setup`/clone write, else `pnpm dev` still collides on 3000).
   if (infraPlan === "isolated" && resolution?.instance?.appPort) {
     writeIsolatedAppEnv({
       targetDir,
@@ -4088,11 +4088,11 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     }
 
     if (opts.noInstall) {
-      log("- Skipping dependency install + setup (--no-install). Checkout + env are ready; run `pnpm install && cinatra instance setup dev` inside the target when ready.");
+      log("- Skipping dependency install + setup (--no-install). Checkout + env are ready; re-run `cinatra install --mode dev` (it reconciles in place — skips the clone, runs deps + setup) when ready.");
     } else {
       pnpmInstall({ targetDir, usePnpmDirect, log });
       if (opts.noSetup) {
-        log("- Skipping setup (--no-setup). Checkout + deps are ready; run `cinatra instance setup dev` inside the target when ready.");
+        log("- Skipping setup (--no-setup). Checkout + deps are ready; re-run `cinatra install --mode dev` (it reconciles in place — runs the setup phase) when ready.");
       } else {
         // devApps are cloned by `setup dev` itself; passing --skip-dev-apps
         // through honors the operator's choice. (We do NOT sync devApps here to
@@ -4101,14 +4101,14 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
       }
     }
   } else if (opts.noInstall) {
-    log("- Skipping dependency install + setup (--no-install). Run `pnpm install && cinatra extensions acquire-prod && pnpm install && cinatra instance setup prod` inside the target when ready.");
+    log("- Skipping dependency install + setup (--no-install). Re-run `cinatra install --mode prod` (it reconciles in place — runs deps + acquire-prod + setup) when ready.");
   } else {
     // prod: install → acquire-prod → install → setup prod (mirrors setup.sh).
     pnpmInstall({ targetDir, usePnpmDirect, log });
     acquireProdExtensions({ targetDir, log });
     pnpmInstall({ targetDir, usePnpmDirect, log });
     if (opts.noSetup) {
-      log("- Skipping setup (--no-setup). Run `cinatra instance setup prod` inside the target when ready.");
+      log("- Skipping setup (--no-setup). Re-run `cinatra install --mode prod` (it reconciles in place — runs the setup phase) when ready.");
     } else {
       runSetupInTarget({ targetDir, mode: "prod", skipDevApps: false, log });
     }

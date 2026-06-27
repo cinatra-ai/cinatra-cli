@@ -35,7 +35,7 @@ export function readDevAppsConfig(repoRoot, readFile = readFileSync) {
  * Sync all configured dev apps into `targetRoot`.
  * - repoRoot: where package.json (the config) lives.
  * - targetRoot: where the clones are materialized (repo root for `setup dev`,
- *   the worktree path for `setup branch` / `setup clone`).
+ *   the worktree path for `branch setup` / `clone new`).
  */
 export async function syncDevApps({
   repoRoot,

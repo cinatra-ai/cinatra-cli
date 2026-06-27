@@ -44,8 +44,15 @@ describe("cinatra-cli#61 — `instance` namespace (the new Class-C head)", () =>
     const res = run(["instance", "--help"]);
     expect(res.status, `stderr: ${res.stderr}`).toBe(0);
     expect(res.stdout).toContain("Cinatra instance — local host/monorepo bootstrap commands");
-    expect(res.stdout).toContain("cinatra instance setup dev");
-    expect(res.stdout).toContain("cinatra instance setup prod"); // the self-contradictory `dev setup prod` is gone
+    // cinatra-cli#62: the in-repo `setup` phase is folded into `cinatra install`;
+    // the group banner steers to it and no longer advertises `instance setup …`.
+    expect(res.stdout).toContain("cinatra install --mode dev|prod");
+    expect(res.stdout).not.toMatch(/cinatra instance setup (dev|prod|nango)/);
+    // cinatra-cli#62: branch lifecycle renamed to `instance branch setup|teardown`.
+    expect(res.stdout).toContain("cinatra instance branch setup");
+    expect(res.stdout).toContain("cinatra instance branch teardown");
+    expect(res.stdout).not.toMatch(/cinatra instance setup branch/);
+    expect(res.stdout).not.toMatch(/cinatra instance teardown branch/);
     expect(res.stdout).toContain("cinatra instance db migrate");
     expect(res.stdout).toContain("cinatra instance clone list");
     // The renamed banner must never advertise the old `cinatra dev …` head.
@@ -58,13 +65,16 @@ describe("cinatra-cli#61 — `instance` namespace (the new Class-C head)", () =>
     expect(res.stdout).toContain("Cinatra instance — local host/monorepo bootstrap commands");
   });
 
-  it("`cinatra instance setup prod --help` shows a synopsis, exits 0, no side effect", () => {
+  it("`cinatra instance setup prod --help` steers to `cinatra install`, exits 0, no side effect", () => {
     // The footgun guard (cinatra#255): a help flag short-circuits BEFORE the
-    // destructive setup handler runs. We assert on output, not a temp-dir scan,
-    // because setup reads/writes the checkout root, not cwd.
+    // destructive setup handler runs. cinatra-cli#62: the folded `setup` phase's
+    // --help steers to the single idempotent `cinatra install --mode dev|prod`
+    // entrypoint instead of advertising the now-internal setup path.
     const res = run(["instance", "setup", "prod", "--help"]);
     expect(res.status, `stderr: ${res.stderr}`).toBe(0);
-    expect(res.stdout).toMatch(/Usage: cinatra instance setup dev\|prod/);
+    expect(res.stdout).toContain("cinatra install --mode dev|prod");
+    expect(res.stdout).toMatch(/folded into the single idempotent/i);
+    expect(res.stdout).not.toMatch(/Usage: cinatra instance setup/); // never advertise the internal path
     expect(res.stdout).not.toMatch(/Prepar(ing|ed) Better Auth/); // never ran the handler
   });
 
