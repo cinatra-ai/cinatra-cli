@@ -1304,7 +1304,7 @@ function acquireProdExtensions({ targetDir, log = console.log }) {
 }
 
 function runSetupInTarget({ targetDir, mode, skipDevApps, log = console.log }) {
-  // eng#232 (renamed cinatra-cli#61): invoke the CANONICAL namespaced form
+  // The command-routing contract (renamed cinatra-cli#61): invoke the CANONICAL namespaced form
   // (`cinatra instance setup <mode>`) so install's own flow never triggers a
   // deprecation notice or steers the operator onto the deprecated bare alias.
   const setupArgs = [PUBLISHED_CLI_BIN, "instance", "setup", mode];

@@ -92,9 +92,10 @@ describe("cinatra <subcommand> --help across matcher shapes", () => {
     [["install", "--help"], "cinatra install"], // command, destructive
     [["update", "--help"], "cinatra update"], // command, moves git + reconciles — must NOT run on --help
     [["upgrade", "--help"], "cinatra upgrade"], // command, alias of update — same footgun guard
-    // eng#232 (renamed cinatra-cli#61): Class-C bootstrap commands are namespaced
-    // under `cinatra instance …`. cinatra-cli#62: the branch lifecycle was renamed
-    // to `instance branch setup|teardown` (the `command+mode+sub` shape here).
+    // The command-routing contract (renamed cinatra-cli#61): Class-C bootstrap
+    // commands are namespaced under `cinatra instance …`. cinatra-cli#62: the
+    // branch lifecycle was renamed to `instance branch setup|teardown` (the
+    // `command+mode+sub` shape here).
     [["instance", "branch", "setup", "--help"], "cinatra instance branch setup"], // command+mode+sub, destructive
     [["instance", "branch", "teardown", "--help"], "cinatra instance branch teardown"], // command+mode+sub, destructive
     [["instance", "db", "migrate", "--help"], "cinatra instance db migrate"], // command+mode+sub, destructive
@@ -169,12 +170,12 @@ describe("cinatra <subcommand> --help edge cases", () => {
     expect(res.stdout).not.toMatch(/^Usage: cinatra install$/m);
   });
 
-  // eng#232 (renamed cinatra-cli#61): a DEPRECATED bare alias (`db migrate`, …)
-  // with --help must still short-circuit (footgun guard: exit 0, NO side effect)
-  // and resolve to the CANONICAL `instance …` synopsis, steering the user to the
-  // new form. cinatra-cli#62: the `instance setup branch` / `instance teardown
-  // branch` forms were renamed; their bare aliases now resolve to the new
-  // `instance branch setup|teardown` canonical.
+  // The command-routing contract (renamed cinatra-cli#61): a DEPRECATED bare alias
+  // (`db migrate`, …) with --help must still short-circuit (footgun guard: exit 0,
+  // NO side effect) and resolve to the CANONICAL `instance …` synopsis, steering
+  // the user to the new form. cinatra-cli#62: the `instance setup branch` /
+  // `instance teardown branch` forms were renamed; their bare aliases now resolve
+  // to the new `instance branch setup|teardown` canonical.
   const aliasHelpCases = [
     [["db", "migrate", "--help"], "cinatra instance db migrate"],
     [["clone", "prune", "--help"], "cinatra instance clone prune"],

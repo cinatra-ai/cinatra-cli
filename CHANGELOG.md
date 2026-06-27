@@ -78,7 +78,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
   hint pointing at its `cinatra dev …` form (suppressed for the
   `clone slug-for-worktree` shell hook and via `CINATRA_SUPPRESS_DEPRECATION=1`).
   They will be removed in a future minor; update your scripts to the namespaced
-  commands. (cinatra-ai/engineering#232)
+  commands.
 
 ### Performance
 
@@ -88,7 +88,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
   `create-extension`, `cinatra dev --help`) no longer pay its load cost. The
   local bootstrap commands still run fully LOCALLY — `cinatra dev db migrate`
   and `cinatra dev setup` work even when the app server is down, talking to
-  Postgres and local tooling directly. (cinatra-ai/engineering#232)
+  Postgres and local tooling directly.
 
 ### Added
 

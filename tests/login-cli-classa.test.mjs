@@ -1,4 +1,4 @@
-// eng#231 — CLI Class-A: RFC 8707 `resource` on interactive auth/exchange/
+// CLI remote-target security model — CLI Class-A: RFC 8707 `resource` on interactive auth/exchange/
 // refresh, the audience-bound byte helpers, the loopback-unauthenticated read
 // path, and the target-origin destructive guard.
 //
@@ -298,7 +298,7 @@ describe("target-origin destructive guard", () => {
   it("refuses a destructive verb against a remote (non-loopback) target", () => {
     expect(() =>
       assertDestructiveTargetAllowed("https://public.example.com", "extensions purge"),
-    ).toThrow(/operator security gate \(eng#229\)/);
+    ).toThrow(/operator security gate/);
   });
 
   it("allows a destructive verb against a loopback target", () => {

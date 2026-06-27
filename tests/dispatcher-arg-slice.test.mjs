@@ -1,6 +1,6 @@
-// Dispatcher arg-slice contract + deprecation notice (eng#232 §2.2 steps 2–3).
+// Dispatcher arg-slice contract + deprecation notice (the command-routing contract).
 //
-// The eng#232 dispatcher computes, for the matched descriptor:
+// The dispatcher computes, for the matched descriptor:
 //   routedTokens = argv.slice(0, descriptor.path.length)
 //   rest         = argv.slice(descriptor.path.length)
 // so a handler reads its routed mode token from `routedTokens` and its trailing

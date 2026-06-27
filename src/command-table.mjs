@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
 // Declarative command table for the `cinatra` CLI (cinatra#255 Stage-1;
-// eng#232 Class-C namespacing).
+// the command-routing contract / Class-C namespacing).
 //
 // Plain ESM `.mjs`, NO imports, NO heavy deps — importable from anywhere
 // (including the eager-`pg`-free unit tests). This module owns the DECLARATIVE
@@ -15,7 +15,7 @@
 // and `buildHelpIndex` lets a drift test assert the help banner and the
 // dispatcher stay in lockstep.
 //
-// MATCHING CONTRACT (eng#232 — REPLACES the old first-match-wins contract):
+// MATCHING CONTRACT (the command-routing contract — REPLACES the old first-match-wins contract):
 //   * Selection is LONGEST-MATCH-WINS, not first-match-wins. `matchDescriptor`
 //     collects every descriptor whose `path` prefix-matches the leading argv
 //     tokens and returns the one with the LONGEST `path`. This is required
@@ -215,12 +215,12 @@ export const COMMAND_DESCRIPTORS = [
     summary: "Import an agent template from a ZIP archive created by `agent export`.",
   },
 
-  // ----- Class-C local host/monorepo bootstrap — namespaced under `cinatra instance …` (eng#232; cinatra-cli#61) -----
+  // ----- Class-C local host/monorepo bootstrap — namespaced under `cinatra instance …` (the command-routing contract; cinatra-cli#61) -----
   // The `instance …` head (cinatra-cli#61): these manage a local Cinatra
   // *instance* and several take an explicit `dev|prod` mode, so a `dev` head was
   // misleading (`cinatra dev setup prod` was self-contradictory). The old `dev …`
   // head is REMOVED with no back-compat alias — `cinatra dev …` no longer resolves.
-  // (The bare-path aliases below are a SEPARATE eng#232 deprecation lane and now
+  // (The bare-path aliases below are a SEPARATE deprecation lane and now
   // point at the `instance …` canonical forms.)
   {
     id: "instance",
@@ -400,7 +400,7 @@ export const COMMAND_DESCRIPTORS = [
   // Each REUSES the canonical id, is `hidden`, and carries `deprecated:"<new>"`.
   // They reserve the old bare token paths LOCAL during the deprecation window
   // (OD-1(A)): a future Class-A remote/admin variant of `db migrate` /
-  // `agent …` (eng#231) must take a DISTINCT `admin …` head, never these tokens.
+  // `agent …` (the CLI remote-target security model) must take a DISTINCT `admin …` head, never these tokens.
   // cinatra-cli#61: their targets now point at the `instance …` canonical forms
   // (the `dev …` namespace they used to alias no longer exists).
   {
@@ -666,7 +666,7 @@ function expandedPaths(d) {
 }
 
 /**
- * Load-time table-validity assertion (eng#232 codex MUST-FIX). Fails the build
+ * Load-time table-validity assertion (the command-routing contract). Fails the build
  * LOUDLY (throws) on any condition that would make longest-match routing
  * ambiguous or let an alias shadow a real command:
  *

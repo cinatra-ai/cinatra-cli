@@ -1,4 +1,4 @@
-// Server-down LOCAL guarantee (eng#232 §3).
+// Server-down LOCAL guarantee (the command-routing contract).
 //
 // Class C exists precisely BECAUSE `dev db migrate` / `dev setup` must work when
 // the app server is down (a migrate that needed the app up could never repair a

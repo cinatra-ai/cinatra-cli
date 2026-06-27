@@ -1,4 +1,4 @@
-// Fetch-poison preload (eng#232 §3 server-down guarantee). Registered via
+// Fetch-poison preload (the command-routing contract — server-down guarantee). Registered via
 // `node --import`, it replaces `global.fetch` with a thrower carrying a stable
 // marker. A Class-C server-down-safe command (`dev db migrate`, `dev setup`)
 // must NEVER take a HARD dependency on reaching the running instance over the
