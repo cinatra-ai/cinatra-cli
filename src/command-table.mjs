@@ -92,7 +92,7 @@ export const COMMAND_DESCRIPTORS = [
     id: "update",
     path: ["update"],
     match: "command",
-    summary: "Move this checkout to the latest v* release, then reconcile deps + dev DB.",
+    summary: "Update the CLI or an instance (two-choice; non-TTY defaults to the instance).",
   },
   {
     id: "upgrade",
