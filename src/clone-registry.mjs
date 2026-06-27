@@ -85,7 +85,7 @@ export function cloneSlugFromBranch(branch) {
     .slice(0, 30);
 }
 
-/** A slug is valid iff it matches the same shape `cinatra instance setup branch` enforces. */
+/** A slug is valid iff it matches the same shape `cinatra instance branch setup` enforces. */
 export function isValidSlug(slug) {
   return typeof slug === "string" && /^[a-z0-9][a-z0-9-]{0,29}$/.test(slug);
 }
