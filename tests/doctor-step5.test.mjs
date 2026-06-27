@@ -212,7 +212,7 @@ describe("doctorAssertDevAppsPresence", () => {
     const a = doctorAssertDevAppsPresence(tmp);
     expect(a.verdict).toBe("fail");
     expect(a.detail).toMatch(/dev\/wordpress-plugin/);
-    expect(a.remediation).toMatch(/cinatra dev setup dev/);
+    expect(a.remediation).toMatch(/cinatra instance setup dev/);
   });
 
   it("FAILS when config exists but a required CMS entry is UNDECLARED (codex must-fix)", () => {

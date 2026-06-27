@@ -60,8 +60,8 @@ describe("server-down guarantee — static boundary on the db/setup path", () =>
   });
 });
 
-describe("server-down guarantee — runtime fetch-poison on `dev db migrate`", () => {
-  it("`dev db migrate` fails on a DB/checkout reason, never on a required network step", () => {
+describe("server-down guarantee — runtime fetch-poison on `instance db migrate`", () => {
+  it("`instance db migrate` fails on a DB/checkout reason, never on a required network step", () => {
     const checkout = makeFakeCheckout({
       env: {
         SUPABASE_DB_URL: "postgres://nope:nope@127.0.0.1:5999/cinatra_serverdown",
@@ -71,7 +71,7 @@ describe("server-down guarantee — runtime fetch-poison on `dev db migrate`", (
     try {
       const res = spawnSync(
         process.execPath,
-        ["--import", POISON, BIN, "dev", "db", "migrate"],
+        ["--import", POISON, BIN, "instance", "db", "migrate"],
         {
           encoding: "utf8",
           timeout: 30_000,

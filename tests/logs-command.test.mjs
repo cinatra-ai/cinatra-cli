@@ -117,11 +117,11 @@ describe("cinatra logs --app — dev-main app log file tail", () => {
     expect(res.stdout).not.toMatch(/Container logs/i);
   });
 
-  it("prints a `cinatra dev start` hint when no app log exists yet", () => {
+  it("prints a `cinatra instance start` hint when no app log exists yet", () => {
     const res = runLogs(["--app"]);
     expect(res.status).toBe(0);
     expect(res.stdout).toMatch(/No app log yet/i);
-    expect(res.stdout).toMatch(/cinatra dev start/);
+    expect(res.stdout).toMatch(/cinatra instance start/);
   });
 });
 

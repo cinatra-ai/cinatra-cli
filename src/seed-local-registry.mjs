@@ -385,7 +385,7 @@ export async function seedLocalRegistryExtensions({
     summary.status = "skipped-unreachable";
     console.log(
       `- Local registry seed: skipped (Verdaccio not reachable at ${registryUrl}; ` +
-        `start the docker stack and re-run \`cinatra setup dev\` to seed bundled extensions).`,
+        `start the docker stack and re-run \`cinatra instance setup dev\` to seed bundled extensions).`,
     );
     return summary;
   }
