@@ -92,8 +92,8 @@ describe("cinatra <subcommand> --help across matcher shapes", () => {
     [["install", "--help"], "cinatra install"], // command, destructive
     [["update", "--help"], "cinatra update"], // command, moves git + reconciles — must NOT run on --help
     [["upgrade", "--help"], "cinatra upgrade"], // command, alias of update — same footgun guard
-    // eng#232 (renamed cinatra-cli#61): Class-C bootstrap commands are namespaced
-    // under `cinatra instance …`.
+    // The command-routing contract (renamed cinatra-cli#61): Class-C bootstrap
+    // commands are namespaced under `cinatra instance …`.
     [["instance", "setup", "dev", "--help"], "cinatra instance setup"], // command+mode+sub (dev|prod alt), destructive
     [["instance", "db", "migrate", "--help"], "cinatra instance db migrate"], // command+mode+sub, destructive
     [["instance", "clone", "prune", "--help"], "cinatra instance clone prune"], // command+mode+sub, destructive
@@ -157,7 +157,7 @@ describe("cinatra <subcommand> --help edge cases", () => {
     expect(res.stdout).not.toMatch(/^Usage: cinatra install$/m);
   });
 
-  // eng#232 (renamed cinatra-cli#61): a DEPRECATED bare alias (`setup dev`,
+  // The command-routing contract (renamed cinatra-cli#61): a DEPRECATED bare alias (`setup dev`,
   // `db migrate`, …) with --help must still short-circuit (footgun guard: exit 0,
   // NO side effect) and resolve to the CANONICAL `instance …` synopsis, steering
   // the user to the new form.

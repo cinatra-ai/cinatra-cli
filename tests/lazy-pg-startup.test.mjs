@@ -1,10 +1,10 @@
-// Lazy-`pg` / lean-STARTUP guard (eng#232 §4.1 + §4.5).
+// Lazy-`pg` / lean-STARTUP guard (the command-routing contract).
 //
 // `pg` is the one genuinely heavy native runtime dependency in the published
 // tarball. Before this change `src/index.mjs` did a top-level `import pg`, so
 // importing the CLI entry (which `bin/cinatra.mjs` does for EVERY command) paid
 // the native pg load even for `--help` / `--version` / `login` /
-// `create-extension` / `dev --help`. eng#232 moves pg behind the single
+// `create-extension` / `dev --help`. The command-routing change moves pg behind the single
 // `createClient` chokepoint via a memoized `getPgClientCtor()`.
 //
 // These tests drive the REAL `bin/cinatra.mjs` (not just `import("../src/...")`)

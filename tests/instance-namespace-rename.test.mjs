@@ -9,7 +9,7 @@
 //   3. The OLD `cinatra dev …` namespace is FULLY GONE — no alias, no resolution.
 //      Every former `dev …` form (and the bare `dev` head) exits non-zero with an
 //      "Unknown command" error (cinatra-cli#61: remove `dev` entirely, per owner).
-//   4. The pre-existing eng#232 bare-path aliases (`clone list`, `db migrate`, …)
+//   4. The pre-existing bare-path aliases (`clone list`, `db migrate`, …)
 //      still work and now steer users at the `instance …` canonical form.
 
 import { spawnSync } from "node:child_process";
@@ -105,7 +105,7 @@ describe("cinatra-cli#61 — the old `dev` namespace is fully removed", () => {
   });
 });
 
-describe("cinatra-cli#61 — eng#232 bare-path aliases now target `instance …`", () => {
+describe("cinatra-cli#61 — bare-path aliases now target `instance …`", () => {
   it("`cinatra clone list` still works and steers the user at `cinatra instance clone list`", () => {
     const home = tmpHome();
     try {

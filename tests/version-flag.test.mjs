@@ -48,9 +48,9 @@ describe("cinatra --version", () => {
     const res = runCli(["--help"]);
     expect(res.status).toBe(0);
     expect(res.stdout).toContain("Cinatra setup CLI");
-    // eng#232 (renamed cinatra-cli#61): the local bootstrap commands moved under
-    // `cinatra instance …`; the top-level banner points at them rather than
-    // listing `cinatra setup`.
+    // The command-routing contract (renamed cinatra-cli#61): the local bootstrap
+    // commands moved under `cinatra instance …`; the top-level banner points at
+    // them rather than listing `cinatra setup`.
     expect(res.stdout).toContain("cinatra instance");
     expect(res.stdout).toContain("cinatra install");
   });

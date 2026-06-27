@@ -149,8 +149,8 @@ describe("extension-empty CLI bootstrap — cold-start load", () => {
     // No load-time crash on the absent connector source.
     expect(output).not.toMatch(/Cannot find module/);
     expect(res.status).toBe(0);
-    // The help banner actually rendered (a handler-free path). eng#232 (renamed
-    // cinatra-cli#61): the local bootstrap commands moved under `cinatra instance …`.
+    // The help banner actually rendered (a handler-free path). The command-routing
+    // contract (renamed cinatra-cli#61): the local bootstrap commands moved under `cinatra instance …`.
     expect(output).toContain("cinatra instance");
   });
 });

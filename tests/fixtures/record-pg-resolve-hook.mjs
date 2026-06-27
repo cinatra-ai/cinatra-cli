@@ -1,4 +1,4 @@
-// Resolve hook for the lean-startup probe (eng#232 §4.5). Emits a stable
+// Resolve hook for the lean-startup probe (the command-routing contract). Emits a stable
 // `__HEAVY_DEP_LOADED__:<name>` line to STDERR the first time any tracked heavy
 // Class-C dependency is RESOLVED (which precedes loading). Tracking resolution
 // (not just load) is conservative: if a specifier is resolved at all, it was

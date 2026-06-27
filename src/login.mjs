@@ -41,7 +41,7 @@ import {
 } from "@modelcontextprotocol/sdk/client/auth.js";
 
 // The OAuth scopes the CLI requests. `mcp:connect` is the instance's admission
-// scope for the control plane; the `cli:*` scopes (eng#231) admit the
+// scope for the control plane; the `cli:*` scopes (the CLI remote-target security model) admit the
 // authenticated `/api/cli/*` read/authoring control plane; the rest are
 // standard OIDC scopes for the token + refresh. Authorization (role) is
 // enforced SERVER-SIDE per endpoint from the verified subject — the scope only
@@ -59,7 +59,7 @@ export const CLI_OAUTH_SCOPES = [
 
 const CLIENT_NAME = "Cinatra CLI";
 
-// eng#231: the dedicated RFC 8707 resource the CLI binds its token to. Passing
+// The CLI remote-target security model: the dedicated RFC 8707 resource the CLI binds its token to. Passing
 // `resource=<origin>/api/cli` on authorize/exchange/refresh makes the AS mint a
 // JWT with `aud=<origin>/api/cli`, which the server's verified-Bearer resolver
 // JWKS-verifies as a remote Bearer — distinct from the `/api/mcp` audience.
@@ -99,7 +99,7 @@ const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
  * (`::1`/`[::1]`), and the ENTIRE IPv4 `127.0.0.0/8` block — and rejects
  * lookalikes (`127.0.0.1.evil.com`, `0x7f.0.0.1`, `localhost.evil.com`). A
  * non-loopback origin is the gate for refusing remote destructive operations
- * and for requiring a token (eng#231).
+ * and for requiring a token (the CLI remote-target security model).
  */
 export function isLoopbackHostname(hostname) {
   if (LOOPBACK_HOSTNAMES.has(hostname)) return true;
@@ -363,7 +363,7 @@ export async function runLogin(opts) {
 
     // 4. Build the authorization URL (PKCE) and open the browser. Bind the
     //    token to the `/api/cli` resource (RFC 8707) so it is JWKS-verifiable
-    //    as a remote Bearer at the CLI control plane (eng#231).
+    //    as a remote Bearer at the CLI control plane (the CLI remote-target security model).
     const resource = cliResourceFor(origin);
     const { authorizationUrl, codeVerifier } = await startAuthorization(origin, {
       metadata,
@@ -425,7 +425,7 @@ export function buildProfileRecord(
     refreshToken: tokens.refresh_token ?? null,
     tokenType: tokens.token_type ?? "Bearer",
     scope: tokens.scope ?? CLI_OAUTH_SCOPES.join(" "),
-    // eng#231: the RFC 8707 resource the token is bound to (re-sent on refresh
+    // The CLI remote-target security model: the RFC 8707 resource the token is bound to (re-sent on refresh
     // so the refreshed token keeps `aud=<origin>/api/cli`). Defaults to the
     // origin's `/api/cli` resource when not explicitly supplied.
     resource: resource ?? cliResourceFor(origin).href,
@@ -482,7 +482,7 @@ export async function resolveAccessToken(opts = {}) {
     throw new Error(`Could not discover OAuth metadata at ${record.origin} to refresh.`);
   }
   // Re-send the stored RFC 8707 resource so the refreshed token keeps the
-  // `<origin>/api/cli` audience (eng#231). Fall back to the origin's resource
+  // `<origin>/api/cli` audience (the CLI remote-target security model). Fall back to the origin's resource
   // for profiles persisted before `resource` was stored.
   const refreshResource = record.resource
     ? new URL(record.resource)
@@ -586,7 +586,7 @@ export async function fetchRemoteStatus(opts = {}) {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve the request origin + headers for a Class-A call (eng#231).
+ * Resolve the request origin + headers for a Class-A call (the CLI remote-target security model).
  *
  * LOOPBACK origins (a local dev box) skip `resolveAccessToken` and send NO
  * Authorization header — the server's dev-admin loopback bypass authorizes
@@ -659,9 +659,9 @@ export async function cliApiPostBytes(
 }
 
 /**
- * Belt-and-suspenders guard (eng#231): refuse a destructive/mutating verb
+ * Belt-and-suspenders guard (the CLI remote-target security model): refuse a destructive/mutating verb
  * against a NON-loopback target BEFORE any network call. The server keeps the
- * destructive surface gated on the operator security gate (eng#229); this CLI
+ * destructive surface gated on the operator security gate; this CLI
  * gate makes a remote-destructive call structurally impossible in the
  * published bin. Loopback targets are allowed (authorized via the dev-bypass).
  *
@@ -674,7 +674,7 @@ export function assertDestructiveTargetAllowed(appUrl, verb) {
   if (isLoopbackOrigin(appUrl)) return; // loopback dev box, allowed via bypass
   throw new Error(
     `Refusing "${verb}" against a remote instance (${appUrl}): remote ` +
-      "destructive operations are disabled by the operator security gate (eng#229). " +
+      "destructive operations are disabled by the operator security gate. " +
       "Run destructive commands locally (loopback) only.",
   );
 }

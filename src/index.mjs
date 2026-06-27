@@ -8,7 +8,7 @@ import { createInterface } from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import net from "node:net";
 // `pg` is the one genuinely heavy native runtime dependency in the published
-// tarball. It is NO LONGER imported at top level (eng#232): importing this
+// tarball. It is NO LONGER imported at top level (the command-routing contract): importing this
 // module from `bin/cinatra.mjs` runs for EVERY command, and a top-level
 // `import pg` paid the native-load cost even for `--help` / `--version` /
 // `login` / `create-extension`, which never touch the DB. It is now lazy-loaded
@@ -594,7 +594,7 @@ Commands:
 }
 
 /**
- * Print the `cinatra instance …` group banner (eng#232; renamed cinatra-cli#61).
+ * Print the `cinatra instance …` group banner (the command-routing contract; renamed cinatra-cli#61).
  * This is the Class-C local host/monorepo bootstrap surface — the commands a
  * contributor/operator runs from inside a checkout to manage a local Cinatra
  * *instance* (dev OR prod; several take an explicit `dev|prod` mode). It is shown
@@ -902,7 +902,7 @@ function normalizeOptionalUrl(value) {
 
 /**
  * Refuse a destructive/mutating verb against a remote (non-loopback) target
- * before any network call (eng#231). Delegates to the login module's
+ * before any network call. Delegates to the login module's
  * target-origin guard via a lazy import (keeps the heavy module out of the
  * top-level import graph). A null/loopback `appUrl` is allowed.
  *
@@ -1156,7 +1156,7 @@ function readConfiguredRuntimeMode(env) {
   return "development";
 }
 
-// Lazy `pg` (eng#232 §4.1). `pg` is a CJS module; under some loaders its
+// Lazy `pg` (the command-routing contract). `pg` is a CJS module; under some loaders its
 // namespace exposes `Client` on `.default`, under others on the namespace
 // itself — normalize before reading `.Client`. Memoized so repeated DB
 // operations in one process pay the import cost once.
@@ -10328,9 +10328,9 @@ async function runSkillsResetRepo(argv) {
     throw new Error('Pass --yes to confirm: cinatra skills reset-repo --yes\nThis will replace all content in the connected GitHub skills repo with the local store.');
   }
 
-  // eng#231: refuse a remote (non-loopback) target before any network call —
+  // Refuse a remote (non-loopback) target before any network call —
   // `skills reset-repo` is a destructive force-push; remote-destructive stays
-  // gated on the operator security gate (eng#229).
+  // gated on the operator security gate.
   await assertRemoteDestructiveRefused(readOptionValue(argv, "--app-url"), "skills reset-repo");
 
   const appUrl = normalizeOptionalUrl(readOptionValue(argv, "--app-url") ?? "http://localhost:3000");
@@ -10384,9 +10384,9 @@ async function runExtensionsPurge(argv) {
     );
   }
   const reason = readOptionValue(argv, "--reason");
-  // eng#231: refuse a remote (non-loopback) target before any network call —
+  // Refuse a remote (non-loopback) target before any network call —
   // `extensions purge` is irreversible; remote-destructive stays gated on the
-  // operator security gate (eng#229).
+  // operator security gate.
   await assertRemoteDestructiveRefused(readOptionValue(argv, "--app-url"), "extensions purge");
   const appUrl = normalizeOptionalUrl(
     readOptionValue(argv, "--app-url") ?? "http://localhost:3000",
@@ -10637,7 +10637,7 @@ async function runAgentExport(argv) {
   const query = argv.find((a) => !a.startsWith("--"));
   if (!query) throw new Error('Usage: cinatra agent export <id-or-name> [--file <output.zip>]');
 
-  // Remote path (eng#231): when a target is selected (--app-url or --profile),
+  // Remote path (the CLI remote-target security model): when a target is selected (--app-url or --profile),
   // fetch the portable ZIP from the instance's authenticated
   // /api/cli/agents/export (no DB connection string needed). The LOCAL
   // direct-Postgres path below is the fallback for the in-repo dev workflow.
@@ -10748,7 +10748,7 @@ async function runAgentImport(argv) {
 
   const zipBuf = readFileSync(absPath);
 
-  // Remote path (eng#231): when a target is selected, POST the ZIP body to the
+  // Remote path (the CLI remote-target security model): when a target is selected, POST the ZIP body to the
   // instance's authenticated /api/cli/agents/import (insert-only authoring).
   // The LOCAL direct-Postgres path below is the in-repo dev fallback.
   const appUrl = readOptionValue(argv, "--app-url");
@@ -10888,7 +10888,7 @@ function readCliVersion() {
  * Build the id-keyed handler map for `runCli`. Each handler closes over the
  * local run* implementations.
  *
- * eng#232 dispatch contract: every handler receives `(rest, routedTokens)` where
+ * Command-routing dispatch contract: every handler receives `(rest, routedTokens)` where
  * `rest = argv.slice(descriptor.path.length)` (every token AFTER the routed
  * path) and `routedTokens = argv.slice(0, descriptor.path.length)`. A handler
  * that needs a routed mode token reads it from `routedTokens` (e.g.
@@ -10905,7 +10905,7 @@ function readCliVersion() {
 function buildHandlers() {
   return {
     install: async (rest) => {
-      // eng#232 dispatcher contract: `rest = argv.slice(path.length)` already
+      // Command-routing dispatcher contract: `rest = argv.slice(path.length)` already
       // holds EVERY token after `install` (the old `mode` re-prepend is gone).
       // The heavy bootstrap body is lazy-loaded to keep the dependency-light
       // core lean — install.mjs uses only node builtins + git/docker/corepack
@@ -10961,7 +10961,7 @@ function buildHandlers() {
     // Class-B authoring: scaffold a new extension package on disk. Folded from
     // the retired `npx create-cinatra-extension` thin alias (cinatra#402) over a
     // shared, zero-dependency authoring core lazy-loaded from ./authoring/.
-    // eng#232 dispatcher contract: `rest` already holds the `<kind>`/name/flags.
+    // Command-routing dispatcher contract: `rest` already holds the `<kind>`/name/flags.
     "create-extension": async (rest) => {
       const { runCreateExtension } = await import("./authoring/cli.mjs");
       await runCreateExtension(rest);
@@ -11065,7 +11065,7 @@ function buildHandlers() {
     doctor: async (rest) => {
       await runDoctor(rest);
     },
-    // Alias: `cinatra mcp llm-access verify`. eng#232: the `verify` token is now
+    // Alias: `cinatra mcp llm-access verify`. Command-routing contract: the `verify` token is now
     // part of the routed path, so `rest` already excludes it (no `.slice(1)`).
     "mcp.llm-access.verify": async (rest) => {
       await runDoctor(rest);
@@ -11118,7 +11118,7 @@ export async function runCli(argv) {
   // used to silently ignore the unknown flag, so a destructive handler would
   // EXECUTE on `--help`. This fires BEFORE dispatch, so no side effect can occur.
   //
-  // eng#232 (renamed cinatra-cli#61): the `instance` GROUP head is special-cased
+  // The command-routing contract (renamed cinatra-cli#61): the `instance` GROUP head is special-cased
   // BEFORE the generic command help so `cinatra instance --help` (and a bare
   // `cinatra instance`) print the Class-C sub-banner, not a per-command synopsis
   // or the global banner.
@@ -11151,7 +11151,7 @@ export async function runCli(argv) {
       process.exit(1);
     }
 
-    // eng#232 dispatcher arg-slice contract: `rest` is everything AFTER the
+    // Command-routing dispatcher arg-slice contract: `rest` is everything AFTER the
     // routed path tokens; `routedTokens` is the matched path slice (so a handler
     // can read a routed mode token like `dev|prod`). Canonical and deprecated
     // alias forms each slice off THEIR OWN path length, so the shared handler
@@ -11179,8 +11179,8 @@ export async function runCli(argv) {
 }
 
 /**
- * Emit the one-line deprecation notice for a matched alias descriptor (eng#232
- * §2.2 step 3). Goes to STDERR only (never STDOUT), so script/stdout consumers
+ * Emit the one-line deprecation notice for a matched alias descriptor (the
+ * command-routing contract). Goes to STDERR only (never STDOUT), so script/stdout consumers
  * are unaffected. Suppressed for the machine-consumed hook command
  * (`clone slug-for-worktree`) and when `CINATRA_SUPPRESS_DEPRECATION=1`.
  *

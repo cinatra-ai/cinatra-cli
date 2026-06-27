@@ -1,8 +1,8 @@
-// Command-table drift + routing invariant (cinatra#255 Stage-1; eng#232
-// Class-C namespacing).
+// Command-table drift + routing invariant (cinatra#255 Stage-1; the
+// command-routing contract / Class-C namespacing).
 //
 // The CLI dispatcher routes through the declarative descriptors in
-// `src/command-table.mjs` via a LONGEST-MATCH-WINS matcher (eng#232 — replacing
+// `src/command-table.mjs` via a LONGEST-MATCH-WINS matcher (replacing
 // the old first-match-wins scan) with a load-time `validateCommandTable`
 // ambiguity/shadow assertion. These tests are the load-bearing guard that:
 //
@@ -529,7 +529,7 @@ describe("command table — descriptor snapshot", () => {
   });
 
   it("every CANONICAL (non-deprecated) descriptor path is unique", () => {
-    // eng#232: alias descriptors deliberately REUSE the canonical id, so the old
+    // The command-routing contract: alias descriptors deliberately REUSE the canonical id, so the old
     // "every id is unique" invariant no longer holds. The real invariant is that
     // no two canonical commands share a routable path.
     const canonical = COMMAND_DESCRIPTORS.filter((d) => !d.deprecated);
@@ -720,7 +720,7 @@ describe("command table — routing (longest-match + aliases)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 2b. Class-A stay-bare guard (eng#232 D2 / F3j).
+// 2b. Class-A stay-bare guard (the command-routing contract).
 // ---------------------------------------------------------------------------
 describe("command table — Class-A control plane stays bare", () => {
   const bareClassA = [
