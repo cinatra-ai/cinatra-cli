@@ -20,7 +20,7 @@ import { renderTree, isNonEmptyDir } from "./template.mjs";
 // This authoring core lives at `src/authoring/` inside the cinatra-cli repo;
 // the scaffold templates ship at the repo root under `templates/`. So the repo
 // root is TWO levels up from this module (src/authoring → src → <repo root>).
-// (Provenance: folded from cinatra-ai/create-cinatra-extension, where this same
+// (Provenance: folded in from the former standalone create-cinatra-extension scaffolder, where this same
 // module sat at `src/` and resolved the root one level up — cinatra#402.)
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = resolve(__dirname, "..", "..");
