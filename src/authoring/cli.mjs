@@ -1,7 +1,7 @@
 // `cinatra create-extension <kind> [name] [options]` — scaffold a new Cinatra
 // extension package on disk (class-B authoring).
 //
-// Folded from cinatra-ai/create-cinatra-extension@c46f6b5 (cinatra#402): the old
+// Folded in from the former standalone create-cinatra-extension scaffolder (cinatra#402): the old
 // `npx create-cinatra-extension <kind>` thin alias is dropped; this is the
 // single authoring entry point. The scaffold CORE (scaffold/kinds/naming/
 // template + the templates/ tree) is shared, zero-dependency, Node-builtins
