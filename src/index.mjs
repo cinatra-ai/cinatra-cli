@@ -26,6 +26,12 @@ import { deriveKindFromName, syncCinatraDevExtensions } from "./cinatra-dev-exte
 import { LOCAL_REGISTRY_URL, seedLocalRegistryExtensions } from "./seed-local-registry.mjs";
 import { parseDevRefreshFlags, describeDockerDecision } from "./dev-refresh.mjs";
 import {
+  CLI_INSTALL_SPEC,
+  parseUpdateArgs,
+  resolveUpdatePath,
+  resolveInstanceMoveTarget,
+} from "./update-target.mjs";
+import {
   SEED_DB_NAME,
   cloneSlugFromBranch,
   cloneDbName,
@@ -430,18 +436,23 @@ Commands:
                     --dry-run               Show the plan; make no changes.
                     --status                Read-only: this checkout's instance state (registry/live = truth).
                     --list-instances        Read-only: list all recorded instances.
-  update            Move THIS checkout to a newer release, then reconcile deps +
-  (alias: upgrade)  the dev database. Fetches origin --tags and fast-forwards the
-                    checkout to the latest \`v*\` release tag (or --ref), then runs
-                    the \`instance refresh\` reconcile. Dev mode only; refuses a dirty or
-                    divergent tree unless --force (which stashes / hard-resets,
-                    exactly like install). Production upgrades via release-tagged
-                    Docker images, never this command.
-                    --ref <ref>       Move to a specific branch/tag/sha (default: latest v* release).
-                    --force           Stash a dirty tree / hard-reset a divergent branch first.
-                    --docker=auto     (default) start the bundled docker stack only when owned.
-                    --docker=always   force docker compose up -d during the reconcile.
-                    --no-docker       skip the docker step of the reconcile.
+  update            Two-choice update. In a terminal, pick: (1) Update the CLI
+  (alias: upgrade)  [default] — \`npm install -g @cinatra-ai/cinatra@latest\`; or
+                    (2) Update a Cinatra instance — move THIS checkout forward by
+                    type (dev → latest \`origin/main\`; prod → latest \`v*\` release)
+                    then run the \`instance refresh\` reconcile (deps + dev DB).
+                    Non-interactively (piped/CI) it NEVER prompts: defaults to the
+                    instance update (script back-compat) unless --cli. Refuses a
+                    dirty/divergent tree unless --force (which stashes /
+                    hard-resets, like install).
+                    --cli             Update the CLI itself (npm install -g …); then re-run cinatra.
+                    --instance        Update the instance (move checkout + reconcile); bypasses the prompt.
+                    --ref <ref>       (instance) move to a specific branch/tag/sha instead of the default.
+                    --force           (instance) stash a dirty tree / hard-reset a divergent branch first.
+                    --docker=auto     (instance) start the bundled docker stack only when owned (default).
+                    --docker=always   (instance) force docker compose up -d during the reconcile.
+                    --no-docker       (instance) skip the docker step of the reconcile.
+                    --dry-run         Describe the chosen action; make no changes.
   skills reset-repo Force-push the entire local skills store to the connected
                     GitHub skills repository (dev mode only). Replaces all repo
                     content with what is currently in data/skills/.
@@ -714,6 +725,32 @@ or \`cinatra --help\` for the top-level command list.
 // every other command keeps the minimal synopsis. The block is printed AFTER the
 // `Usage:` synopsis and BEFORE the "see cinatra --help" pointer.
 const COMMAND_HELP_DETAILS = {
+  update: `Two-choice update (cinatra-cli#60):
+  1. Update the CLI       [default in a terminal] — npm install -g @cinatra-ai/cinatra@latest,
+                          then re-run cinatra (the running process holds the old code).
+  2. Update an instance   move THIS checkout forward by type, then reconcile deps + dev DB:
+                            dev  → fast-forward to the latest origin/main
+                            prod → move to the latest v* release tag
+
+Interactive (TTY): a picker (↑/↓ or 1/2, Enter); default highlighted = update the CLI.
+Non-interactive (piped/CI): never prompts — defaults to the INSTANCE update (script
+back-compat) unless --cli. Explicit flags always bypass the prompt.
+
+Options:
+  --cli                Update the CLI itself (mutually exclusive with the instance flags).
+  --instance           Update the instance (move checkout + reconcile).
+  --ref <ref>          (instance) move to a specific branch/tag/sha instead of the type default.
+  --force              (instance) stash a dirty tree / hard-reset a divergent branch first.
+  --docker=auto|always (instance) docker behavior during the dev reconcile (default: auto).
+  --no-docker          (instance) skip the docker step of the reconcile.
+  --dry-run            Describe the chosen action; make no changes.
+
+Examples:
+  cinatra update                 # TTY: pick CLI or instance; non-TTY: update the instance
+  cinatra update --cli           # update the CLI (npm install -g …)
+  cinatra update --instance      # update the instance (dev→origin/main, prod→release)
+  cinatra update --ref <tag-or-sha>  # update the instance to a specific ref
+  cinatra update --cli --dry-run     # show what the CLI update would run`,
   "create-extension": `Kinds:
   agent       An OpenAgentSpec Flow + co-located skills (first-party scope).
   connector   A capability/MCP provider with a register(ctx) server entry (any scope).
@@ -4745,91 +4782,229 @@ async function runDbMigrate(rest) {
 }
 
 // ---------------------------------------------------------------------------
-// Release update (`cinatra update` / `cinatra upgrade`) — cinatra-cli#11.
+// Update (`cinatra update` / `cinatra upgrade`) — cinatra-cli#11, #60.
 // ---------------------------------------------------------------------------
 //
-// Unlike `instance refresh` (which reconciles deps + dev DB to the code ALREADY
-// checked out and never touches git) and unlike `install` (which bootstraps from
-// zero), `update` is the one command that MOVES an existing checkout forward: it
-// fetches origin --tags, fast-forwards the checkout to the latest published `v*`
-// release tag (reusing install.mjs's shared git-move helpers — the same fetch →
-// checkout → ff-only/reset logic install uses, exported as
-// fastForwardCheckoutToRef + resolveLatestReleaseTag), then runs the `dev
-// refresh` reconcile (deps + dev DB schema). The heavy git-move primitives are
-// lazy-imported from the dependency-light install.mjs (same pattern as the
-// install handler) so the thin-CLI core stays lean.
+// `cinatra update` is a TWO-CHOICE command (cinatra-cli#60):
+//   1. Update the CLI       — `npm install -g @cinatra-ai/cinatra@latest` (the
+//                             DEFAULT in a TTY). After it completes we print a
+//                             "re-run cinatra" notice: the currently-running
+//                             process still holds the OLD code.
+//   2. Update an instance   — MOVE this checkout forward + reconcile deps + dev
+//                             DB. By instance TYPE: dev → fast-forward the latest
+//                             `origin/main`; prod → the latest `v*` release tag
+//                             (today's behavior). The reconcile step is the same
+//                             `instance refresh` flow (cinatra-cli#61). The
+//                             git-move primitives are lazy-imported from the
+//                             dependency-light install.mjs (same pattern as the
+//                             install handler).
 //
-// Dev-only and never destructive to git history beyond an explicit --force
-// (which stashes a dirty tree / hard-resets a divergent branch, exactly like
-// install). Production instances ship as release-tagged Docker images, never
-// through this command (the dev-refresh guards below enforce that).
-
-// A git ref `update` is willing to move to via --ref: a branch/tag/sha name.
-// Mirrors install.mjs's SAFE_REF_RE (no whitespace, no leading dash → no
-// option-injection, no `..` refspec metacharacters).
-const UPDATE_SAFE_REF_RE = /^(?!-)[A-Za-z0-9._\/-]+$/;
-
-/** Parse `update` flags: `--ref <ref>` pins a target ref (default: the latest
- *  `v*` release tag); `--force` stashes a dirty tree / hard-resets a divergent
- *  branch; the remaining tokens (`--docker=…`, `--no-docker`) pass through to
- *  the `instance refresh` reconcile. ALL flags (including the forwarded docker flags)
- *  are validated HERE, before any git move, so a typo can never leave the
- *  checkout moved but the deps/DB unreconciled. Unknown flags fail loudly. */
-function parseUpdateArgs(argv = []) {
-  let ref = null;
-  let force = false;
-  const refreshArgs = [];
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    if (arg === "--ref") {
-      const value = argv[i + 1];
-      if (value === undefined || value.startsWith("--")) {
-        throw new Error(`--ref requires a value (got ${value === undefined ? "end of arguments" : `"${value}"`}).`);
-      }
-      if (!UPDATE_SAFE_REF_RE.test(value) || value.includes("..")) {
-        throw new Error(
-          `Invalid --ref "${value}". Use a branch, tag, or commit sha ` +
-            `(letters/digits/dot/dash/underscore/slash; no leading dash, no "..").`,
-        );
-      }
-      ref = value;
-      i += 1;
-      continue;
-    }
-    if (arg === "--force") {
-      force = true;
-      continue;
-    }
-    if (arg === "--no-docker" || arg.startsWith("--docker=")) {
-      refreshArgs.push(arg);
-      continue;
-    }
-    throw new Error(
-      `Unknown flag "${arg}" for cinatra update. Supported flags: --ref <ref>, --force, --docker=auto|always, --no-docker.`,
-    );
-  }
-  // Validate the forwarded docker flags NOW (parseDevRefreshFlags throws on a
-  // bad --docker= value) so we never move git and then fail the reconcile.
-  parseDevRefreshFlags(refreshArgs);
-  return { ref, force, refreshArgs };
-}
+// Routing (parsed in update-target.mjs; back-compat per #60):
+//   - explicit flag (`--cli` / `--instance` / an instance-only flag) wins, no prompt.
+//   - TTY + no flag → the two-choice picker (default highlighted = CLI update).
+//   - non-TTY + no flag → default to the INSTANCE update so existing
+//     `cinatra update` scripts (which update the instance) keep working — it must
+//     never hang waiting on stdin in a pipe/CI.
+//
+// `--dry-run` describes the chosen action on EITHER path and makes no changes.
+// The instance path is never destructive to git history beyond an explicit
+// --force (stash a dirty tree / hard-reset a divergent branch, exactly like
+// install). The flag parsing + path/target decision logic lives in the pure,
+// testable update-target.mjs (parseUpdateArgs / resolveUpdatePath /
+// resolveInstanceMoveTarget).
 
 async function runUpdate(rest) {
-  const { ref: pinnedRef, force, refreshArgs } = parseUpdateArgs(rest);
+  // Parse + validate ALL flags up front (in the pure module) so a typo fails
+  // loudly before any side effect (npm install / git move).
+  const parsed = parseUpdateArgs(rest);
+  // Validate the forwarded docker flags NOW (parseDevRefreshFlags throws on a
+  // bad --docker= value) so we never move git and then fail the reconcile.
+  parseDevRefreshFlags(parsed.refreshArgs);
 
+  const isTty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  const resolved = resolveUpdatePath(parsed.target, isTty);
+
+  let chosen = resolved.path;
+  if (resolved.interactive) {
+    // No explicit selection + a TTY → present the two-choice picker. The default
+    // highlighted choice is the CLI update.
+    chosen = await promptUpdateChoice();
+  } else {
+    console.log(`update: ${resolved.reason}.`);
+  }
+
+  if (chosen === "cli") {
+    await runCliUpdate(parsed);
+    return;
+  }
+  await runInstanceUpdate(parsed);
+}
+
+/**
+ * Interactive two-choice picker for `cinatra update` (TTY only). Returns "cli"
+ * or "instance". Default highlighted on option 1 (CLI). Selection by typing the
+ * NUMBER (1/2) or by arrow up/down + Enter; bare Enter accepts the default.
+ *
+ * Arrow-key navigation needs raw mode; if raw mode is unavailable we degrade to
+ * a plain numbered prompt (still TTY, just no live highlight). Either way the
+ * default is the CLI update.
+ */
+async function promptUpdateChoice() {
+  const OPTIONS = [
+    { value: "cli", label: "Update the CLI", hint: "npm install -g @cinatra-ai/cinatra@latest" },
+    { value: "instance", label: "Update a Cinatra instance", hint: "move this checkout forward + reconcile deps/DB" },
+  ];
+  const DEFAULT_INDEX = 0;
+
+  // Raw-mode arrow-key picker. Falls back to a numbered readline prompt when raw
+  // mode is unavailable (e.g. a TTY that does not support setRawMode).
+  const canRaw = typeof process.stdin.setRawMode === "function";
+  if (canRaw) {
+    return await new Promise((resolve) => {
+      let index = DEFAULT_INDEX;
+      const render = (first) => {
+        if (!first) {
+          // Move cursor up over the rendered option lines to redraw in place.
+          process.stdout.write(`\x1b[${OPTIONS.length}A`);
+        }
+        for (let i = 0; i < OPTIONS.length; i += 1) {
+          const sel = i === index;
+          const marker = sel ? "›" : " ";
+          const num = `${i + 1}.`;
+          const line = `${marker} ${num} ${OPTIONS[i].label}  (${OPTIONS[i].hint})`;
+          // Clear the line, then write the (optionally bold) option.
+          process.stdout.write(`\x1b[2K${sel ? `\x1b[1m${line}\x1b[0m` : line}\n`);
+        }
+      };
+      console.log("What would you like to update?  (↑/↓ or 1/2, Enter to confirm)\n");
+      render(true);
+
+      const stdin = process.stdin;
+      stdin.setRawMode(true);
+      stdin.resume();
+      stdin.setEncoding("utf8");
+
+      const cleanup = () => {
+        stdin.setRawMode(false);
+        stdin.pause();
+        stdin.removeListener("data", onData);
+      };
+      const choose = (i) => {
+        cleanup();
+        console.log("");
+        resolve(OPTIONS[i].value);
+      };
+      const onData = (key) => {
+        // Ctrl-C / Ctrl-D → abort the whole command (do not silently pick one).
+        if (key === "" || key === "") {
+          cleanup();
+          console.log("");
+          process.exit(130);
+        }
+        if (key === "\r" || key === "\n") {
+          choose(index);
+          return;
+        }
+        if (key === "1") {
+          choose(0);
+          return;
+        }
+        if (key === "2") {
+          choose(1);
+          return;
+        }
+        if (key === "\x1b[A" || key === "k") {
+          index = (index - 1 + OPTIONS.length) % OPTIONS.length;
+          render(false);
+          return;
+        }
+        if (key === "\x1b[B" || key === "j") {
+          index = (index + 1) % OPTIONS.length;
+          render(false);
+          return;
+        }
+      };
+      stdin.on("data", onData);
+    });
+  }
+
+  // Fallback: a plain numbered prompt (default = 1, the CLI update).
+  console.log("What would you like to update?");
+  for (let i = 0; i < OPTIONS.length; i += 1) {
+    const def = i === DEFAULT_INDEX ? " [default]" : "";
+    console.log(`  ${i + 1}. ${OPTIONS[i].label}  (${OPTIONS[i].hint})${def}`);
+  }
+  const readline = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    while (true) {
+      const answer = (await readline.question("Choose 1 or 2 [1]: ")).trim();
+      if (answer === "") return OPTIONS[DEFAULT_INDEX].value;
+      if (answer === "1") return OPTIONS[0].value;
+      if (answer === "2") return OPTIONS[1].value;
+    }
+  } finally {
+    readline.close();
+  }
+}
+
+/**
+ * Option 1 — update the CLI itself: `npm install -g @cinatra-ai/cinatra@latest`.
+ * Prints the resolved new version + a "re-run cinatra" notice (the running
+ * process still holds the old code). `--dry-run` prints the command and exits.
+ */
+async function runCliUpdate({ dryRun }) {
+  if (dryRun) {
+    console.log(`[dry-run] Would update the CLI: npm install -g ${CLI_INSTALL_SPEC}`);
+    console.log("[dry-run] After it completes you would re-run `cinatra` to pick up the new code.");
+    return;
+  }
+
+  console.log(`Updating the Cinatra CLI: npm install -g ${CLI_INSTALL_SPEC}`);
+  runCommandOrThrow(
+    "npm",
+    ["install", "-g", CLI_INSTALL_SPEC],
+    `Failed to update the CLI (npm install -g ${CLI_INSTALL_SPEC}). ` +
+      "Check your npm global permissions (you may need a different prefix or sudo).",
+  );
+
+  // Read back the freshly-installed global version (best-effort — never fatal).
+  let newVersion = null;
+  try {
+    const out = spawnSync("npm", ["ls", "-g", CLI_INSTALL_SPEC.split("@latest")[0], "--depth=0"], {
+      encoding: "utf8",
+    });
+    const m = (out.stdout || "").match(/@cinatra-ai\/cinatra@(\S+)/);
+    if (m) newVersion = m[1];
+  } catch {
+    /* best-effort */
+  }
+
+  console.log(
+    `\n✔ CLI updated${newVersion ? ` to ${newVersion}` : ""}. ` +
+      "Re-run `cinatra` — the current process is still running the old code.",
+  );
+}
+
+/**
+ * Option 2 — update an instance: MOVE this checkout forward (by instance TYPE)
+ * then reconcile deps + dev DB. dev → fast-forward latest `origin/main`;
+ * prod → latest `v*` release tag (today's behavior). An explicit `--ref` always
+ * overrides the type-derived default.
+ */
+async function runInstanceUpdate({ ref: pinnedRef, force, refreshArgs, dryRun }) {
   // Anchor on the operator's checkout (same resolution every other in-checkout
   // command uses). update operates on an EXISTING checkout — getRepoRoot throws
   // the actionable "must run from inside a cinatra checkout" message otherwise.
   const repoRoot = getRepoRoot();
 
-  // Guard: update is dev-only, fail-closed — production updates ship as
-  // release-tagged Docker images, never through this command. Mirror the
-  // dev-refresh mode guard (the .env.local file value is authoritative; a shell
-  // override cannot loosen it).
+  // Read the runtime mode from .env.local (authoritative; a shell override cannot
+  // change it). The mode SELECTS the move target: dev → origin/main, prod →
+  // latest release. The file must exist + name a mode (the instance must have
+  // been installed); otherwise there is nothing to update.
   const envPath = path.join(repoRoot, ".env.local");
   if (!existsSync(envPath)) {
     throw new Error(
-      "No .env.local found. `cinatra update` moves an existing dev checkout to a newer release — " +
+      "No .env.local found. `cinatra update --instance` moves an existing checkout to a newer version — " +
         "run `cinatra install` (or `make setup`) first.",
     );
   }
@@ -4839,38 +5014,34 @@ async function runUpdate(rest) {
   ).find((value) => value.length > 0);
   if (!fileMode) {
     throw new Error(
-      "No CINATRA_RUNTIME_MODE set in .env.local. `cinatra update` moves an existing dev checkout — " +
+      "No CINATRA_RUNTIME_MODE set in .env.local. `cinatra update --instance` moves an existing checkout — " +
         "run `cinatra install` first.",
     );
   }
-  const fileModeLower = fileMode.toLowerCase();
-  if (fileModeLower !== "development" && fileModeLower !== "dev") {
-    throw new Error(
-      `cinatra update is development-only, but .env.local has CINATRA_RUNTIME_MODE=${fileMode}. ` +
-        "Production instances upgrade via release-tagged Docker images, not this command.",
-    );
-  }
+  const instanceMode = normalizeRuntimeMode(fileMode); // "development" | "production"
+  const isDev = instanceMode === "development";
 
-  // Preflight the SAME shell-override guard `runDevRefresh` enforces, but BEFORE
-  // the git move — a `SUPABASE_DB_URL`/`SUPABASE_SCHEMA` shell export that
-  // differs from .env.local would make the post-move reconcile throw, leaving the
+  // Preflight the SAME shell-override guard the dev reconcile enforces, but BEFORE
+  // the git move — a `SUPABASE_DB_URL`/`SUPABASE_SCHEMA` shell export that differs
+  // from .env.local would make the post-move dev reconcile throw, leaving the
   // checkout advanced but deps/DB unreconciled. Fail fast here so a known
-  // reconcile blocker never produces a half-applied update. (runDevRefresh
-  // re-checks it too, so this is belt-and-braces, not a behavior change.)
-  for (const key of ["SUPABASE_DB_URL", "SUPABASE_SCHEMA"]) {
-    const shellValue = process.env[key];
-    if (shellValue !== undefined && shellValue.trim() !== (fileEnv[key]?.trim() ?? "")) {
-      throw new Error(
-        `Refusing: ${key} is set in your shell environment and differs from .env.local. ` +
-          "cinatra update reconciles the .env.local dev database after moving git — unset the override " +
-          "(or run from a clean shell) and retry.",
-      );
+  // reconcile blocker never produces a half-applied update. (Only matters for the
+  // dev path, which runs the reconcile; harmless to check either way.)
+  if (isDev) {
+    for (const key of ["SUPABASE_DB_URL", "SUPABASE_SCHEMA"]) {
+      const shellValue = process.env[key];
+      if (shellValue !== undefined && shellValue.trim() !== (fileEnv[key]?.trim() ?? "")) {
+        throw new Error(
+          `Refusing: ${key} is set in your shell environment and differs from .env.local. ` +
+            "cinatra update reconciles the .env.local dev database after moving git — unset the override " +
+            "(or run from a clean shell) and retry.",
+        );
+      }
     }
   }
 
-  // Lazy-import the dependency-light git-move helpers from install.mjs (same
-  // pattern as the install handler) — keeps the thin-CLI core lean.
-  const { resolveLatestReleaseTag, moveExistingCheckoutToRef } = await import("./install.mjs");
+  // Decide the git-move target from the instance type (+ an explicit --ref).
+  const move = resolveInstanceMoveTarget(instanceMode, pinnedRef);
 
   const currentSha = (() => {
     try {
@@ -4883,34 +5054,54 @@ async function runUpdate(rest) {
     }
   })();
   if (currentSha) console.log(`Current commit: ${currentSha}`);
+  console.log(`- Instance type: ${instanceMode}.`);
 
-  // 1. Resolve the target: an explicit --ref (kind "ref" — auto-detect branch vs
-  //    tag/sha), else the latest `v*` release TAG read from origin via
-  //    `git ls-remote` (kind "tag" — moved to detached, immune to a tag/branch
-  //    name collision).
-  let targetRef = pinnedRef;
-  let moveKind = "ref";
-  if (targetRef) {
-    console.log(`- Target ref: ${targetRef} (--ref).`);
-  } else {
+  // Lazy-import the dependency-light git-move helpers from install.mjs (same
+  // pattern as the install handler) — keeps the thin-CLI core lean.
+  const { resolveLatestReleaseTag, moveExistingCheckoutToRef } = await import("./install.mjs");
+
+  // Resolve the concrete target ref. prod's default (move.ref === null) means
+  // "the latest v* release tag" — resolved here from origin.
+  let targetRef = move.ref;
+  if (targetRef === null) {
     targetRef = await resolveLatestReleaseTag({ targetDir: repoRoot });
-    moveKind = "tag";
-    console.log(`- Latest release: ${targetRef}.`);
+  }
+  console.log(`- Target: ${targetRef} (${move.source}).`);
+
+  if (dryRun) {
+    console.log(
+      `[dry-run] Would move ${repoRoot} to ${targetRef} (kind=${move.kind}` +
+        `${force ? ", --force" : ""})${isDev ? ", then reconcile deps + dev DB." : "."}`,
+    );
+    if (!isDev) {
+      console.log(
+        "[dry-run] prod instances run on release-tagged Docker images — the checkout move is the update.",
+      );
+    }
+    return;
   }
 
-  // 2. Move the checkout to the target. The helper fetches the EXACT ref,
-  //    resolves it to a concrete commit (NOT ambient FETCH_HEAD), and fast-
-  //    forwards (or, with --force, hard-resets) onto it. Returns the new HEAD sha.
-  const newSha = moveExistingCheckoutToRef({ targetDir: repoRoot, ref: targetRef, kind: moveKind, force });
+  // Move the checkout to the target. The helper fetches the EXACT ref, resolves
+  // it to a concrete commit (NOT ambient FETCH_HEAD), and fast-forwards (or, with
+  // --force, hard-resets) onto it. Returns the new HEAD sha.
+  const newSha = moveExistingCheckoutToRef({ targetDir: repoRoot, ref: targetRef, kind: move.kind, force });
   console.log(`✓ Checkout moved to ${targetRef} (${newSha}).`);
 
-  // 3. Reconcile deps + dev DB schema to the freshly-moved code — exactly the
-  //    `instance refresh` flow (idempotent, non-destructive). Forward the (already
-  //    validated) docker flags through verbatim.
-  console.log("- Reconciling dependencies + dev database to the new release…");
-  await runDevRefresh(refreshArgs);
-
-  console.log(`\n✔ Updated to ${targetRef}. Restart your dev server: make dev`);
+  if (isDev) {
+    // Reconcile deps + dev DB schema to the freshly-moved code — exactly the
+    // `instance refresh` flow (cinatra-cli#61; idempotent, non-destructive).
+    // Forward the (already validated) docker flags through verbatim.
+    console.log("- Reconciling dependencies + dev database to the new code…");
+    await runDevRefresh(refreshArgs);
+    console.log(`\n✔ Instance updated to ${targetRef}. Restart your dev server: make dev`);
+  } else {
+    // prod instances run on release-tagged Docker images: the checkout move is
+    // the update. We do NOT run the dev reconcile (it is dev-only, fail-closed).
+    console.log(
+      `\n✔ Instance checkout moved to ${targetRef}. ` +
+        "Apply it the production way: rebuild/redeploy the release-tagged images.",
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
