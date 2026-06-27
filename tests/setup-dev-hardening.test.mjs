@@ -976,7 +976,7 @@ describe("ensureDevPublicMcpUrl — Step 3 self-establish + self-heal", () => {
     expect(r.status).toBe("write-failed");
     expect(r.owned).toBe(false);
     expect(r.publicBaseUrl).toBeNull();
-    expect(r.fixHint).toBe("cinatra dev tunnel start");
+    expect(r.fixHint).toBe("cinatra instance tunnel start");
   });
 
   it("FRESH-NXDOMAIN-NOT-DEAD: a just-provisioned (un-propagated) matching URL is OWNED, never torn down", async () => {
@@ -1035,7 +1035,7 @@ describe("ensureDevPublicMcpUrl — Step 3 self-establish + self-heal", () => {
     expect(r.owned).toBe(false);
     expect(r.status).toBe("hostname-mismatch");
     // fixHint must be an ESTABLISHING command, not the diagnostic `status`.
-    expect(r.fixHint).toBe("cinatra dev tunnel stop && cinatra dev tunnel start");
+    expect(r.fixHint).toBe("cinatra instance tunnel stop && cinatra instance tunnel start");
     expect(r.fixHint).not.toContain("status");
     expect(deps.runDevTunnel).not.toHaveBeenCalled();
     expect(deps.writeClonePublicBaseUrl).not.toHaveBeenCalled();
@@ -1090,7 +1090,7 @@ describe("ensureDevPublicMcpUrl — Step 3 self-establish + self-heal", () => {
     expect(r.status).toBe("bring-up-failed");
     expect(r.owned).toBe(false);
     expect(r.broughtUp).toBe(false);
-    expect(r.fixHint).toBe("cinatra dev tunnel start");
+    expect(r.fixHint).toBe("cinatra instance tunnel start");
     expect(deps.writeClonePublicBaseUrl).not.toHaveBeenCalled();
   });
 
@@ -1114,7 +1114,7 @@ describe("ensureDevPublicMcpUrl — Step 3 self-establish + self-heal", () => {
     expect(r.owned).toBe(false);
     expect(r.status).toBe("established-unverified");
     // fixHint names the ESTABLISHING command (not the diagnostic `status`).
-    expect(r.fixHint).toBe("cinatra dev tunnel start");
+    expect(r.fixHint).toBe("cinatra instance tunnel start");
     expect(deps.writeClonePublicBaseUrl).not.toHaveBeenCalled();
   });
 
@@ -1149,7 +1149,7 @@ describe("ensureDevPublicMcpUrl — Step 3 self-establish + self-heal", () => {
     expect(r.broughtUp).toBe(true);
     expect(r.owned).toBe(false); // NOT owned → loud summary warning will fire
     expect(r.status).toBe("established-write-failed");
-    expect(r.fixHint).toBe("cinatra dev tunnel start");
+    expect(r.fixHint).toBe("cinatra instance tunnel start");
   });
 
   // --- honor schemaName (codex must-fix) ----------------------------------

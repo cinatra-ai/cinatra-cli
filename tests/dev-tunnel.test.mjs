@@ -1,4 +1,4 @@
-// Hermetic guard for `cinatra dev tunnel`.
+// Hermetic guard for `cinatra instance tunnel`.
 //
 // `runDevTunnel`'s `start` path requires Docker + Tailscale + a Nango
 // token + the main app DB, so it CANNOT be exercised end-to-end in a
@@ -93,13 +93,13 @@ describe("dev tunnel — reuses clone-start machinery (no duplication)", () => {
 
 describe("dev tunnel — development-only hard gate", () => {
   it.each(["start", "stop", "status"])(
-    "refuses `dev tunnel %s` under CINATRA_RUNTIME_MODE=production before any side effect",
+    "refuses `instance tunnel %s` under CINATRA_RUNTIME_MODE=production before any side effect",
     async (action) => {
       const prev = process.env.CINATRA_RUNTIME_MODE;
       process.env.CINATRA_RUNTIME_MODE = "production";
       try {
-        await expect(runCli(["dev", "tunnel", action])).rejects.toThrow(
-          /cinatra dev tunnel is development-only/,
+        await expect(runCli(["instance", "tunnel", action])).rejects.toThrow(
+          /cinatra instance tunnel is development-only/,
         );
       } finally {
         if (prev === undefined) delete process.env.CINATRA_RUNTIME_MODE;
@@ -108,14 +108,14 @@ describe("dev tunnel — development-only hard gate", () => {
     },
   );
 
-  it("rejects an unknown dev tunnel sub-command", async () => {
+  it("rejects an unknown instance tunnel sub-command", async () => {
     const prev = process.env.CINATRA_RUNTIME_MODE;
     // Even in development mode, a bad sub-action must throw the usage
     // error (sub-action parse happens before the dev gate is moot).
     process.env.CINATRA_RUNTIME_MODE = "development";
     try {
-      await expect(runCli(["dev", "tunnel", "bogus"])).rejects.toThrow(
-        /Unknown 'cinatra dev tunnel' sub-command/,
+      await expect(runCli(["instance", "tunnel", "bogus"])).rejects.toThrow(
+        /Unknown 'cinatra instance tunnel' sub-command/,
       );
     } finally {
       if (prev === undefined) delete process.env.CINATRA_RUNTIME_MODE;
@@ -277,7 +277,7 @@ describe("ensureDevPublicMcpUrl — one-shot read, NO reintroduced poller", () =
 
 // --- 5. Step 3 auto-bring-up Docker spawns are BOUNDED (no setup hang) -----
 //
-// codex must-fix: the auto-bring-up path (`cinatra setup dev` → runDevTunnel
+// codex must-fix: the auto-bring-up path (`cinatra instance setup dev` → runDevTunnel
 // "start") calls `docker build` (ensureWayflowImage) and `docker compose up`.
 // Both must carry a finite `timeout` so a hung docker can never block setup.
 
@@ -320,7 +320,7 @@ describe("auto-bring-up Docker spawns carry a finite timeout (Step 3 must-fix)",
   it("bounds the fast docker-CLI metadata probes reached by setup auto-bring-up", () => {
     // codex round-3 must-fix: `compose version` (isComposeAvailable),
     // `compose ps` (isComposeProjectUp), and `image inspect` (ensureWayflowImage)
-    // are now on the `cinatra setup dev` path before the bounded build/up/status
+    // are now on the `cinatra instance setup dev` path before the bounded build/up/status
     // calls. A hung docker CLI must not block setup.
     expect(INDEX_SRC.includes("const DOCKER_CLI_PROBE_TIMEOUT_MS = 15_000;")).toBe(true);
     for (const anchor of [
@@ -330,7 +330,7 @@ describe("auto-bring-up Docker spawns carry a finite timeout (Step 3 must-fix)",
     ]) {
       const i = INDEX_SRC.indexOf(anchor);
       expect(i).toBeGreaterThan(-1);
-      const window = INDEX_SRC.slice(i, i + 500);
+      const window = INDEX_SRC.slice(i, i + 600);
       expect(window.includes("timeout: DOCKER_CLI_PROBE_TIMEOUT_MS")).toBe(true);
     }
   });

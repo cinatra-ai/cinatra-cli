@@ -27,7 +27,7 @@
 //      inside the auto-mint `try`, so an absent extension falls through to
 //      local-only mode and the run proceeds to its next (DB) precheck.
 //
-//   4. DEV-TUNNEL STOP (MEDIUM regression) — `cinatra dev tunnel stop` must
+//   4. DEV-TUNNEL STOP (MEDIUM regression) — `cinatra instance tunnel stop` must
 //      complete teardown with the connector forced-absent. `stop` needs no
 //      hostname, so the hostname-helper import lives in the `start` branch (not
 //      the shared preamble) and `stop` never touches the connector source.
@@ -149,9 +149,9 @@ describe("extension-empty CLI bootstrap — cold-start load", () => {
     // No load-time crash on the absent connector source.
     expect(output).not.toMatch(/Cannot find module/);
     expect(res.status).toBe(0);
-    // The help banner actually rendered (a handler-free path). eng#232: the
-    // local bootstrap commands moved under `cinatra dev …`.
-    expect(output).toContain("cinatra dev");
+    // The help banner actually rendered (a handler-free path). eng#232 (renamed
+    // cinatra-cli#61): the local bootstrap commands moved under `cinatra instance …`.
+    expect(output).toContain("cinatra instance");
   });
 });
 
@@ -225,14 +225,14 @@ describe("extension-empty CLI bootstrap — post-config handlers degrade gracefu
     expect(output).toMatch(/cannot reach clone database/);
   });
 
-  it("`dev tunnel stop` tears down (exit 0, no ERR_MODULE_NOT_FOUND) when the connector is absent", () => {
+  it("`instance tunnel stop` tears down (exit 0, no ERR_MODULE_NOT_FOUND) when the connector is absent", () => {
     // MEDIUM regression: `stop` needs no hostname derivation, so the lazy
     // hostname-helper import lives in the `start` branch — not the shared
     // preamble. An empty SUPABASE_DB_URL keeps the teardown DB-free, and the
     // temp HOME means no dev-main compose project exists, so stop is a clean
     // best-effort no-op that exits 0.
     const home = makeTempHome();
-    const res = runCliExtensionAbsent(["dev", "tunnel", "stop"], {
+    const res = runCliExtensionAbsent(["instance", "tunnel", "stop"], {
       home,
       extraEnv: { SUPABASE_DB_URL: "", CINATRA_RUNTIME_MODE: "development" },
     });
@@ -241,6 +241,6 @@ describe("extension-empty CLI bootstrap — post-config handlers degrade gracefu
     expect(output).not.toMatch(/Cannot find module/);
     expect(output).not.toMatch(/ERR_MODULE_NOT_FOUND/);
     expect(res.status).toBe(0);
-    expect(output).toMatch(/cinatra dev tunnel stopped/);
+    expect(output).toMatch(/cinatra instance tunnel stopped/);
   });
 });

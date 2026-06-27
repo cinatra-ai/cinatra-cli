@@ -4,7 +4,7 @@
 // Plain ESM `.mjs` — NO TypeScript, NO `@/` aliases, NO `server-only`,
 // NO `node:child_process`, NO DB, NO network. Same leaf-purity contract
 // as `clone-runtime.mjs` so BOTH the plain-Node CLI (`runCloneStart`)
-// and the `cinatra dev tunnel` verb import the exact same proven decision
+// and the `cinatra instance tunnel` verb import the exact same proven decision
 // boundary, hermetically unit-testable without Docker / Tailscale.
 //
 // This module owns two safety-critical, reviewable concerns:
@@ -40,7 +40,7 @@
 // ABSENT on a fresh checkout. It is loaded lazily inside
 // `verifyRegisteredHostnameMatchesPrediction` so this module — and any host
 // (CLI) module that statically imports it — resolves on an extension-empty
-// checkout. By the time a provisioning caller invokes verify, `cinatra dev setup
+// checkout. By the time a provisioning caller invokes verify, `cinatra instance setup
 // dev` has populated the extension.
 
 /**

@@ -31,23 +31,23 @@ Requires Node.js >= 24.
     cinatra create-extension <kind>  # scaffold a new extension to author
 
 The local host/monorepo bootstrap commands you run from inside a Cinatra
-checkout now live under `cinatra dev …`:
+checkout now live under `cinatra instance …`:
 
-    cinatra dev setup dev            # provision a local development instance
-    cinatra dev setup prod           # provision a production instance
-    cinatra dev db migrate           # apply schema updates (works when the app is down)
-    cinatra dev clone new <name>     # create an isolated deep-fork clone
-    cinatra dev refresh              # reconcile deps + dev DB to your checkout
-    cinatra dev tunnel start         # manage the dev Tailscale Funnel
-    cinatra dev backup create        # take a local backup bundle
-    cinatra dev reset --yes          # reset the development environment
+    cinatra instance setup dev            # provision a local development instance
+    cinatra instance setup prod           # provision a production instance
+    cinatra instance db migrate           # apply schema updates (works when the app is down)
+    cinatra instance clone new <name>     # create an isolated deep-fork clone
+    cinatra instance refresh              # reconcile deps + dev DB to your checkout
+    cinatra instance tunnel start         # manage the dev Tailscale Funnel
+    cinatra instance backup create        # take a local backup bundle
+    cinatra instance reset --yes          # reset the development environment
 
-Run `cinatra --help` for the top-level command list, or `cinatra dev --help`
+Run `cinatra --help` for the top-level command list, or `cinatra instance --help`
 for the full local-bootstrap command list.
 
 > The old bare forms (`cinatra setup dev`, `cinatra db migrate`, `cinatra clone …`,
 > `cinatra reset dev`, `cinatra backup …`) still work this release but are
-> deprecated — they print a one-line hint pointing at the new `cinatra dev …`
+> deprecated — they print a one-line hint pointing at the new `cinatra instance …`
 > form. Update your scripts to the namespaced commands.
 
 ## Running more than one instance
@@ -186,8 +186,8 @@ or `--on-conflict=stop-existing` stops the existing stack before installing.
 
 **Deprecated command warnings**
 Commands like `cinatra setup dev` or `cinatra db migrate` print a deprecation
-hint pointing at their `cinatra dev …` equivalents. Update your scripts to the
-namespaced forms (e.g. `cinatra dev setup dev`, `cinatra dev db migrate`) —
+hint pointing at their `cinatra instance …` equivalents. Update your scripts to the
+namespaced forms (e.g. `cinatra instance setup dev`, `cinatra instance db migrate`) —
 the old bare forms will be removed in a future minor release. To suppress the
 warnings temporarily while you migrate, set `CINATRA_SUPPRESS_DEPRECATION=1`.
 

@@ -313,7 +313,7 @@ export function acquireRuntimeLock(slug, opts) {
     if (ownerPid != null && isPidAlive(ownerPid)) {
       throw new Error(
         `clone start: runtime lock held by pid ${ownerPid} at ${lockPath}. ` +
-          `Either wait for the other invocation to finish, or run 'cinatra dev clone status --slug ${slug}' to investigate.`,
+          `Either wait for the other invocation to finish, or run 'cinatra instance clone status --slug ${slug}' to investigate.`,
       );
     }
     if (ownerPid == null) {
@@ -352,7 +352,7 @@ export function acquireRuntimeLock(slug, opts) {
       try { unlinkSync(stealPath); } catch { /* best-effort */ }
       throw new Error(
         `clone start: runtime lock held by pid ${stolenOwner} at ${lockPath}. ` +
-          `Either wait for the other invocation to finish, or run 'cinatra dev clone status --slug ${slug}' to investigate.`,
+          `Either wait for the other invocation to finish, or run 'cinatra instance clone status --slug ${slug}' to investigate.`,
       );
     }
     // Genuinely stale — discard and loop to re-publish.
@@ -360,7 +360,7 @@ export function acquireRuntimeLock(slug, opts) {
   }
   throw new Error(
     `clone start: could not acquire the runtime lock at ${lockPath} after repeated ` +
-      `contention. Run 'cinatra dev clone status --slug ${slug}' to investigate.`,
+      `contention. Run 'cinatra instance clone status --slug ${slug}' to investigate.`,
   );
 }
 

@@ -6,6 +6,25 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING:** Renamed the `cinatra dev …` command group to `cinatra instance …`.
+  The Class-C local host/monorepo bootstrap commands manage a local Cinatra
+  *instance* — and several take an explicit `dev|prod` mode — so the `dev` head was
+  misleading (`cinatra dev setup prod` was self-contradictory). Every subcommand
+  moved verbatim under the new head: `cinatra instance setup dev|prod|nango|branch`,
+  `cinatra instance teardown branch`, `cinatra instance db migrate`, the
+  `cinatra instance clone …` worktree/seed commands, `cinatra instance refresh`,
+  `cinatra instance tunnel`, `cinatra instance start|stop|restart`,
+  `cinatra instance wordpress|drupal`, `cinatra instance reset`, and the
+  `cinatra instance backup …` commands. `cinatra instance --help` lists the full
+  surface. The old `cinatra dev …` namespace is **removed entirely — there is no
+  back-compat alias**, so `cinatra dev …` no longer resolves (it exits with
+  "Unknown command"). The unrelated bare-path aliases (`cinatra setup dev`,
+  `cinatra db migrate`, `cinatra clone …`, `cinatra reset dev`, `cinatra backup …`)
+  still work this release and now point their deprecation hint at the new
+  `cinatra instance …` form. (#61)
+
 ### Added
 
 - `cinatra install --on-conflict=co-use` / `--infra=share` now IMPLEMENTS the

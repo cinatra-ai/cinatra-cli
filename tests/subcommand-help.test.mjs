@@ -92,18 +92,19 @@ describe("cinatra <subcommand> --help across matcher shapes", () => {
     [["install", "--help"], "cinatra install"], // command, destructive
     [["update", "--help"], "cinatra update"], // command, moves git + reconciles — must NOT run on --help
     [["upgrade", "--help"], "cinatra upgrade"], // command, alias of update — same footgun guard
-    // eng#232: Class-C bootstrap commands are now namespaced under `cinatra dev …`.
-    [["dev", "setup", "dev", "--help"], "cinatra dev setup"], // command+mode+sub (dev|prod alt), destructive
-    [["dev", "db", "migrate", "--help"], "cinatra dev db migrate"], // command+mode+sub, destructive
-    [["dev", "clone", "prune", "--help"], "cinatra dev clone prune"], // command+mode+sub, destructive
-    [["dev", "refresh", "--help"], "cinatra dev refresh"], // command+mode, destructive
-    [["dev", "start", "--help"], "cinatra dev start"], // command+mode, spawns pnpm dev — must NOT run on --help
-    [["dev", "stop", "--help"], "cinatra dev stop"], // command+mode, sends signals — must NOT run on --help
-    [["dev", "restart", "--help"], "cinatra dev restart"], // command+mode, stop+start — must NOT run on --help
-    [["dev", "wordpress", "start", "--help"], "cinatra dev wordpress"], // command+mode, spawns docker compose — must NOT run on --help
-    [["dev", "drupal", "stop", "--help"], "cinatra dev drupal"], // command+mode, spawns docker compose — must NOT run on --help
-    [["dev", "backup", "import", "--help"], "cinatra dev backup import"], // command+mode+sub, destructive
-    [["dev", "reset", "--help"], "cinatra dev reset"], // command+mode, destructive
+    // eng#232 (renamed cinatra-cli#61): Class-C bootstrap commands are namespaced
+    // under `cinatra instance …`.
+    [["instance", "setup", "dev", "--help"], "cinatra instance setup"], // command+mode+sub (dev|prod alt), destructive
+    [["instance", "db", "migrate", "--help"], "cinatra instance db migrate"], // command+mode+sub, destructive
+    [["instance", "clone", "prune", "--help"], "cinatra instance clone prune"], // command+mode+sub, destructive
+    [["instance", "refresh", "--help"], "cinatra instance refresh"], // command+mode, destructive
+    [["instance", "start", "--help"], "cinatra instance start"], // command+mode, spawns pnpm dev — must NOT run on --help
+    [["instance", "stop", "--help"], "cinatra instance stop"], // command+mode, sends signals — must NOT run on --help
+    [["instance", "restart", "--help"], "cinatra instance restart"], // command+mode, stop+start — must NOT run on --help
+    [["instance", "wordpress", "start", "--help"], "cinatra instance wordpress"], // command+mode, spawns docker compose — must NOT run on --help
+    [["instance", "drupal", "stop", "--help"], "cinatra instance drupal"], // command+mode, spawns docker compose — must NOT run on --help
+    [["instance", "backup", "import", "--help"], "cinatra instance backup import"], // command+mode+sub, destructive
+    [["instance", "reset", "--help"], "cinatra instance reset"], // command+mode, destructive
     [["mcp", "llm-access", "setup", "--help"], "cinatra mcp llm-access setup"], // command+mode+sub
     [["doctor", "--help"], "cinatra doctor"], // command (read-only, still must not run)
     [["status", "-h"], "cinatra status"], // command, -h alias
@@ -156,15 +157,16 @@ describe("cinatra <subcommand> --help edge cases", () => {
     expect(res.stdout).not.toMatch(/^Usage: cinatra install$/m);
   });
 
-  // eng#232: a DEPRECATED bare alias (`setup dev`, `db migrate`, …) with --help
-  // must still short-circuit (footgun guard: exit 0, NO side effect) and resolve
-  // to the CANONICAL `dev …` synopsis, steering the user to the new form.
+  // eng#232 (renamed cinatra-cli#61): a DEPRECATED bare alias (`setup dev`,
+  // `db migrate`, …) with --help must still short-circuit (footgun guard: exit 0,
+  // NO side effect) and resolve to the CANONICAL `instance …` synopsis, steering
+  // the user to the new form.
   const aliasHelpCases = [
-    [["setup", "dev", "--help"], "cinatra dev setup"],
-    [["db", "migrate", "--help"], "cinatra dev db migrate"],
-    [["clone", "prune", "--help"], "cinatra dev clone prune"],
-    [["reset", "dev", "--help"], "cinatra dev reset"],
-    [["backup", "import", "--help"], "cinatra dev backup import"],
+    [["setup", "dev", "--help"], "cinatra instance setup"],
+    [["db", "migrate", "--help"], "cinatra instance db migrate"],
+    [["clone", "prune", "--help"], "cinatra instance clone prune"],
+    [["reset", "dev", "--help"], "cinatra instance reset"],
+    [["backup", "import", "--help"], "cinatra instance backup import"],
   ];
 
   it.each(aliasHelpCases)(
