@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-06-29
+
 ### Changed
 
 - **Consolidated `cinatra setup` into `cinatra install --mode dev|prod`** as the
@@ -59,6 +61,37 @@ project adheres to [Semantic Versioning](https://semver.org/).
   per-instance) requires the explicit `--allow-shared-graphiti`. Provisioning is
   transactional: a failure rolls back, dropping only the database this run just
   created (a name-shape + created-this-run guard). (#40)
+- `cli-smoke` — an all-commands CLI smoke entry-point (`npm run cli-smoke`) that
+  exercises every command in the table at the depth that is safe to run without a
+  live instance (the no-side-effect surface: `--help` / `--version`, the help-only
+  `instance` group head, and the read-only no-instance paths). It asserts that
+  `--help` short-circuits before any handler or side-effect for every visible
+  command, that every visible command id has a reachable help row (no orphaned or
+  undocumented command), and that `--version` reports the package version. This is
+  the single release-closeout sweep that catches "passes unit tests but breaks when
+  actually run" regressions. (#58)
+
+### Fixed
+
+- `cinatra instance reset` now drops **every** auth table when wiping an instance.
+  Previously it left some authentication tables behind, so a "reset" instance could
+  retain stale auth state (orphaned accounts / sessions) instead of starting clean.
+  The reset now clears the full set of auth tables for a true from-scratch state.
+  (#70, PR #71)
+
+### Known issues
+
+The following are known limitations shipping in 0.1.4 and tracked for a follow-up
+release (0.1.5):
+
+- `cinatra instance backup` restore is not yet wired end-to-end — backups are
+  created, but the restore path needs the remaining glue before it round-trips
+  cleanly. (#68)
+- The source-checkout production install path has a rough edge; the published
+  container image is unaffected and remains the supported production install. (#74)
+- `cinatra agents install` can hit a cold-boot ordering issue on a fresh machine.
+  (#69)
+- `cinatra instance refresh` of the dev companion apps has a known gap. (#73)
 
 ## [0.1.3] - 2026-06-25
 
@@ -141,6 +174,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Initial public release of the thin, checkout-driven `cinatra` CLI, published
   as the scoped `@cinatra-ai/cinatra`. (#2)
 
+[0.1.4]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.4
 [0.1.3]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.3
 [0.1.2]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.2
 [0.1.1]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.1
