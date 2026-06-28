@@ -28,7 +28,8 @@
   ],
   "scripts": {
     "test": "vitest run",
-    "lint:skills": "node scripts/lint-skills.mjs"
+    "lint:skills": "node scripts/lint-skills.mjs",
+    "cli-smoke": "node scripts/cli-smoke.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
