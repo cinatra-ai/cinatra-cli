@@ -28,5 +28,5 @@ jobs:
       attestations: write
     # cinatra-ai/.github publishes no tags; pinned to its current main HEAD
     # (re-resolve + bump the SHA when the reusable release workflow changes).
-    uses: cinatra-ai/.github/.github/workflows/reusable-extension-release.yml@9bdf7f1abfe38c6bb710d46def7c415906713902 # v0.1.0
+    uses: cinatra-ai/.github/.github/workflows/reusable-extension-release.yml@671d3e6fd945ba6c1d572ec2a405c576f41dcb98 # v0.1.0
     secrets: inherit
