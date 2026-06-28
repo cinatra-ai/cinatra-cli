@@ -2911,21 +2911,20 @@ async function resetDevelopmentData(client, schemaName, purgeAppData) {
     await client.query(`drop schema if exists ${quoteIdentifier(schemaName)} cascade`);
   }
 
+  // Drop EVERY Better Auth table — derived from the single `AUTH_TABLES` source
+  // of truth so the reset list can never drift from the table set the setup
+  // re-provision (`maybeRunBetterAuthMigrate` → `readAuthTableState`) checks
+  // against (cinatra-cli#70). A hard-coded subset left `team`/`teamMember`
+  // behind, so the post-reset `runSetup` saw a PARTIAL auth schema and refused
+  // to rebuild ("Better Auth appears partially initialized"), leaving the
+  // instance un-bootable. `cascade` handles FK dependency order regardless of
+  // listing order; identifiers are quoted (the names are mixed-case, e.g.
+  // "oauthClient", "teamMember").
+  const authTableList = AUTH_TABLES.map((name) => `public.${quoteIdentifier(name)}`).join(",\n        ");
   await client.query(
     `
       drop table if exists
-        public."oauthAccessToken",
-        public."oauthRefreshToken",
-        public."oauthConsent",
-        public."oauthClient",
-        public."jwks",
-        public."invitation",
-        public."member",
-        public."organization",
-        public."verification",
-        public."account",
-        public."session",
-        public."user"
+        ${authTableList}
       cascade
     `,
   );
@@ -10894,6 +10893,10 @@ export {
   enumerateEmittedExtensionPackages,
   repairWorkspaceConnectorLinks,
   ensureClonedExtensionsLinked,
+  // cinatra-cli#70 — reset must drop EVERY auth table (no drift from AUTH_TABLES).
+  AUTH_TABLES,
+  resetDevelopmentData,
+  readAuthTableState,
 };
 
 /**
