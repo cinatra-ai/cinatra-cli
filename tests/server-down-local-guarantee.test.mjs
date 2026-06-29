@@ -92,7 +92,7 @@ describe("server-down guarantee — runtime fetch-poison on `instance db migrate
     }
   });
 
-  it("the same alias `db migrate` also stays local under fetch-poison", () => {
+  it("cinatra-cli#81: the old bare `db migrate` form is gone — UNKNOWN, never a network step", () => {
     const checkout = makeFakeCheckout({
       env: {
         SUPABASE_DB_URL: "postgres://nope:nope@127.0.0.1:5999/cinatra_serverdown2",
@@ -109,12 +109,14 @@ describe("server-down guarantee — runtime fetch-poison on `instance db migrate
           env: {
             ...process.env,
             CINATRA_REPO_ROOT: checkout.root,
-            CINATRA_SUPPRESS_DEPRECATION: "1",
           },
         },
       );
       const out = `${res.stdout ?? ""}${res.stderr ?? ""}`;
       expect(res.status).not.toBe(0);
+      // It is now an Unknown command (no back-compat alias), and it certainly
+      // never reaches the network.
+      expect(out).toMatch(/Unknown command: db migrate/);
       expect(out).not.toMatch(POISON_MARKER);
     } finally {
       checkout.cleanup();

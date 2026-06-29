@@ -13,7 +13,8 @@
 //   3. The branch lifecycle is renamed to `cinatra instance branch setup` /
 //      `cinatra instance branch teardown`; the old `instance setup branch` /
 //      `instance teardown branch` (and the bare `setup branch` / `teardown
-//      branch`) forms still route as DEPRECATED aliases of the new forms.
+//      branch`) forms were REMOVED with no back-compat (cinatra-cli#81) and now
+//      route to UNKNOWN.
 
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
@@ -119,7 +120,6 @@ describe("cinatra-cli#62 — `setup` is demoted to an internal phase", () => {
     [["instance", "setup", "dev", "--help"]],
     [["instance", "setup", "prod", "--help"]],
     [["instance", "setup", "nango", "--help"]],
-    [["setup", "dev", "--help"]],
   ])("`%j` steers to `cinatra install`, never advertises the internal setup path", (args) => {
     const res = run(args);
     expect(res.status, `stderr: ${res.stderr}`).toBe(0);
@@ -150,23 +150,19 @@ describe("cinatra-cli#62 — branch lifecycle renamed to `instance branch …`",
   it.each([
     [["instance", "branch", "setup"], "setup.branch"],
     [["instance", "branch", "teardown"], "teardown.branch"],
-  ])("`%j` routes to %s as the canonical (non-deprecated) form", (tokens, id) => {
+  ])("`%j` routes to %s as the canonical form", (tokens, id) => {
     const d = matchDescriptor(COMMAND_DESCRIPTORS, tokens);
     expect(d.id).toBe(id);
-    expect(d.deprecated).toBeUndefined();
     expect(d.hidden).toBeFalsy();
   });
 
   it.each([
-    [["instance", "setup", "branch"], "instance branch setup"],
-    [["instance", "teardown", "branch"], "instance branch teardown"],
-    [["setup", "branch"], "instance branch setup"],
-    [["teardown", "branch"], "instance branch teardown"],
-  ])("the old form `%j` still routes as a deprecated alias of `%s`", (tokens, target) => {
-    const d = matchDescriptor(COMMAND_DESCRIPTORS, tokens);
-    expect(d).toBeTruthy();
-    expect(d.deprecated).toBe(target);
-    expect(d.hidden).toBe(true);
+    [["instance", "setup", "branch"]],
+    [["instance", "teardown", "branch"]],
+    [["setup", "branch"]],
+    [["teardown", "branch"]],
+  ])("cinatra-cli#81: the old form `%j` is REMOVED — routes to UNKNOWN", (tokens) => {
+    expect(matchDescriptor(COMMAND_DESCRIPTORS, tokens)).toBeNull();
   });
 
   it("`instance branch setup --help` shows its synopsis with no side effect", () => {
@@ -177,17 +173,15 @@ describe("cinatra-cli#62 — branch lifecycle renamed to `instance branch …`",
     expect(res.stdout).not.toMatch(/Provisioned|overwrite the source/i); // handler never ran
   });
 
-  it("the deprecated `teardown branch` (no --yes) emits a rename notice then the renamed destructive guard", () => {
+  it("cinatra-cli#81: the old bare `teardown branch` is UNKNOWN — no command runs, no notice", () => {
     const work = mkdtempSync(path.join(os.tmpdir(), "cinatra-62-td-"));
     try {
       const res = run(["teardown", "branch"], { cwd: work });
-      // The deprecation notice (stderr only — script-safe) names the new form.
-      expect(res.stderr).toMatch(
-        /"cinatra teardown branch" is now "cinatra instance branch teardown"/,
-      );
-      // The destructive guard message also uses the renamed form.
-      expect(res.stderr).toMatch(/cinatra instance branch teardown is destructive/);
       expect(res.status).not.toBe(0);
+      expect(res.stderr).toMatch(/Unknown command: teardown branch/);
+      // No back-compat "is now" notice and the destructive handler never ran.
+      expect(`${res.stdout}${res.stderr}`).not.toMatch(/is now "cinatra/);
+      expect(res.stderr).not.toMatch(/is destructive/);
     } finally {
       rmSync(work, { recursive: true, force: true });
     }

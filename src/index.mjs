@@ -792,36 +792,11 @@ function printSetupPhaseHelp() {
 }
 
 function printCommandHelp(descriptor) {
-  // cinatra-cli#62: `--help` for any folded setup phase (hidden canonical OR its
-  // deprecated bare alias) steers to `cinatra install --mode dev|prod` instead of
-  // advertising the now-internal `setup` path. Checked FIRST so both the hidden
-  // canonical and the deprecated-alias branches below route here.
+  // cinatra-cli#62: `--help` for any folded setup phase (the hidden internal
+  // `instance setup …` forms) steers to `cinatra install --mode dev|prod` instead
+  // of advertising the now-internal `setup` path.
   if (SETUP_PHASE_IDS.has(descriptor.id)) {
     printSetupPhaseHelp();
-    return;
-  }
-  // A deprecated alias (hidden) resolves to its canonical twin's synopsis so
-  // `cinatra instance setup branch --help` still prints useful help (exit 0, no
-  // side effect — the footgun guard) AND steers the user to the canonical form
-  // (`cinatra instance branch setup`).
-  if (descriptor.deprecated) {
-    const canonical =
-      COMMAND_DESCRIPTORS.find(
-        (d) => d.id === descriptor.id && !d.deprecated && d.summary,
-      ) ?? null;
-    const oldForm = descriptor.path.join(" ");
-    if (canonical) {
-      console.log(
-        `Usage: cinatra ${canonical.path.join(" ")}\n\n  ${canonical.summary}\n\n` +
-          `Note: "cinatra ${oldForm}" is the deprecated form of ` +
-          `"cinatra ${canonical.path.join(" ")}" — the old form still works this release.\n`,
-      );
-      const detail = COMMAND_HELP_DETAILS[canonical.id];
-      if (detail) console.log(`${detail}\n`);
-      console.log(`Run "cinatra instance --help" for the local bootstrap commands.`);
-      return;
-    }
-    printHelp();
     return;
   }
   if (descriptor.hidden || !descriptor.summary) {
@@ -10986,9 +10961,7 @@ function readCliVersion() {
  * path) and `routedTokens = argv.slice(0, descriptor.path.length)`. A handler
  * that needs a routed mode token reads it from `routedTokens` (e.g.
  * `setup.dev|prod` reads the trailing `dev`/`prod`); no handler re-prepends a
- * `mode` slot or re-slices `rest` anymore. A canonical `dev …` form and its
- * deprecated bare alias each slice off THEIR OWN path length, so both deliver an
- * identical `rest` to the shared handler.
+ * `mode` slot or re-slices `rest` anymore.
  *
  * Returning (vs awaiting) is preserved where it was load-bearing:
  * `agents install` returns the `runAgentsInstall(rest)` promise.
@@ -11238,7 +11211,7 @@ export async function runCli(argv) {
   if (descriptor) {
     // The `instance` group head has NO handler — a bare `cinatra instance` prints
     // the group banner and exits non-zero (mirrors the old `agents`-no-mode
-    // fallback). A deprecation notice never applies to it.
+    // fallback).
     if (descriptor.match === "group") {
       printGroupHelp("instance");
       process.exit(1);
@@ -11246,15 +11219,9 @@ export async function runCli(argv) {
 
     // Command-routing dispatcher arg-slice contract: `rest` is everything AFTER the
     // routed path tokens; `routedTokens` is the matched path slice (so a handler
-    // can read a routed mode token like `dev|prod`). Canonical and deprecated
-    // alias forms each slice off THEIR OWN path length, so the shared handler
-    // receives an identical `rest`.
+    // can read a routed mode token like `dev|prod`).
     const routedTokens = argv.slice(0, descriptor.path.length);
     const rest = argv.slice(descriptor.path.length);
-
-    if (descriptor.deprecated) {
-      emitDeprecationNotice(descriptor, routedTokens);
-    }
 
     const handlers = buildHandlers();
     const handler = handlers[descriptor.id];
@@ -11269,39 +11236,4 @@ export async function runCli(argv) {
   }
 
   throw new Error(`Unknown command: ${[command, mode].filter(Boolean).join(" ")}. Run "cinatra --help" for usage.`);
-}
-
-/**
- * Emit the one-line deprecation notice for a matched alias descriptor (the
- * command-routing contract). Goes to STDERR only (never STDOUT), so script/stdout consumers
- * are unaffected. Suppressed for the machine-consumed hook command
- * (`clone slug-for-worktree`) and when `CINATRA_SUPPRESS_DEPRECATION=1`.
- *
- * The `<old>`/`<new>` strings are built from the ACTUAL routed argv tokens, so
- * an alternation alias prints the concrete token the user typed
- * (`cinatra instance setup dev`), never the literal `dev|prod` pipe form.
- *
- * @param {import("./command-table.mjs").CommandDescriptor} descriptor
- * @param {string[]} routedTokens
- */
-function emitDeprecationNotice(descriptor, routedTokens) {
-  const suppress =
-    process.env.CINATRA_SUPPRESS_DEPRECATION === "1" ||
-    descriptor.id === "clone.slug-for-worktree";
-  if (suppress) return;
-  // `<old>` is the actual tokens the user typed for the matched alias path.
-  const oldForm = routedTokens.join(" ");
-  // `<new>` maps the canonical target, substituting the alias's concrete mode
-  // token into a trailing alternation slot (`setup dev` → `instance setup dev`).
-  const target = descriptor.deprecated;
-  let newForm = target;
-  const aliasHasModeToken = descriptor.path.some((t) => t.includes("|"));
-  if (aliasHasModeToken) {
-    const modeIdx = descriptor.path.findIndex((t) => t.includes("|"));
-    const concreteMode = routedTokens[modeIdx];
-    if (concreteMode) newForm = `${target} ${concreteMode}`;
-  }
-  process.stderr.write(
-    `"cinatra ${oldForm}" is now "cinatra ${newForm}" — the old form still works this release.\n`,
-  );
 }
