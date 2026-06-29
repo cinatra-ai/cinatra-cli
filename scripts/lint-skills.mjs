@@ -12,7 +12,9 @@
 //                              not authored) and intentionally retain placeholder
 //                              guidance; they are linted via their RENDERED output
 //                              by the template tests, not as raw source.
-//   - node_modules/**, .git/** — never source.
+//   - node_modules/**, .git/**, .claude/** — never source (.claude holds the
+//                              org-convention local tooling dir, incl. nested git
+//                              worktrees that carry a FULL repo copy + templates).
 //   - any path matching a `# skills-lint: ignore` exclusion list below.
 //
 // Zero runtime dependencies (Node builtins only) so CI runs it with no install.
@@ -30,8 +32,17 @@ import { lintSkillContent } from "../src/authoring/skill-frontmatter.mjs";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(HERE, "..");
 
-// Directory names never descended into (anywhere in the tree).
-const PRUNE_DIRS = new Set(["node_modules", ".git"]);
+// Directory names never descended into (anywhere in the tree). These are
+// infrastructure/tooling containers, never authored CLI source: dependency and
+// VCS trees, plus `.claude` — the org-convention local tooling dir that holds
+// nested git worktrees (`.claude/worktrees/<task>/…`). A worktree carries a FULL
+// copy of the repo, including its `templates/` placeholder SKILL.md files; those
+// live at `.claude/worktrees/<task>/templates/…`, which does NOT match the
+// root-relative `templates/` EXCLUDED_PREFIX, so without pruning `.claude` the
+// lint would scan another task's un-rendered templates as source and fail. The
+// dir is untracked (absent on a clean checkout/CI), so this only hardens local
+// runs; an authored source SKILL.md never lives under `.claude`.
+const PRUNE_DIRS = new Set(["node_modules", ".git", ".claude"]);
 
 // Path PREFIXES (relative, POSIX-style) whose SKILL.md files are excluded from
 // the SOURCE lint. `templates/` holds un-rendered scaffold templates (linted via
