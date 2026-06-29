@@ -1305,8 +1305,8 @@ function acquireProdExtensions({ targetDir, log = console.log }) {
 
 function runSetupInTarget({ targetDir, mode, skipDevApps, log = console.log }) {
   // The command-routing contract (renamed cinatra-cli#61): invoke the CANONICAL namespaced form
-  // (`cinatra instance setup <mode>`) so install's own flow never triggers a
-  // deprecation notice or steers the operator onto the deprecated bare alias.
+  // (`cinatra instance setup <mode>`) — the only form that resolves (the bare
+  // `setup <mode>` was removed in cinatra-cli#81).
   const setupArgs = [PUBLISHED_CLI_BIN, "instance", "setup", mode];
   if (mode === "dev" && skipDevApps) setupArgs.push("--skip-dev-apps");
   log(`- Running \`cinatra instance setup ${mode}\` inside ${targetDir}…`);

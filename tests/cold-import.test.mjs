@@ -210,10 +210,13 @@ describe("extension-empty CLI bootstrap — post-config handlers degrade gracefu
       JSON.stringify(registry),
     );
 
-    const res = runCliExtensionAbsent(["clone", "start", "--slug", "coldtest"], {
-      home,
-      extraEnv: { TS_AUTHKEY: "" },
-    });
+    const res = runCliExtensionAbsent(
+      ["instance", "clone", "start", "--slug", "coldtest"],
+      {
+        home,
+        extraEnv: { TS_AUTHKEY: "" },
+      },
+    );
     const output = `${res.stdout ?? ""}${res.stderr ?? ""}`;
 
     // The fix: NO module-not-found crash on the absent connector source.
