@@ -2676,6 +2676,51 @@ function preCleanSchemas(repoRoot, env, connectionString, schemas) {
   );
 }
 
+const PG_SYSTEM_SCHEMAS = new Set(["pg_catalog", "information_schema", "pg_toast"]);
+
+/**
+ * Derive the set of schemas a plain `pg_dump` will (re)create, read FROM THE DUMP
+ * FILE itself — the restore contract, not a live query. Used to pre-clean a DB
+ * before restoring a full-database `--clean --if-exists` dump (cinatra-cli#68).
+ *
+ * Why dump-derived, not a live `pg` query of the target DB: the dump is the exact
+ * source of truth for what WILL be recreated. A live query can drop a schema the
+ * dump won't restore, or miss one the dump WILL restore (leaving the `--clean`
+ * `ALTER TABLE ... DROP CONSTRAINT` of an *inherited* partition-child pkey to
+ * fight live objects — the original failure: `cannot drop inherited constraint`).
+ * Dropping the schemas the dump recreates makes every `--clean` statement a no-op.
+ *
+ * `public` is ALWAYS included: it pre-exists so `pg_dump` emits no `CREATE SCHEMA
+ * public`, yet it may hold tables (Nango keeps `knex_migrations` there) and stale
+ * partition children — so it must be cleaned too. `preCleanSchemas` re-creates an
+ * empty `public` afterward.
+ *
+ * Identifier parsing handles both pg_dump forms — unquoted (`CREATE SCHEMA nango;`)
+ * and quoted with doubled-quote escaping (`CREATE SCHEMA "weird""schema";`).
+ *
+ * @param {string} dumpPath
+ * @returns {string[]} unique schema names, always including `public`
+ */
+function extractSchemasFromDump(dumpPath) {
+  const contents = readFileSync(dumpPath, "utf8");
+  const schemas = new Set(["public"]);
+  // `CREATE SCHEMA [IF NOT EXISTS] (<quoted> | <unquoted>);` at statement start.
+  const pattern = /^\s*CREATE SCHEMA (?:IF NOT EXISTS )?(?:"((?:[^"]|"")+)"|([A-Za-z_][A-Za-z0-9_$]*))\s*;/gm;
+
+  let match;
+  while ((match = pattern.exec(contents)) !== null) {
+    const quoted = match[1];
+    const unquoted = match[2];
+    const name = quoted !== undefined ? quoted.replaceAll('""', '"') : unquoted;
+    if (!name || PG_SYSTEM_SCHEMAS.has(name)) {
+      continue;
+    }
+    schemas.add(name);
+  }
+
+  return [...schemas];
+}
+
 function readBackupManifest(extractedBundleRoot) {
   const manifestPath = path.join(extractedBundleRoot, "manifest.json");
   if (!existsSync(manifestPath)) {
@@ -2854,6 +2899,7 @@ function importBackupBundle(repoRoot, env, appConnectionString, filePath) {
 
     const nangoDumpPath = path.join(tempDirectory, "postgres", "nango.sql");
     let nangoDatabaseUrl = null;
+    let nangoSchemas = null;
     if (existsSync(nangoDumpPath)) {
       nangoDatabaseUrl = getNangoDatabaseUrl(env);
       if (!nangoDatabaseUrl) {
@@ -2862,6 +2908,13 @@ function importBackupBundle(repoRoot, env, appConnectionString, filePath) {
             "Set one of these environment variables, or remove postgres/nango.sql from the bundle to skip the Nango import.",
         );
       }
+      // Derive the Nango schemas to pre-clean from the dump itself (the restore
+      // contract). The Nango dump is a FULL-DB dump created with
+      // `--clean --if-exists`; without a pre-clean those statements run against
+      // the LIVE Nango DB and fail on inherited partition-child pkeys
+      // (`cannot drop inherited constraint`, cinatra-cli#68). Read in pre-flight
+      // (before any DB mutation) so a malformed dump aborts the whole import.
+      nangoSchemas = extractSchemasFromDump(nangoDumpPath);
     }
 
     // --- Determine schemas to pre-clean ---
@@ -2876,6 +2929,10 @@ function importBackupBundle(repoRoot, env, appConnectionString, filePath) {
     importBackupFile(repoRoot, env, appConnectionString, cinatraDumpPath);
 
     if (nangoDatabaseUrl) {
+      // Mirror the app-DB pre-clean for Nango: DROP the dump's schemas CASCADE so
+      // the dump's own `--clean` ALTER/DROP statements become no-ops, then restore
+      // into the cleaned DB (cinatra-cli#68).
+      preCleanSchemas(repoRoot, env, nangoDatabaseUrl, nangoSchemas);
       importBackupFile(repoRoot, env, nangoDatabaseUrl, nangoDumpPath);
     }
 
@@ -10900,6 +10957,10 @@ export {
   AUTH_TABLES,
   resetDevelopmentData,
   readAuthTableState,
+  // cinatra-cli#68 — Nango restore pre-clean: schemas derived from the dump.
+  extractSchemasFromDump,
+  createBackupBundle,
+  importBackupBundle,
 };
 
 /**
