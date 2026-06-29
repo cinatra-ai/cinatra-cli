@@ -146,12 +146,9 @@ export async function runCreateExtension(argv) {
     stdout.write(`\nNext steps:\n`);
     stdout.write(`  1. cd ${result.slug}\n`);
     stdout.write(`  2. Edit README.md, then fill in the kind-specific payload (the generated README explains the kind).\n`);
-    if (kind === "agent" || kind === "workflow") {
-      stdout.write(`  3. Run the kind gate:  node extension-kind-gate.mjs --package-root .\n`);
-      stdout.write(`  4. Validate package shape:  npm pack --dry-run\n`);
-    } else {
-      stdout.write(`  3. Validate package shape:  npm pack --dry-run\n`);
-    }
+    stdout.write(`  3. Run the kind gate:  node extension-kind-gate.mjs --package-root .\n`);
+    stdout.write(`     (the same self-contained gate the install pipeline mirrors — catches blockers before you publish.)\n`);
+    stdout.write(`  4. Validate package shape:  npm pack --dry-run\n`);
     stdout.write(`  5. Publish: cut a GitHub Release tagged v<version> to trigger the marketplace submit pipeline.\n`);
     stdout.write(`     (Deferred until @cinatra-ai/sdk-extensions@0.1.1 is published; the SDK peer is optional today.)\n`);
     return 0;

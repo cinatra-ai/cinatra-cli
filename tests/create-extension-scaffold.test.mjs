@@ -156,9 +156,10 @@ describe.each(KINDS)("create-extension scaffolds a valid %s", (kind) => {
     errors.push(...validateDepShape(pkg));
     errors.push(...validateReadme(readFileSync(join(dir, "README.md"), "utf8")));
 
-    if (kind === "agent" || kind === "workflow") {
-      expect(existsSync(join(dir, "extension-kind-gate.mjs")), `${kind} must ship extension-kind-gate.mjs`).toBe(true);
-    }
+    // ALL FIVE kinds now ship the self-contained gate (cinatra-cli#72): the
+    // common cross-kind rules + the per-kind gate catch what the install
+    // pipeline rejects, before publish — not just agent + workflow.
+    expect(existsSync(join(dir, "extension-kind-gate.mjs")), `${kind} must ship extension-kind-gate.mjs`).toBe(true);
     const gate = runGate(dir);
     for (const e of gate.errors) errors.push(`kind-gate: ${e}`);
 

@@ -6,6 +6,33 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`cinatra create-extension` now ships the FULL self-contained kind gate into
+  EVERY scaffolded extension repo (all five kinds), and defaults connectors to
+  the hot-installable schema-config setup surface.** Previously only the `agent`
+  and `workflow` scaffolds shipped a gate, and it was a lightweight stub ("any
+  other kind → pass"). The gate (`extension-kind-gate.mjs`) is now the full,
+  zero-dependency validator that mirrors the install pipeline: the common
+  cross-kind rules (manifest shape, host-port names, `sdkAbiRange` grammar, the
+  `@/` host-internal + non-SDK first-party import bans, the host-peer
+  value-import ban over the `serverEntry` graph, the README/license contract,
+  `serverEntry` preflight) PLUS the per-kind gate (agent OAS, connector manifest
+  + **`configSchema`**, artifact descriptor, skill naming, workflow BPMN). The
+  `connector/`, `artifact/`, and `skill/` template CI workflows now run it as a
+  real `kind-gates` job instead of a no-op echo. Authors catch what the
+  marketplace would reject BEFORE publishing, for every kind. (cinatra-cli#72)
+- **Scaffolded connectors now declare `cinatra.uiSurface: "schema-config"` with a
+  starter `cinatra.configSchema`** (a `text` + `secret` setup form) — the
+  hot-installable declarative setup surface the host renders WITHOUT a rebuild.
+  This replaces the old bundled-React `setup-page.tsx` assumption as the default.
+  The gate validates the `configSchema` (the extended cinatra#658 vocabulary:
+  `select`, `record-list`, `banner`, `advisory` in addition to `text`, `secret`,
+  `nango-connect`, `repeatable-list`, `status-probe`, `copyable-credential`,
+  `named-action`) and rejects any smuggled per-field key — the configSchema is
+  pure data, never executable code or HTML. See **Migrating to hot-installable
+  extensions** in `templates/_shared/MIGRATING-HOT-INSTALL.md`. (cinatra-cli#72)
+
 ## [0.1.4] - 2026-06-29
 
 ### Changed
