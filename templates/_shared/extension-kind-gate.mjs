@@ -12,8 +12,8 @@
 // connector, artifact, skill, workflow).
 //
 // CANONICAL OWNER: this gate is the canonical author-facing pre-publish gate
-// (cinatra-cli#72 / eng#369). Its rules mirror the AUTHORITATIVE host enforcers
-// in the cinatra monorepo (the install pipeline). extension-release-tooling#36
+// (cinatra-cli#72). Its rules mirror the AUTHORITATIVE host enforcers
+// in the cinatra monorepo (the install pipeline). The release tooling
 // mirrors/tracks it; the cinatra-cli copy is the source of truth for authors.
 //
 // IT MUST STAY SELF-CONTAINED — only Node builtins, no `@cinatra-ai/*`
