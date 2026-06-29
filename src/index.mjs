@@ -645,7 +645,7 @@ Usage:
   cinatra instance clone prune [--worktree-path <path>] [--slug <slug>] --yes
   cinatra instance clone list
   cinatra instance db migrate [--down] [--count=N] [--dir <abs> --namespace <ns>]
-  cinatra instance refresh [--docker=auto|always|--no-docker]
+  cinatra instance refresh [--docker=auto|always|--no-docker] [--with-dev-apps]
   cinatra instance tunnel start
   cinatra instance tunnel stop
   cinatra instance tunnel status
@@ -687,6 +687,8 @@ Commands:
                       --down / --count=N / --dir <abs> --namespace <ns>.
   instance refresh    Reconcile your local dev environment (deps + dev DB schema)
                       to the code on disk. Dev mode only; never touches git.
+                      --with-dev-apps: opt in to dev-app reconciliation (skipped
+                      by default to keep refresh fast).
   instance tunnel start|stop|status
                       Manage the dev-main Tailscale Funnel.
   instance start|stop|restart
@@ -5199,7 +5201,7 @@ async function runDevRefresh(rest) {
     }
   }
 
-  const { dockerMode } = parseDevRefreshFlags(rest);
+  const { dockerMode, withDevApps } = parseDevRefreshFlags(rest);
   const dockerDecision = describeDockerDecision({ dockerMode, env: fileEnv });
 
   console.log("Refreshing the dev environment to match the checked-out code…");
@@ -5244,9 +5246,10 @@ async function runDevRefresh(rest) {
   // 3. Database + settings: the existing idempotent dev setup (additive bootstrap +
   //    ensure* settings) followed by the versioned core migration chain
   //    (migrations/core/, recorded in the pgmigrations ledger) — both run inside
-  //    runSetup. Dev app sync is skipped to keep refresh fast.
+  //    runSetup. Dev app sync is skipped by default to keep refresh fast; pass
+  //    --with-dev-apps to opt into dev-app reconciliation.
   console.log("- Database + settings: running idempotent dev setup…");
-  await runSetup("dev", { skipDevApps: true });
+  await runSetup("dev", { skipDevApps: !withDevApps });
 
   // 4. Advisory: additive schema is reconciled automatically and the versioned
   //    migration chain has been applied (or ledger-faked on a fresh schema) by
