@@ -498,6 +498,54 @@ async function installResolvedTree({ tree, install }) {
 }
 
 // ---------------------------------------------------------------------------
+// DB preflight — guard against never-booted instances (cinatra-cli#69)
+// ---------------------------------------------------------------------------
+
+/**
+ * Run a preflight check before any agent_templates DB write.
+ *
+ * A never-booted instance has no `cinatra` schema at all; a partially-migrated
+ * instance may have the table but be missing the `package_name` column added in
+ * a later migration. Both cases produce cryptic Postgres errors mid-write.
+ *
+ * Throws with an actionable message when the schema/table/column is absent so
+ * the operator knows exactly what to do before retrying.
+ *
+ * @param {import("pg").Client} client  An already-connected pg Client.
+ * @param {string} schema               The Postgres search-path schema to check.
+ */
+async function checkAgentDbPreflight(client, schema) {
+  // `to_regclass` returns NULL when the relation does not exist (no error/exception).
+  const tableResult = await client.query(
+    `SELECT to_regclass($1::text) AS rel`,
+    [`${schema}.agent_templates`],
+  );
+  if (tableResult.rows[0].rel == null) {
+    throw new Error(
+      `Schema preflight failed: relation "${schema}.agent_templates" does not exist. ` +
+        `Start the cinatra instance once so its database schema is created and all ` +
+        `migrations have run, then retry this command.`,
+    );
+  }
+  // Verify the package_name column exists (added in a later migration).
+  const colResult = await client.query(
+    `SELECT column_name
+       FROM information_schema.columns
+      WHERE table_schema = $1
+        AND table_name   = 'agent_templates'
+        AND column_name  = 'package_name'`,
+    [schema],
+  );
+  if (colResult.rows.length === 0) {
+    throw new Error(
+      `Schema preflight failed: column "package_name" is missing from ` +
+        `"${schema}.agent_templates". Start the cinatra instance once so its ` +
+        `migrations run to completion, then retry this command.`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Install single agent package — extract tarball + write to DB
 // ---------------------------------------------------------------------------
 
@@ -566,11 +614,17 @@ async function installAgentFromPackage({ packageName, packageVersion, registryUr
     const sourceVersionId = agent?.version?.sourceVersionId ?? cinatraMeta.sourceVersionId ?? null;
     const sourceVersionNumber = agent?.version?.sourceVersionNumber ?? cinatraMeta.sourceVersionNumber ?? 1;
 
-    const schema = process.env.SUPABASE_SCHEMA ?? "cinatra";
+    const schema = (process.env.SUPABASE_SCHEMA || "").trim() || "cinatra";
     const client = new pg.Client({ connectionString: dbUrl });
     await client.connect();
 
     try {
+      // Preflight: confirm the schema and required column exist before any write.
+      // A never-booted instance has no cinatra schema; a partially-migrated one
+      // may be missing the package_name column. Both produce cryptic errors
+      // mid-INSERT — bail early with actionable guidance instead.
+      await checkAgentDbPreflight(client, schema);
+
       // Check for existing template by packageName
       const existingResult = await client.query(
         `SELECT id FROM ${schema}.agent_templates WHERE package_name = $1 LIMIT 1`,
@@ -951,10 +1005,15 @@ async function deleteAgentTemplateByPackage(packageName) {
         "Use --keep-db to prune the lockfile entry only.",
     );
   }
-  const schema = process.env.SUPABASE_SCHEMA ?? "cinatra";
+  const schema = (process.env.SUPABASE_SCHEMA || "").trim() || "cinatra";
   const client = new pg.Client({ connectionString: dbUrl });
   await client.connect();
   try {
+    // Preflight: confirm the schema/table/column exist before attempting deletes
+    // (same guard as install — a never-booted or partially-migrated instance must
+    // start first). Throws with actionable guidance if the check fails.
+    await checkAgentDbPreflight(client, schema);
+
     // The two deletes run in one transaction: since we deliberately do NOT rely
     // on a DB-level ON DELETE CASCADE, a mid-sequence failure (lock timeout,
     // connection drop) must not leave a template row orphaned without its
@@ -1112,4 +1171,6 @@ export const __test = {
   deriveInputSchemaFromOas,
   pickInputSchema,
   safeJsonParse,
+  // Exported for unit+integration test coverage of the DB preflight guard (#69).
+  checkAgentDbPreflight,
 };
