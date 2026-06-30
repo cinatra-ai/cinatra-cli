@@ -6,6 +6,33 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-06-30
+
+Compatibility backport. This is the version the Cinatra app pins. It carries the
+prior (0.1.3) `cinatra setup dev|prod` command surface plus only the production
+extension-acquisition fix, so the app can pin a fixed CLI without adopting the
+0.1.4/0.1.5 command-surface migration.
+
+### Fixed
+
+- **Production extension acquisition no longer fails on the pnpm workspace
+  symlink.** Backports the `cinatra-ai/cinatra#735` fix onto the 0.1.3 command
+  surface: the acquired-tree re-verify walk (`computeTreeSha256FromDir`) now
+  skips a `node_modules` install root even when pnpm lands it as a symlink — the
+  in-repo `@cinatra-ai/sdk-extensions` workspace package linked into each acquired
+  extension's `node_modules` — instead of failing closed on the non-regular entry.
+  Branched from `v0.1.3` and ports ONLY this fix (none of the `dev`→`instance`,
+  `setup`→internal-phase, or bare-form-removal refactors). Integrity is unchanged:
+  a device/FIFO `node_modules`, and any symlink OUTSIDE `node_modules`, still
+  hard-fail. (`cinatra-ai/cinatra#735`)
+
+## [0.1.5] - 2026-06-30
+
+The new/reorganized command surface plus the production extension-acquisition fix
+at the new boundary. Published, but the Cinatra app stays on the 0.1.6 backport
+for this release cycle; adopting this surface is tracked in
+`cinatra-ai/cinatra#742`.
+
 ### Changed
 
 - **`cinatra create-extension` now ships the FULL self-contained kind gate into
@@ -32,6 +59,21 @@ project adheres to [Semantic Versioning](https://semver.org/).
   `named-action`) and rejects any smuggled per-field key — the configSchema is
   pure data, never executable code or HTML. See **Migrating to hot-installable
   extensions** in `templates/_shared/MIGRATING-HOT-INSTALL.md`. (cinatra-cli#72)
+
+### Removed
+
+- **BREAKING:** Removed the deprecated bare-form command aliases (`cinatra
+  setup …`, `cinatra db migrate`, `cinatra clone …`, `cinatra reset dev`,
+  `cinatra backup …`). These printed a one-line deprecation rename hint in 0.1.4;
+  they are now gone — use the namespaced `cinatra instance …` forms. (#81, PR #82)
+
+### Fixed
+
+- **Production extension acquisition.** The acquired-tree re-verify walk
+  (`computeTreeSha256FromDir`) now skips a `node_modules` install root even when
+  pnpm lands it as a symlink, fixing a fail-closed production install
+  (`cinatra-ai/cinatra#735`). Integrity is unchanged: a device/FIFO
+  `node_modules`, and any symlink OUTSIDE `node_modules`, still hard-fail. (#86)
 
 ## [0.1.4] - 2026-06-29
 
@@ -201,6 +243,9 @@ release (0.1.5):
 - Initial public release of the thin, checkout-driven `cinatra` CLI, published
   as the scoped `@cinatra-ai/cinatra`. (#2)
 
+[Unreleased]: https://github.com/cinatra-ai/cinatra-cli/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.6
+[0.1.5]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.5
 [0.1.4]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.4
 [0.1.3]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.3
 [0.1.2]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.2
