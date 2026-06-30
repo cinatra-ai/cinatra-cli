@@ -28,6 +28,18 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # RELEASE-APPROVAL WALL (cinatra-engineering release-approval doctrine):
+    # this job PUBLISHES @cinatra-ai/cinatra to PUBLIC npm via OIDC trusted
+    # publishing on a `v*` tag push. This is the exact path whose unapproved
+    # auto-publish triggered the hardening. The protected `release-approval`
+    # Environment (required reviewer + prevent_self_review + can_admins_bypass=
+    # false) PAUSES this job until a human approves it, so a `v*` tag can never
+    # auto-publish to npm again without an explicit approval click. The
+    # Environment is provisioned in this repo via the GitHub API; if it is ever
+    # deleted GitHub auto-recreates it WITHOUT rules (unblocked), so do not delete
+    # it — and NEVER remove this `environment:` line — without explicit owner
+    # approval. It is the technical backstop for the no-autonomous-publish rule.
+    environment: release-approval
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
