@@ -495,8 +495,7 @@ Commands:
                     author + publish. One of five kinds: agent, connector,
                     artifact, skill, workflow. Zero-dependency, offline; the
                     generated repo pins @cinatra-ai/sdk-extensions as an
-                    OPTIONAL peer (never installed by this command). Replaces the
-                    retired \`npx create-cinatra-extension\` scaffolder.
+                    OPTIONAL peer (never installed by this command).
                     <kind>            agent | connector | artifact | skill | workflow.
                     [name]            Extension name; the \`-<kind>\` (or \`-skills\`)
                                       suffix is appended if absent. Prompted on a TTY.
@@ -11024,8 +11023,7 @@ function buildHandlers() {
     "extensions.list": async (rest) => {
       await runExtensionsList(rest);
     },
-    // Class-B authoring: scaffold a new extension package on disk. Folded from
-    // the retired `npx create-cinatra-extension` thin alias (cinatra#402) over a
+    // Class-B authoring: scaffold a new extension package on disk via a
     // shared, zero-dependency authoring core lazy-loaded from ./authoring/.
     // Command-routing dispatcher contract: `rest` already holds the `<kind>`/name/flags.
     "create-extension": async (rest) => {

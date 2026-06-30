@@ -1,9 +1,9 @@
 // `cinatra create-extension <kind>` scaffold parity + correctness (cinatra#402).
 //
-// This is the folded-in equivalent of create-cinatra-extension's
-// `test/scaffold-all-kinds.test.mjs`: scaffold each of the five kinds via the
-// SHARED authoring core (the same code path the `cinatra create-extension`
-// command drives) and assert the SDK-P1-equivalent local invariants per kind —
+// `cinatra create-extension` scaffold parity + correctness: scaffold each of
+// the five kinds via the SHARED authoring core (the same code path the
+// `cinatra create-extension` command drives) and assert the SDK-P1-equivalent
+// local invariants per kind —
 //   - manifest shape (cinatra.apiVersion/kind, license, semver),
 //   - first-party dep shape (no leaked @cinatra-ai deps; SDK is an optional peer),
 //   - README gate shape (one H1; allowed/ordered H2; no H3+),
@@ -136,8 +136,8 @@ beforeAll(() => {
 
 describe("create-extension authoring core — templates resolve from src/authoring/", () => {
   it("REPO_ROOT points at the cinatra-cli repo root and templates/ exists there", () => {
-    // The locator moved one level deeper (src/authoring/ vs the standalone's
-    // src/); this asserts the two-levels-up fix is correct.
+    // The authoring core sits at src/authoring/, two levels up from repo root;
+    // this asserts the two-levels-up resolve is correct.
     expect(existsSync(join(REPO_ROOT, "templates"))).toBe(true);
     expect(existsSync(join(REPO_ROOT, "templates", "_shared", "extension-kind-gate.mjs"))).toBe(true);
     for (const kind of KINDS) {
