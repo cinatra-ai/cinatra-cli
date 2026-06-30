@@ -219,12 +219,9 @@ release (0.1.5):
 
 ### Changed
 
-- Folded the standalone `create-cinatra-extension` scaffolder into the unified
-  CLI as `cinatra create-extension <kind>`, over a shared zero-dependency
-  authoring core. The standalone `npx create-cinatra-extension` path is retired
-  in favor of `cinatra create-extension <kind>`. Scaffold output remains
-  byte-identical to the former standalone scaffolder across all five kinds:
-  agent, connector, artifact, skill, and workflow. (#7)
+- Added `cinatra create-extension <kind>` — scaffold a new extension package on
+  disk via a shared zero-dependency authoring core. Scaffold output covers all
+  five kinds: agent, connector, artifact, skill, and workflow. (#7)
 
 ## [0.1.1] - 2026-06-22
 

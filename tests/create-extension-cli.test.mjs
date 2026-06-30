@@ -80,7 +80,7 @@ describe("cinatra create-extension argument routing (the kind token in `mode`)",
   });
 });
 
-describe("cinatra create-extension typed exit codes (parity with the standalone scaffolder)", () => {
+describe("cinatra create-extension typed exit codes", () => {
   it("exits 2 on an unknown kind (usage error), not 1", () => {
     const res = run(["create-extension", "bogus", "x", "--yes"]);
     expect(res.status).toBe(2);

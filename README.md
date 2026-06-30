@@ -109,9 +109,6 @@ kind-specific payload). The generated package pins `@cinatra-ai/sdk-extensions`
 as an optional peer; nothing is installed for you. Run `cinatra create-extension
 --help` for the kinds and options.
 
-> This replaces the standalone `npx create-cinatra-extension` scaffolder, which
-> is retired.
-
 ## Repo structure
 
 ```
