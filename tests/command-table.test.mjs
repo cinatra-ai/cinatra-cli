@@ -114,6 +114,12 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode",
         },
         {
+          "command": "extensions verify-prod",
+          "hidden": false,
+          "id": "extensions.verify-prod",
+          "match": "command+mode",
+        },
+        {
           "command": "create-extension",
           "hidden": false,
           "id": "create-extension",
