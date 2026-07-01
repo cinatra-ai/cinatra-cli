@@ -377,6 +377,7 @@ Usage:
   cinatra create-extension <kind> [name] [--scope <scope>] [--display-name <name>]
                            [--description <text>] [--dir <path>] [--force] [--yes]
   cinatra extensions acquire-prod
+  cinatra extensions verify-prod [--json]
   cinatra mcp llm-access setup
   cinatra mcp llm-access refresh
   cinatra mcp llm-access verify
@@ -516,6 +517,20 @@ Commands:
                     Idempotent; fails loud on any integrity mismatch. Run
                     \`corepack pnpm install\` afterwards to link the packages
                     (the Dockerfile and scripts/setup.sh prod flow do this).
+
+  extensions verify-prod
+                    READ-ONLY assertion that the prod required-extension state is
+                    COHERENT across all five authorities: the on-disk set
+                    (extensions/), the baked seed (cinatra.extensions), the lock
+                    (cinatra-required-extensions.lock.json), what the running
+                    instance's loader actually registered/activated (the live
+                    installed_extension rows), and what WayFlow can see (the
+                    materialized agent-OAS trees under the agent-install dir).
+                    Fails NON-mutatingly with a distinct diagnostic per mismatch
+                    class (missing-on-disk / extra-seed-owned-dir / lock-mismatch
+                    / loader-missing / wayflow-missing); exits non-zero on any
+                    mismatch, zero when fully coherent. Never writes/downloads/
+                    removes anything. --json for machine output.
 
   status            Show current setup state (auth tables, user count, MCP config).
 
@@ -10565,6 +10580,117 @@ async function runExtensionsList(argv = []) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// extensions verify-prod — READ-ONLY prod required-extension COHERENCE check
+// (cinatra#789). Asserts on-disk == baked seed == lock == loader-registered
+// (installed_extension) == WayFlow-visible (materialized agent-OAS trees). Fails
+// NON-mutatingly with a distinct, actionable diagnostic per mismatch class;
+// exits non-zero on any mismatch, zero when fully coherent. Never writes,
+// downloads, renames, or removes anything.
+// ---------------------------------------------------------------------------
+
+// Resolve the agent-install dir (the WayFlow `:/agents:ro` mount) the SAME way
+// the runtime does (packages/agents/src/agent-install-path.ts resolveAgentInstallDir):
+// the `CINATRA_AGENT_INSTALL_DIR` env var wins (deploy determinism), else the
+// DB metadata key `agent_install_path`, else the historical default
+// `<root>/extensions`. A relative value is resolved against repoRoot. Read-only.
+async function resolveAgentInstallDirForVerify(repoRoot, env, client, schemaName) {
+  const envValue = typeof env.CINATRA_AGENT_INSTALL_DIR === "string" ? env.CINATRA_AGENT_INSTALL_DIR.trim() : "";
+  let configured = envValue;
+  // The env override wins and needs no DB. Only when it is unset do we consult
+  // the `agent_install_path` metadata key — and a metadata READ failure (e.g. a
+  // missing/unmigrated metadata table) must NOT abort the whole verify run
+  // before it can emit its findings. Fall back to the historical default; the
+  // DB-level coherence gaps still surface as their own (loader-missing)
+  // findings. Env override is honored regardless of DB health.
+  if (!configured && client) {
+    try {
+      const stored = await readMetadataValue(client, schemaName, "agent_install_path", null);
+      if (typeof stored === "string" && stored.trim()) configured = stored.trim();
+    } catch {
+      /* metadata unreadable -> fall through to the default; do not abort */
+    }
+  }
+  if (!configured) configured = "extensions";
+  return path.isAbsolute(configured) ? configured : path.resolve(repoRoot, configured);
+}
+
+async function runExtensionsVerifyProd(argv = []) {
+  const asJson = argv.includes("--json");
+  for (const a of argv) {
+    if (a !== "--json") {
+      throw new Error(`Unexpected argument: ${a}\nUsage: cinatra extensions verify-prod [--json]`);
+    }
+  }
+
+  const repoRoot = getRepoRoot();
+  const env = collectEnvironment(repoRoot);
+  const schemaName = env.SUPABASE_SCHEMA?.trim() || "cinatra";
+
+  // Open a pg client if a connection string is configured. A MISSING/unreachable
+  // DB is NOT a hard throw here — verify-prod reports it as a `loader-missing`
+  // finding (so the CLI still prints the on-disk/lock findings and exits
+  // non-zero) rather than aborting before the coherent-subset checks run.
+  let client = null;
+  let dbError = null;
+  const connectionString = env.SUPABASE_DB_URL?.trim();
+  if (!connectionString) {
+    dbError = "SUPABASE_DB_URL is not set";
+  } else {
+    try {
+      client = await createClient(connectionString);
+      await client.connect();
+    } catch (err) {
+      client = null;
+      dbError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  try {
+    const installDir = await resolveAgentInstallDirForVerify(repoRoot, env, client, schemaName);
+    const { verifyProdRequiredExtensions } = await import("./prod-extension-verify.mjs");
+    const report = await verifyProdRequiredExtensions({
+      repoRoot,
+      installDir,
+      dbClient: client,
+      schemaName,
+      dbError,
+    });
+
+    if (asJson) {
+      console.log(JSON.stringify({ ok: report.ok, checked: report.checked, findings: report.findings }, null, 2));
+    } else {
+      await printVerifyProdReport(report, installDir);
+    }
+    if (!report.ok) process.exitCode = 1;
+  } finally {
+    if (client) await client.end();
+  }
+}
+
+async function printVerifyProdReport(report, installDir) {
+  console.log("Cinatra prod required-extension coherence check (READ-ONLY):");
+  console.log(`  Verified ${report.checked} locked package(s); agent-install dir: ${installDir}`);
+  if (report.ok) {
+    console.log(
+      "  ✓ COHERENT — on-disk == baked seed == lock == loader-registered == WayFlow-visible.",
+    );
+    return;
+  }
+  const { MISMATCH_CLASSES } = await import("./prod-extension-verify.mjs");
+  console.log(`  ✗ INCOHERENT — ${report.findings.length} mismatch(es):`);
+  for (const cls of MISMATCH_CLASSES) {
+    const inClass = report.findings.filter((f) => f.class === cls);
+    if (inClass.length === 0) continue;
+    console.log(`\n  [${cls}] (${inClass.length})`);
+    for (const f of inClass) {
+      const who = f.packageName ? `${f.packageName}: ` : "";
+      console.log(`    ✗ ${who}${f.detail}`);
+      if (f.remediation) console.log(`        ↳ ${f.remediation}`);
+    }
+  }
+}
+
 async function runStatus(argv = []) {
   // Remote path: when an explicit target is selected (--app-url or --profile),
   // call the instance's authenticated /api/cli/status over HTTP using the
@@ -11022,6 +11148,9 @@ function buildHandlers() {
     },
     "extensions.list": async (rest) => {
       await runExtensionsList(rest);
+    },
+    "extensions.verify-prod": async (rest) => {
+      await runExtensionsVerifyProd(rest);
     },
     // Class-B authoring: scaffold a new extension package on disk via a
     // shared, zero-dependency authoring core lazy-loaded from ./authoring/.

@@ -461,7 +461,15 @@ export async function extractVerifiedTarball(tarBuffer, destDir, { tar }) {
   normalizeModes(destDir);
 }
 
-function readMarker(destDir) {
+/**
+ * Read the acquisition marker (`.cinatra-acquired.json`) at a package dir root,
+ * or null when absent/unreadable. A pure read (no writes) — exported so the
+ * read-only `extensions verify-prod` verifier can distinguish an
+ * acquisition-managed dir (has a marker) from a dev clone / user install
+ * (markerless) WITHOUT re-implementing the marker path or duplicating the
+ * acquisition logic.
+ */
+export function readAcquisitionMarker(destDir) {
   const markerPath = path.join(destDir, ACQUISITION_MARKER_FILENAME);
   if (!existsSync(markerPath)) return null;
   try {
@@ -591,7 +599,7 @@ export async function acquireProdRequiredExtensions({
     const label = `${entry.packageName}@${entry.packageVersion} (${entry.repo}#${entry.resolvedSha.slice(0, 12)})`;
 
     if (existsSync(dest)) {
-      const marker = readMarker(dest);
+      const marker = readAcquisitionMarker(dest);
       if (!marker) {
         throw new Error(
           `[prod-extension-acquisition] ${dest} exists but is not acquisition-managed (no ` +

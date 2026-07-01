@@ -138,6 +138,13 @@ export const COMMAND_DESCRIPTORS = [
     summary: "List installed extensions (name, kind, version) from the extensions/ tree.",
   },
   {
+    id: "extensions.verify-prod",
+    path: ["extensions", "verify-prod"],
+    match: "command+mode",
+    summary:
+      "Verify prod required-extension coherence (on-disk == seed == lock == registered == WayFlow); read-only.",
+  },
+  {
     id: "create-extension",
     path: ["create-extension"],
     match: "command",
