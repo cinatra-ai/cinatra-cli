@@ -10358,7 +10358,7 @@ async function runBackupImportApiConfigs(argv) {
     filePath = findLatestApiConfigsFile(repoRoot);
     if (!filePath) {
       throw new Error(
-        `No API config files found in ${path.join(repoRoot, DEFAULT_BACKUP_DIRECTORY)}. ` +
+        `No API config files found in ${path.join(repoRoot, DEFAULT_DATA_DIRECTORY)}. ` +
           `Export them first with "cinatra instance backup export-api-configs", or specify a file with --file.`,
       );
     }
@@ -10382,13 +10382,22 @@ async function runBackupImportApiConfigs(argv) {
   await client.connect();
 
   try {
-    for (const entry of raw.entries) {
-      await client.query(
-        `INSERT INTO ${quoteIdentifier(schemaName)}.metadata (key, value)
-         VALUES ($1, $2)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [entry.key, typeof entry.value === "string" ? entry.value : JSON.stringify(entry.value)],
-      );
+    // Apply all upserts atomically: a mid-loop failure must not leave a
+    // half-applied config set behind (cinatra-cli#95).
+    await client.query("BEGIN");
+    try {
+      for (const entry of raw.entries) {
+        await client.query(
+          `INSERT INTO ${quoteIdentifier(schemaName)}.metadata (key, value)
+           VALUES ($1, $2)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+          [entry.key, typeof entry.value === "string" ? entry.value : JSON.stringify(entry.value)],
+        );
+      }
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
     }
     console.log(`Imported ${raw.entries.length} API config entries from ${filePath}`);
   } finally {
@@ -10975,35 +10984,37 @@ async function runAgentImport(argv) {
 
   const importedName = readOptionValue(argv, "--name") ?? agent.name ?? "Imported Agent";
 
+  // Local import AUTHORS a brand-new template. Synthesize a package_name that is
+  // unique by construction (a full UUID) inside a reserved local scope that can
+  // never collide with a real marketplace package — so the shared upsert helper
+  // always INSERTs and never clobbers an installed package (insert-only
+  // authoring). The shared writer JSON.stringify()s every JSON column, so
+  // `compiledPlan` is passed as the raw JS array it already is (cinatra-cli#95).
+  const slug =
+    importedName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") ||
+    "agent";
+  const packageName = `@cinatra-local/${slug}-${randomUUID()}`;
+
   const client = await createClient(connectionString);
   await client.connect();
   try {
-    const newId = randomUUID();
-    await client.query(
-      `INSERT INTO ${quoteIdentifier(schemaName)}.agent_templates
-       (id, name, description, source_nl, compiled_plan, input_schema, output_schema, approval_policy, execution_mode, task_spec, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft')`,
-      [
-        newId,
-        importedName,
-        agent.description ?? null,
-        agent.sourceNl ?? "",
-        agent.compiledPlan ?? "[]",
-        agent.inputSchema ?? "{}",
-        agent.outputSchema ?? null,
-        agent.approvalPolicy ?? "{}",
-        agent.executionMode ?? "deterministic",
-        agent.taskSpec ?? null,
-      ],
-    );
-
-    const snapshotStr = JSON.stringify({ compiledPlan: agent.compiledPlan, inputSchema: agent.inputSchema, taskSpec: agent.taskSpec });
-    const contentHash = createHash("sha256").update(snapshotStr).digest("hex");
-    await client.query(
-      `INSERT INTO ${quoteIdentifier(schemaName)}.agent_versions (id, template_id, content_hash, snapshot)
-       VALUES ($1, $2, $3, $4)`,
-      [randomUUID(), newId, contentHash, snapshotStr],
-    );
+    const { upsertAgentTemplate } = await import("./agents-install.mjs");
+    const { templateId: newId } = await upsertAgentTemplate(client, schemaName, {
+      name: importedName,
+      description: agent.description ?? null,
+      sourceNl: agent.sourceNl ?? "",
+      compiledPlan: agent.compiledPlan ?? [],
+      inputSchema: agent.inputSchema ?? {},
+      outputSchema: agent.outputSchema ?? null,
+      approvalPolicy: agent.approvalPolicy ?? { steps: [] },
+      taskSpec: agent.taskSpec ?? null,
+      packageName,
+      snapshot: {
+        compiledPlan: agent.compiledPlan,
+        inputSchema: agent.inputSchema,
+        taskSpec: agent.taskSpec,
+      },
+    });
 
     console.log(`Imported agent "${importedName}" → ID: ${newId}`);
     console.log(`View in app: /agents/builder/${newId}`);
