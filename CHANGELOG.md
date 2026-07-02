@@ -6,6 +6,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-07-02
+
+### Changed
+
+- Renamed the `dev` command to `instance` (manages named Cinatra instances).
+- Replaced `setup` with `install` plus an explicit `--mode` flag.
+
+### Removed
+
+- Removed the legacy bare-form command aliases.
+- Removed all references to the retired `create-cinatra-extension` package.
+
+### Added
+
+- Added `extensions verify-prod` to check a running instance against its
+  required-extension lock.
+
 ## [0.1.6] - 2026-06-30
 
 Compatibility backport. This is the version the Cinatra app pins. It carries the
@@ -241,6 +258,7 @@ release (0.1.5):
   as the scoped `@cinatra-ai/cinatra`. (#2)
 
 [Unreleased]: https://github.com/cinatra-ai/cinatra-cli/compare/v0.1.6...HEAD
+[0.1.7]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.7
 [0.1.6]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.6
 [0.1.5]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.5
 [0.1.4]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.4
