@@ -110,6 +110,9 @@ import { resolve, join, basename, dirname, relative, normalize, isAbsolute, sep 
 // ===========================================================================
 export function parseArgs(argv) {
   let packageRoot = ".";
+  // Artifact-parity enforcement (the WARN→BLOCK ratchet): default is WARN
+  // (advisory); the release/republish path opts into BLOCK via the flag or env.
+  let enforceArtifactParity = process.env.CINATRA_ARTIFACT_PARITY === "block";
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--package-root") {
@@ -119,9 +122,11 @@ export function parseArgs(argv) {
       i++;
     } else if (arg.startsWith("--package-root=")) {
       packageRoot = arg.slice("--package-root=".length);
+    } else if (arg === "--enforce-artifact-parity") {
+      enforceArtifactParity = true;
     }
   }
-  return { packageRoot: resolve(packageRoot) };
+  return { packageRoot: resolve(packageRoot), enforceArtifactParity };
 }
 
 // ===========================================================================
@@ -1174,6 +1179,268 @@ function scanOasString(field, text, findings) {
   }
 }
 
+// ===========================================================================
+// Layer-1 artifact-parity — the earliest, zero-dep static screen for the
+// declarative artifact-materialization contract (a companion to the host-side
+// compile/publish-time parity gates). An agent that DECLARES `cinatra.produces`
+// must ship a runnable materialization for it: either a declarative EndNode
+// output binding (`outputs[].cinatra.artifact`) or a deterministic
+// `artifact_materialize` passthrough node. This mirrors a STATIC SUBSET of the
+// host binding grammar (the host module is the authoritative validator and
+// re-checks at compile/run time); it is dependency-free so it runs in every
+// extension repo's standalone CI before the registry is reachable.
+//
+// ROLLOUT (ratchet): every finding here is ADVISORY (a warning) by default, so
+// the un-migrated fleet never reddens. The release/republish path opts into
+// enforcement — `--enforce-artifact-parity` or env CINATRA_ARTIFACT_PARITY=block
+// — which promotes the SAME findings to hard errors. runGate does the routing.
+// ===========================================================================
+
+/** Text-authorable MIME universe for declarative bindings (v1). Byte-mirror of
+ * the host ARTIFACT_BINDING_AUTHORABLE_MIMES; binary artifacts stay on the
+ * upload/template paths. */
+export const ARTIFACT_AUTHORABLE_MIMES = new Set([
+  "text/markdown", "text/plain", "text/html", "application/json", "application/xml",
+]);
+/** The deterministic passthrough tool that materializes an artifact mid-flow. */
+export const ARTIFACT_MATERIALIZE_TOOL = "artifact_materialize";
+/** URL marker identifying the deterministic passthrough route. */
+export const AGENTS_PASSTHROUGH_URL_MARKER = "/api/agents/passthrough";
+/** Passthrough tools that WRITE (persist) — a node invoking one must NOT be
+ * stamped riskClass:"read_only". Keyed on the invoked tool, never the node name
+ * (a node literally named "write" that only calls the LLM bridge is read_only). */
+export const ARTIFACT_WRITE_SEAM_TOOLS = new Set([
+  "artifact_materialize", "artifact_authoring_emit", "objects_save",
+]);
+const ARTIFACT_BINDING_KEYS = new Set(["extension", "contentFrom", "titleFrom", "declaredMime", "mimeFrom"]);
+
+function isPlainObj(v) {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+function isNonEmptyStr(v) {
+  return typeof v === "string" && v.length > 0;
+}
+/** A `{{ ... }}` placeholder makes a value runtime-templated — not a literal. */
+function isTemplated(v) {
+  return typeof v === "string" && v.includes("{{");
+}
+
+/** Normalize package.json `cinatra.produces` to a Set of extension names, or
+ * `null` when the field is ABSENT (nothing declared ⇒ no parity obligation).
+ * Accepts the on-disk `[{extension}]` object form and, defensively, bare
+ * strings. A present-but-malformed value normalizes to an EMPTY set (fail-closed
+ * membership: any binding then disagrees with declared production). */
+export function normalizeProduces(cinatra) {
+  const raw = cinatra?.produces;
+  if (raw === undefined) return null;
+  if (!Array.isArray(raw)) return new Set();
+  const out = new Set();
+  for (const entry of raw) {
+    if (typeof entry === "string") out.add(entry);
+    else if (isPlainObj(entry) && typeof entry.extension === "string") out.add(entry.extension);
+  }
+  return out;
+}
+
+/** Validate the SHAPE of one `cinatra.artifact` binding — static mirror of the
+ * host `artifactOutputBindingSchema` (strict keys; declaredMime XOR mimeFrom;
+ * authorable MIME). Returns human-readable issue phrases (empty ⇒ valid shape). */
+export function validateArtifactBindingShape(obj) {
+  const issues = [];
+  if (!isPlainObj(obj)) return ["binding must be an object"];
+  for (const k of Object.keys(obj)) {
+    if (!ARTIFACT_BINDING_KEYS.has(k)) issues.push(`unknown field "${k}" (strict — a typo never silently no-ops)`);
+  }
+  if (!isNonEmptyStr(obj.extension)) issues.push("extension must be a non-empty string");
+  if (!isNonEmptyStr(obj.contentFrom)) issues.push("contentFrom must be a non-empty string");
+  if (!isNonEmptyStr(obj.titleFrom)) issues.push("titleFrom must be a non-empty string");
+  const hasDeclared = obj.declaredMime !== undefined;
+  const hasFrom = obj.mimeFrom !== undefined;
+  if (hasDeclared === hasFrom) issues.push("exactly one of declaredMime / mimeFrom is required");
+  if (hasDeclared) {
+    if (!isNonEmptyStr(obj.declaredMime)) issues.push("declaredMime must be a non-empty string");
+    else if (!ARTIFACT_AUTHORABLE_MIMES.has(obj.declaredMime)) {
+      issues.push(`declaredMime "${obj.declaredMime}" is not text-authorable (allowed: ${[...ARTIFACT_AUTHORABLE_MIMES].join(", ")})`);
+    }
+  }
+  if (hasFrom && !isNonEmptyStr(obj.mimeFrom)) issues.push("mimeFrom must be a non-empty string");
+  return issues;
+}
+
+/** Collect + validate `outputs[].cinatra.artifact` bindings on the TOP-LEVEL
+ * EndNode components (subflow EndNodes do not surface run-completion outputs, so
+ * they cannot bind — matches the host scope). Returns `{ attempted, errors }`;
+ * `attempted` counts EVERY annotation (valid or not) so the presence check can
+ * distinguish "tried but broke" from "absent". `producesSet`: Set of declared
+ * extensions, or null to SKIP the membership check. */
+export function collectArtifactBindings(oasDoc, producesSet) {
+  const errors = [];
+  let attempted = 0;
+  const refs = isPlainObj(oasDoc?.$referenced_components) ? oasDoc.$referenced_components : {};
+  for (const [nodeId, comp] of Object.entries(refs)) {
+    if (!isPlainObj(comp) || comp.component_type !== "EndNode") continue;
+    const outputs = Array.isArray(comp.outputs) ? comp.outputs : [];
+    const outputTitles = new Set(
+      outputs.filter(isPlainObj).map((o) => o.title).filter((t) => typeof t === "string"),
+    );
+    for (const out of outputs) {
+      if (!isPlainObj(out)) continue;
+      const ann = isPlainObj(out.cinatra) ? out.cinatra : null;
+      const artifact = ann?.artifact;
+      if (artifact === undefined || artifact === null) continue;
+      attempted++;
+      const title = typeof out.title === "string" ? out.title : "<untitled>";
+      const where = `cinatra/oas.json EndNode "${nodeId}" output "${title}" cinatra.artifact`;
+      const shape = validateArtifactBindingShape(artifact);
+      if (shape.length) {
+        for (const s of shape) errors.push(`${where}: ${s}`);
+        continue;
+      }
+      let refBad = false;
+      const refFields = ["contentFrom", "titleFrom"];
+      if (artifact.mimeFrom !== undefined) refFields.push("mimeFrom");
+      for (const field of refFields) {
+        if (!outputTitles.has(artifact[field])) {
+          errors.push(`${where}.${field}: "${artifact[field]}" does not name an output of EndNode "${nodeId}" (outputs: [${[...outputTitles].join(", ")}])`);
+          refBad = true;
+        }
+      }
+      if (refBad) continue;
+      if (producesSet && !producesSet.has(artifact.extension)) {
+        errors.push(`${where}.extension: "${artifact.extension}" is not declared in package.json cinatra.produces — declared production and bindings must agree`);
+      }
+    }
+  }
+  return { attempted, errors };
+}
+
+/** Walk every passthrough-route ApiNode (`url` carries the passthrough marker),
+ * top-level AND inside nested Flows / FlowNode subflows (the tool fires
+ * mid-flow, so unlike EndNode bindings there is no top-level-only scoping). */
+function walkPassthroughApiNodes(oasDoc, visit) {
+  function go(value, refKey) {
+    if (!isPlainObj(value)) return;
+    if (
+      value.component_type === "ApiNode" &&
+      typeof value.url === "string" &&
+      value.url.includes(AGENTS_PASSTHROUGH_URL_MARKER)
+    ) {
+      visit(value, refKey);
+    }
+    const refs = value.$referenced_components;
+    if (isPlainObj(refs)) for (const [k, v] of Object.entries(refs)) go(v, k);
+    if (isPlainObj(value.subflow)) go(value.subflow, refKey);
+  }
+  go(oasDoc, "$");
+}
+
+/** Read a passthrough ApiNode's `data` block, accepting the object form or a
+ * JSON string that parses to an object (the fleet authors object-shaped blocks). */
+function readPassthroughData(node) {
+  let data = node.data;
+  if (typeof data === "string") {
+    try {
+      const parsed = JSON.parse(data);
+      if (isPlainObj(parsed)) data = parsed;
+    } catch {
+      /* leave as string — not an object-shaped block */
+    }
+  }
+  return isPlainObj(data) ? data : null;
+}
+
+/** Collect + validate `artifact_materialize` passthrough nodes — static mirror
+ * of the host `collectArtifactMaterializeNodesFromOasDocument` subset: literal
+ * extension (∈ produces), literal authorable declaredMime, literal node_id equal
+ * to the ApiNode's id, present content + title. Returns `{ attempted, errors }`. */
+export function collectArtifactMaterializeNodes(oasDoc, producesSet) {
+  const errors = [];
+  let attempted = 0;
+  walkPassthroughApiNodes(oasDoc, (node, refKey) => {
+    const data = readPassthroughData(node);
+    if (!data || data.tool !== ARTIFACT_MATERIALIZE_TOOL) return;
+    attempted++;
+    const nodeId = isNonEmptyStr(node.id) ? node.id : refKey;
+    const where = `cinatra/oas.json ApiNode "${nodeId}" artifact_materialize`;
+    const input = data.input;
+    if (!isPlainObj(input)) {
+      errors.push(`${where}.input: required object {extension, content, title, declaredMime, node_id}`);
+      return;
+    }
+    if (!isNonEmptyStr(input.extension) || isTemplated(input.extension)) {
+      errors.push(`${where}.input.extension: must be a literal artifact-extension package name (got ${JSON.stringify(input.extension)})`);
+    } else if (producesSet && !producesSet.has(input.extension)) {
+      errors.push(`${where}.input.extension: "${input.extension}" is not declared in package.json cinatra.produces — declared production and materialization must agree`);
+    }
+    if (!isNonEmptyStr(input.declaredMime) || isTemplated(input.declaredMime)) {
+      errors.push(`${where}.input.declaredMime: must be a literal MIME type (got ${JSON.stringify(input.declaredMime)})`);
+    } else if (!ARTIFACT_AUTHORABLE_MIMES.has(input.declaredMime)) {
+      errors.push(`${where}.input.declaredMime: "${input.declaredMime}" is not text-authorable (allowed: ${[...ARTIFACT_AUTHORABLE_MIMES].join(", ")})`);
+    }
+    if (!isNonEmptyStr(input.node_id) || isTemplated(input.node_id)) {
+      errors.push(`${where}.input.node_id: must be a literal equal to this ApiNode's id`);
+    } else if (input.node_id !== nodeId) {
+      errors.push(`${where}.input.node_id: "${input.node_id}" must equal this ApiNode's id ("${nodeId}") — it is the idempotency-ledger identity`);
+    }
+    if (!isNonEmptyStr(input.content)) errors.push(`${where}.input.content: required non-empty string`);
+    if (!isNonEmptyStr(input.title)) errors.push(`${where}.input.title: required non-empty string`);
+  });
+  return { attempted, errors };
+}
+
+/** A node stamped riskClass:"read_only" that invokes a WRITE-seam passthrough
+ * tool is mislabelled — the run persists, so it is not read-only. Keyed on the
+ * invoked `data.tool`, never the node name. Returns string[] errors. */
+export function findReadonlyWriteToolMislabels(oasDoc) {
+  const errors = [];
+  walkPassthroughApiNodes(oasDoc, (node, refKey) => {
+    const data = readPassthroughData(node);
+    const tool = data?.tool;
+    if (typeof tool !== "string" || !ARTIFACT_WRITE_SEAM_TOOLS.has(tool)) return;
+    const riskClass = node?.metadata?.cinatra?.riskClass;
+    if (riskClass === "read_only") {
+      const nodeId = isNonEmptyStr(node.id) ? node.id : refKey;
+      errors.push(`cinatra/oas.json ApiNode "${nodeId}": riskClass "read_only" on a node invoking the write tool "${tool}" — a persisting node must not be labelled read_only`);
+    }
+  });
+  return errors;
+}
+
+/** Layer-1 artifact-parity findings (mode-independent string[]). Fires only for
+ * AGENTS: an agent that declares `cinatra.produces` must ship a runnable
+ * materialization; bindings / materialize nodes must be well-formed and agree
+ * with `produces`; a write-seam node must not be labelled read_only. runGate
+ * routes these to warnings (default) or errors (enforce). */
+export function collectArtifactParityFindings(packageRoot, pkg) {
+  const cinatra = pkg?.cinatra;
+  if (cinatra?.kind !== "agent") return [];
+  const producesSet = normalizeProduces(cinatra);
+  const declaresProduces = producesSet !== null && producesSet.size > 0;
+  const declared = declaresProduces ? [...producesSet].join(", ") : "";
+
+  const oasPath = join(packageRoot, "cinatra", "oas.json");
+  if (!existsSync(oasPath)) {
+    if (declaresProduces) {
+      return [`package.json cinatra.produces declares [${declared}] but the agent ships no cinatra/oas.json — no runnable materialization (a declarative EndNode binding or an artifact_materialize node) exists for the declared production`];
+    }
+    return [];
+  }
+  let oasDoc;
+  try {
+    oasDoc = JSON.parse(readFileSync(oasPath, "utf8"));
+  } catch {
+    return []; // validateAgent already reports the parse error
+  }
+
+  const bindings = collectArtifactBindings(oasDoc, producesSet);
+  const nodes = collectArtifactMaterializeNodes(oasDoc, producesSet);
+  const findings = [...bindings.errors, ...nodes.errors, ...findReadonlyWriteToolMislabels(oasDoc)];
+  if (declaresProduces && bindings.attempted === 0 && nodes.attempted === 0) {
+    findings.push(`package.json cinatra.produces declares [${declared}] but cinatra/oas.json has no runnable materialization (no outputs[].cinatra.artifact binding and no artifact_materialize node) for the declared production`);
+  }
+  return findings;
+}
+
 /** Validate an agent extension at packageRoot. Pure: returns string[] errors. */
 export function validateAgent(packageRoot) {
   const errors = [];
@@ -1554,8 +1821,12 @@ const KIND_GATES = {
 };
 
 /** Run the full gate for the package at packageRoot. Returns
- * { kind, errors, warnings }. ALWAYS runs the common rules, THEN the kind gate. */
-export function runGate(packageRoot) {
+ * { kind, errors, warnings }. ALWAYS runs the common rules, THEN the kind gate.
+ * `opts.enforceArtifactParity` promotes the Layer-1 artifact-parity findings
+ * from warnings (the default rollout state) to hard errors (BLOCK on republish);
+ * when omitted it falls back to env CINATRA_ARTIFACT_PARITY. The extra arg is
+ * optional, so `runGate(packageRoot)` stays source-compatible. */
+export function runGate(packageRoot, opts = {}) {
   let pkg;
   try {
     pkg = readPackageJson(packageRoot);
@@ -1568,12 +1839,19 @@ export function runGate(packageRoot) {
   const warnings = [...common.warnings];
   const kindGate = KIND_GATES[kind];
   if (kindGate) errors.push(...kindGate(packageRoot));
+  // Layer-1 artifact parity (ratchet): warnings by default so the un-migrated
+  // fleet never reddens; hard errors under enforcement (BLOCK on republish).
+  const enforceArtifactParity =
+    opts.enforceArtifactParity ?? (process.env.CINATRA_ARTIFACT_PARITY === "block");
+  const parity = collectArtifactParityFindings(packageRoot, pkg);
+  if (enforceArtifactParity) errors.push(...parity);
+  else warnings.push(...parity);
   return { kind, errors, warnings };
 }
 
 function main() {
-  const { packageRoot } = parseArgs(process.argv.slice(2));
-  const { kind, errors, warnings } = runGate(packageRoot);
+  const { packageRoot, enforceArtifactParity } = parseArgs(process.argv.slice(2));
+  const { kind, errors, warnings } = runGate(packageRoot, { enforceArtifactParity });
   for (const w of warnings) console.warn(`  ⚠ ${w}`);
   if (errors.length === 0) {
     console.log(
