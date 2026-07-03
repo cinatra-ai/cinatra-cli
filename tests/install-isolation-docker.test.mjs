@@ -180,3 +180,80 @@ describe.skipIf(!HAVE_DOCKER)("cinatra-cli#57 — config interpolates ${VAR} fro
     expect(JSON.parse(r.stdout).services.app.environment.OPENAI_API_KEY).toBe("sk-operator-from-envlocal");
   });
 });
+
+// cinatra-cli#97 — DOCKER-GATED proof that the isolated nango-server container
+// advertises its OWN (isolated) host port, not the donor's. The generator shifts
+// the self-advertised loopback URLs (NANGO_SERVER_URL / NANGO_PUBLIC_SERVER_URL:
+// http://localhost:3003) by the offset; this runs the REAL `docker compose
+// config` engine and asserts the RESOLVED container env carries the SHIFTED URL
+// (…:23003 for offset 20000) while a service-DNS infra URL + bare port stay
+// verbatim, and the published host port itself moved to the same band.
+//
+// envFileKeys is an EMPTY set: like a real isolated install, .env.local does not
+// supply these compose-baked defaults, so the generator keeps them LITERAL and
+// `config` resolves them without a --env-file (and with no blank-string warning).
+describe.skipIf(!HAVE_DOCKER)("cinatra-cli#97 — real `docker compose config` resolves the isolated nango self-URL", () => {
+  let dir;
+  let resolved;
+  let configStderr;
+  beforeAll(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cinatra-97-docker-"));
+    const nangoConfig = {
+      name: "cinatra",
+      services: {
+        "nango-server": {
+          image: "alpine:3",
+          command: "true",
+          environment: {
+            SERVER_PORT: "3003",
+            NANGO_SERVER_URL: "http://localhost:3003",
+            NANGO_PUBLIC_SERVER_URL: "http://localhost:3003",
+            RECORDS_DATABASE_URL: "postgresql://nango-db:5432/nango",
+          },
+          ports: [{ published: "3003", target: 3003, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+        },
+      },
+      networks: { default: { name: "cinatra_default" } },
+      volumes: {},
+    };
+    const { doc } = generateIsolatedCompose({
+      resolvedConfig: nangoConfig,
+      offset: 20000,
+      projectName: "cinatra_iso97test",
+      slug: "iso97test",
+      appPort: 33010,
+      envFileKeys: new Set(),
+    });
+    const composePath = writeIsolatedComposeFile(path.join(dir, ISOLATED_COMPOSE_FILENAME), doc);
+    const r = spawnSync(
+      "docker",
+      ["compose", "-f", composePath, "-p", "cinatra_iso97test", "config", "--format", "json"],
+      { cwd: dir, encoding: "utf8" },
+    );
+    if (r.status !== 0) throw new Error(`docker compose config failed: ${r.stderr}`);
+    resolved = JSON.parse(r.stdout);
+    configStderr = r.stderr;
+  });
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("the isolated nango-server advertises the SHIFTED host port (3003 → 23003), not the donor's", () => {
+    const env = resolved.services["nango-server"].environment;
+    expect(env.NANGO_SERVER_URL).toBe("http://localhost:23003");
+    expect(env.NANGO_PUBLIC_SERVER_URL).toBe("http://localhost:23003");
+    // The DONOR default port must NOT survive anywhere in the resolved env.
+    expect(JSON.stringify(env)).not.toContain("localhost:3003");
+  });
+
+  it("leaves the in-network service-DNS infra URL + the bare port verbatim", () => {
+    const env = resolved.services["nango-server"].environment;
+    expect(env.RECORDS_DATABASE_URL).toBe("postgresql://nango-db:5432/nango");
+    expect(env.SERVER_PORT).toBe("3003");
+  });
+
+  it("published the isolated host port on the shifted band (3003 → 23003) and emitted no blank-string warning", () => {
+    const published = (resolved.services["nango-server"].ports ?? []).map((p) => String(p.published));
+    expect(published).toContain("23003");
+    expect(published).not.toContain("3003");
+    expect(configStderr).not.toMatch(/variable is not set\. Defaulting to a blank string/i);
+  });
+});
