@@ -232,6 +232,26 @@ export function syncOneRepo({
       ? haveRemote === wantRemote
       : isLocalGitRemote(url) && isLocalGitRemote(originRaw) && path.resolve(originRaw) === path.resolve(url);
 
+  // A detached HEAD reports "HEAD" as its branch. In PINNED mode that is the
+  // expected state (handled in full below). In NON-PINNED mode a detached,
+  // origin-matching companion is the committed-lock state a pinned fresh-clone
+  // left behind (`make setup` → scripts/ci/sync-dev-extensions.mjs --pinned,
+  // cinatra#489) — NOT a wrong branch. Leave it AT the validated pin instead of
+  // throwing, and instead of dragging it to the branch tip (which would
+  // reintroduce the #489 lockfile/generated-maps drift). cinatra#835: this is
+  // exactly what `cinatra instance refresh` (and `instance setup dev`) hit after
+  // a pinned `make setup` — without this the non-pinned sync exits non-zero with
+  // a confusing `tracks ... on branch "HEAD"` error even though the checkout sits
+  // at precisely the lock the committed tree was built against. A WRONG origin
+  // (checked below) still hard-fails; a NON-detached wrong branch still hard-fails.
+  if (sha === undefined && originMatches && curBranch === "HEAD") {
+    const head = git(["rev-parse", "HEAD"], dest).trim();
+    log(
+      `  ${pkgName}: detached at ${head.slice(0, 12)} (committed-lock fresh-clone state) — leaving as-is.`,
+    );
+    return { pkgName, action: "skipped-detached", changed: false };
+  }
+
   // Pinned mode skips the branch-name check (a detached HEAD reports "HEAD",
   // and a pre-existing branch checkout is simply re-pinned below) — the origin
   // check still applies in full.
