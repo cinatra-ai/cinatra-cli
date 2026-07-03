@@ -414,6 +414,89 @@ function remapServicePorts(ports, offset) {
   });
 }
 
+// ── cinatra-cli#97 — self-advertised host-URL remap ──────────────────────────
+//
+// Shifting a service's PUBLISHED host ports (remapServicePorts) is not enough: a
+// container that ADVERTISES its own public URL back to the host/browser does so
+// as a loopback URL on that published port — e.g. Nango's
+// `NANGO_SERVER_URL` / `NANGO_PUBLIC_SERVER_URL: http://localhost:3003` (used to
+// build OAuth callback URLs the HOST browser must reach). If that URL is left on
+// the donor/default port while the host binding moved to `<port>+offset`, the
+// isolated stack's OAuth callbacks land on the MAIN instance's Nango — the
+// cinatra-cli#97 isolation leak. Such URLs must follow the host-port shift.
+//
+// An IN-NETWORK infra URL is different: it uses service-DNS (`http://nango-db:
+// 5432`, `redis://redis:6379`) — host = the service name, NOT loopback — and is
+// left verbatim (the container resolves it over the compose network, not a host
+// port). So the rewrite is gated to loopback hosts (`localhost` / `127.0.0.1`)
+// AND to ports the stack actually publishes; a bare port number
+// (`SERVER_PORT: "3003"`) has no `://` and is untouched.
+const LOOPBACK_HOSTPORT_SRC = "\\b(localhost|127\\.0\\.0\\.1):(\\d{1,5})\\b";
+
+/** Shift the port of every loopback URL (`localhost`/`127.0.0.1`) in `value` by
+ *  `offset` when that port is in `publishedSet` (the stack's pre-shift published
+ *  host ports). Only URL-shaped values (containing `://`) are considered, so a
+ *  bare host:port config or a non-URL string is never touched. Surgical string
+ *  replace — scheme/path/query are preserved exactly (no URL re-normalisation
+ *  that could add a stray trailing slash). Returns the (possibly) new string.
+ *  cinatra-cli#97. Pure. */
+function remapEnvHostUrlPorts(value, offset, publishedSet) {
+  if (typeof value !== "string" || !value.includes("://")) return value;
+  if (!(publishedSet instanceof Set) || publishedSet.size === 0) return value;
+  return value.replace(new RegExp(LOOPBACK_HOSTPORT_SRC, "gi"), (match, host, portStr) => {
+    const port = Number.parseInt(portStr, 10);
+    if (Number.isInteger(port) && publishedSet.has(port)) return `${host}:${port + offset}`;
+    return match;
+  });
+}
+
+/** cinatra-cli#97 invariant scan: return the `service.KEY` list of any generated
+ *  compose `environment` value that STILL references a loopback URL on an
+ *  UN-OFFSET (original) published host port — i.e. a self-advertised URL that did
+ *  not follow the host-port shift. Empty ⇒ the invariant holds.
+ *  `originalPublishedPorts` is the pre-shift published host-port set (numbers or
+ *  a Set). Pure. */
+function findUnmappedComposeHostUrls(doc, originalPublishedPorts) {
+  const set =
+    originalPublishedPorts instanceof Set
+      ? originalPublishedPorts
+      : new Set((Array.isArray(originalPublishedPorts) ? originalPublishedPorts : []).filter(Number.isInteger));
+  const offenders = [];
+  if (set.size === 0) return offenders;
+  const services = doc?.services && typeof doc.services === "object" ? doc.services : {};
+  for (const [svcName, svc] of Object.entries(services)) {
+    const env = svc?.environment;
+    if (!env || typeof env !== "object" || Array.isArray(env)) continue;
+    for (const [key, value] of Object.entries(env)) {
+      if (typeof value !== "string" || !value.includes("://")) continue;
+      for (const m of value.matchAll(new RegExp(LOOPBACK_HOSTPORT_SRC, "gi"))) {
+        const port = Number.parseInt(m[2], 10);
+        if (set.has(port)) {
+          offenders.push(`${svcName}.${key}`);
+          break;
+        }
+      }
+    }
+  }
+  return offenders;
+}
+
+/** Throwing wrapper: assert the generated compose leaves NO self-advertised
+ *  loopback URL on an un-offset default port (cinatra-cli#97). Holds by
+ *  construction (generateIsolatedCompose shifts them); asserted defensively so a
+ *  future regression fails loud at install time, not as a silent cross-instance
+ *  OAuth/self-URL leak. */
+export function assertComposeHostUrlsRemapped(doc, originalPublishedPorts) {
+  const offenders = findUnmappedComposeHostUrls(doc, originalPublishedPorts);
+  if (offenders.length > 0) {
+    throw new Error(
+      `Isolated compose generation left ${offenders.length} app-facing URL(s) on an UN-OFFSET default port ` +
+        `(${offenders.join(", ")}) — the isolated stack would advertise the donor/default host port and leak ` +
+        `OAuth callbacks / self-URL traffic to the main instance (cinatra-cli#97). Internal invariant violation.`,
+    );
+  }
+}
+
 /**
  * Generate the resolved ISOLATED compose document.
  *
@@ -430,11 +513,13 @@ function remapServicePorts(ports, offset) {
  *   env-file is a compose-baked infra-init DEFAULT and is left as its literal
  *   (resolves correctly; per-service values are never collapsed). When omitted,
  *   every secret-shaped value is scrubbed (legacy behaviour).
- * @returns {{ doc: object, ports: object, scrubbedKeys: string[] }}
+ * @returns {{ doc: object, ports: object, scrubbedKeys: string[], remappedEnvUrls: string[] }}
  *   - doc:   the rewritten compose document (valid YAML as JSON)
  *   - ports: `{ <service>: [hostPort, …] }` the FULL remapped published-port set
  *   - scrubbedKeys: the env-file-supplied keys re-symbolised to `${KEY}` (NAMES
  *     only — never values; for transparency / the executor's invariant check).
+ *   - remappedEnvUrls: the `service.KEY` names whose self-advertised loopback URL
+ *     was shifted to the isolated host port (cinatra-cli#97; NAMES only).
  */
 export function generateIsolatedCompose({ resolvedConfig, offset, projectName, slug, appPort = null, envFileKeys = null }) {
   if (!resolvedConfig || typeof resolvedConfig !== "object") {
@@ -490,6 +575,22 @@ export function generateIsolatedCompose({ resolvedConfig, offset, projectName, s
   const scrubbedKeys = new Set();
   const keySet = envFileKeys instanceof Set ? envFileKeys : null;
 
+  // cinatra-cli#97: the PRE-SHIFT published host-port set (computed before the
+  // loop mutates `svc.ports`). A container's self-advertised loopback URL on one
+  // of these ports must follow the host-port shift (else it advertises the
+  // donor/default port). Collected across every service.
+  const originalPublishedPorts = new Set();
+  if (doc.services && typeof doc.services === "object") {
+    for (const svc of Object.values(doc.services)) {
+      if (!svc || typeof svc !== "object" || !Array.isArray(svc.ports)) continue;
+      for (const p of svc.ports) {
+        const n = Number.parseInt(String(p?.published ?? ""), 10);
+        if (Number.isInteger(n) && n > 0) originalPublishedPorts.add(n);
+      }
+    }
+  }
+  const remappedEnvUrls = new Set();
+
   // Services: remap ports, scrub secret env, add labels, rewrite container_name.
   if (doc.services && typeof doc.services === "object") {
     for (const [svcName, svc] of Object.entries(doc.services)) {
@@ -523,6 +624,22 @@ export function generateIsolatedCompose({ resolvedConfig, offset, projectName, s
         }
       }
 
+      // (5) cinatra-cli#97: shift any SELF-ADVERTISED loopback URL
+      // (`localhost:<port>`) whose port is a published host port by the same
+      // offset — so the isolated stack advertises its OWN host port (Nango's
+      // NANGO_SERVER_URL / NANGO_PUBLIC_SERVER_URL, an OAuth callback/base URL),
+      // not the donor's. Runs AFTER scrub (a `${VAR}` placeholder has no `://`,
+      // so it is skipped); service-DNS infra URLs + bare ports are untouched.
+      if (svc.environment && typeof svc.environment === "object" && !Array.isArray(svc.environment)) {
+        for (const [k, v] of Object.entries(svc.environment)) {
+          const shifted = remapEnvHostUrlPorts(v, offset, originalPublishedPorts);
+          if (shifted !== v) {
+            svc.environment[k] = shifted;
+            remappedEnvUrls.add(`${svcName}.${k}`);
+          }
+        }
+      }
+
       // (3) Ownership labels. `config` emits labels as an object.
       const existing =
         svc.labels && typeof svc.labels === "object" && !Array.isArray(svc.labels) ? svc.labels : {};
@@ -530,7 +647,7 @@ export function generateIsolatedCompose({ resolvedConfig, offset, projectName, s
     }
   }
 
-  return { doc, ports: remappedPorts, scrubbedKeys: [...scrubbedKeys] };
+  return { doc, ports: remappedPorts, scrubbedKeys: [...scrubbedKeys], remappedEnvUrls: [...remappedEnvUrls] };
 }
 
 /**
@@ -566,6 +683,8 @@ export const __test = {
   isSecretEnvKey,
   scrubServiceEnv,
   remapServicePorts,
+  remapEnvHostUrlPorts,
+  findUnmappedComposeHostUrls,
   generateIsolatedCompose,
   renderIsolatedComposeYaml,
 };

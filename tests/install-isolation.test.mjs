@@ -6,10 +6,12 @@ import {
   classifyPortHolder,
   generateIsolatedCompose,
   renderIsolatedComposeYaml,
+  assertComposeHostUrlsRemapped,
   __test,
 } from "../src/install-isolation.mjs";
 
-const { scrubServiceEnv, isSecretEnvKey, remapServicePorts } = __test;
+const { scrubServiceEnv, isSecretEnvKey, remapServicePorts, remapEnvHostUrlPorts, findUnmappedComposeHostUrls } =
+  __test;
 
 // A fixture `docker inspect` row that owns a host port via the working_dir label.
 const inspectRow = (workingDir, hostPort, containerPort = `${hostPort}`) => ({
@@ -434,6 +436,117 @@ describe("generateIsolatedCompose (T7)", () => {
     const { doc } = generateIsolatedCompose({ resolvedConfig, offset: 10000, projectName: "cinatra_alpha", slug: "alpha" });
     const yaml = renderIsolatedComposeYaml(doc);
     expect(() => JSON.parse(yaml)).not.toThrow();
+  });
+
+  // ── cinatra-cli#97 — self-advertised host-URL remap ─────────────────────────
+  // A container that advertises its OWN public URL does so as a loopback URL on
+  // its published host port (Nango's NANGO_SERVER_URL / NANGO_PUBLIC_SERVER_URL:
+  // http://localhost:3003). When the host port is shifted by `offset`, that URL
+  // must follow — else OAuth callbacks land on the donor/main instance. An
+  // in-network service-DNS URL and a bare port number must be left verbatim.
+  describe("cinatra-cli#97 — shifts self-advertised loopback URLs by the offset", () => {
+    const nangoConfig = {
+      name: "cinatra",
+      services: {
+        "nango-server": {
+          image: "nango",
+          environment: {
+            SERVER_PORT: "3003",
+            NANGO_SERVER_URL: "http://localhost:3003",
+            NANGO_PUBLIC_SERVER_URL: "http://127.0.0.1:3003",
+            RECORDS_DATABASE_URL: "postgresql://nango-db:5432/nango",
+            NANGO_REDIS_URL: "redis://redis:6379",
+          },
+          ports: [{ published: "3003", target: 3003, host_ip: "0.0.0.0", protocol: "tcp", mode: "host" }],
+        },
+        redis: {
+          image: "redis",
+          ports: [{ published: "6379", target: 6379, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+        },
+      },
+      networks: { default: { name: "cinatra_default" } },
+      volumes: {},
+    };
+
+    it("shifts a self-advertised loopback URL (localhost + 127.0.0.1) to the isolated host port", () => {
+      const { doc, remappedEnvUrls } = generateIsolatedCompose({
+        resolvedConfig: nangoConfig, offset: 10000, projectName: "cinatra_iso", slug: "iso",
+      });
+      const env = doc.services["nango-server"].environment;
+      // 3003 → 13003, preserving scheme/host form (no trailing-slash mutation).
+      expect(env.NANGO_SERVER_URL).toBe("http://localhost:13003");
+      expect(env.NANGO_PUBLIC_SERVER_URL).toBe("http://127.0.0.1:13003");
+      // Reported (NAMES only) for transparency.
+      expect(new Set(remappedEnvUrls)).toEqual(
+        new Set(["nango-server.NANGO_SERVER_URL", "nango-server.NANGO_PUBLIC_SERVER_URL"]),
+      );
+    });
+
+    it("leaves service-DNS infra URLs and bare port numbers verbatim", () => {
+      // Empty envFileKeys → the scrub is a no-op here, so this asserts the REMAP
+      // (not the #57 scrub) leaves a service-DNS cred-URL untouched.
+      const { doc } = generateIsolatedCompose({
+        resolvedConfig: nangoConfig, offset: 10000, projectName: "cinatra_iso", slug: "iso", envFileKeys: new Set(),
+      });
+      const env = doc.services["nango-server"].environment;
+      // Host is a service name (nango-db / redis), NOT loopback → untouched.
+      expect(env.RECORDS_DATABASE_URL).toBe("postgresql://nango-db:5432/nango");
+      expect(env.NANGO_REDIS_URL).toBe("redis://redis:6379");
+      // A bare port number (no `://`) is not a URL → untouched.
+      expect(env.SERVER_PORT).toBe("3003");
+    });
+
+    it("does NOT shift a loopback URL whose port the stack does not publish", () => {
+      const cfg = {
+        name: "cinatra",
+        services: {
+          app: { image: "x", environment: { EXTERNAL_URL: "http://localhost:9999" }, ports: [] },
+          redis: {
+            image: "redis",
+            ports: [{ published: "6379", target: 6379, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+          },
+        },
+        networks: {},
+        volumes: {},
+      };
+      const { doc } = generateIsolatedCompose({ resolvedConfig: cfg, offset: 10000, projectName: "cinatra_iso", slug: "iso" });
+      // 9999 is not a published host port → not part of the isolation shift.
+      expect(doc.services.app.environment.EXTERNAL_URL).toBe("http://localhost:9999");
+    });
+
+    it("the generated doc passes the un-offset-URL invariant (findUnmappedComposeHostUrls empty)", () => {
+      const { doc } = generateIsolatedCompose({
+        resolvedConfig: nangoConfig, offset: 10000, projectName: "cinatra_iso", slug: "iso",
+      });
+      const originalPublished = new Set([3003, 6379]);
+      expect(findUnmappedComposeHostUrls(doc, originalPublished)).toEqual([]);
+      expect(() => assertComposeHostUrlsRemapped(doc, originalPublished)).not.toThrow();
+    });
+
+    it("the INVARIANT catches a leaked un-offset self-URL (defensive guard)", () => {
+      // A hand-built doc that skipped the env remap → still on the default port.
+      const leaked = {
+        services: {
+          "nango-server": { environment: { NANGO_PUBLIC_SERVER_URL: "http://localhost:3003" } },
+        },
+      };
+      expect(findUnmappedComposeHostUrls(leaked, new Set([3003]))).toEqual(["nango-server.NANGO_PUBLIC_SERVER_URL"]);
+      expect(() => assertComposeHostUrlsRemapped(leaked, new Set([3003]))).toThrow(/UN-OFFSET default port/);
+    });
+
+    it("remapEnvHostUrlPorts unit: only URL-shaped loopback values on a published port shift", () => {
+      const set = new Set([3003]);
+      expect(remapEnvHostUrlPorts("http://localhost:3003", 10000, set)).toBe("http://localhost:13003");
+      expect(remapEnvHostUrlPorts("http://localhost:3003/oauth/callback", 10000, set)).toBe(
+        "http://localhost:13003/oauth/callback",
+      );
+      // bare host:port (no scheme) is not a URL → untouched.
+      expect(remapEnvHostUrlPorts("localhost:3003", 10000, set)).toBe("localhost:3003");
+      // a non-published port → untouched.
+      expect(remapEnvHostUrlPorts("http://localhost:8080", 10000, set)).toBe("http://localhost:8080");
+      // a longer number that merely ends in the port must NOT partial-match.
+      expect(remapEnvHostUrlPorts("http://localhost:33003", 10000, set)).toBe("http://localhost:33003");
+    });
   });
 
   // ── cinatra-cli#57 — env-file-AWARE scrub (the real fix) ────────────────────

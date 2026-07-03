@@ -667,6 +667,81 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     expect(env).not.toMatch(/^NEO4J_URI=.*:7687$/m);
   });
 
+  // ── cinatra-cli#97 — app-facing self-URLs remapped (WAYFLOW + Nango) ─────────
+  // Isolation shifted the DB/Redis/app-Nango-URL host ports but left two
+  // app-facing URLs on the DONOR's default ports:
+  //   • .env.local WAYFLOW_BASE_URL (host app → the per-instance WayFlow runtime), and
+  //   • the nango-server CONTAINER's self-advertised NANGO_SERVER_URL /
+  //     NANGO_PUBLIC_SERVER_URL (`localhost:3003` → the OAuth callback base).
+  // Both must follow the +offset host-port shift, else the isolated stack's
+  // WayFlow / OAuth flows resolve against the MAIN instance (partial-isolation
+  // leak). A service-DNS infra URL + a bare port number must stay verbatim.
+  it("#97: isolated install remaps WAYFLOW_BASE_URL (.env.local) + nango self-URLs (container env)", async () => {
+    const installDir = path.join(sandbox, "iso97");
+    const CONFIG_WITH_APP_URLS = {
+      ...RESOLVED_CONFIG,
+      services: {
+        ...RESOLVED_CONFIG.services,
+        // nango-server self-advertises its public URL on the loopback host port;
+        // an in-network URL uses service-DNS and a bare port is a plain number.
+        "nango-server": {
+          ...RESOLVED_CONFIG.services["nango-server"],
+          environment: {
+            SERVER_PORT: "3003",
+            NANGO_SERVER_URL: "http://localhost:3003",
+            NANGO_PUBLIC_SERVER_URL: "http://localhost:3003",
+            RECORDS_DATABASE_URL: "postgresql://nango-db:5432/nango",
+          },
+        },
+        // WayFlow is a compose service in the band (host port 3010).
+        wayflow: {
+          image: "cinatra-wayflow",
+          environment: { PORT: "3010", CINATRA_BASE_URL: "http://host.docker.internal:3000" },
+          ports: [{ published: "3010", target: 3010, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+        },
+      },
+    };
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso97",
+      ],
+      {
+        log: () => {},
+        deps: flowDeps({
+          composeConfigForFiles: () => CONFIG_WITH_APP_URLS,
+          detectPortConflicts: async (band) => {
+            const pg = band.find((b) => b.service === "postgres");
+            if (pg && pg.port === 5434) return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+            return [];
+          },
+          bringUpInfra: () => {},
+        }),
+      },
+    );
+    expect(res.infraPlan).toBe("isolated");
+
+    // (1) Host .env.local: WAYFLOW_BASE_URL re-pointed at the isolated WayFlow
+    // host port (3010 → 13010); the donor default must NOT survive.
+    const env = readFileSync(path.join(installDir, ".env.local"), "utf8");
+    // Prefix match (rewriteUrlPort normalises to a trailing slash, as for the
+    // sibling NANGO_SERVER_URL); the un-offset default :3010 must NOT survive.
+    expect(env).toMatch(/^WAYFLOW_BASE_URL=http:\/\/127\.0\.0\.1:13010/m);
+    expect(env).not.toContain(":3010");
+
+    // (2) Generated compose: the nango-server CONTAINER's self-advertised URLs
+    // follow the host-port shift (3003 → 13003); the service-DNS infra URL is
+    // left verbatim; the bare SERVER_PORT number is untouched.
+    const genBody = readFileSync(path.join(installDir, "docker-compose.cinatra-isolated.yml"), "utf8");
+    const nangoEnv = JSON.parse(genBody).services["nango-server"].environment;
+    expect(nangoEnv.NANGO_SERVER_URL).toBe("http://localhost:13003");
+    expect(nangoEnv.NANGO_PUBLIC_SERVER_URL).toBe("http://localhost:13003");
+    expect(nangoEnv.RECORDS_DATABASE_URL).toBe("postgresql://nango-db:5432/nango");
+    expect(nangoEnv.SERVER_PORT).toBe("3003");
+    // No un-offset default self-URL survives anywhere in the generated compose.
+    expect(genBody).not.toContain("localhost:3003");
+  });
+
   // ── cinatra-cli#38 — isolated app port live-probe + reserved-set validate ───
   // The app port (Next.js PORT) is NOT a compose-published port, so it bypassed
   // the infra band's live probe. Distinguish the app-port probe from the band
