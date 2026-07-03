@@ -72,7 +72,7 @@ function snapshotTree(root) {
 
 describe("verifyProdRequiredExtensions (cinatra#789)", () => {
   let root; // workspace root: package.json + lock + extensions/
-  let installDir; // agent-install dir (WayFlow mount): <vendor>/<slug>/cinatra/oas.json
+  let installDir; // agent runtime mount (WayFlow :/agents mount): <vendor>/<slug>/cinatra/oas.json
 
   const AGENT_PKG = "@cinatra-ai/demo-agent";
   const CONNECTOR_PKG = "@cinatra-ai/demo-connector";

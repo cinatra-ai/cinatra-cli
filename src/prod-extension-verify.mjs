@@ -21,12 +21,24 @@
 //                                app's boot `required-activation-assert` uses via
 //                                `verifyRequiredInProdInstalled`).
 //   (E) WayFlow-visible set     — the materialized agent-OAS trees on disk under
-//                                the resolved agent-install dir
+//                                the resolved agent RUNTIME MOUNT
+//                                `<CINATRA_EXTENSION_DATA_ROOT>/.agent-mount`
 //                                (`<vendor>/<slug>/cinatra/oas.json`, seed-owned
 //                                via `.cinatra-required-seed.json`, and present in
 //                                the seed `manifest.json`). This dir IS the
 //                                WayFlow `:/agents:ro` mount, so its on-disk
-//                                contents are exactly what WayFlow can see.
+//                                contents are exactly what WayFlow can see. Post
+//                                the unified-store cutover (cinatra#793) the mount
+//                                is a BOOT-PROJECTED cache of the content-addressed
+//                                store: the boot required-extension-materialize
+//                                phase writes these OAS trees + seed markers +
+//                                `manifest.json` into it on every boot (the
+//                                agent-mount-projection phase self-heals the
+//                                rest). So (E) — like the (D) loader check — is
+//                                meaningful ONLY against a BOOTED, running
+//                                instance whose mount has been projected; at
+//                                pre-boot image-inspection time the mount is not
+//                                yet populated and (E) is not assertable.
 //
 // This module NEVER writes, renames, downloads, or removes anything. It reuses
 // the acquisition module's PURE read helpers (`readRequiredExtensionsLock`,
@@ -52,7 +64,7 @@
 //                                skip).
 //   - "wayflow-missing"        : an AGENT-kind locked required package has no
 //                                materialized, seed-owned, manifest-listed OAS
-//                                tree under the agent-install dir.
+//                                tree under the agent runtime mount.
 //
 // `ok` is true iff `findings` is empty. The CLI wrapper exits non-zero on any
 // finding, zero when fully coherent.
@@ -237,7 +249,7 @@ export function listAcquisitionManagedPackages(repoRoot) {
  * @param {object} args
  * @param {string} args.repoRoot          workspace/image root holding extensions/ + package.json + lock
  * @param {string} [args.lockPath]        override for the lock path (defaults to <repoRoot>/LOCK_FILENAME)
- * @param {string} args.installDir        resolved agent-install dir (the WayFlow :/agents mount)
+ * @param {string} args.installDir        resolved agent RUNTIME MOUNT (`<CINATRA_EXTENSION_DATA_ROOT>/.agent-mount`, the WayFlow :/agents mount)
  * @param {object|null} args.dbClient     a connected pg client, or null when the DB was unreachable
  * @param {string} args.schemaName        the app DB schema (default "cinatra")
  * @param {string|null} [args.dbError]    a message when dbClient is null (surfaced as loader-missing)
@@ -576,9 +588,11 @@ export async function verifyProdRequiredExtensions({
 
 /**
  * WayFlow visibility for a single agent-kind locked package: prove a
- * materialized, seed-owned, manifest-listed OAS tree exists under `installDir`.
- * The slug dir is <vendor>/<slug> derived from the scoped package name
- * (@vendor/slug). `seedManifest` is `{ readable, slugs }` from readSeedManifest:
+ * materialized, seed-owned, manifest-listed OAS tree exists under `installDir`
+ * — the boot-projected agent runtime mount (`<CINATRA_EXTENSION_DATA_ROOT>/
+ * .agent-mount`), so this is meaningful only on a booted instance whose mount
+ * has been projected. The slug dir is <vendor>/<slug> derived from the scoped
+ * package name (@vendor/slug). `seedManifest` is `{ readable, slugs }` from readSeedManifest:
  * an UNREADABLE manifest (absent/malformed) can NOT confirm membership, so it
  * fails the check (never a silent pass). Returns a finding on any gap, or null
  * when visible. Pure read.
@@ -595,13 +609,14 @@ export function verifyWayflowVisibility(packageName, installDir, seedManifest) {
   if (!existsSync(oasPath)) {
     return finding(
       "wayflow-missing",
-      `no materialized OAS at ${slugKey}/${OAS_REL_PATH.split(path.sep).join("/")} under the agent-install dir ` +
+      `no materialized OAS at ${slugKey}/${OAS_REL_PATH.split(path.sep).join("/")} under the agent runtime mount ` +
         `— WayFlow cannot see this required agent`,
       {
         packageName,
         remediation:
-          "Rebuild/redeploy the image so the required-extension OAS seed is materialized, or verify " +
-          "CINATRA_AGENT_INSTALL_DIR points at the deploy-managed (not a stale/frozen) agent dir.",
+          "Redeploy/restart the instance so the boot required-extension-materialize phase projects the OAS seed " +
+          "into the agent runtime mount, or verify CINATRA_EXTENSION_DATA_ROOT (env > DB metadata " +
+          "extension_data_root) points at the deploy-managed data volume (the mount is <root>/.agent-mount).",
       },
     );
   }
@@ -625,7 +640,8 @@ export function verifyWayflowVisibility(packageName, installDir, seedManifest) {
       {
         packageName,
         remediation:
-          "Rebuild/redeploy the image so a valid required-OAS seed manifest.json is materialized alongside the OAS trees.",
+          "Redeploy/restart the instance so the boot required-extension-materialize phase writes a valid seed " +
+          "manifest.json alongside the OAS trees on the agent runtime mount.",
       },
     );
   }
@@ -636,7 +652,9 @@ export function verifyWayflowVisibility(packageName, installDir, seedManifest) {
         `the current required seed set`,
       {
         packageName,
-        remediation: "Rebuild the required-OAS seed so the manifest lists this slug, then redeploy.",
+        remediation:
+          "Re-seed the required-OAS set (the boot required-extension-materialize phase) so the manifest lists this " +
+          "slug on the agent runtime mount, then redeploy/restart.",
       },
     );
   }

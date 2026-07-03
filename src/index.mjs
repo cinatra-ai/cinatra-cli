@@ -525,7 +525,7 @@ Commands:
                     (cinatra-required-extensions.lock.json), what the running
                     instance's loader actually registered/activated (the live
                     installed_extension rows), and what WayFlow can see (the
-                    materialized agent-OAS trees under the agent-install dir).
+                    materialized agent-OAS trees under the agent runtime mount).
                     Fails NON-mutatingly with a distinct diagnostic per mismatch
                     class (missing-on-disk / extra-seed-owned-dir / lock-mismatch
                     / loader-missing / wayflow-missing); exits non-zero on any
@@ -10598,30 +10598,48 @@ async function runExtensionsList(argv = []) {
 // downloads, renames, or removes anything.
 // ---------------------------------------------------------------------------
 
-// Resolve the agent-install dir (the WayFlow `:/agents:ro` mount) the SAME way
-// the runtime does (packages/agents/src/agent-install-path.ts resolveAgentInstallDir):
-// the `CINATRA_AGENT_INSTALL_DIR` env var wins (deploy determinism), else the
-// DB metadata key `agent_install_path`, else the historical default
-// `<root>/extensions`. A relative value is resolved against repoRoot. Read-only.
-async function resolveAgentInstallDirForVerify(repoRoot, env, client, schemaName) {
-  const envValue = typeof env.CINATRA_AGENT_INSTALL_DIR === "string" ? env.CINATRA_AGENT_INSTALL_DIR.trim() : "";
-  let configured = envValue;
+// Resolve the WayFlow agent RUNTIME MOUNT (the `:/agents:ro` volume) the SAME
+// way the host runtime does after the unified-store cutover (cinatra#793):
+// `<extension-data-root>/.agent-mount`. The extension data root mirrors
+// `src/lib/extension-data-root.ts resolveExtensionDataRoot()` — env
+// `CINATRA_EXTENSION_DATA_ROOT` (non-empty) wins (deploy determinism, ops#436),
+// else the DB metadata key `extension_data_root`, else the default
+// `/data/extensions` — and the `.agent-mount` suffix mirrors
+// `packages/agents/src/agent-runtime-mount.ts resolveAgentRuntimeMountDir()`.
+//
+// The deleted host `agent-install-path.ts` single knob (a dedicated agent-install
+// env var + a DB metadata key + a `<root>/extensions` default) is GONE: there is
+// deliberately NO agent-specific path knob anymore — the extension data root
+// alone carries the deploy determinism, and the mount is a boot-projected cache
+// of the content-addressed store (never `<root>/extensions`).
+//
+// A relative extension-data-root value resolves against `process.cwd()` — the
+// SAME base `resolveExtensionDataRoot()` uses — so the resolved mount matches
+// what the running host + WayFlow actually read (prod pins an ABSOLUTE root, so
+// the relative branch is a dev-only convenience). Read-only.
+const AGENT_RUNTIME_MOUNT_DIRNAME = ".agent-mount";
+const DEFAULT_EXTENSION_DATA_ROOT = "/data/extensions";
+async function resolveAgentInstallDirForVerify(env, client, schemaName) {
+  const envValue =
+    typeof env.CINATRA_EXTENSION_DATA_ROOT === "string" ? env.CINATRA_EXTENSION_DATA_ROOT.trim() : "";
+  let dataRoot = envValue;
   // The env override wins and needs no DB. Only when it is unset do we consult
-  // the `agent_install_path` metadata key — and a metadata READ failure (e.g. a
+  // the `extension_data_root` metadata key — and a metadata READ failure (e.g. a
   // missing/unmigrated metadata table) must NOT abort the whole verify run
-  // before it can emit its findings. Fall back to the historical default; the
-  // DB-level coherence gaps still surface as their own (loader-missing)
-  // findings. Env override is honored regardless of DB health.
-  if (!configured && client) {
+  // before it can emit its findings. Fall back to the default; the DB-level
+  // coherence gaps still surface as their own (loader-missing) findings. Env
+  // override is honored regardless of DB health.
+  if (!dataRoot && client) {
     try {
-      const stored = await readMetadataValue(client, schemaName, "agent_install_path", null);
-      if (typeof stored === "string" && stored.trim()) configured = stored.trim();
+      const stored = await readMetadataValue(client, schemaName, "extension_data_root", null);
+      if (typeof stored === "string" && stored.trim()) dataRoot = stored.trim();
     } catch {
       /* metadata unreadable -> fall through to the default; do not abort */
     }
   }
-  if (!configured) configured = "extensions";
-  return path.isAbsolute(configured) ? configured : path.resolve(repoRoot, configured);
+  if (!dataRoot) dataRoot = DEFAULT_EXTENSION_DATA_ROOT;
+  const absRoot = path.isAbsolute(dataRoot) ? dataRoot : path.resolve(process.cwd(), dataRoot);
+  return path.join(absRoot, AGENT_RUNTIME_MOUNT_DIRNAME);
 }
 
 async function runExtensionsVerifyProd(argv = []) {
@@ -10656,7 +10674,7 @@ async function runExtensionsVerifyProd(argv = []) {
   }
 
   try {
-    const installDir = await resolveAgentInstallDirForVerify(repoRoot, env, client, schemaName);
+    const installDir = await resolveAgentInstallDirForVerify(env, client, schemaName);
     const { verifyProdRequiredExtensions } = await import("./prod-extension-verify.mjs");
     const report = await verifyProdRequiredExtensions({
       repoRoot,
@@ -10679,7 +10697,7 @@ async function runExtensionsVerifyProd(argv = []) {
 
 async function printVerifyProdReport(report, installDir) {
   console.log("Cinatra prod required-extension coherence check (READ-ONLY):");
-  console.log(`  Verified ${report.checked} locked package(s); agent-install dir: ${installDir}`);
+  console.log(`  Verified ${report.checked} locked package(s); agent runtime mount: ${installDir}`);
   if (report.ok) {
     console.log(
       "  ✓ COHERENT — on-disk == baked seed == lock == loader-registered == WayFlow-visible.",
