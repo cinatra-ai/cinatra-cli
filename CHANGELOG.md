@@ -6,6 +6,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-07-07
+
+### Fixed
+
+- `agent import` repairs the local Postgres path via the shared upsert
+  helper. (#95)
+- `install --on-conflict=isolated` remaps app-facing self-URLs to the
+  isolated instance. (#98)
+- Non-pinned dev extension sync tolerates a detached companion. (#100)
+- `extensions verify-prod` resolves the agent runtime mount instead of the
+  deleted install-dir knob. (#101)
+
+### Added
+
+- Layer-1 artifact-parity screen in the kind gate (`produces` implies a
+  runnable materialization). (#102)
+
 ## [0.1.7] - 2026-07-02
 
 ### Changed
@@ -258,6 +275,7 @@ release (0.1.5):
   as the scoped `@cinatra-ai/cinatra`. (#2)
 
 [Unreleased]: https://github.com/cinatra-ai/cinatra-cli/compare/v0.1.6...HEAD
+[0.1.8]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.8
 [0.1.7]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.7
 [0.1.6]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.6
 [0.1.5]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.5
