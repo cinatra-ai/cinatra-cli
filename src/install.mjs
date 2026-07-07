@@ -1197,8 +1197,9 @@ function bringUpInfra({ targetDir, log = console.log, composeFiles = null, compo
  *  invocation). The recorded set is the authority (cinatra-cli#17 §C.8) so
  *  up/exec/down all target the same files+project. An `envFile` is threaded so
  *  the ISOLATED generated compose can resolve its scrubbed `${VAR}` placeholders
- *  from .env.local at up-time (review hardening #1) — the default path omits it, keeping
- *  compose's normal `.env` discovery (byte-identical to before). */
+ *  from .env.local at up-time (review hardening #1). The DEFAULT install `up`
+ *  passes it too (eng#513 — the base compose interpolates no-default secrets);
+ *  a null envFile keeps compose's normal `.env` discovery. */
 function composeArgsFor({ composeFiles = null, composeProject = null, envFile = null } = {}) {
   const files = composeFiles && composeFiles.length
     ? composeFiles
@@ -4090,7 +4091,21 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
     defaultProject = await withAllocLock(lockPath, async () => {
       const resolved = resolveDefaultProject({ targetDir, opts, log, deps });
-      startInfra({ targetDir, log, composeProject: resolved });
+      // eng#513 real-host sweep: the default `up` MUST pass `--env-file
+      // .env.local` like every isolated/attach bring-up does — the base
+      // docker-compose.yml interpolates `${NANGO_ENCRYPTION_KEY}` and
+      // `${CINATRA_BRIDGE_TOKEN}` (no compose defaults), so without the
+      // env-file the freshly-written secrets resolve to BLANK strings (compose
+      // warns "variable is not set") and nango-server runs with an EMPTY
+      // encryption key that silently diverges from the key recorded in
+      // .env.local — the cinatra-cli#57 failure class on the DEFAULT path.
+      const defaultEnvFile = path.join(targetDir, ".env.local");
+      startInfra({
+        targetDir,
+        log,
+        composeProject: resolved,
+        envFile: existsSync(defaultEnvFile) ? defaultEnvFile : null,
+      });
       return resolved;
     });
   }
