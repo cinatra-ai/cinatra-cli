@@ -679,3 +679,129 @@ describe.skipIf(!INTEGRATION_DB_URL)("checkAgentDbPreflight — real DB round-tr
     ).resolves.toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// eng#513 — LIVE-SCHEMA writer/deleter round-trip.
+//
+// The v0.1.7 closeout real-host sweep (engineering#513) found BOTH agent DB
+// writers broken against the REAL app schema while every hermetic/mock test
+// stayed green, because the mocks (and the DDL above) modelled a uuid PK and a
+// FULL unique constraint. The live schema (cinatra monorepo main) has:
+//   * TEXT ids (agent_templates.id, agent_versions.template_id) — so the
+//     uninstall's `ANY($1::uuid[])` cast made `text = uuid` (42883), and
+//   * a PARTIAL unique index `… (package_name) WHERE package_name IS NOT NULL`
+//     — which a bare `ON CONFLICT (package_name)` cannot infer (42P10).
+// This suite recreates the FAITHFUL live shapes and drives the real writers.
+// ---------------------------------------------------------------------------
+describe.skipIf(!INTEGRATION_DB_URL)("upsert/delete agent template — LIVE schema round-trip (eng#513)", () => {
+  let pg;
+  let client;
+  const TEST_SCHEMA = `agents_live_schema_${Math.random().toString(36).slice(2, 10)}`;
+
+  beforeEach(async () => {
+    ({ default: pg } = await import("pg"));
+    client = new pg.Client({ connectionString: INTEGRATION_DB_URL });
+    await client.connect();
+    await client.query(`CREATE SCHEMA ${TEST_SCHEMA}`);
+    // FAITHFUL live shapes: text ids; NOT NULL package_name with a PARTIAL
+    // unique index (as in the app's migrations); text template_id.
+    await client.query(`
+      CREATE TABLE ${TEST_SCHEMA}.agent_templates (
+        id text PRIMARY KEY,
+        name text NOT NULL,
+        description text,
+        source_nl text NOT NULL,
+        compiled_plan text NOT NULL,
+        input_schema text NOT NULL,
+        output_schema text,
+        approval_policy text NOT NULL,
+        type text NOT NULL DEFAULT 'leaf',
+        task_spec text,
+        package_name text NOT NULL,
+        package_version text,
+        agent_dependencies text,
+        lg_graph_code text,
+        lg_graph_id text,
+        execution_provider text NOT NULL DEFAULT 'default',
+        hitl_required boolean NOT NULL DEFAULT false,
+        status text NOT NULL DEFAULT 'draft',
+        created_at timestamptz NOT NULL DEFAULT NOW(),
+        updated_at timestamptz NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX agent_templates_package_name_idx
+        ON ${TEST_SCHEMA}.agent_templates (package_name)
+        WHERE package_name IS NOT NULL
+    `);
+    await client.query(`
+      CREATE TABLE ${TEST_SCHEMA}.agent_versions (
+        id text PRIMARY KEY,
+        template_id text NOT NULL,
+        version_number integer NOT NULL,
+        snapshot text NOT NULL,
+        content_hash text,
+        created_at timestamptz NOT NULL DEFAULT NOW()
+      )
+    `);
+  });
+
+  afterEach(async () => {
+    await client.query(`DROP SCHEMA IF EXISTS ${TEST_SCHEMA} CASCADE`);
+    await client.end();
+  });
+
+  const fields = (over = {}) => ({
+    name: "Live Schema Agent",
+    sourceNl: "test",
+    compiledPlan: [{ step: 1 }],
+    inputSchema: { type: "object" },
+    approvalPolicy: { steps: [] },
+    packageName: "@cinatra-test/live-schema-agent",
+    packageVersion: "0.0.1",
+    snapshot: { any: "thing" },
+    ...over,
+  });
+
+  it("INSERTS through the partial unique index (42P10 regression), then UPDATES on re-run", async () => {
+    const first = await __test.upsertAgentTemplate(client, TEST_SCHEMA, fields());
+    expect(first.templateId).toBeTruthy();
+    expect(first.versionNumber).toBe(1);
+    // compiled_plan must be VALID JSON text (the #95 corruption pin).
+    const row = await client.query(
+      `SELECT id, compiled_plan FROM ${TEST_SCHEMA}.agent_templates WHERE package_name = $1`,
+      ["@cinatra-test/live-schema-agent"],
+    );
+    expect(JSON.parse(row.rows[0].compiled_plan)).toEqual([{ step: 1 }]);
+
+    // Re-run → same template row updated (id preserved), next version number.
+    const second = await __test.upsertAgentTemplate(
+      client,
+      TEST_SCHEMA,
+      fields({ name: "Live Schema Agent v2" }),
+    );
+    expect(second.templateId).toBe(first.templateId);
+    expect(second.versionNumber).toBe(2);
+  });
+
+  it("DELETES text-id rows (42883 uuid-cast regression) atomically", async () => {
+    await __test.upsertAgentTemplate(client, TEST_SCHEMA, fields());
+    const prevSchema = process.env.SUPABASE_SCHEMA;
+    const prevDb = process.env.SUPABASE_DB_URL;
+    process.env.SUPABASE_SCHEMA = TEST_SCHEMA;
+    process.env.SUPABASE_DB_URL = INTEGRATION_DB_URL;
+    try {
+      const removed = await __test.deleteAgentTemplateByPackage("@cinatra-test/live-schema-agent");
+      expect(removed).toBe(1);
+    } finally {
+      if (prevSchema === undefined) delete process.env.SUPABASE_SCHEMA;
+      else process.env.SUPABASE_SCHEMA = prevSchema;
+      if (prevDb === undefined) delete process.env.SUPABASE_DB_URL;
+      else process.env.SUPABASE_DB_URL = prevDb;
+    }
+    const left = await client.query(`SELECT count(*)::int AS n FROM ${TEST_SCHEMA}.agent_templates`);
+    expect(left.rows[0].n).toBe(0);
+    const versionsLeft = await client.query(`SELECT count(*)::int AS n FROM ${TEST_SCHEMA}.agent_versions`);
+    expect(versionsLeft.rows[0].n).toBe(0);
+  });
+});

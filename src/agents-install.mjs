@@ -570,8 +570,16 @@ function quoteIdent(name) {
  * (there is no `execution_mode` column any more); `package_name` (NOT NULL +
  * UNIQUE) is always set.
  *
- * The template upsert is an atomic `ON CONFLICT (package_name) DO UPDATE` (no
- * racy SELECT-then-INSERT). On a package_name conflict only the mutable content
+ * The template upsert is an atomic `ON CONFLICT (package_name) WHERE
+ * package_name IS NOT NULL DO UPDATE` (no racy SELECT-then-INSERT). The
+ * arbiter predicate is REQUIRED: the app schema's unique index on
+ * package_name is PARTIAL (`agent_templates_package_name_idx … WHERE
+ * package_name IS NOT NULL`), and Postgres cannot infer a partial unique
+ * index from a bare `ON CONFLICT (package_name)` (SQLSTATE 42P10 — the
+ * eng#513 real-host failure: "there is no unique or exclusion constraint
+ * matching the ON CONFLICT specification"). A non-partial unique index is
+ * still inferred with the predicate present, so this stays compatible with
+ * either index shape. On a package_name conflict only the mutable content
  * columns + updated_at are refreshed — `status`, `package_name`, `id` and
  * `created_at` are PRESERVED, matching the historical install-update contract.
  * `version_number` is computed as MAX(version_number)+1 for the template in the
@@ -619,7 +627,7 @@ export async function upsertAgentTemplate(client, schema, fields) {
        ) VALUES (
          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW(),NOW()
        )
-       ON CONFLICT (package_name) DO UPDATE SET
+       ON CONFLICT (package_name) WHERE package_name IS NOT NULL DO UPDATE SET
          name = EXCLUDED.name,
          description = EXCLUDED.description,
          source_nl = EXCLUDED.source_nl,
@@ -1087,7 +1095,11 @@ async function deleteAgentTemplateByPackage(packageName) {
     }
     const ids = found.rows.map((r) => r.id);
     await client.query(
-      `DELETE FROM ${schema}.agent_versions WHERE template_id = ANY($1::uuid[])`,
+      // eng#513 real-host sweep: agent_templates.id / agent_versions.template_id
+      // are TEXT columns in the live app schema — casting the parameter to
+      // uuid[] made the comparison `text = uuid` (SQLSTATE 42883: operator does
+      // not exist), so every `agents uninstall` failed against a real instance.
+      `DELETE FROM ${schema}.agent_versions WHERE template_id = ANY($1::text[])`,
       [ids],
     );
     const deleted = await client.query(
@@ -1233,5 +1245,7 @@ export const __test = {
   checkAgentDbPreflight,
   // Exported for the shared agent-template writer round-trip tests (#95).
   upsertAgentTemplate,
+  // Exported for the live-schema uninstall round-trip test (eng#513).
+  deleteAgentTemplateByPackage,
   quoteIdent,
 };
