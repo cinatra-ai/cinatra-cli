@@ -4072,7 +4072,21 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
     defaultProject = await withAllocLock(lockPath, async () => {
       const resolved = resolveDefaultProject({ targetDir, opts, log, deps });
-      startInfra({ targetDir, log, composeProject: resolved });
+      // eng#513 real-host sweep: the default `up` MUST pass `--env-file
+      // .env.local` like every isolated/attach bring-up does — the base
+      // docker-compose.yml interpolates `${NANGO_ENCRYPTION_KEY}` and
+      // `${CINATRA_BRIDGE_TOKEN}` (no compose defaults), so without the
+      // env-file the freshly-written secrets resolve to BLANK strings (compose
+      // warns "variable is not set") and nango-server runs with an EMPTY
+      // encryption key that silently diverges from the key recorded in
+      // .env.local — the cinatra-cli#57 failure class on the DEFAULT path.
+      const defaultEnvFile = path.join(targetDir, ".env.local");
+      startInfra({
+        targetDir,
+        log,
+        composeProject: resolved,
+        envFile: existsSync(defaultEnvFile) ? defaultEnvFile : null,
+      });
       return resolved;
     });
   }

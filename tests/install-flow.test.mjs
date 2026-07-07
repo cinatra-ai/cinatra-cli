@@ -272,6 +272,32 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     expect(reg.registry.instances["p35-default"].composeProject).toBe("cinatra_p35_default");
   });
 
+  it("eng#513: the default `up` passes `--env-file .env.local` (secrets never interpolate blank)", async () => {
+    // The base docker-compose.yml interpolates ${NANGO_ENCRYPTION_KEY} /
+    // ${CINATRA_BRIDGE_TOKEN} with NO compose defaults. The default flow writes
+    // .env.local BEFORE the infra `up`, so the `up` must resolve interpolation
+    // from that file — omitting it starts nango-server with a BLANK encryption
+    // key (the cinatra-cli#57 failure class on the DEFAULT path; live-observed
+    // in the v0.1.7 closeout real-host sweep, engineering#513).
+    const installDir = path.join(sandbox, "p513-envfile");
+    const upCalls = [];
+    const res = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [], // no conflict
+          bringUpInfra: (args) => upCalls.push(args),
+        }),
+      },
+    );
+    expect(res.infraPlan).toBe("default");
+    expect(upCalls.length).toBe(1);
+    expect(upCalls[0].envFile).toBe(path.join(installDir, ".env.local"));
+    // …and that file really exists at `up` time (env-before-infra ordering).
+    expect(existsSync(upCalls[0].envFile)).toBe(true);
+  });
+
   it("#35: a mismatched-working_dir inspect row REJECTS before `up` (no bringUpInfra)", async () => {
     const installDir = path.join(sandbox, "p35-hijack");
     const otherDir = path.join(sandbox, "p35-other-checkout");
