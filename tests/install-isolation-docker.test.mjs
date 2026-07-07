@@ -257,3 +257,60 @@ describe.skipIf(!HAVE_DOCKER)("cinatra-cli#97 — real `docker compose config` r
     expect(configStderr).not.toMatch(/variable is not set\. Defaulting to a blank string/i);
   });
 });
+
+// ── eng#513 — the REAL compose engine's `--profile "*"` contract ──────────────
+// The isolated executor resolves the checkout's compose config with
+// `--profile "*"` (composeConfigForFiles { allProfiles: true }) so profile-gated
+// services (the real checkout's wayflow) enter the band/remap/self-URL logic.
+// This proves the two engine behaviors that fix relies on, against the REAL
+// `docker compose config`:
+//   1. WITHOUT profiles a profile-gated service is DROPPED (why the leak hid);
+//   2. WITH `--profile "*"` it is INCLUDED and its `profiles` attribute is
+//      RETAINED (so a plain `up` of the generated file still skips it).
+describe.skipIf(!HAVE_DOCKER)("eng#513 — real `docker compose --profile \"*\" config` includes profile-gated services WITH their profiles", () => {
+  let dir;
+  beforeAll(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cinatra-513-profiles-"));
+    writeFileSync(
+      path.join(dir, "docker-compose.yml"),
+      [
+        "services:",
+        "  postgres:",
+        "    image: postgres:16-alpine",
+        "    ports:",
+        '      - "127.0.0.1:5434:5432"',
+        "  wayflow:",
+        "    image: alpine:3",
+        "    profiles: [wayflow, drupal, wordpress]",
+        "    ports:",
+        '      - "127.0.0.1:3010:3010"',
+        "",
+      ].join("\n"),
+    );
+  });
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  function composeConfig(extraArgs) {
+    const r = spawnSync(
+      "docker",
+      ["compose", ...extraArgs, "-f", "docker-compose.yml", "config", "--format", "json"],
+      { cwd: dir, encoding: "utf8" },
+    );
+    if (r.status !== 0) throw new Error(`docker compose config failed: ${r.stderr}`);
+    return JSON.parse(r.stdout);
+  }
+
+  it("plain `config` DROPS the profile-gated service (the pre-fix blind spot)", () => {
+    const resolved = composeConfig([]);
+    expect(resolved.services.postgres).toBeDefined();
+    expect(resolved.services.wayflow).toBeUndefined();
+  });
+
+  it('`--profile "*"` INCLUDES it, retains `profiles`, and exposes its published port', () => {
+    const resolved = composeConfig(["--profile", "*"]);
+    expect(resolved.services.wayflow).toBeDefined();
+    expect(resolved.services.wayflow.profiles).toEqual(["wayflow", "drupal", "wordpress"]);
+    const published = (resolved.services.wayflow.ports ?? []).map((p) => String(p.published));
+    expect(published).toContain("3010");
+  });
+});
