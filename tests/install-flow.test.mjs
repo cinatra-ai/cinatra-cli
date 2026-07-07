@@ -278,7 +278,7 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     // .env.local BEFORE the infra `up`, so the `up` must resolve interpolation
     // from that file — omitting it starts nango-server with a BLANK encryption
     // key (the cinatra-cli#57 failure class on the DEFAULT path; live-observed
-    // in the v0.1.7 closeout real-host sweep, engineering#513).
+    // in a real-host CLI sweep).
     const installDir = path.join(sandbox, "p513-envfile");
     const upCalls = [];
     const res = await runInstall(
