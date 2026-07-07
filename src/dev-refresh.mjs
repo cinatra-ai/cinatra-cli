@@ -15,22 +15,32 @@ const DEFAULT_QUEUE = "cinatra-background-jobs";
 const DOCKER_FLAG_PREFIX = "--docker=";
 
 /**
- * Parse `instance refresh` flags into a normalized docker mode.
- * - `--no-docker`            → "off" (takes precedence over --docker=)
- * - `--docker=always`        → "always"
- * - `--docker=auto` / absent → "auto"
+ * Parse `instance refresh` flags into a normalized options object.
+ *
+ * Docker mode:
+ * - `--no-docker`            → dockerMode "off" (takes precedence over --docker=)
+ * - `--docker=always`        → dockerMode "always"
+ * - `--docker=auto` / absent → dockerMode "auto"
  * Any other `--docker=<value>` throws.
+ *
+ * Dev-app reconciliation (opt-in):
+ * - `--with-dev-apps`        → withDevApps true  (run dev-app sync inside runSetup)
+ * - absent                   → withDevApps false (default: skip dev-app sync for speed)
  */
 export function parseDevRefreshFlags(argv = []) {
   // Reject anything that is not a recognized flag so typos (`--dockr=always`) or a
   // dropped flag (`--rebuild-shell`) fail loudly instead of silently no-opping to
   // the default — a silent `--dockr=always` would run `auto` and surprise the user.
   for (const arg of argv) {
-    if (arg === "--no-docker" || arg.startsWith(DOCKER_FLAG_PREFIX)) {
+    if (
+      arg === "--no-docker" ||
+      arg.startsWith(DOCKER_FLAG_PREFIX) ||
+      arg === "--with-dev-apps"
+    ) {
       continue;
     }
     throw new Error(
-      `Unknown flag "${arg}" for cinatra instance refresh. Supported flags: --docker=auto|always, --no-docker.`,
+      `Unknown flag "${arg}" for cinatra instance refresh. Supported flags: --docker=auto|always, --no-docker, --with-dev-apps.`,
     );
   }
 
@@ -46,13 +56,18 @@ export function parseDevRefreshFlags(argv = []) {
   // A malformed --docker= value is always rejected above, so typos fail loudly even
   // when combined with --no-docker. Otherwise --no-docker is the most conservative
   // choice and wins over a valid --docker=.
+  let dockerMode;
   if (argv.includes("--no-docker")) {
-    return { dockerMode: "off" };
+    dockerMode = "off";
+  } else if (dockerArg) {
+    dockerMode = dockerArg.slice(DOCKER_FLAG_PREFIX.length);
+  } else {
+    dockerMode = "auto";
   }
-  if (dockerArg) {
-    return { dockerMode: dockerArg.slice(DOCKER_FLAG_PREFIX.length) };
-  }
-  return { dockerMode: "auto" };
+
+  const withDevApps = argv.includes("--with-dev-apps");
+
+  return { dockerMode, withDevApps };
 }
 
 function hostnameOf(url) {

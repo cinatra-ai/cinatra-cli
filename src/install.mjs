@@ -78,6 +78,7 @@ import {
   classifyPortHolder,
   generateIsolatedCompose,
   writeIsolatedComposeFile,
+  assertComposeHostUrlsRemapped,
   ISOLATED_COMPOSE_FILENAME,
 } from "./install-isolation.mjs";
 import {
@@ -1305,8 +1306,8 @@ function acquireProdExtensions({ targetDir, log = console.log }) {
 
 function runSetupInTarget({ targetDir, mode, skipDevApps, log = console.log }) {
   // The command-routing contract (renamed cinatra-cli#61): invoke the CANONICAL namespaced form
-  // (`cinatra instance setup <mode>`) so install's own flow never triggers a
-  // deprecation notice or steers the operator onto the deprecated bare alias.
+  // (`cinatra instance setup <mode>`) — the only form that resolves (the bare
+  // `setup <mode>` was removed in cinatra-cli#81).
   const setupArgs = [PUBLISHED_CLI_BIN, "instance", "setup", mode];
   if (mode === "dev" && skipDevApps) setupArgs.push("--skip-dev-apps");
   log(`- Running \`cinatra instance setup ${mode}\` inside ${targetDir}…`);
@@ -2106,6 +2107,14 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
     // silent blank-password DB crash.
     assertScrubbedKeysSupplied(targetDir, scrubbedKeys);
 
+    // cinatra-cli#97 invariant: NO generated service env may still advertise a
+    // loopback URL on an UN-OFFSET (donor/default) published host port — every
+    // self-URL (Nango's NANGO_SERVER_URL / NANGO_PUBLIC_SERVER_URL, any OAuth
+    // callback/base URL) must have followed the host-port shift. Holds by
+    // construction; assert defensively so a regression fails loud at install
+    // time, not as a silent cross-instance OAuth/self-URL leak to the main stack.
+    assertComposeHostUrlsRemapped(doc, new Set(baseBand.map((b) => b.port)));
+
     // Persist the generated compose + provisioning row + marker (recording the
     // generated SOLE file as composeFiles[]).
     const generatedFile = writeIsolatedComposeFile(path.join(targetDir, ISOLATED_COMPOSE_FILENAME), doc);
@@ -2302,6 +2311,10 @@ const ISOLATED_INFRA_ENV_KEYS = [
   "NANGO_DATABASE_URL",
   "NANGO_DB_URL",
   "GRAPHITI_URL",
+  // cinatra-cli#97: WAYFLOW_BASE_URL is host-remapped to the isolated WayFlow
+  // port; an exported value would override the rewrite and re-route the isolated
+  // app's WayFlow-backed features back at the default/main instance's WayFlow.
+  "WAYFLOW_BASE_URL",
   // cinatra-cli#36: the Verdaccio registry-client + Neo4j-client URLs are now
   // rewritten too — an exported stale value (e.g. a donor's …:4873 / …:7687)
   // would otherwise win over the isolated .env.local (collectEnvironment lets
@@ -3077,6 +3090,13 @@ function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = console.log
   }
   const graphitiPort = first("graphiti");
   if (graphitiPort) body = upsertEnvKey(body, "GRAPHITI_URL", rewriteUrlPort(cur.GRAPHITI_URL, graphitiPort, "http", ""));
+  // cinatra-cli#97: the app reaches the per-instance WayFlow runtime via
+  // WAYFLOW_BASE_URL (default http://localhost:3010). WayFlow is a compose
+  // service in the isolated band, so its host port is shifted — re-point the URL
+  // at the isolated WayFlow host port too, else the isolated app's WayFlow-backed
+  // features drive the DEFAULT/main instance's WayFlow (partial-isolation leak).
+  const wayflowPort = first("wayflow");
+  if (wayflowPort) body = upsertEnvKey(body, "WAYFLOW_BASE_URL", rewriteUrlPort(cur.WAYFLOW_BASE_URL, wayflowPort, "http", ""));
   // cinatra-cli#36: the registry CLIENT (Verdaccio) is env-overridable via
   // CINATRA_AGENT_REGISTRY_URL / _UI_URL (default …:4873). Without re-pointing
   // them, an isolated install run beside a live donor publishes/installs into the
@@ -3106,6 +3126,7 @@ function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = console.log
     nangoPort && `nango:${nangoPort}`,
     nangoDbPort && `nango-db:${nangoDbPort}`,
     graphitiPort && `graphiti:${graphitiPort}`,
+    wayflowPort && `wayflow:${wayflowPort}`,
     verdaccioPort && `verdaccio:${verdaccioPort}`,
     neo4jBoltPort && `neo4j:${neo4jBoltPort}`,
   ]

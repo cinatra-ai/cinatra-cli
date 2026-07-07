@@ -52,15 +52,6 @@ checkout live under `cinatra instance …`:
 Run `cinatra --help` for the top-level command list, or `cinatra instance --help`
 for the full local-bootstrap command list.
 
-> The old bare forms (`cinatra db migrate`, `cinatra clone …`, `cinatra reset dev`,
-> `cinatra backup …`, and the renamed `cinatra teardown branch`) still work this
-> release but are deprecated — they print a one-line hint pointing at their
-> `cinatra instance …` form. Update your scripts to the canonical commands.
->
-> The in-repo provisioning phase (`cinatra setup dev|prod`) is folded into
-> `cinatra install --mode dev|prod` — there is no standalone `setup` command to
-> run; re-run `cinatra install` to reconcile an existing instance.
-
 ## Running more than one instance
 
 If you already have a Cinatra instance running and `cinatra install` finds its
@@ -117,9 +108,6 @@ It generates a complete, standalone repo (manifest, README, CI, kind gate, and
 kind-specific payload). The generated package pins `@cinatra-ai/sdk-extensions`
 as an optional peer; nothing is installed for you. Run `cinatra create-extension
 --help` for the kinds and options.
-
-> This replaces the standalone `npx create-cinatra-extension` scaffolder, which
-> is retired.
 
 ## Repo structure
 
@@ -194,15 +182,6 @@ ports. Use `--list-instances` to see what is running:
 Then pick a resolution: `--on-conflict=isolated` starts a second instance on
 its own port band, `--on-conflict=attach` re-attaches to the existing checkout,
 or `--on-conflict=stop-existing` stops the existing stack before installing.
-
-**Deprecated command warnings**
-Commands like `cinatra db migrate` or `cinatra teardown branch` print a deprecation
-hint pointing at their canonical equivalents. Update your scripts to the canonical
-forms (e.g. `cinatra instance db migrate`, `cinatra instance branch teardown`) — the
-old bare forms will be removed in a future minor release. The in-repo provisioning
-phase (`cinatra setup dev|prod`) was folded into `cinatra install --mode dev|prod`;
-re-run `cinatra install` to reconcile an existing instance. To suppress the warnings
-temporarily while you migrate, set `CINATRA_SUPPRESS_DEPRECATION=1`.
 
 **`cinatra doctor` for diagnosing a broken instance**
 If your instance is misbehaving, `cinatra doctor` checks your local setup and

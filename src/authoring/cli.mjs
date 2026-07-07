@@ -1,9 +1,8 @@
 // `cinatra create-extension <kind> [name] [options]` — scaffold a new Cinatra
 // extension package on disk (class-B authoring).
 //
-// Folded in from the former standalone create-cinatra-extension scaffolder (cinatra#402): the old
-// `npx create-cinatra-extension <kind>` thin alias is dropped; this is the
-// single authoring entry point. The scaffold CORE (scaffold/kinds/naming/
+// This is the single authoring entry point for `cinatra create-extension`.
+// The scaffold CORE (scaffold/kinds/naming/
 // template + the templates/ tree) is shared, zero-dependency, Node-builtins
 // only — no network, no @cinatra-ai dependency. Generated templates pin
 // @cinatra-ai/sdk-extensions as an OPTIONAL peer; the CLI never installs it.
@@ -24,9 +23,9 @@
 //   --yes, -y                accept defaults, never prompt
 //
 // `runCreateExtension(argv)` RETURNS 0 on success and THROWS on error. A usage /
-// validation error throws an Error carrying `.exitCode = 2` so the bin can exit
-// with the same typed code the standalone scaffolder used (parity); any other
-// failure throws a plain Error (exit 1 via the central runCli catch).
+// validation error throws an Error carrying `.exitCode = 2` so the bin exits
+// 2 for bad usage; any other failure throws a plain Error (exit 1 via the
+// central runCli catch).
 
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
@@ -35,8 +34,7 @@ import { EXTENSION_KINDS, KIND_SCOPE_POLICY, DEFAULT_SCOPE } from "./kinds.mjs";
 import { scaffold, titleize } from "./scaffold.mjs";
 import { deriveSlug, baseOf } from "./naming.mjs";
 
-/** A usage/validation error that should exit with code 2 (parity with the
- * standalone scaffolder), not the generic 1. */
+/** A usage/validation error that should exit with code 2, not the generic 1. */
 function usageError(message) {
   const err = new Error(message);
   err.exitCode = 2;
@@ -58,7 +56,7 @@ export function parseCreateExtensionArgv(argv) {
     else if (a === "--dir") opts.dir = argv[++i];
     else if (a.startsWith("--dir=")) opts.dir = a.slice("--dir=".length);
     else if (a.startsWith("-")) {
-      // Unknown flag — usage error (exit 2), matching the standalone scaffolder.
+      // Unknown flag — usage error (exit 2).
       throw usageError(`Unknown option: ${a}`);
     } else opts._.push(a);
   }
@@ -146,12 +144,9 @@ export async function runCreateExtension(argv) {
     stdout.write(`\nNext steps:\n`);
     stdout.write(`  1. cd ${result.slug}\n`);
     stdout.write(`  2. Edit README.md, then fill in the kind-specific payload (the generated README explains the kind).\n`);
-    if (kind === "agent" || kind === "workflow") {
-      stdout.write(`  3. Run the kind gate:  node extension-kind-gate.mjs --package-root .\n`);
-      stdout.write(`  4. Validate package shape:  npm pack --dry-run\n`);
-    } else {
-      stdout.write(`  3. Validate package shape:  npm pack --dry-run\n`);
-    }
+    stdout.write(`  3. Run the kind gate:  node extension-kind-gate.mjs --package-root .\n`);
+    stdout.write(`     (the same self-contained gate the install pipeline mirrors — catches blockers before you publish.)\n`);
+    stdout.write(`  4. Validate package shape:  npm pack --dry-run\n`);
     stdout.write(`  5. Publish: cut a GitHub Release tagged v<version> to trigger the marketplace submit pipeline.\n`);
     stdout.write(`     (Deferred until @cinatra-ai/sdk-extensions@0.1.1 is published; the SDK peer is optional today.)\n`);
     return 0;

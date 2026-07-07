@@ -12,8 +12,8 @@
 // published `@cinatra-ai/cinatra` package, those two template files are stored
 // in the tree under non-dotted sentinel names (`gitignore`, `npmrc`) so they
 // survive packing, and are renamed back to their leading-dot form on scaffold.
-// The generated extension's on-disk output is therefore byte-identical to the
-// standalone scaffolder's. No other dotfile (`.gitattributes`, `.github/**`)
+// The generated extension's on-disk output preserves the expected dotfiles.
+// No other dotfile (`.gitattributes`, `.github/**`)
 // needs this — npm ships those — so the map is intentionally minimal.
 
 import { readdirSync, readFileSync, mkdirSync, writeFileSync, statSync } from "node:fs";

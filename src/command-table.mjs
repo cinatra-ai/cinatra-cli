@@ -43,33 +43,22 @@
 //                               `!mode` guard so `instance setup bogus` (and the
 //                               alias `setup bogus`) route to UNKNOWN, never to
 //                               the env-driven setup.
-//   * A `deprecated` descriptor (an OLD bare path kept as a hidden alias for one
-//     minor) participates in matching exactly like its canonical twin (same
-//     effective path-length), and carries `deprecated: "<new path>"`. The
-//     dispatcher prints a one-line stderr deprecation notice then routes to the
-//     SAME handler id. `validateCommandTable` guarantees no alias ever shadows a
-//     real canonical command.
 //   * The dispatcher computes `rest = argv.slice(path.length)` (everything AFTER
 //     the routed tokens) and `routedTokens = argv.slice(0, path.length)`. A
 //     handler that needs a routed token (e.g. the `dev|prod` mode) reads it from
-//     `routedTokens`. Canonical and alias forms deliver an IDENTICAL `rest` to
-//     the shared handler because each slices off its own path length.
+//     `routedTokens`.
 //   * `hidden: true` marks dispatch-only descriptors with no standalone help row
-//     (the env-driven no-mode entries, the removed `mcp tunnel` stub, every
-//     deprecated alias, and the `instance` group head). The dispatcher still routes
-//     them; `buildHelpIndex` does not advertise them.
+//     (the env-driven no-mode entries, the removed `mcp tunnel` stub, the internal
+//     `instance setup` phase forms, and the `instance` group head). The dispatcher
+//     still routes them; `buildHelpIndex` does not advertise them.
 // ---------------------------------------------------------------------------
 
 /**
  * @typedef {Object} CommandDescriptor
- * @property {string} id        Stable handler key (index.mjs HANDLERS[id]). Alias
- *                              descriptors deliberately REUSE the canonical id.
+ * @property {string} id        Stable handler key (index.mjs HANDLERS[id]).
  * @property {string[]} path    The literal token(s) that route to this command.
  * @property {"command"|"command-no-mode"|"command+mode"|"command+mode+sub"|"group"} match  Match kind.
  * @property {boolean} [hidden] Dispatch-only (no standalone help row) when true.
- * @property {string} [deprecated] When set, this is a deprecated alias; the value
- *                              is the canonical path (space-joined) the dispatcher
- *                              names in its deprecation notice. Always `hidden`.
  * @property {string} [summary] One-line description for the help index.
  */
 
@@ -149,6 +138,13 @@ export const COMMAND_DESCRIPTORS = [
     summary: "List installed extensions (name, kind, version) from the extensions/ tree.",
   },
   {
+    id: "extensions.verify-prod",
+    path: ["extensions", "verify-prod"],
+    match: "command+mode",
+    summary:
+      "Verify prod required-extension coherence (on-disk == seed == lock == registered == WayFlow); read-only.",
+  },
+  {
     id: "create-extension",
     path: ["create-extension"],
     match: "command",
@@ -220,8 +216,10 @@ export const COMMAND_DESCRIPTORS = [
   // *instance* and several take an explicit `dev|prod` mode, so a `dev` head was
   // misleading (`cinatra dev setup prod` was self-contradictory). The old `dev …`
   // head is REMOVED with no back-compat alias — `cinatra dev …` no longer resolves.
-  // (The bare-path aliases below are a SEPARATE deprecation lane and now
-  // point at the `instance …` canonical forms.)
+  // cinatra-cli#81: the old BARE-form paths (`db migrate`, `clone …`, `reset dev`,
+  // `backup …`, `setup branch`/`teardown branch`) were also removed with NO
+  // back-compat — only the canonical `instance …` forms resolve; the bare forms
+  // route to UNKNOWN.
   {
     id: "instance",
     path: ["instance"],
@@ -255,8 +253,8 @@ export const COMMAND_DESCRIPTORS = [
   // cinatra-cli#62: branch lifecycle commands manage an existing env slice (NOT a
   // from-zero install), so they stay SEPARATE from `install` and are renamed for
   // clarity to the `branch …` head: `instance branch setup` / `instance branch
-  // teardown`. The old `instance setup branch` / `instance teardown branch` forms
-  // are kept as hidden deprecated aliases (one minor) further down.
+  // teardown`. (cinatra-cli#81: the old `instance setup branch` / `instance
+  // teardown branch` forms were removed with no back-compat alias.)
   {
     id: "setup.branch",
     path: ["instance", "branch", "setup"],
@@ -395,162 +393,6 @@ export const COMMAND_DESCRIPTORS = [
     match: "command+mode+sub",
     summary: "Import API configs from an export-api-configs JSON file.",
   },
-
-  // ----- Deprecated LOCAL aliases (one minor) — old bare paths → their `instance …` forms -----
-  // Each REUSES the canonical id, is `hidden`, and carries `deprecated:"<new>"`.
-  // They reserve the old bare token paths LOCAL during the deprecation window
-  // (OD-1(A)): a future Class-A remote/admin variant of `db migrate` /
-  // `agent …` (the CLI remote-target security model) must take a DISTINCT `admin …` head, never these tokens.
-  // cinatra-cli#61: their targets now point at the `instance …` canonical forms
-  // (the `dev …` namespace they used to alias no longer exists).
-  {
-    id: "setup",
-    path: ["setup"],
-    match: "command-no-mode",
-    hidden: true,
-    deprecated: "instance setup",
-  },
-  {
-    id: "setup.dev|prod",
-    path: ["setup", "dev|prod"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance setup",
-  },
-  // cinatra-cli#62: there is NO bare `setup nango` alias — `setup nango` was
-  // never a documented standalone operator command; Nango is provisioned as an
-  // internal phase of `cinatra install`. (The hidden `instance setup nango`
-  // descriptor above is kept ONLY so install's internal invocation routes.)
-  // cinatra-cli#62: the OLD `instance setup branch` / `instance teardown branch`
-  // forms (renamed to `instance branch setup` / `instance branch teardown`) are
-  // kept as hidden deprecated aliases for one minor, alongside the original bare
-  // aliases (now re-pointed at the `branch …` canonical forms).
-  {
-    id: "setup.branch",
-    path: ["instance", "setup", "branch"],
-    match: "command+mode+sub",
-    hidden: true,
-    deprecated: "instance branch setup",
-  },
-  {
-    id: "teardown.branch",
-    path: ["instance", "teardown", "branch"],
-    match: "command+mode+sub",
-    hidden: true,
-    deprecated: "instance branch teardown",
-  },
-  {
-    id: "setup.branch",
-    path: ["setup", "branch"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance branch setup",
-  },
-  {
-    id: "teardown.branch",
-    path: ["teardown", "branch"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance branch teardown",
-  },
-  {
-    id: "setup.clone",
-    path: ["setup", "clone"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance clone new",
-  },
-  {
-    id: "clone.refresh-seed",
-    path: ["clone", "refresh-seed"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance clone refresh-seed",
-  },
-  {
-    id: "clone.prune",
-    path: ["clone", "prune"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance clone prune",
-  },
-  {
-    id: "clone.list",
-    path: ["clone", "list"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance clone list",
-  },
-  {
-    id: "clone.start",
-    path: ["clone", "start"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance clone start",
-  },
-  {
-    id: "clone.stop",
-    path: ["clone", "stop"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance clone stop",
-  },
-  {
-    id: "clone.status",
-    path: ["clone", "status"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance clone status",
-  },
-  {
-    id: "clone.slug-for-worktree",
-    path: ["clone", "slug-for-worktree"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance clone slug-for-worktree",
-  },
-  {
-    id: "db.migrate",
-    path: ["db", "migrate"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance db migrate",
-  },
-  {
-    id: "reset.dev",
-    path: ["reset", "dev"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance reset",
-  },
-  {
-    id: "backup.create",
-    path: ["backup", "create"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance backup create",
-  },
-  {
-    id: "backup.import",
-    path: ["backup", "import"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance backup import",
-  },
-  {
-    id: "backup.export-api-configs",
-    path: ["backup", "export-api-configs"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance backup export-api-configs",
-  },
-  {
-    id: "backup.import-api-configs",
-    path: ["backup", "import-api-configs"],
-    match: "command+mode",
-    hidden: true,
-    deprecated: "instance backup import-api-configs",
-  },
 ];
 
 /**
@@ -668,15 +510,12 @@ function expandedPaths(d) {
 /**
  * Load-time table-validity assertion (the command-routing contract). Fails the build
  * LOUDLY (throws) on any condition that would make longest-match routing
- * ambiguous or let an alias shadow a real command:
+ * ambiguous:
  *
- *   (1) two NON-deprecated descriptors that TIE — same effective length AND an
- *       overlapping expanded leading-token sequence (alternation-aware), where
- *       neither is a legitimate group/no-mode prefix pair;
- *   (2) a `deprecated` whose expanded path collides with any canonical
- *       (non-deprecated) expanded path (an alias must never shadow a real one);
- *   (3) a `deprecated.target` that does not resolve to a real canonical path;
- *   (4) a `deprecated` descriptor that is not also `hidden`.
+ *   (1) two descriptors that TIE — same effective length AND an overlapping
+ *       expanded leading-token sequence (alternation-aware);
+ *   (1b) a shorter PLAIN-prefix leaf that strictly prefixes a longer descriptor
+ *        (it would steal the longer descriptor's argv).
  *
  * A strict-prefix pair is ALLOWED when the shorter descriptor is a `group` head
  * or a `command-no-mode` leaf (both length-exact, so they never ambiguously
@@ -687,13 +526,9 @@ function expandedPaths(d) {
  * @returns {true}
  */
 export function validateCommandTable(descriptors) {
-  const canonical = descriptors.filter((d) => !d.deprecated);
-  const deprecated = descriptors.filter((d) => d.deprecated);
-
   // An unambiguous key for an expanded token sequence — JSON-encoded so tokens
-  // containing spaces/empties can never alias distinct sequences (codex
-  // SHOULD-FIX). `expandedPaths` returns token ARRAYS, so boundaries are never
-  // lost upstream of this key.
+  // containing spaces/empties can never alias distinct sequences. `expandedPaths`
+  // returns token ARRAYS, so boundaries are never lost upstream of this key.
   const key = (seq) => JSON.stringify(seq);
   const seqs = (d) => expandedPaths(d);
 
@@ -708,40 +543,41 @@ export function validateCommandTable(descriptors) {
   // argv.length === path.length) cannot ambiguously shadow a longer descriptor.
   const isLengthExact = (d) => d.match === "command-no-mode" || d.match === "group";
 
-  // Canonical expanded-path key → descriptor, for exact shadow + target lookup.
+  // Expanded-path key → descriptor, to catch two distinct descriptors sharing an
+  // exact routable path.
   /** @type {Map<string, CommandDescriptor>} */
-  const canonicalByPath = new Map();
-  for (const d of canonical) {
+  const byPath = new Map();
+  for (const d of descriptors) {
     for (const seq of seqs(d)) {
       const k = key(seq);
-      const existing = canonicalByPath.get(k);
+      const existing = byPath.get(k);
       if (existing && existing !== d) {
         throw new Error(
-          `command-table: ambiguous canonical descriptors for "${seq.join(" ")}" ` +
+          `command-table: ambiguous descriptors for "${seq.join(" ")}" ` +
             `(ids "${existing.id}" and "${d.id}").`,
         );
       }
-      canonicalByPath.set(k, d);
+      byPath.set(k, d);
     }
   }
 
-  // (1) Tie detection among canonical descriptors at EQUAL effective length AND
-  //     (1b) strict-PREFIX shadowing: a shorter PLAIN-prefix leaf (NOT group,
-  //     NOT command-no-mode) that is a strict prefix of a longer descriptor
-  //     would steal the longer descriptor's argv (e.g. plain `["instance"]` shadowing
-  //     `["instance","setup"]` for `instance typo`). Length-exact shorter forms are the
-  //     ONLY allowed strict-prefix case (codex MUST-FIX).
-  for (let i = 0; i < canonical.length; i++) {
-    for (let j = i + 1; j < canonical.length; j++) {
-      const a = canonical[i];
-      const b = canonical[j];
+  // (1) Tie detection at EQUAL effective length AND (1b) strict-PREFIX shadowing:
+  //     a shorter PLAIN-prefix leaf (NOT group, NOT command-no-mode) that is a
+  //     strict prefix of a longer descriptor would steal the longer descriptor's
+  //     argv (e.g. plain `["instance"]` shadowing `["instance","setup"]` for
+  //     `instance typo`). Length-exact shorter forms are the ONLY allowed
+  //     strict-prefix case.
+  for (let i = 0; i < descriptors.length; i++) {
+    for (let j = i + 1; j < descriptors.length; j++) {
+      const a = descriptors[i];
+      const b = descriptors[j];
       const seqsA = seqs(a);
       const seqsB = seqs(b);
       if (effectiveLength(a) === effectiveLength(b)) {
         const setA = new Set(seqsA.map(key));
         if (seqsB.map(key).some((k) => setA.has(k))) {
           throw new Error(
-            `command-table: ambiguous tie between canonical descriptors ` +
+            `command-table: ambiguous tie between descriptors ` +
               `"${a.id}" (${a.path.join(" ")}) and "${b.id}" (${b.path.join(" ")}) ` +
               `at equal length ${effectiveLength(a)}.`,
           );
@@ -756,84 +592,13 @@ export function validateCommandTable(descriptors) {
         for (const l of longSeqs) {
           if (isStrictPrefix(s, l)) {
             throw new Error(
-              `command-table: canonical descriptor "${shortD.id}" (${s.join(" ")}) is a ` +
+              `command-table: descriptor "${shortD.id}" (${s.join(" ")}) is a ` +
                 `plain-prefix LEAF that would shadow a longer command (${l.join(" ")}); ` +
                 `make it a group/no-mode form or re-path it.`,
             );
           }
         }
       }
-    }
-  }
-
-  // (5) two deprecated aliases must not share an expanded path. Key on the
-  //     descriptor IDENTITY (object), not its id — alias descriptors reuse the
-  //     canonical id, so an id-based check would miss a real path collision
-  //     between two distinct descriptors that share an id (codex MUST-FIX).
-  /** @type {Map<string, CommandDescriptor>} */
-  const aliasByPath = new Map();
-  for (const d of deprecated) {
-    for (const seq of seqs(d)) {
-      const k = key(seq);
-      const prior = aliasByPath.get(k);
-      if (prior && prior !== d) {
-        throw new Error(
-          `command-table: two deprecated aliases collide on path "${seq.join(" ")}" ` +
-            `("${prior.id}" and "${d.id}").`,
-        );
-      }
-      aliasByPath.set(k, d);
-    }
-  }
-
-  for (const d of deprecated) {
-    // (4) every deprecated alias must be hidden.
-    if (!d.hidden) {
-      throw new Error(
-        `command-table: deprecated alias "${d.id}" (${d.path.join(" ")}) must be hidden.`,
-      );
-    }
-    // (2) an alias must never collide with a canonical command — checked as
-    //     EXACT path equality AND strict-prefix shadowing (an alias that is a
-    //     strict prefix of, or strictly prefixed by, a canonical leaf would
-    //     mis-route). Length-exact alias forms only need the exact-equality
-    //     check (they never prefix-shadow).
-    for (const aliasSeq of seqs(d)) {
-      const exact = canonicalByPath.get(key(aliasSeq));
-      if (exact) {
-        throw new Error(
-          `command-table: deprecated alias "${d.id}" (${aliasSeq.join(" ")}) shadows ` +
-            `canonical command "${exact.id}".`,
-        );
-      }
-      for (const c of canonical) {
-        // A canonical plain leaf SHORTER than the alias would steal the alias's
-        // argv; a canonical descriptor LONGER than a plain-prefix alias would be
-        // stolen by the alias. Either direction is a shadow.
-        for (const cSeq of seqs(c)) {
-          if (isStrictPrefix(cSeq, aliasSeq) && !isLengthExact(c)) {
-            throw new Error(
-              `command-table: deprecated alias "${d.id}" (${aliasSeq.join(" ")}) is shadowed by ` +
-                `canonical plain-prefix command "${c.id}" (${cSeq.join(" ")}).`,
-            );
-          }
-          if (isStrictPrefix(aliasSeq, cSeq) && !isLengthExact(d)) {
-            throw new Error(
-              `command-table: deprecated alias "${d.id}" (${aliasSeq.join(" ")}) is a plain-prefix ` +
-                `that would shadow canonical command "${c.id}" (${cSeq.join(" ")}).`,
-            );
-          }
-        }
-      }
-    }
-    // (3) the alias target must resolve to an EXACT canonical path (not router
-    //     prefix semantics — `"foo bogus"` must NOT resolve to plain `["foo"]`).
-    const targetSeq = d.deprecated.split(" ");
-    if (!canonicalByPath.has(key(targetSeq))) {
-      throw new Error(
-        `command-table: deprecated alias "${d.id}" targets "${d.deprecated}", ` +
-          `which does not resolve to a canonical command path.`,
-      );
     }
   }
 
@@ -851,16 +616,14 @@ validateCommandTable(COMMAND_DESCRIPTORS);
  * visible command (and vice-versa), so the dispatcher and the banner can never
  * silently diverge.
  *
- * Hidden descriptors AND deprecated aliases are excluded — neither has a help
- * row. (Aliases are excluded by the `deprecated` property as well as `hidden`,
- * so a future edit that forgets `hidden` still cannot leak an alias into help.)
+ * Hidden descriptors are excluded — they have no help row.
  *
  * @param {CommandDescriptor[]} descriptors
  * @returns {{ id: string, command: string, summary: string }[]}
  */
 export function buildHelpIndex(descriptors) {
   return descriptors
-    .filter((d) => !d.hidden && !d.deprecated)
+    .filter((d) => !d.hidden)
     .map((d) => ({
       id: d.id,
       command: d.path.join(" "),

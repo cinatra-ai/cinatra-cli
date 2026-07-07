@@ -170,48 +170,61 @@ describe("cinatra <subcommand> --help edge cases", () => {
     expect(res.stdout).not.toMatch(/^Usage: cinatra install$/m);
   });
 
-  // The command-routing contract (renamed cinatra-cli#61): a DEPRECATED bare alias
-  // (`db migrate`, …) with --help must still short-circuit (footgun guard: exit 0,
-  // NO side effect) and resolve to the CANONICAL `instance …` synopsis, steering
-  // the user to the new form. cinatra-cli#62: the `instance setup branch` /
-  // `instance teardown branch` forms were renamed; their bare aliases now resolve
-  // to the new `instance branch setup|teardown` canonical.
-  const aliasHelpCases = [
-    [["db", "migrate", "--help"], "cinatra instance db migrate"],
-    [["clone", "prune", "--help"], "cinatra instance clone prune"],
-    [["reset", "dev", "--help"], "cinatra instance reset"],
-    [["backup", "import", "--help"], "cinatra instance backup import"],
-    [["setup", "branch", "--help"], "cinatra instance branch setup"],
-    [["teardown", "branch", "--help"], "cinatra instance branch teardown"],
-    [["instance", "setup", "branch", "--help"], "cinatra instance branch setup"],
-    [["instance", "teardown", "branch", "--help"], "cinatra instance branch teardown"],
+  // cinatra-cli#81: the old TOP-LEVEL bare forms were removed with NO back-compat.
+  // They no longer route a help descriptor, so `<bare> --help` falls back to the
+  // GLOBAL banner (exit 0, no side effect) — it must NOT print a "deprecated form"
+  // synopsis (that mechanism is gone) and must NOT run the destructive handler.
+  const removedBareHelpCases = [
+    [["db", "migrate", "--help"]],
+    [["clone", "prune", "--help"]],
+    [["reset", "dev", "--help"]],
+    [["backup", "import", "--help"]],
+    [["setup", "branch", "--help"]],
+    [["teardown", "branch", "--help"]],
   ];
 
-  it.each(aliasHelpCases)(
-    "deprecated alias `%j --help` exits 0, shows the canonical synopsis, no side effect",
-    (args, canonicalToken) => {
+  it.each(removedBareHelpCases)(
+    "removed bare form `%j --help` exits 0, prints the GLOBAL banner, no deprecated synopsis",
+    (args) => {
       const res = runHelp(args);
       expect(res.status, `stderr: ${res.stderr}`).toBe(0);
-      expect(res.stdout).toContain(canonicalToken);
-      expect(res.stdout).toMatch(/deprecated form/i);
-      expect(res.stdout).toMatch(/Usage:/i);
+      expect(res.stdout).toContain("Cinatra setup CLI"); // the global banner
+      expect(res.stdout).not.toMatch(/deprecated form/i);
+      expect(res.stdout).not.toMatch(/is now "cinatra/);
+      assertNoSideEffect();
+    },
+  );
+
+  // cinatra-cli#81: the removed OLD-ORDER `instance setup branch` / `instance
+  // teardown branch` forms are now unknown `instance …` subcommands, so their
+  // `--help` falls back to the `instance` GROUP banner (exit 0, no side effect) —
+  // never a deprecated synopsis, never the destructive handler.
+  const removedInstanceHelpCases = [
+    [["instance", "setup", "branch", "--help"]],
+    [["instance", "teardown", "branch", "--help"]],
+  ];
+
+  it.each(removedInstanceHelpCases)(
+    "removed old-order form `%j --help` exits 0, prints the `instance` GROUP banner",
+    (args) => {
+      const res = runHelp(args);
+      expect(res.status, `stderr: ${res.stderr}`).toBe(0);
+      expect(res.stdout).toContain("cinatra instance branch setup"); // group banner
+      expect(res.stdout).not.toMatch(/deprecated form/i);
+      expect(res.stdout).not.toMatch(/is now "cinatra/);
       assertNoSideEffect();
     },
   );
 
   // cinatra-cli#62: the in-repo provisioning phase (`setup dev|prod`, `setup
-  // nango`) is FOLDED into `cinatra install --mode dev|prod`. Its `--help` (canonical
-  // hidden form AND the deprecated bare alias) must short-circuit (exit 0, no side
-  // effect) and STEER to `cinatra install` — never advertise the internal setup path.
-  // NOTE: the bare no-mode `setup --help` does NOT route a help descriptor (the
-  // no-mode form is length-exact, so `["setup","--help"]` matches nothing) and
-  // falls back to the full banner — asserted separately below. The forms here all
-  // carry a routable trailing token, so they resolve to the folded setup phase.
+  // nango`) is FOLDED into `cinatra install --mode dev|prod`. Its `--help` must
+  // short-circuit (exit 0, no side effect) and STEER to `cinatra install` — never
+  // advertise the internal setup path. (cinatra-cli#81: the bare `setup dev` form
+  // is gone, so only the namespaced `instance setup …` forms are tested here.)
   const setupPhaseHelpCases = [
     [["instance", "setup", "dev", "--help"]],
     [["instance", "setup", "prod", "--help"]],
     [["instance", "setup", "nango", "--help"]], // hidden internal phase (still routes)
-    [["setup", "dev", "--help"]], // deprecated bare alias
   ];
 
   it.each(setupPhaseHelpCases)(

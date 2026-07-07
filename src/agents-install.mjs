@@ -498,6 +498,189 @@ async function installResolvedTree({ tree, install }) {
 }
 
 // ---------------------------------------------------------------------------
+// DB preflight — guard against never-booted instances (cinatra-cli#69)
+// ---------------------------------------------------------------------------
+
+/**
+ * Run a preflight check before any agent_templates DB write.
+ *
+ * A never-booted instance has no `cinatra` schema at all; a partially-migrated
+ * instance may have the table but be missing the `package_name` column added in
+ * a later migration. Both cases produce cryptic Postgres errors mid-write.
+ *
+ * Throws with an actionable message when the schema/table/column is absent so
+ * the operator knows exactly what to do before retrying.
+ *
+ * @param {import("pg").Client} client  An already-connected pg Client.
+ * @param {string} schema               The Postgres search-path schema to check.
+ */
+async function checkAgentDbPreflight(client, schema) {
+  // `to_regclass` returns NULL when the relation does not exist (no error/exception).
+  const tableResult = await client.query(
+    `SELECT to_regclass($1::text) AS rel`,
+    [`${schema}.agent_templates`],
+  );
+  if (tableResult.rows[0].rel == null) {
+    throw new Error(
+      `Schema preflight failed: relation "${schema}.agent_templates" does not exist. ` +
+        `Start the cinatra instance once so its database schema is created and all ` +
+        `migrations have run, then retry this command.`,
+    );
+  }
+  // Verify the package_name column exists (added in a later migration).
+  const colResult = await client.query(
+    `SELECT column_name
+       FROM information_schema.columns
+      WHERE table_schema = $1
+        AND table_name   = 'agent_templates'
+        AND column_name  = 'package_name'`,
+    [schema],
+  );
+  if (colResult.rows.length === 0) {
+    throw new Error(
+      `Schema preflight failed: column "package_name" is missing from ` +
+        `"${schema}.agent_templates". Start the cinatra instance once so its ` +
+        `migrations run to completion, then retry this command.`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shared agent-template writer (cinatra-cli#95)
+// ---------------------------------------------------------------------------
+
+/**
+ * Quote a Postgres identifier (schema/table name) so an operator-supplied
+ * SUPABASE_SCHEMA can never break out of the identifier position.
+ */
+function quoteIdent(name) {
+  return `"${String(name).replace(/"/g, '""')}"`;
+}
+
+/**
+ * Upsert one agent_templates row (keyed on package_name) plus a fresh
+ * agent_versions snapshot, inside a single transaction. This is the ONE
+ * canonical agent-template writer, shared by `cinatra agents install` and the
+ * `cinatra agent import` local direct-Postgres path (cinatra-cli#95).
+ *
+ * Every JSON-as-TEXT column is JSON.stringify()'d HERE (callers pass raw JS
+ * values), so a JS array/object can never reach node-postgres as a Postgres
+ * array literal `{…}` or "[object Object]" — the exact corruption that broke
+ * `agent import`. Only columns that exist in the CURRENT app schema are written
+ * (there is no `execution_mode` column any more); `package_name` (NOT NULL +
+ * UNIQUE) is always set.
+ *
+ * The template upsert is an atomic `ON CONFLICT (package_name) DO UPDATE` (no
+ * racy SELECT-then-INSERT). On a package_name conflict only the mutable content
+ * columns + updated_at are refreshed — `status`, `package_name`, `id` and
+ * `created_at` are PRESERVED, matching the historical install-update contract.
+ * `version_number` is computed as MAX(version_number)+1 for the template in the
+ * same statement; because the template row is locked by the upsert within the
+ * transaction, a concurrent writer of the same package blocks and then sees the
+ * committed version row, so numbers never collide.
+ *
+ * @param {import("pg").Client} client  An already-connected pg Client (no open tx).
+ * @param {string} schema               Postgres schema (e.g. "cinatra").
+ * @param {object} fields               Raw template fields (JSON columns as JS values).
+ * @returns {Promise<{templateId:string, versionId:string, versionNumber:number}>}
+ */
+export async function upsertAgentTemplate(client, schema, fields) {
+  await checkAgentDbPreflight(client, schema);
+
+  const templatesTable = `${quoteIdent(schema)}.agent_templates`;
+  const versionsTable = `${quoteIdent(schema)}.agent_versions`;
+
+  // Serialise every JSON-as-TEXT column exactly once. Nullable JSON columns
+  // become SQL NULL; required ones always resolve to a JSON string.
+  const compiledPlanJson = JSON.stringify(fields.compiledPlan ?? []);
+  const inputSchemaJson = JSON.stringify(fields.inputSchema ?? {});
+  const outputSchemaJson =
+    fields.outputSchema == null ? null : JSON.stringify(fields.outputSchema);
+  const approvalPolicyJson = JSON.stringify(fields.approvalPolicy ?? { steps: [] });
+  const agentDependenciesJson =
+    fields.agentDependencies == null ? null : JSON.stringify(fields.agentDependencies);
+  const snapshotJson = JSON.stringify(fields.snapshot ?? {});
+  const contentHash = createHash("sha256").update(snapshotJson).digest("hex");
+
+  const newTemplateId = randomUUID();
+  const versionId = randomUUID();
+
+  await client.query("BEGIN");
+  try {
+    // Atomic upsert keyed on the package_name UNIQUE index. On conflict, refresh
+    // only the mutable content columns (NOT status/package_name/id/created_at).
+    const upsertResult = await client.query(
+      `INSERT INTO ${templatesTable} (
+         id, name, description, source_nl, compiled_plan, input_schema,
+         output_schema, approval_policy, type, task_spec,
+         package_name, package_version, agent_dependencies,
+         lg_graph_code, lg_graph_id, execution_provider,
+         hitl_required, status, created_at, updated_at
+       ) VALUES (
+         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW(),NOW()
+       )
+       ON CONFLICT (package_name) DO UPDATE SET
+         name = EXCLUDED.name,
+         description = EXCLUDED.description,
+         source_nl = EXCLUDED.source_nl,
+         compiled_plan = EXCLUDED.compiled_plan,
+         input_schema = EXCLUDED.input_schema,
+         output_schema = EXCLUDED.output_schema,
+         approval_policy = EXCLUDED.approval_policy,
+         type = EXCLUDED.type,
+         task_spec = EXCLUDED.task_spec,
+         package_version = EXCLUDED.package_version,
+         agent_dependencies = EXCLUDED.agent_dependencies,
+         lg_graph_code = EXCLUDED.lg_graph_code,
+         lg_graph_id = EXCLUDED.lg_graph_id,
+         execution_provider = EXCLUDED.execution_provider,
+         updated_at = NOW()
+       RETURNING id`,
+      [
+        newTemplateId,
+        fields.name,
+        fields.description ?? null,
+        fields.sourceNl ?? "",
+        compiledPlanJson,
+        inputSchemaJson,
+        outputSchemaJson,
+        approvalPolicyJson,
+        fields.type ?? "leaf",
+        fields.taskSpec ?? null,
+        fields.packageName,
+        fields.packageVersion ?? null,
+        agentDependenciesJson,
+        fields.lgGraphCode ?? null,
+        fields.lgGraphId ?? null,
+        fields.executionProvider ?? "wayflow",
+        fields.hitlRequired ?? false,
+        fields.status ?? "draft",
+      ],
+    );
+    const templateId = upsertResult.rows[0].id;
+
+    // Compute the next version number atomically in the same INSERT…SELECT. The
+    // template row is locked by the upsert above (same transaction).
+    const versionResult = await client.query(
+      `INSERT INTO ${versionsTable} (
+         id, template_id, version_number, content_hash, snapshot, created_at
+       )
+       SELECT $1, $2, COALESCE(MAX(version_number), 0) + 1, $3, $4, NOW()
+       FROM ${versionsTable} WHERE template_id = $2
+       RETURNING version_number`,
+      [versionId, templateId, contentHash, snapshotJson],
+    );
+    const versionNumber = versionResult.rows[0].version_number;
+
+    await client.query("COMMIT");
+    return { templateId, versionId, versionNumber };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Install single agent package — extract tarball + write to DB
 // ---------------------------------------------------------------------------
 
@@ -566,104 +749,33 @@ async function installAgentFromPackage({ packageName, packageVersion, registryUr
     const sourceVersionId = agent?.version?.sourceVersionId ?? cinatraMeta.sourceVersionId ?? null;
     const sourceVersionNumber = agent?.version?.sourceVersionNumber ?? cinatraMeta.sourceVersionNumber ?? 1;
 
-    const schema = process.env.SUPABASE_SCHEMA ?? "cinatra";
+    const schema = (process.env.SUPABASE_SCHEMA || "").trim() || "cinatra";
     const client = new pg.Client({ connectionString: dbUrl });
     await client.connect();
 
     try {
-      // Check for existing template by packageName
-      const existingResult = await client.query(
-        `SELECT id FROM ${schema}.agent_templates WHERE package_name = $1 LIMIT 1`,
-        [packageName]
-      );
-
-      let templateId;
-      const versionId = randomUUID();
-
-      if (existingResult.rows.length > 0) {
-        // Update existing template
-        templateId = existingResult.rows[0].id;
-        await client.query(
-          `UPDATE ${schema}.agent_templates SET
-            name = $2, description = $3, source_nl = $4, compiled_plan = $5,
-            input_schema = $6, output_schema = $7, approval_policy = $8,
-            type = $9, task_spec = $10,
-            package_version = $11, agent_dependencies = $12,
-            lg_graph_code = $13, lg_graph_id = $14, execution_provider = $15,
-            updated_at = NOW()
-          WHERE id = $1`,
-          [
-            templateId,
-            templateName,
-            description,
-            sourceNl,
-            JSON.stringify(compiledPlan),
-            JSON.stringify(inputSchema),
-            outputSchema ? JSON.stringify(outputSchema) : null,
-            JSON.stringify(approvalPolicy),
-            agentType,
-            taskSpec,
-            pkg.version,
-            Object.keys(agentDeps).length > 0 ? JSON.stringify(agentDeps) : null,
-            lgGraphCode,
-            lgGraphId,
-            executionProvider,
-          ]
-        );
-      } else {
-        // Insert new template
-        templateId = randomUUID();
-        await client.query(
-          `INSERT INTO ${schema}.agent_templates (
-            id, name, description, source_nl, compiled_plan, input_schema,
-            output_schema, approval_policy, type, task_spec,
-            package_name, package_version, agent_dependencies,
-            lg_graph_code, lg_graph_id, execution_provider,
-            hitl_required, status, created_at, updated_at
-          ) VALUES (
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-            false, 'draft', NOW(), NOW()
-          )`,
-          [
-            templateId,
-            templateName,
-            description,
-            sourceNl,
-            JSON.stringify(compiledPlan),
-            JSON.stringify(inputSchema),
-            outputSchema ? JSON.stringify(outputSchema) : null,
-            JSON.stringify(approvalPolicy),
-            agentType,
-            taskSpec,
-            packageName,
-            pkg.version,
-            Object.keys(agentDeps).length > 0 ? JSON.stringify(agentDeps) : null,
-            lgGraphCode,
-            lgGraphId,
-            executionProvider,
-          ]
-        );
-      }
-
-      // Insert version row
-      const contentHash = createHash("sha256")
-        .update(JSON.stringify(snapshot))
-        .digest("hex");
-
-      // Determine next version number
-      const versionNumResult = await client.query(
-        `SELECT COALESCE(MAX(version_number), 0) + 1 AS next_num
-         FROM ${schema}.agent_versions WHERE template_id = $1`,
-        [templateId]
-      );
-      const versionNumber = versionNumResult.rows[0].next_num;
-
-      await client.query(
-        `INSERT INTO ${schema}.agent_versions (
-          id, template_id, version_number, content_hash, snapshot, created_at
-        ) VALUES ($1, $2, $3, $4, $5, NOW())`,
-        [versionId, templateId, versionNumber, contentHash, JSON.stringify(snapshot)]
-      );
+      // Preflight + transactional upsert of agent_templates + agent_versions is
+      // owned by the shared writer (cinatra-cli#95). Pass RAW JS values for the
+      // JSON columns; the helper JSON.stringify()s them and computes the version
+      // number. `agentDependencies` stays null when empty (unchanged behaviour).
+      const { templateId, versionId } = await upsertAgentTemplate(client, schema, {
+        name: templateName,
+        description,
+        sourceNl,
+        compiledPlan,
+        inputSchema,
+        outputSchema,
+        approvalPolicy,
+        type: agentType,
+        taskSpec,
+        packageName,
+        packageVersion: pkg.version,
+        agentDependencies: Object.keys(agentDeps).length > 0 ? agentDeps : null,
+        lgGraphCode,
+        lgGraphId,
+        executionProvider,
+        snapshot,
+      });
 
       return { templateId, versionId, packageName, packageVersion: pkg.version, agentDependencies: agentDeps };
     } finally {
@@ -951,10 +1063,15 @@ async function deleteAgentTemplateByPackage(packageName) {
         "Use --keep-db to prune the lockfile entry only.",
     );
   }
-  const schema = process.env.SUPABASE_SCHEMA ?? "cinatra";
+  const schema = (process.env.SUPABASE_SCHEMA || "").trim() || "cinatra";
   const client = new pg.Client({ connectionString: dbUrl });
   await client.connect();
   try {
+    // Preflight: confirm the schema/table/column exist before attempting deletes
+    // (same guard as install — a never-booted or partially-migrated instance must
+    // start first). Throws with actionable guidance if the check fails.
+    await checkAgentDbPreflight(client, schema);
+
     // The two deletes run in one transaction: since we deliberately do NOT rely
     // on a DB-level ON DELETE CASCADE, a mid-sequence failure (lock timeout,
     // connection drop) must not leave a template row orphaned without its
@@ -1112,4 +1229,9 @@ export const __test = {
   deriveInputSchemaFromOas,
   pickInputSchema,
   safeJsonParse,
+  // Exported for unit+integration test coverage of the DB preflight guard (#69).
+  checkAgentDbPreflight,
+  // Exported for the shared agent-template writer round-trip tests (#95).
+  upsertAgentTemplate,
+  quoteIdent,
 };

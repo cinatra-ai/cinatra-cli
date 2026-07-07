@@ -32,6 +32,28 @@
       "capabilities"
     ],
     "sdkAbiRange": "{{sdkAbiRange}}",
-    "migrationsDir": "cinatra/migrations"
+    "migrationsDir": "cinatra/migrations",
+    "uiSurface": "schema-config",
+    "configSchema": {
+      "title": "{{displayName}}",
+      "description": "Configure how this connector talks to its provider. The host renders this declarative schema as the connector's setup page — no bundled React, hot-installable.",
+      "fields": [
+        {
+          "kind": "text",
+          "key": "apiBaseUrl",
+          "label": "API base URL",
+          "placeholder": "https://api.example.com",
+          "description": "The base URL of the provider API this connector calls.",
+          "required": true
+        },
+        {
+          "kind": "secret",
+          "key": "apiKey",
+          "label": "API key",
+          "description": "The provider API key. Stored in the host secrets vault, never returned to the browser.",
+          "required": true
+        }
+      ]
+    }
   }
 }

@@ -115,21 +115,20 @@ describe("cinatra-cli#61 — the old `dev` namespace is fully removed", () => {
   });
 });
 
-describe("cinatra-cli#61 — bare-path aliases now target `instance …`", () => {
-  it("`cinatra clone list` still works and steers the user at `cinatra instance clone list`", () => {
+describe("cinatra-cli#81 — old bare-path forms are removed (no back-compat)", () => {
+  it("`cinatra clone list` is an Unknown command; only `cinatra instance clone list` resolves", () => {
     const home = tmpHome();
     try {
-      const res = run(["clone", "list"], { home });
-      // Read-only listing succeeds (empty registry).
-      expect(res.status).toBe(0);
-      // The deprecation notice (stderr) now names the `instance …` canonical form.
-      expect(res.stderr).toMatch(
-        /"cinatra clone list" is now "cinatra instance clone list" — the old form still works this release\./,
-      );
-      // Never the removed `dev …` form.
-      expect(res.stderr).not.toMatch(/cinatra dev clone/);
-      // And never on stdout (script-safe).
-      expect(res.stdout).not.toMatch(/is now "cinatra/);
+      const bare = run(["clone", "list"], { home });
+      expect(bare.status).not.toBe(0);
+      expect(bare.stderr).toMatch(/Unknown command: clone list/);
+      // No back-compat "is now" notice anywhere.
+      expect(`${bare.stdout}${bare.stderr}`).not.toMatch(/is now "cinatra/);
+
+      // The canonical namespaced form still works (empty registry, exit 0).
+      const canonical = run(["instance", "clone", "list"], { home });
+      expect(canonical.status).toBe(0);
+      expect(canonical.stderr).not.toMatch(/Unknown command/);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

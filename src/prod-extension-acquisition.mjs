@@ -195,9 +195,19 @@ export function foldTreeHash(records) {
  * Compute the canonical tree hash of an on-disk package directory (the
  * marker-hit RE-VERIFICATION path). The acquisition marker at the package
  * root is excluded (it is written by us after verification, never part of
- * the upstream tree). Any directory entry that is not a regular file or a
- * directory (e.g. a symlink introduced after acquisition) is a hard error —
- * a verified tree never contains one.
+ * the upstream tree). `node_modules/` entries are also excluded — pnpm
+ * populates them between the initial acquisition and the `setup:prod`
+ * re-verify step (workspace symlinks, never part of the upstream tarball).
+ * The skip is keyed on NAME and accepts a `node_modules` that is either a
+ * real directory OR a symlink: pnpm's nested/hoisted workspace layout links
+ * the in-repo `@cinatra-ai/sdk-extensions` workspace package into each
+ * acquired extension, and the `node_modules` install root itself can land as
+ * a symlink — `isDirectory()` is false for that, so a name-only check nested
+ * under an `isDirectory()` branch misses it and fails closed (cinatra#735).
+ * Any OTHER directory entry that is not a regular file or a directory
+ * (e.g. a symlink introduced after acquisition outside node_modules, or a
+ * `node_modules` that is a device/FIFO) is a hard error — a verified tree
+ * never contains one.
  */
 export function computeTreeSha256FromDir(rootDir) {
   const records = [];
@@ -206,6 +216,11 @@ export function computeTreeSha256FromDir(rootDir) {
       const full = path.join(dir, dirent.name);
       const rel = path.relative(rootDir, full).split(path.sep).join("/");
       if (rel === ACQUISITION_MARKER_FILENAME) continue;
+      // Skip the whole pnpm-managed node_modules subtree (dir OR symlink),
+      // before the type dispatch. It is populated post-acquisition and is
+      // never part of the verified upstream payload. A node_modules that is
+      // a device/FIFO is NOT skipped and still hard-fails below.
+      if (dirent.name === "node_modules" && (dirent.isDirectory() || dirent.isSymbolicLink())) continue;
       if (dirent.isDirectory()) {
         walk(full);
       } else if (dirent.isFile()) {
@@ -446,7 +461,15 @@ export async function extractVerifiedTarball(tarBuffer, destDir, { tar }) {
   normalizeModes(destDir);
 }
 
-function readMarker(destDir) {
+/**
+ * Read the acquisition marker (`.cinatra-acquired.json`) at a package dir root,
+ * or null when absent/unreadable. A pure read (no writes) — exported so the
+ * read-only `extensions verify-prod` verifier can distinguish an
+ * acquisition-managed dir (has a marker) from a dev clone / user install
+ * (markerless) WITHOUT re-implementing the marker path or duplicating the
+ * acquisition logic.
+ */
+export function readAcquisitionMarker(destDir) {
   const markerPath = path.join(destDir, ACQUISITION_MARKER_FILENAME);
   if (!existsSync(markerPath)) return null;
   try {
@@ -576,7 +599,7 @@ export async function acquireProdRequiredExtensions({
     const label = `${entry.packageName}@${entry.packageVersion} (${entry.repo}#${entry.resolvedSha.slice(0, 12)})`;
 
     if (existsSync(dest)) {
-      const marker = readMarker(dest);
+      const marker = readAcquisitionMarker(dest);
       if (!marker) {
         throw new Error(
           `[prod-extension-acquisition] ${dest} exists but is not acquisition-managed (no ` +

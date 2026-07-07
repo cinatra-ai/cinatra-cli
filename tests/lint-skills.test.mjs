@@ -7,7 +7,8 @@
 //      tests/fixtures/ (intentional good/bad cases) so the repo lint is clean;
 //   3. reports a clean repo (no violations among real source SKILL.md files).
 
-import { readFileSync, readdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -72,6 +73,40 @@ describe("skills-lint source scoping", () => {
 
   it("includes a real source skill path (e.g. skills/<name>/SKILL.md)", () => {
     expect(isSourceSkill("skills/my-real-skill/SKILL.md")).toBe(true);
+  });
+
+  it("PRUNES `.claude/` so a nested worktree's templates never reach the source lint", () => {
+    // A `.claude/worktrees/<task>/` worktree carries a FULL repo copy, including
+    // its `templates/` placeholder SKILL.md files. Those land at a path that does
+    // NOT match the root-relative `templates/` exclusion prefix, so without the
+    // `.claude` PRUNE_DIRS entry they would be linted as source and FAIL on their
+    // intentional placeholder copy. lintRepo must descend-skip `.claude` entirely.
+    const root = mkdtempSync(join(tmpdir(), "lint-claude-prune-"));
+    try {
+      const placeholderSkill = readFileSync(
+        join(REPO_ROOT, "tests", "fixtures", "skills-lint", "bad-placeholder", "SKILL.md"),
+        "utf8",
+      );
+      const goodSkill = readFileSync(
+        join(REPO_ROOT, "tests", "fixtures", "skills-lint", "good-skill", "SKILL.md"),
+        "utf8",
+      );
+      // A stray nested worktree under .claude carrying placeholder templates.
+      const wt = join(root, ".claude", "worktrees", "task-x", "templates", "skill", "skills", "x");
+      mkdirSync(wt, { recursive: true });
+      writeFileSync(join(wt, "SKILL.md"), placeholderSkill);
+      // A SIBLING real source skill OUTSIDE .claude — MUST still be scanned (so a
+      // `scanned === 0` assertion can't pass via a broken traversal that stopped
+      // scanning everything; it proves ONLY .claude is pruned).
+      const realSkill = join(root, "skills", "real-one");
+      mkdirSync(realSkill, { recursive: true });
+      writeFileSync(join(realSkill, "SKILL.md"), goodSkill);
+      const { scanned, violations } = lintRepo(root);
+      expect(scanned, "exactly the real source skill is scanned; the .claude worktree is pruned").toBe(1);
+      expect(violations).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

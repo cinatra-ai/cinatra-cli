@@ -20,14 +20,20 @@ import { renderTree, isNonEmptyDir } from "./template.mjs";
 // This authoring core lives at `src/authoring/` inside the cinatra-cli repo;
 // the scaffold templates ship at the repo root under `templates/`. So the repo
 // root is TWO levels up from this module (src/authoring → src → <repo root>).
-// (Provenance: folded in from the former standalone create-cinatra-extension scaffolder, where this same
-// module sat at `src/` and resolved the root one level up — cinatra#402.)
+// This module sits at `src/authoring/` so the repo root is two levels up.
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = resolve(__dirname, "..", "..");
 export const TEMPLATES_ROOT = join(REPO_ROOT, "templates");
 
-/** Kinds that ship the self-contained extension-kind-gate.mjs (agent, workflow). */
-const KINDS_WITH_GATE = new Set(["agent", "workflow"]);
+/** Kinds that ship the self-contained extension-kind-gate.mjs.
+ *
+ * ALL FIVE kinds ship it (cinatra-cli#72 / hot-install): the shared gate now
+ * runs the COMMON cross-kind rules (manifest shape, host ports, sdkAbiRange,
+ * @/ + SDK-only import bans, host-peer value-import ban, README/license,
+ * serverEntry preflight, schema-config) PLUS the kind-specific gate — so every
+ * scaffolded repo catches what the install pipeline rejects BEFORE publishing,
+ * not just agent + workflow. (Previously agent/workflow only.) */
+const KINDS_WITH_GATE = new Set(EXTENSION_KINDS);
 
 /** Titleize a slug base, e.g. "web-research" → "Web Research". */
 export function titleize(base) {

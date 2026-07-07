@@ -377,6 +377,7 @@ Usage:
   cinatra create-extension <kind> [name] [--scope <scope>] [--display-name <name>]
                            [--description <text>] [--dir <path>] [--force] [--yes]
   cinatra extensions acquire-prod
+  cinatra extensions verify-prod [--json]
   cinatra mcp llm-access setup
   cinatra mcp llm-access refresh
   cinatra mcp llm-access verify
@@ -495,8 +496,7 @@ Commands:
                     author + publish. One of five kinds: agent, connector,
                     artifact, skill, workflow. Zero-dependency, offline; the
                     generated repo pins @cinatra-ai/sdk-extensions as an
-                    OPTIONAL peer (never installed by this command). Replaces the
-                    retired \`npx create-cinatra-extension\` scaffolder.
+                    OPTIONAL peer (never installed by this command).
                     <kind>            agent | connector | artifact | skill | workflow.
                     [name]            Extension name; the \`-<kind>\` (or \`-skills\`)
                                       suffix is appended if absent. Prompted on a TTY.
@@ -517,6 +517,20 @@ Commands:
                     Idempotent; fails loud on any integrity mismatch. Run
                     \`corepack pnpm install\` afterwards to link the packages
                     (the Dockerfile and scripts/setup.sh prod flow do this).
+
+  extensions verify-prod
+                    READ-ONLY assertion that the prod required-extension state is
+                    COHERENT across all five authorities: the on-disk set
+                    (extensions/), the baked seed (cinatra.extensions), the lock
+                    (cinatra-required-extensions.lock.json), what the running
+                    instance's loader actually registered/activated (the live
+                    installed_extension rows), and what WayFlow can see (the
+                    materialized agent-OAS trees under the agent runtime mount).
+                    Fails NON-mutatingly with a distinct diagnostic per mismatch
+                    class (missing-on-disk / extra-seed-owned-dir / lock-mismatch
+                    / loader-missing / wayflow-missing); exits non-zero on any
+                    mismatch, zero when fully coherent. Never writes/downloads/
+                    removes anything. --json for machine output.
 
   status            Show current setup state (auth tables, user count, MCP config).
 
@@ -645,7 +659,7 @@ Usage:
   cinatra instance clone prune [--worktree-path <path>] [--slug <slug>] --yes
   cinatra instance clone list
   cinatra instance db migrate [--down] [--count=N] [--dir <abs> --namespace <ns>]
-  cinatra instance refresh [--docker=auto|always|--no-docker]
+  cinatra instance refresh [--docker=auto|always|--no-docker] [--with-dev-apps]
   cinatra instance tunnel start
   cinatra instance tunnel stop
   cinatra instance tunnel status
@@ -687,6 +701,8 @@ Commands:
                       --down / --count=N / --dir <abs> --namespace <ns>.
   instance refresh    Reconcile your local dev environment (deps + dev DB schema)
                       to the code on disk. Dev mode only; never touches git.
+                      --with-dev-apps: opt in to dev-app reconciliation (skipped
+                      by default to keep refresh fast).
   instance tunnel start|stop|status
                       Manage the dev-main Tailscale Funnel.
   instance start|stop|restart
@@ -790,36 +806,11 @@ function printSetupPhaseHelp() {
 }
 
 function printCommandHelp(descriptor) {
-  // cinatra-cli#62: `--help` for any folded setup phase (hidden canonical OR its
-  // deprecated bare alias) steers to `cinatra install --mode dev|prod` instead of
-  // advertising the now-internal `setup` path. Checked FIRST so both the hidden
-  // canonical and the deprecated-alias branches below route here.
+  // cinatra-cli#62: `--help` for any folded setup phase (the hidden internal
+  // `instance setup …` forms) steers to `cinatra install --mode dev|prod` instead
+  // of advertising the now-internal `setup` path.
   if (SETUP_PHASE_IDS.has(descriptor.id)) {
     printSetupPhaseHelp();
-    return;
-  }
-  // A deprecated alias (hidden) resolves to its canonical twin's synopsis so
-  // `cinatra instance setup branch --help` still prints useful help (exit 0, no
-  // side effect — the footgun guard) AND steers the user to the canonical form
-  // (`cinatra instance branch setup`).
-  if (descriptor.deprecated) {
-    const canonical =
-      COMMAND_DESCRIPTORS.find(
-        (d) => d.id === descriptor.id && !d.deprecated && d.summary,
-      ) ?? null;
-    const oldForm = descriptor.path.join(" ");
-    if (canonical) {
-      console.log(
-        `Usage: cinatra ${canonical.path.join(" ")}\n\n  ${canonical.summary}\n\n` +
-          `Note: "cinatra ${oldForm}" is the deprecated form of ` +
-          `"cinatra ${canonical.path.join(" ")}" — the old form still works this release.\n`,
-      );
-      const detail = COMMAND_HELP_DETAILS[canonical.id];
-      if (detail) console.log(`${detail}\n`);
-      console.log(`Run "cinatra instance --help" for the local bootstrap commands.`);
-      return;
-    }
-    printHelp();
     return;
   }
   if (descriptor.hidden || !descriptor.summary) {
@@ -2674,6 +2665,51 @@ function preCleanSchemas(repoRoot, env, connectionString, schemas) {
   );
 }
 
+const PG_SYSTEM_SCHEMAS = new Set(["pg_catalog", "information_schema", "pg_toast"]);
+
+/**
+ * Derive the set of schemas a plain `pg_dump` will (re)create, read FROM THE DUMP
+ * FILE itself — the restore contract, not a live query. Used to pre-clean a DB
+ * before restoring a full-database `--clean --if-exists` dump (cinatra-cli#68).
+ *
+ * Why dump-derived, not a live `pg` query of the target DB: the dump is the exact
+ * source of truth for what WILL be recreated. A live query can drop a schema the
+ * dump won't restore, or miss one the dump WILL restore (leaving the `--clean`
+ * `ALTER TABLE ... DROP CONSTRAINT` of an *inherited* partition-child pkey to
+ * fight live objects — the original failure: `cannot drop inherited constraint`).
+ * Dropping the schemas the dump recreates makes every `--clean` statement a no-op.
+ *
+ * `public` is ALWAYS included: it pre-exists so `pg_dump` emits no `CREATE SCHEMA
+ * public`, yet it may hold tables (Nango keeps `knex_migrations` there) and stale
+ * partition children — so it must be cleaned too. `preCleanSchemas` re-creates an
+ * empty `public` afterward.
+ *
+ * Identifier parsing handles both pg_dump forms — unquoted (`CREATE SCHEMA nango;`)
+ * and quoted with doubled-quote escaping (`CREATE SCHEMA "weird""schema";`).
+ *
+ * @param {string} dumpPath
+ * @returns {string[]} unique schema names, always including `public`
+ */
+function extractSchemasFromDump(dumpPath) {
+  const contents = readFileSync(dumpPath, "utf8");
+  const schemas = new Set(["public"]);
+  // `CREATE SCHEMA [IF NOT EXISTS] (<quoted> | <unquoted>);` at statement start.
+  const pattern = /^\s*CREATE SCHEMA (?:IF NOT EXISTS )?(?:"((?:[^"]|"")+)"|([A-Za-z_][A-Za-z0-9_$]*))\s*;/gm;
+
+  let match;
+  while ((match = pattern.exec(contents)) !== null) {
+    const quoted = match[1];
+    const unquoted = match[2];
+    const name = quoted !== undefined ? quoted.replaceAll('""', '"') : unquoted;
+    if (!name || PG_SYSTEM_SCHEMAS.has(name)) {
+      continue;
+    }
+    schemas.add(name);
+  }
+
+  return [...schemas];
+}
+
 function readBackupManifest(extractedBundleRoot) {
   const manifestPath = path.join(extractedBundleRoot, "manifest.json");
   if (!existsSync(manifestPath)) {
@@ -2852,6 +2888,7 @@ function importBackupBundle(repoRoot, env, appConnectionString, filePath) {
 
     const nangoDumpPath = path.join(tempDirectory, "postgres", "nango.sql");
     let nangoDatabaseUrl = null;
+    let nangoSchemas = null;
     if (existsSync(nangoDumpPath)) {
       nangoDatabaseUrl = getNangoDatabaseUrl(env);
       if (!nangoDatabaseUrl) {
@@ -2860,6 +2897,13 @@ function importBackupBundle(repoRoot, env, appConnectionString, filePath) {
             "Set one of these environment variables, or remove postgres/nango.sql from the bundle to skip the Nango import.",
         );
       }
+      // Derive the Nango schemas to pre-clean from the dump itself (the restore
+      // contract). The Nango dump is a FULL-DB dump created with
+      // `--clean --if-exists`; without a pre-clean those statements run against
+      // the LIVE Nango DB and fail on inherited partition-child pkeys
+      // (`cannot drop inherited constraint`, cinatra-cli#68). Read in pre-flight
+      // (before any DB mutation) so a malformed dump aborts the whole import.
+      nangoSchemas = extractSchemasFromDump(nangoDumpPath);
     }
 
     // --- Determine schemas to pre-clean ---
@@ -2874,6 +2918,10 @@ function importBackupBundle(repoRoot, env, appConnectionString, filePath) {
     importBackupFile(repoRoot, env, appConnectionString, cinatraDumpPath);
 
     if (nangoDatabaseUrl) {
+      // Mirror the app-DB pre-clean for Nango: DROP the dump's schemas CASCADE so
+      // the dump's own `--clean` ALTER/DROP statements become no-ops, then restore
+      // into the cleaned DB (cinatra-cli#68).
+      preCleanSchemas(repoRoot, env, nangoDatabaseUrl, nangoSchemas);
       importBackupFile(repoRoot, env, nangoDatabaseUrl, nangoDumpPath);
     }
 
@@ -5199,7 +5247,7 @@ async function runDevRefresh(rest) {
     }
   }
 
-  const { dockerMode } = parseDevRefreshFlags(rest);
+  const { dockerMode, withDevApps } = parseDevRefreshFlags(rest);
   const dockerDecision = describeDockerDecision({ dockerMode, env: fileEnv });
 
   console.log("Refreshing the dev environment to match the checked-out code…");
@@ -5244,9 +5292,10 @@ async function runDevRefresh(rest) {
   // 3. Database + settings: the existing idempotent dev setup (additive bootstrap +
   //    ensure* settings) followed by the versioned core migration chain
   //    (migrations/core/, recorded in the pgmigrations ledger) — both run inside
-  //    runSetup. Dev app sync is skipped to keep refresh fast.
+  //    runSetup. Dev app sync is skipped by default to keep refresh fast; pass
+  //    --with-dev-apps to opt into dev-app reconciliation.
   console.log("- Database + settings: running idempotent dev setup…");
-  await runSetup("dev", { skipDevApps: true });
+  await runSetup("dev", { skipDevApps: !withDevApps });
 
   // 4. Advisory: additive schema is reconciled automatically and the versioned
   //    migration chain has been applied (or ledger-faked on a fresh schema) by
@@ -10309,7 +10358,7 @@ async function runBackupImportApiConfigs(argv) {
     filePath = findLatestApiConfigsFile(repoRoot);
     if (!filePath) {
       throw new Error(
-        `No API config files found in ${path.join(repoRoot, DEFAULT_BACKUP_DIRECTORY)}. ` +
+        `No API config files found in ${path.join(repoRoot, DEFAULT_DATA_DIRECTORY)}. ` +
           `Export them first with "cinatra instance backup export-api-configs", or specify a file with --file.`,
       );
     }
@@ -10333,13 +10382,22 @@ async function runBackupImportApiConfigs(argv) {
   await client.connect();
 
   try {
-    for (const entry of raw.entries) {
-      await client.query(
-        `INSERT INTO ${quoteIdentifier(schemaName)}.metadata (key, value)
-         VALUES ($1, $2)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [entry.key, typeof entry.value === "string" ? entry.value : JSON.stringify(entry.value)],
-      );
+    // Apply all upserts atomically: a mid-loop failure must not leave a
+    // half-applied config set behind (cinatra-cli#95).
+    await client.query("BEGIN");
+    try {
+      for (const entry of raw.entries) {
+        await client.query(
+          `INSERT INTO ${quoteIdentifier(schemaName)}.metadata (key, value)
+           VALUES ($1, $2)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+          [entry.key, typeof entry.value === "string" ? entry.value : JSON.stringify(entry.value)],
+        );
+      }
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
     }
     console.log(`Imported ${raw.entries.length} API config entries from ${filePath}`);
   } finally {
@@ -10528,6 +10586,135 @@ async function runExtensionsList(argv = []) {
   console.log(`${"EXTENSION".padEnd(nameWidth)}  ${"KIND".padEnd(kindWidth)}  VERSION`);
   for (const r of rows) {
     console.log(`${r.name.padEnd(nameWidth)}  ${(r.kind ?? "-").padEnd(kindWidth)}  ${r.version || "-"}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// extensions verify-prod — READ-ONLY prod required-extension COHERENCE check
+// (cinatra#789). Asserts on-disk == baked seed == lock == loader-registered
+// (installed_extension) == WayFlow-visible (materialized agent-OAS trees). Fails
+// NON-mutatingly with a distinct, actionable diagnostic per mismatch class;
+// exits non-zero on any mismatch, zero when fully coherent. Never writes,
+// downloads, renames, or removes anything.
+// ---------------------------------------------------------------------------
+
+// Resolve the WayFlow agent RUNTIME MOUNT (the `:/agents:ro` volume) the SAME
+// way the host runtime does after the unified-store cutover (cinatra#793):
+// `<extension-data-root>/.agent-mount`. The extension data root mirrors
+// `src/lib/extension-data-root.ts resolveExtensionDataRoot()` — env
+// `CINATRA_EXTENSION_DATA_ROOT` (non-empty) wins (deploy determinism, ops#436),
+// else the DB metadata key `extension_data_root`, else the default
+// `/data/extensions` — and the `.agent-mount` suffix mirrors
+// `packages/agents/src/agent-runtime-mount.ts resolveAgentRuntimeMountDir()`.
+//
+// The deleted host `agent-install-path.ts` single knob (a dedicated agent-install
+// env var + a DB metadata key + a `<root>/extensions` default) is GONE: there is
+// deliberately NO agent-specific path knob anymore — the extension data root
+// alone carries the deploy determinism, and the mount is a boot-projected cache
+// of the content-addressed store (never `<root>/extensions`).
+//
+// A relative extension-data-root value resolves against `process.cwd()` — the
+// SAME base `resolveExtensionDataRoot()` uses — so the resolved mount matches
+// what the running host + WayFlow actually read (prod pins an ABSOLUTE root, so
+// the relative branch is a dev-only convenience). Read-only.
+const AGENT_RUNTIME_MOUNT_DIRNAME = ".agent-mount";
+const DEFAULT_EXTENSION_DATA_ROOT = "/data/extensions";
+async function resolveAgentInstallDirForVerify(env, client, schemaName) {
+  const envValue =
+    typeof env.CINATRA_EXTENSION_DATA_ROOT === "string" ? env.CINATRA_EXTENSION_DATA_ROOT.trim() : "";
+  let dataRoot = envValue;
+  // The env override wins and needs no DB. Only when it is unset do we consult
+  // the `extension_data_root` metadata key — and a metadata READ failure (e.g. a
+  // missing/unmigrated metadata table) must NOT abort the whole verify run
+  // before it can emit its findings. Fall back to the default; the DB-level
+  // coherence gaps still surface as their own (loader-missing) findings. Env
+  // override is honored regardless of DB health.
+  if (!dataRoot && client) {
+    try {
+      const stored = await readMetadataValue(client, schemaName, "extension_data_root", null);
+      if (typeof stored === "string" && stored.trim()) dataRoot = stored.trim();
+    } catch {
+      /* metadata unreadable -> fall through to the default; do not abort */
+    }
+  }
+  if (!dataRoot) dataRoot = DEFAULT_EXTENSION_DATA_ROOT;
+  const absRoot = path.isAbsolute(dataRoot) ? dataRoot : path.resolve(process.cwd(), dataRoot);
+  return path.join(absRoot, AGENT_RUNTIME_MOUNT_DIRNAME);
+}
+
+async function runExtensionsVerifyProd(argv = []) {
+  const asJson = argv.includes("--json");
+  for (const a of argv) {
+    if (a !== "--json") {
+      throw new Error(`Unexpected argument: ${a}\nUsage: cinatra extensions verify-prod [--json]`);
+    }
+  }
+
+  const repoRoot = getRepoRoot();
+  const env = collectEnvironment(repoRoot);
+  const schemaName = env.SUPABASE_SCHEMA?.trim() || "cinatra";
+
+  // Open a pg client if a connection string is configured. A MISSING/unreachable
+  // DB is NOT a hard throw here — verify-prod reports it as a `loader-missing`
+  // finding (so the CLI still prints the on-disk/lock findings and exits
+  // non-zero) rather than aborting before the coherent-subset checks run.
+  let client = null;
+  let dbError = null;
+  const connectionString = env.SUPABASE_DB_URL?.trim();
+  if (!connectionString) {
+    dbError = "SUPABASE_DB_URL is not set";
+  } else {
+    try {
+      client = await createClient(connectionString);
+      await client.connect();
+    } catch (err) {
+      client = null;
+      dbError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  try {
+    const installDir = await resolveAgentInstallDirForVerify(env, client, schemaName);
+    const { verifyProdRequiredExtensions } = await import("./prod-extension-verify.mjs");
+    const report = await verifyProdRequiredExtensions({
+      repoRoot,
+      installDir,
+      dbClient: client,
+      schemaName,
+      dbError,
+    });
+
+    if (asJson) {
+      console.log(JSON.stringify({ ok: report.ok, checked: report.checked, findings: report.findings }, null, 2));
+    } else {
+      await printVerifyProdReport(report, installDir);
+    }
+    if (!report.ok) process.exitCode = 1;
+  } finally {
+    if (client) await client.end();
+  }
+}
+
+async function printVerifyProdReport(report, installDir) {
+  console.log("Cinatra prod required-extension coherence check (READ-ONLY):");
+  console.log(`  Verified ${report.checked} locked package(s); agent runtime mount: ${installDir}`);
+  if (report.ok) {
+    console.log(
+      "  ✓ COHERENT — on-disk == baked seed == lock == loader-registered == WayFlow-visible.",
+    );
+    return;
+  }
+  const { MISMATCH_CLASSES } = await import("./prod-extension-verify.mjs");
+  console.log(`  ✗ INCOHERENT — ${report.findings.length} mismatch(es):`);
+  for (const cls of MISMATCH_CLASSES) {
+    const inClass = report.findings.filter((f) => f.class === cls);
+    if (inClass.length === 0) continue;
+    console.log(`\n  [${cls}] (${inClass.length})`);
+    for (const f of inClass) {
+      const who = f.packageName ? `${f.packageName}: ` : "";
+      console.log(`    ✗ ${who}${f.detail}`);
+      if (f.remediation) console.log(`        ↳ ${f.remediation}`);
+    }
   }
 }
 
@@ -10815,35 +11002,37 @@ async function runAgentImport(argv) {
 
   const importedName = readOptionValue(argv, "--name") ?? agent.name ?? "Imported Agent";
 
+  // Local import AUTHORS a brand-new template. Synthesize a package_name that is
+  // unique by construction (a full UUID) inside a reserved local scope that can
+  // never collide with a real marketplace package — so the shared upsert helper
+  // always INSERTs and never clobbers an installed package (insert-only
+  // authoring). The shared writer JSON.stringify()s every JSON column, so
+  // `compiledPlan` is passed as the raw JS array it already is (cinatra-cli#95).
+  const slug =
+    importedName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") ||
+    "agent";
+  const packageName = `@cinatra-local/${slug}-${randomUUID()}`;
+
   const client = await createClient(connectionString);
   await client.connect();
   try {
-    const newId = randomUUID();
-    await client.query(
-      `INSERT INTO ${quoteIdentifier(schemaName)}.agent_templates
-       (id, name, description, source_nl, compiled_plan, input_schema, output_schema, approval_policy, execution_mode, task_spec, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft')`,
-      [
-        newId,
-        importedName,
-        agent.description ?? null,
-        agent.sourceNl ?? "",
-        agent.compiledPlan ?? "[]",
-        agent.inputSchema ?? "{}",
-        agent.outputSchema ?? null,
-        agent.approvalPolicy ?? "{}",
-        agent.executionMode ?? "deterministic",
-        agent.taskSpec ?? null,
-      ],
-    );
-
-    const snapshotStr = JSON.stringify({ compiledPlan: agent.compiledPlan, inputSchema: agent.inputSchema, taskSpec: agent.taskSpec });
-    const contentHash = createHash("sha256").update(snapshotStr).digest("hex");
-    await client.query(
-      `INSERT INTO ${quoteIdentifier(schemaName)}.agent_versions (id, template_id, content_hash, snapshot)
-       VALUES ($1, $2, $3, $4)`,
-      [randomUUID(), newId, contentHash, snapshotStr],
-    );
+    const { upsertAgentTemplate } = await import("./agents-install.mjs");
+    const { templateId: newId } = await upsertAgentTemplate(client, schemaName, {
+      name: importedName,
+      description: agent.description ?? null,
+      sourceNl: agent.sourceNl ?? "",
+      compiledPlan: agent.compiledPlan ?? [],
+      inputSchema: agent.inputSchema ?? {},
+      outputSchema: agent.outputSchema ?? null,
+      approvalPolicy: agent.approvalPolicy ?? { steps: [] },
+      taskSpec: agent.taskSpec ?? null,
+      packageName,
+      snapshot: {
+        compiledPlan: agent.compiledPlan,
+        inputSchema: agent.inputSchema,
+        taskSpec: agent.taskSpec,
+      },
+    });
 
     console.log(`Imported agent "${importedName}" → ID: ${newId}`);
     console.log(`View in app: /agents/builder/${newId}`);
@@ -10897,6 +11086,10 @@ export {
   AUTH_TABLES,
   resetDevelopmentData,
   readAuthTableState,
+  // cinatra-cli#68 — Nango restore pre-clean: schemas derived from the dump.
+  extractSchemasFromDump,
+  createBackupBundle,
+  importBackupBundle,
 };
 
 /**
@@ -10922,9 +11115,7 @@ function readCliVersion() {
  * path) and `routedTokens = argv.slice(0, descriptor.path.length)`. A handler
  * that needs a routed mode token reads it from `routedTokens` (e.g.
  * `setup.dev|prod` reads the trailing `dev`/`prod`); no handler re-prepends a
- * `mode` slot or re-slices `rest` anymore. A canonical `dev …` form and its
- * deprecated bare alias each slice off THEIR OWN path length, so both deliver an
- * identical `rest` to the shared handler.
+ * `mode` slot or re-slices `rest` anymore.
  *
  * Returning (vs awaiting) is preserved where it was load-bearing:
  * `agents install` returns the `runAgentsInstall(rest)` promise.
@@ -10987,8 +11178,10 @@ function buildHandlers() {
     "extensions.list": async (rest) => {
       await runExtensionsList(rest);
     },
-    // Class-B authoring: scaffold a new extension package on disk. Folded from
-    // the retired `npx create-cinatra-extension` thin alias (cinatra#402) over a
+    "extensions.verify-prod": async (rest) => {
+      await runExtensionsVerifyProd(rest);
+    },
+    // Class-B authoring: scaffold a new extension package on disk via a
     // shared, zero-dependency authoring core lazy-loaded from ./authoring/.
     // Command-routing dispatcher contract: `rest` already holds the `<kind>`/name/flags.
     "create-extension": async (rest) => {
@@ -11174,7 +11367,7 @@ export async function runCli(argv) {
   if (descriptor) {
     // The `instance` group head has NO handler — a bare `cinatra instance` prints
     // the group banner and exits non-zero (mirrors the old `agents`-no-mode
-    // fallback). A deprecation notice never applies to it.
+    // fallback).
     if (descriptor.match === "group") {
       printGroupHelp("instance");
       process.exit(1);
@@ -11182,15 +11375,9 @@ export async function runCli(argv) {
 
     // Command-routing dispatcher arg-slice contract: `rest` is everything AFTER the
     // routed path tokens; `routedTokens` is the matched path slice (so a handler
-    // can read a routed mode token like `dev|prod`). Canonical and deprecated
-    // alias forms each slice off THEIR OWN path length, so the shared handler
-    // receives an identical `rest`.
+    // can read a routed mode token like `dev|prod`).
     const routedTokens = argv.slice(0, descriptor.path.length);
     const rest = argv.slice(descriptor.path.length);
-
-    if (descriptor.deprecated) {
-      emitDeprecationNotice(descriptor, routedTokens);
-    }
 
     const handlers = buildHandlers();
     const handler = handlers[descriptor.id];
@@ -11205,39 +11392,4 @@ export async function runCli(argv) {
   }
 
   throw new Error(`Unknown command: ${[command, mode].filter(Boolean).join(" ")}. Run "cinatra --help" for usage.`);
-}
-
-/**
- * Emit the one-line deprecation notice for a matched alias descriptor (the
- * command-routing contract). Goes to STDERR only (never STDOUT), so script/stdout consumers
- * are unaffected. Suppressed for the machine-consumed hook command
- * (`clone slug-for-worktree`) and when `CINATRA_SUPPRESS_DEPRECATION=1`.
- *
- * The `<old>`/`<new>` strings are built from the ACTUAL routed argv tokens, so
- * an alternation alias prints the concrete token the user typed
- * (`cinatra instance setup dev`), never the literal `dev|prod` pipe form.
- *
- * @param {import("./command-table.mjs").CommandDescriptor} descriptor
- * @param {string[]} routedTokens
- */
-function emitDeprecationNotice(descriptor, routedTokens) {
-  const suppress =
-    process.env.CINATRA_SUPPRESS_DEPRECATION === "1" ||
-    descriptor.id === "clone.slug-for-worktree";
-  if (suppress) return;
-  // `<old>` is the actual tokens the user typed for the matched alias path.
-  const oldForm = routedTokens.join(" ");
-  // `<new>` maps the canonical target, substituting the alias's concrete mode
-  // token into a trailing alternation slot (`setup dev` → `instance setup dev`).
-  const target = descriptor.deprecated;
-  let newForm = target;
-  const aliasHasModeToken = descriptor.path.some((t) => t.includes("|"));
-  if (aliasHasModeToken) {
-    const modeIdx = descriptor.path.findIndex((t) => t.includes("|"));
-    const concreteMode = routedTokens[modeIdx];
-    if (concreteMode) newForm = `${target} ${concreteMode}`;
-  }
-  process.stderr.write(
-    `"cinatra ${oldForm}" is now "cinatra ${newForm}" — the old form still works this release.\n`,
-  );
 }

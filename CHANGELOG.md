@@ -6,6 +6,109 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-07-07
+
+### Fixed
+
+- `agent import` repairs the local Postgres path via the shared upsert
+  helper. (#95)
+- `install --on-conflict=isolated` remaps app-facing self-URLs to the
+  isolated instance. (#98)
+- Non-pinned dev extension sync tolerates a detached companion. (#100)
+- `extensions verify-prod` resolves the agent runtime mount instead of the
+  deleted install-dir knob. (#101)
+
+### Added
+
+- Layer-1 artifact-parity screen in the kind gate (`produces` implies a
+  runnable materialization). (#102)
+
+## [0.1.7] - 2026-07-02
+
+### Changed
+
+- Renamed the `dev` command to `instance` (manages named Cinatra instances).
+- Replaced `setup` with `install` plus an explicit `--mode` flag.
+
+### Removed
+
+- Removed the legacy bare-form command aliases.
+- Removed all references to the retired `create-cinatra-extension` package.
+
+### Added
+
+- Added `extensions verify-prod` to check a running instance against its
+  required-extension lock.
+
+## [0.1.6] - 2026-06-30
+
+Compatibility backport. This is the version the Cinatra app pins. It carries the
+prior (0.1.3) `cinatra setup dev|prod` command surface plus only the production
+extension-acquisition fix, so the app can pin a fixed CLI without adopting the
+0.1.4/0.1.5 command-surface migration.
+
+### Fixed
+
+- **Production extension acquisition no longer fails on the pnpm workspace
+  symlink.** Backports the `cinatra-ai/cinatra#735` fix onto the 0.1.3 command
+  surface: the acquired-tree re-verify walk (`computeTreeSha256FromDir`) now
+  skips a `node_modules` install root even when pnpm lands it as a symlink — the
+  in-repo `@cinatra-ai/sdk-extensions` workspace package linked into each acquired
+  extension's `node_modules` — instead of failing closed on the non-regular entry.
+  Branched from `v0.1.3` and ports ONLY this fix (none of the `dev`→`instance`,
+  `setup`→internal-phase, or bare-form-removal refactors). Integrity is unchanged:
+  a device/FIFO `node_modules`, and any symlink OUTSIDE `node_modules`, still
+  hard-fail. (`cinatra-ai/cinatra#735`)
+
+## [0.1.5] - 2026-06-30
+
+The new/reorganized command surface plus the production extension-acquisition fix
+at the new boundary. Published, but the Cinatra app stays on the 0.1.6 backport
+for this release cycle; adopting this surface is tracked in
+`cinatra-ai/cinatra#742`.
+
+### Changed
+
+- **`cinatra create-extension` now ships the FULL self-contained kind gate into
+  EVERY scaffolded extension repo (all five kinds), and defaults connectors to
+  the hot-installable schema-config setup surface.** Previously only the `agent`
+  and `workflow` scaffolds shipped a gate, and it was a lightweight stub ("any
+  other kind → pass"). The gate (`extension-kind-gate.mjs`) is now the full,
+  zero-dependency validator that mirrors the install pipeline: the common
+  cross-kind rules (manifest shape, host-port names, `sdkAbiRange` grammar, the
+  `@/` host-internal + non-SDK first-party import bans, the host-peer
+  value-import ban over the `serverEntry` graph, the README/license contract,
+  `serverEntry` preflight) PLUS the per-kind gate (agent OAS, connector manifest
+  + **`configSchema`**, artifact descriptor, skill naming, workflow BPMN). The
+  `connector/`, `artifact/`, and `skill/` template CI workflows now run it as a
+  real `kind-gates` job instead of a no-op echo. Authors catch what the
+  marketplace would reject BEFORE publishing, for every kind. (cinatra-cli#72)
+- **Scaffolded connectors now declare `cinatra.uiSurface: "schema-config"` with a
+  starter `cinatra.configSchema`** (a `text` + `secret` setup form) — the
+  hot-installable declarative setup surface the host renders WITHOUT a rebuild.
+  This replaces the old bundled-React `setup-page.tsx` assumption as the default.
+  The gate validates the `configSchema` (the extended cinatra#658 vocabulary:
+  `select`, `record-list`, `banner`, `advisory` in addition to `text`, `secret`,
+  `nango-connect`, `repeatable-list`, `status-probe`, `copyable-credential`,
+  `named-action`) and rejects any smuggled per-field key — the configSchema is
+  pure data, never executable code or HTML. See **Migrating to hot-installable
+  extensions** in `templates/_shared/MIGRATING-HOT-INSTALL.md`. (cinatra-cli#72)
+
+### Removed
+
+- **BREAKING:** Removed the deprecated bare-form command aliases (`cinatra
+  setup …`, `cinatra db migrate`, `cinatra clone …`, `cinatra reset dev`,
+  `cinatra backup …`). These printed a one-line deprecation rename hint in 0.1.4;
+  they are now gone — use the namespaced `cinatra instance …` forms. (#81, PR #82)
+
+### Fixed
+
+- **Production extension acquisition.** The acquired-tree re-verify walk
+  (`computeTreeSha256FromDir`) now skips a `node_modules` install root even when
+  pnpm lands it as a symlink, fixing a fail-closed production install
+  (`cinatra-ai/cinatra#735`). Integrity is unchanged: a device/FIFO
+  `node_modules`, and any symlink OUTSIDE `node_modules`, still hard-fail. (#86)
+
 ## [0.1.4] - 2026-06-29
 
 ### Changed
@@ -150,12 +253,9 @@ release (0.1.5):
 
 ### Changed
 
-- Folded the standalone `create-cinatra-extension` scaffolder into the unified
-  CLI as `cinatra create-extension <kind>`, over a shared zero-dependency
-  authoring core. The standalone `npx create-cinatra-extension` path is retired
-  in favor of `cinatra create-extension <kind>`. Scaffold output remains
-  byte-identical to the former standalone scaffolder across all five kinds:
-  agent, connector, artifact, skill, and workflow. (#7)
+- Added `cinatra create-extension <kind>` — scaffold a new extension package on
+  disk via a shared zero-dependency authoring core. Scaffold output covers all
+  five kinds: agent, connector, artifact, skill, and workflow. (#7)
 
 ## [0.1.1] - 2026-06-22
 
@@ -174,6 +274,11 @@ release (0.1.5):
 - Initial public release of the thin, checkout-driven `cinatra` CLI, published
   as the scoped `@cinatra-ai/cinatra`. (#2)
 
+[Unreleased]: https://github.com/cinatra-ai/cinatra-cli/compare/v0.1.6...HEAD
+[0.1.8]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.8
+[0.1.7]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.7
+[0.1.6]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.6
+[0.1.5]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.5
 [0.1.4]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.4
 [0.1.3]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.3
 [0.1.2]: https://github.com/cinatra-ai/cinatra-cli/releases/tag/v0.1.2
