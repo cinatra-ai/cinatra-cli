@@ -1086,24 +1086,26 @@ async function deleteAgentTemplateByPackage(packageName) {
     // versions. BEGIN/COMMIT make the pair atomic; any error rolls back.
     await client.query("BEGIN");
     const found = await client.query(
-      `SELECT id FROM ${schema}.agent_templates WHERE package_name = $1`,
+      `SELECT id FROM ${quoteIdent(schema)}.agent_templates WHERE package_name = $1`,
       [packageName],
     );
     if (found.rows.length === 0) {
       await client.query("ROLLBACK");
       return 0;
     }
-    const ids = found.rows.map((r) => r.id);
+    const ids = found.rows.map((r) => String(r.id));
     await client.query(
       // eng#513 real-host sweep: agent_templates.id / agent_versions.template_id
       // are TEXT columns in the live app schema — casting the parameter to
       // uuid[] made the comparison `text = uuid` (SQLSTATE 42883: operator does
       // not exist), so every `agents uninstall` failed against a real instance.
-      `DELETE FROM ${schema}.agent_versions WHERE template_id = ANY($1::text[])`,
+      // Comparing as text-on-text (column cast + text[] param) works for BOTH
+      // a text and a legacy uuid column shape (codex convergence).
+      `DELETE FROM ${quoteIdent(schema)}.agent_versions WHERE template_id::text = ANY($1::text[])`,
       [ids],
     );
     const deleted = await client.query(
-      `DELETE FROM ${schema}.agent_templates WHERE package_name = $1`,
+      `DELETE FROM ${quoteIdent(schema)}.agent_templates WHERE package_name = $1`,
       [packageName],
     );
     await client.query("COMMIT");

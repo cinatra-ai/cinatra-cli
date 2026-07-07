@@ -747,8 +747,11 @@ describe.skipIf(!INTEGRATION_DB_URL)("upsert/delete agent template — LIVE sche
   });
 
   afterEach(async () => {
-    await client.query(`DROP SCHEMA IF EXISTS ${TEST_SCHEMA} CASCADE`);
-    await client.end();
+    try {
+      await client?.query(`DROP SCHEMA IF EXISTS ${TEST_SCHEMA} CASCADE`);
+    } finally {
+      await client?.end().catch(() => {});
+    }
   });
 
   const fields = (over = {}) => ({
