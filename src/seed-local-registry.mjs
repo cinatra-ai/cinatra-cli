@@ -359,6 +359,17 @@ function tarballIntegrity(tarballPath) {
 export async function seedLocalRegistryExtensions({
   repoRoot,
   registryUrl = LOCAL_REGISTRY_URL,
+  // Package names whose on-disk source the just-completed extension sync
+  // verified to sit AT a committed lock pin (detached, sha-verified). For
+  // those, a same-version/different-content skew is the EXPECTED update-path
+  // state (cinatra#1136): the local registry still carries the tarball seeded
+  // from the PREVIOUS release's pin, while the source legitimately moved with
+  // the committed lock — that must not turn a successful reconcile into a
+  // non-zero exit. The warning still prints (the local registry keeps serving
+  // the previous content for that version until a bump/purge); only ad-hoc,
+  // non-pinned divergence (local edits without a version bump) stays a
+  // meaningful, exit-flipping skew.
+  pinnedSourceNames = null,
 } = {}) {
   const summary = {
     status: "ok",
@@ -442,12 +453,22 @@ export async function seedLocalRegistryExtensions({
             }
             if (localIntegrity !== registryIntegrity) {
               summary.skew.push(id);
-              console.warn(
-                `\n⚠ Local registry seed: ${id} is already published but the on-disk source ` +
-                  `differs from the published tarball. NOT republishing the same version. ` +
-                  `Purge/reset the local Verdaccio or bump the extension version to refresh it.\n`,
-              );
-              process.exitCode = 1;
+              if (pinnedSourceNames?.has(ext.name)) {
+                // Committed-lock pin → expected after an update; informational.
+                console.warn(
+                  `\n⚠ Local registry seed: ${id} is already published from a previous pin; the on-disk ` +
+                    `source now sits at the committed lock with the same version. NOT republishing the same ` +
+                    `version — the local registry serves the previously seeded content for ${ext.version} ` +
+                    `until the extension version bumps (or the local Verdaccio is purged/reset).\n`,
+                );
+              } else {
+                console.warn(
+                  `\n⚠ Local registry seed: ${id} is already published but the on-disk source ` +
+                    `differs from the published tarball. NOT republishing the same version. ` +
+                    `Purge/reset the local Verdaccio or bump the extension version to refresh it.\n`,
+                );
+                process.exitCode = 1;
+              }
               continue;
             }
           }

@@ -25,6 +25,7 @@ import { syncDevApps, readDevAppsConfig } from "./dev-apps.mjs";
 import { deriveKindFromName, syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
 import { LOCAL_REGISTRY_URL, seedLocalRegistryExtensions } from "./seed-local-registry.mjs";
 import { parseDevRefreshFlags, describeDockerDecision } from "./dev-refresh.mjs";
+import { applyCheckoutBootstrapDdl } from "./checkout-bootstrap-ddl.mjs";
 import {
   CLI_INSTALL_SPEC,
   parseUpdateArgs,
@@ -4611,6 +4612,25 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
     // `ensureStoreSchema` creates would fail (cinatra#116).
     const freshCoreSchema = await isFreshCoreSchema(client, schemaName);
     await ensureStoreSchema(client, schemaName);
+    // cinatra#1136 — apply the CHECKOUT's own schema-bootstrap DDL
+    // (buildCreateStoreSchemaQueries) between the bundled baseline above and
+    // the versioned chain below, in the same order the boot path runs them
+    // (bootstrap DDL first — the baseline the chain assumes). The chain
+    // EXECUTES on existing schemas (the upgrade path) and may reference
+    // tables/columns only the checkout's current DDL creates; the bundled
+    // ensureStoreSchema is necessarily a snapshot and cannot know them.
+    // A baked runtime image without the TS source skips quietly (boot remains
+    // the bootstrap authority there). A DEV checkout that carries the source
+    // but cannot resolve tsx fails EARLY with the install remediation instead
+    // of letting the chain abort mid-flight; a prod checkout installed without
+    // devDependencies warns + skips. A real DDL failure always throws (see
+    // checkout-bootstrap-ddl.mjs).
+    applyCheckoutBootstrapDdl({
+      repoRoot,
+      connectionString,
+      schemaName,
+      required: mode === "dev",
+    });
     // Versioned core schema migrations (node-pg-migrate; shared ledger
     // `pgmigrations` in the app schema). Runs on its own short-lived client
     // under the `cinatra-schema-init` advisory lock — the setup client above
@@ -4863,7 +4883,21 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
         // :4873. `env` already merges .env.local + process.env (process.env
         // wins). seedLocalRegistryExtensions keeps the loopback-only guard.
         const seedRegistryUrl = env.CINATRA_AGENT_REGISTRY_URL?.trim() || LOCAL_REGISTRY_URL;
-        await seedLocalRegistryExtensions({ repoRoot, registryUrl: seedRegistryUrl });
+        // cinatra#1136 — sources the sync just verified at a committed lock
+        // pin (detached, sha-verified: pinned/repinned/pinned-clone, or
+        // confirmed-at-lock). For those a same-version registry skew is the
+        // expected update-path state, not local drift — the seed warns
+        // without flipping the exit code (see seed-local-registry.mjs).
+        const pinnedSourceNames = new Set(
+          (extensionSync?.results ?? [])
+            .filter((r) => typeof r.pinnedSha === "string")
+            .map((r) => r.pkgName),
+        );
+        await seedLocalRegistryExtensions({
+          repoRoot,
+          registryUrl: seedRegistryUrl,
+          pinnedSourceNames,
+        });
       } catch (err) {
         // Defensive: the helper is already loud-but-non-fatal, but never let an
         // unexpected escape undo the completed setup.
