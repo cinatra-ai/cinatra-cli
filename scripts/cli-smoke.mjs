@@ -140,7 +140,7 @@ for (const path of visiblePaths) {
 // ---------------------------------------------------------------------------
 if (liveRoot) {
   const env = { CINATRA_REPO_ROOT: liveRoot };
-  // `extensions verify-prod` (added in the v0.1.7 milestone, cinatra-cli#92,
+  // `extensions verify-prod` (cinatra-cli#92,
   // runtime-mount resolution fixed by #101) legitimately reports FINDINGS on a
   // dev checkout (a dev tree is not an acquisition-managed prod install), so
   // the smoke bar is NOT exit 0 — it is "runs the full check and emits the
