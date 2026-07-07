@@ -1197,8 +1197,9 @@ function bringUpInfra({ targetDir, log = console.log, composeFiles = null, compo
  *  invocation). The recorded set is the authority (cinatra-cli#17 §C.8) so
  *  up/exec/down all target the same files+project. An `envFile` is threaded so
  *  the ISOLATED generated compose can resolve its scrubbed `${VAR}` placeholders
- *  from .env.local at up-time (review hardening #1) — the default path omits it, keeping
- *  compose's normal `.env` discovery (byte-identical to before). */
+ *  from .env.local at up-time (review hardening #1). The DEFAULT install `up`
+ *  passes it too (eng#513 — the base compose interpolates no-default secrets);
+ *  a null envFile keeps compose's normal `.env` discovery. */
 function composeArgsFor({ composeFiles = null, composeProject = null, envFile = null } = {}) {
   const files = composeFiles && composeFiles.length
     ? composeFiles
@@ -1375,7 +1376,7 @@ async function typedConfirm(question, phrase) {
  *  the isolated container. Reading from `.env.local` makes the resolved config
  *  carry the real operator values, which the generator then re-symbolises back to
  *  `${KEY}` (resolved again from `.env.local` at up-time): end-to-end consistent. */
-function composeConfigForFiles(targetDir, composeFiles, deps = {}) {
+function composeConfigForFiles(targetDir, composeFiles, deps = {}, { allProfiles = false } = {}) {
   const cap = deps.capture ?? capture;
   const fileArgs = (composeFiles && composeFiles.length
     ? composeFiles
@@ -1383,7 +1384,18 @@ function composeConfigForFiles(targetDir, composeFiles, deps = {}) {
   ).flatMap((f) => ["-f", f]);
   const envLocal = path.join(targetDir, ".env.local");
   const envArgs = existsSync(envLocal) ? ["--env-file", ".env.local"] : [];
-  const raw = cap("docker", ["compose", ...envArgs, ...fileArgs, "config", "--format", "json"], { cwd: targetDir });
+  // eng#513 sweep: `docker compose config` DROPS profile-gated services (the
+  // real checkout's `wayflow` carries `profiles: [wayflow, drupal, wordpress]`),
+  // so an isolated install's band/remap/self-URL logic never saw them — the
+  // isolated `.env.local` kept the DONOR's WAYFLOW_BASE_URL :3010 (the exact
+  // cinatra-cli#97 partial-isolation leak, resurfacing via the profiles path).
+  // `--profile "*"` includes every profile-gated service in the resolved config
+  // while RETAINING each service's `profiles` attribute, so a plain `up` of the
+  // generated isolated file still starts only the default (un-profiled) set.
+  // Opt-in: only the ISOLATED path passes `allProfiles` — the default-install
+  // preflight keeps probing only the ports a default `up` would actually bind.
+  const profileArgs = allProfiles ? ["--profile", "*"] : [];
+  const raw = cap("docker", ["compose", ...envArgs, ...profileArgs, ...fileArgs, "config", "--format", "json"], { cwd: targetDir });
   if (!raw) return null;
   try {
     return JSON.parse(raw);
@@ -1951,8 +1963,15 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
     ensureEnvLocal({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, log });
   }
 
-  // Resolve the base band from the checkout's own compose config.
-  const resolvedConfig = getConfig(targetDir, ["docker-compose.yml", "docker-compose.dev.yml"], deps);
+  // Resolve the base band from the checkout's own compose config — WITH every
+  // profile-gated service included (`allProfiles`): the isolated band, the port
+  // remap, the self-URL shift, and the `.env.local` re-point must all cover a
+  // service the operator can later enable on THIS isolated stack (wayflow, the
+  // wordpress/drupal/twenty/plane family), else its published port and
+  // self-advertised URL stay on the DONOR's band (cinatra-cli#97 leak via the
+  // profiles path — eng#513 sweep). Each service keeps its `profiles` attribute
+  // in the generated file, so a plain `up` still starts only the default set.
+  const resolvedConfig = getConfig(targetDir, ["docker-compose.yml", "docker-compose.dev.yml"], deps, { allProfiles: true });
   if (!resolvedConfig) {
     throw new Error(
       "Could not resolve the checkout's `docker compose config` to build an isolated stack. " +
@@ -4087,7 +4106,21 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
     defaultProject = await withAllocLock(lockPath, async () => {
       const resolved = resolveDefaultProject({ targetDir, opts, log, deps });
-      startInfra({ targetDir, log, composeProject: resolved });
+      // eng#513 real-host sweep: the default `up` MUST pass `--env-file
+      // .env.local` like every isolated/attach bring-up does — the base
+      // docker-compose.yml interpolates `${NANGO_ENCRYPTION_KEY}` and
+      // `${CINATRA_BRIDGE_TOKEN}` (no compose defaults), so without the
+      // env-file the freshly-written secrets resolve to BLANK strings (compose
+      // warns "variable is not set") and nango-server runs with an EMPTY
+      // encryption key that silently diverges from the key recorded in
+      // .env.local — the cinatra-cli#57 failure class on the DEFAULT path.
+      const defaultEnvFile = path.join(targetDir, ".env.local");
+      startInfra({
+        targetDir,
+        log,
+        composeProject: resolved,
+        envFile: existsSync(defaultEnvFile) ? defaultEnvFile : null,
+      });
       return resolved;
     });
   }

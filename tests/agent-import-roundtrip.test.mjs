@@ -110,7 +110,9 @@ describe("upsertAgentTemplate — JSON encoding + current-schema contract (#95)"
     const insert = client.calls.find((c) => /INSERT INTO .*agent_templates/s.test(c.sql));
     expect(insert.sql).not.toMatch(/execution_mode/); // dropped column must never be referenced
     expect(insert.sql).toMatch(/package_name/);
-    expect(insert.sql).toMatch(/ON CONFLICT \(package_name\)/); // atomic upsert, no racy SELECT
+    expect(insert.sql).toMatch(
+      /ON CONFLICT \(package_name\) WHERE package_name IS NOT NULL/,
+    ); // atomic upsert, no racy SELECT; predicate REQUIRED to infer the app's PARTIAL unique index (eng#513)
     // $11 = package_name (params[10]) — non-null.
     expect(insert.params[10]).toBe("@cinatra-local/a-xyz");
   });
