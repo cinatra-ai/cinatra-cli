@@ -742,6 +742,69 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     expect(genBody).not.toContain("localhost:3003");
   });
 
+  // ── eng#513 sweep — the #97 leak resurfaced via PROFILE-GATED services ──────
+  // The REAL checkout's wayflow service is profile-gated (`profiles: [wayflow,
+  // drupal, wordpress]`) and `docker compose config` DROPS profile-gated
+  // services unless profiles are enabled — so on a real host the isolated
+  // executor never saw wayflow: no band entry, no port remap, and the isolated
+  // `.env.local` silently kept the DONOR's WAYFLOW_BASE_URL :3010 (proven live
+  // in the eng#513 real-host sweep). The executor must resolve the compose
+  // config with ALL profiles; the generated file keeps each service's
+  // `profiles` attribute so a plain `up` still starts only the default set.
+  it("eng#513: isolated install resolves the compose config with ALL profiles — a profile-gated wayflow is remapped", async () => {
+    const installDir = path.join(sandbox, "iso513prof");
+    const WAYFLOW_GATED = {
+      image: "cinatra-wayflow",
+      profiles: ["wayflow", "drupal", "wordpress"],
+      environment: { PORT: "3010" },
+      ports: [{ published: "3010", target: 3010, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+    };
+    const CONFIG_ALL_PROFILES = {
+      ...RESOLVED_CONFIG,
+      services: { ...RESOLVED_CONFIG.services, wayflow: WAYFLOW_GATED },
+    };
+    const allProfilesCalls = [];
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso513p",
+      ],
+      {
+        log: () => {},
+        deps: flowDeps({
+          // Mirror the real `docker compose config` contract: the profile-gated
+          // wayflow exists ONLY in the all-profiles resolution.
+          composeConfigForFiles: (_dir, _files, _deps, opts) => {
+            allProfilesCalls.push(opts?.allProfiles === true);
+            return opts?.allProfiles ? CONFIG_ALL_PROFILES : RESOLVED_CONFIG;
+          },
+          detectPortConflicts: async (band) => {
+            const pg = band.find((b) => b.service === "postgres");
+            if (pg && pg.port === 5434) return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+            return [];
+          },
+          bringUpInfra: () => {},
+        }),
+      },
+    );
+    expect(res.infraPlan).toBe("isolated");
+    // The isolated executor requested the ALL-PROFILES resolution.
+    expect(allProfilesCalls).toContain(true);
+
+    // Host .env.local: WAYFLOW_BASE_URL re-pointed (3010 → 13010); the donor
+    // default must NOT survive.
+    const env = readFileSync(path.join(installDir, ".env.local"), "utf8");
+    expect(env).toMatch(/^WAYFLOW_BASE_URL=http:\/\/127\.0\.0\.1:13010/m);
+    expect(env).not.toContain(":3010");
+
+    // Generated isolated compose: wayflow present, `profiles` retained (a plain
+    // `up` must not start it), published port shifted into the isolated band.
+    const gen = JSON.parse(readFileSync(path.join(installDir, "docker-compose.cinatra-isolated.yml"), "utf8"));
+    expect(gen.services.wayflow).toBeDefined();
+    expect(gen.services.wayflow.profiles).toEqual(["wayflow", "drupal", "wordpress"]);
+    expect(String(gen.services.wayflow.ports[0].published)).toBe("13010");
+  });
+
   // ── cinatra-cli#38 — isolated app port live-probe + reserved-set validate ───
   // The app port (Next.js PORT) is NOT a compose-published port, so it bypassed
   // the infra band's live probe. Distinguish the app-port probe from the band
