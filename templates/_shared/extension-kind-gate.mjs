@@ -1688,11 +1688,19 @@ export function validateBpmnSanity(xml) {
     errors.push("cinatra/workflow.bpmn is empty");
     return errors;
   }
-  const stripped = xml
-    .replace(/<!--[\s\S]*?-->/g, "")
-    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, "")
-    .replace(/<\?[\s\S]*?\?>/g, "")
-    .replace(/<!DOCTYPE[^>]*>/gi, "");
+  // Strip comments/CDATA/PIs/DOCTYPE to a fixpoint: a single replace pass can
+  // splice removed spans into NEW marker sequences (e.g. "<!<!---->--" becomes
+  // "<!--" after one pass), letting crafted input smuggle content past the
+  // tag-structure checks below. Iterating until stable closes that gap.
+  let stripped = xml;
+  for (let previous = null; previous !== stripped; ) {
+    previous = stripped;
+    stripped = stripped
+      .replace(/<!--[\s\S]*?-->/g, "")
+      .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, "")
+      .replace(/<\?[\s\S]*?\?>/g, "")
+      .replace(/<!DOCTYPE[^>]*>/gi, "");
+  }
 
   const prefixOf = (qname) => (qname.includes(":") ? qname.split(":")[0] : "");
   const localOf = (qname) => (qname.includes(":") ? qname.split(":")[1] : qname);
