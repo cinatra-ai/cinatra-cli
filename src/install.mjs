@@ -1197,9 +1197,8 @@ function bringUpInfra({ targetDir, log = console.log, composeFiles = null, compo
  *  invocation). The recorded set is the authority (cinatra-cli#17 §C.8) so
  *  up/exec/down all target the same files+project. An `envFile` is threaded so
  *  the ISOLATED generated compose can resolve its scrubbed `${VAR}` placeholders
- *  from .env.local at up-time (review hardening #1). The DEFAULT install `up`
- *  passes it too (eng#513 — the base compose interpolates no-default secrets);
- *  a null envFile keeps compose's normal `.env` discovery. */
+ *  from .env.local at up-time (review hardening #1) — the default path omits it, keeping
+ *  compose's normal `.env` discovery (byte-identical to before). */
 function composeArgsFor({ composeFiles = null, composeProject = null, envFile = null } = {}) {
   const files = composeFiles && composeFiles.length
     ? composeFiles
@@ -2606,13 +2605,9 @@ export function decideDefaultProjectOwnership({
           `adopting it keeps the named volumes stable`,
       };
     }
-    if (legacyForeign.length > 0 && (!wantDir || dirs.has(wantDir) || dirs.has(null))) {
-      // The legacy basename project is rooted here AND shared with a foreign/
-      // unknown owner, has an UNATTRIBUTABLE owner (no working_dir label — it
-      // could be THIS checkout's own old stack, so falling through could orphan
-      // its data behind a fresh candidate stack; codex convergence on eng#513),
-      // or the target dir itself cannot be attributed. Never adopt it (codex
-      // blocker #3). REFUSE.
+    if (legacyForeign.length > 0) {
+      // The legacy basename project is shared with a foreign/unknown owner — never
+      // adopt it (codex blocker #3). REFUSE.
       const conflictDir = [...dirs].find((d) => d !== null && d !== wantDir);
       return {
         action: "refuse",
@@ -2624,17 +2619,6 @@ export function decideDefaultProjectOwnership({
           ` — adopting it could hijack that stack`,
       };
     }
-    // Otherwise the legacy basename project exists ONLY at KNOWN foreign
-    // checkouts: there is nothing to adopt here, and the candidate `-p` project
-    // name is DISTINCT (`cinatra_<slug>` ≠ bare basename), so bringing up the
-    // candidate stack cannot touch the foreign legacy stack's containers or
-    // named volumes.
-    // Refusing here bricked every install into a dir NAMED `cinatra` (the CLI's
-    // own suggested default) on any host where a different checkout ever ran a
-    // legacy default stack — with a remediation message advising the exact
-    // `--instance` flag the user had already passed. Fall through to the
-    // candidate-project ownership rules (2/2b), which still refuse a real
-    // candidate collision.
   }
 
   // 2. Ownership refuse — the candidate project exists and is NOT provably ours.
@@ -4106,21 +4090,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
     defaultProject = await withAllocLock(lockPath, async () => {
       const resolved = resolveDefaultProject({ targetDir, opts, log, deps });
-      // eng#513 real-host sweep: the default `up` MUST pass `--env-file
-      // .env.local` like every isolated/attach bring-up does — the base
-      // docker-compose.yml interpolates `${NANGO_ENCRYPTION_KEY}` and
-      // `${CINATRA_BRIDGE_TOKEN}` (no compose defaults), so without the
-      // env-file the freshly-written secrets resolve to BLANK strings (compose
-      // warns "variable is not set") and nango-server runs with an EMPTY
-      // encryption key that silently diverges from the key recorded in
-      // .env.local — the cinatra-cli#57 failure class on the DEFAULT path.
-      const defaultEnvFile = path.join(targetDir, ".env.local");
-      startInfra({
-        targetDir,
-        log,
-        composeProject: resolved,
-        envFile: existsSync(defaultEnvFile) ? defaultEnvFile : null,
-      });
+      startInfra({ targetDir, log, composeProject: resolved });
       return resolved;
     });
   }

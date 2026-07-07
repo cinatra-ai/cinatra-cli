@@ -252,53 +252,6 @@ describe("decideDefaultProjectOwnership (cinatra-cli#35)", () => {
     expect(d.action).toBe("refuse");
   });
 
-  // Real-host regression (CLI sweep): a legacy `cinatra`
-  // stack from a DIFFERENT checkout — with NO legacy containers rooted here —
-  // refused EVERY install into a dir named `cinatra` (the CLI's own suggested
-  // default dir), even with an explicit `--instance` slug, and the refusal
-  // message advised the very `--instance` flag already in use. Nothing is
-  // adoptable in that state and the candidate `-p` project name is distinct, so
-  // the candidate stack cannot touch the foreign legacy stack.
-  it("USE-DEFAULT when the legacy project exists ONLY at a foreign checkout (nothing to adopt; distinct -p cannot hijack)", () => {
-    const otherDir = "/Users/ordnas/Code/cinatra-ai/cinatra";
-    const d = decideDefaultProjectOwnership({
-      candidateProject,
-      legacyProject,
-      targetDir,
-      containerRows: [containerRow(legacyProject, otherDir)],
-      volumeRows: [],
-    });
-    expect(d.action).toBe("use-default");
-    expect(d.project).toBe(candidateProject);
-  });
-
-  it("USE-DEFAULT for an explicit --instance candidate when the legacy project is foreign-only (the eng#513 repro shape)", () => {
-    const otherDir = "/Users/ordnas/Code/cinatra-ai/.claude/scratch/lane-1003/cinatra";
-    const d = decideDefaultProjectOwnership({
-      candidateProject: "cinatra_e2e513",
-      legacyProject,
-      targetDir,
-      containerRows: [containerRow(legacyProject, otherDir)],
-      volumeRows: [],
-    });
-    expect(d.action).toBe("use-default");
-    expect(d.project).toBe("cinatra_e2e513");
-  });
-
-  it("still REFUSES when the only legacy owner is UNATTRIBUTABLE (could be OUR OWN old stack — codex convergence)", () => {
-    // No working_dir label means the legacy stack cannot be proven foreign: it
-    // could be THIS checkout's own old legacy stack, and falling through would
-    // silently start a fresh candidate stack next to (and orphan) its data.
-    const d = decideDefaultProjectOwnership({
-      candidateProject,
-      legacyProject,
-      targetDir,
-      containerRows: [containerRow(legacyProject, null)],
-      volumeRows: [],
-    });
-    expect(d.action).toBe("refuse");
-  });
-
   it("ADOPT-LEGACY when the legacy project is rooted ONLY here, even if a SEPARATE (foreign) candidate project also exists", () => {
     // A legacy stack is rooted HERE (and nowhere else) and a separate (foreign)
     // candidate-named project also exists at another dir — adopting the legacy

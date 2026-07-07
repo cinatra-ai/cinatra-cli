@@ -3953,6 +3953,149 @@ async function applyDoctorFix({ report, deps = {} } = {}) {
   return { attempted, applied, failed, aborted };
 }
 
+// ---------------------------------------------------------------------------
+// cinatra-cli#93 — graceful DB-down / un-migrated handling for `status`/`doctor`
+// ---------------------------------------------------------------------------
+//
+// The LOCAL direct-Postgres path of `cinatra status` and `cinatra doctor` used
+// to let a `connect()` failure (stack down) or a missing-relation query error
+// (fresh volume, schema not migrated) propagate to the top-level bin catch —
+// a bare `connect ECONNREFUSED 127.0.0.1:5434` with no remediation, violating
+// engineering#456's "broken install → actionable output" row. Mirror the soft
+// `dbError` pattern `runExtensionsVerifyProd` already uses: convert the two
+// well-known broken-install classes into an ACTIONABLE degraded report (still
+// exiting non-zero), and let every OTHER error keep crashing loudly.
+
+// Sanitized `host:port` for operator display. NEVER returns credentials — the
+// connection string embeds `user:password@`, so only hostname/port survive.
+//
+// @param {string} connectionString
+// @returns {string}
+function describeDbTarget(connectionString) {
+  try {
+    const u = new URL(String(connectionString));
+    const host = u.hostname || "localhost";
+    const port = u.port || "5432";
+    return `${host}:${port}`;
+  } catch {
+    return "the SUPABASE_DB_URL target";
+  }
+}
+
+// Network-level errno codes that mean "nothing answered at the target" —
+// the stack-down class `cinatra install`/`pnpm dev` remediates.
+const DB_UNREACHABLE_ERRNO_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ECONNABORTED",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ETIMEDOUT",
+  "EPIPE",
+]);
+
+// Postgres SQLSTATE classes for "the server did not take the connection":
+// class 08 (connection exception) + 57P03 (cannot_connect_now — starting up /
+// shutting down, e.g. a container mid-boot).
+const DB_UNREACHABLE_PG_CODES = new Set(["08000", "08001", "08003", "08004", "08006", "57P03"]);
+
+// TRUE only for the stack-down/unreachable class (codex must-fix: the
+// connect-phase guard must be NARROW). Auth failures (28P01), bad-database,
+// TLS/config mistakes, and pg loader/constructor bugs are NOT "unreachable" —
+// they rethrow loudly so a real bug is never dressed up as a down stack.
+// Node's dual-stack (Happy Eyeballs) connect surfaces per-address failures as
+// an AggregateError, so recurse into `.errors`.
+//
+// @param {unknown} err
+// @returns {boolean}
+function isDbUnreachableError(err) {
+  if (err == null) return false;
+  if (err instanceof AggregateError && Array.isArray(err.errors)) {
+    if (err.errors.some((inner) => isDbUnreachableError(inner))) return true;
+  }
+  const code = /** @type {{code?: unknown}} */ (err).code;
+  if (typeof code === "string" && (DB_UNREACHABLE_ERRNO_CODES.has(code) || DB_UNREACHABLE_PG_CODES.has(code))) {
+    return true;
+  }
+  // pg's own no-code failure shapes: connect timeout ("timeout expired") and a
+  // socket the server dropped mid-handshake ("Connection terminated ...").
+  const message = err instanceof Error ? err.message : String(err);
+  return /timeout expired|connection terminated/i.test(message);
+}
+
+// TRUE only for the reachable-but-un-migrated class: Postgres `undefined_table`
+// (42P01 — `relation "cinatra.metadata" does not exist`, the observed fresh-
+// volume shape even with the schema absent) or `invalid_schema_name` (3F000).
+// Everything else (auth failure mid-query, connection drop, real bugs) stays a
+// hard throw — this classifier must not swallow unknown errors.
+//
+// @param {unknown} err
+// @returns {boolean}
+function isDbNotMigratedError(err) {
+  if (err == null) return false;
+  const code = /** @type {{code?: unknown}} */ (err).code;
+  if (code === "42P01" || code === "3F000") return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return /relation "[^"]*" does not exist/i.test(message);
+}
+
+// One remediation line per broken-install class (issue #93's exact hints).
+//
+// @param {"unreachable"|"unmigrated"} kind
+// @param {"status"|"doctor"} command
+// @returns {string}
+function dbDownRemediation(kind, command) {
+  return kind === "unmigrated"
+    ? `Instance DB is reachable but not migrated — run \`cinatra instance db migrate\` (or \`cinatra install\`), then re-run \`cinatra ${command}\`.`
+    : `Instance DB unreachable — start the local stack (\`cinatra install\`, or \`pnpm dev\` in the checkout), then re-run \`cinatra ${command}\`.`;
+}
+
+// Degraded `cinatra doctor` report: one FAIL assertion in the standard
+// { assertions, counts } shape, so `runDoctorCore` prints it through the normal
+// report renderer and gates exit-non-zero. `planDoctorFixActions` maps it to no
+// auto-remediation (starting the stack / migrating are not doctor --fix scope).
+// Secret boundary: `message` is the pg error message (e.g. `connect ECONNREFUSED
+// 127.0.0.1:5434`) — the same string verify-prod reports as `dbError`; the
+// connection string itself is never echoed.
+//
+// @param {{ kind: "unreachable"|"unmigrated", target: string, message: string }} args
+// @returns {{ assertions: Array<object>, counts: {pass:number,fail:number,skip:number} }}
+function buildDbDownDoctorReport({ kind, target, message }) {
+  const detail =
+    kind === "unmigrated"
+      ? `Instance DB at ${target} is reachable but not migrated (${message})`
+      : `Instance DB unreachable at ${target} (${message})`;
+  return {
+    assertions: [
+      {
+        id: "db-reachable",
+        label: "Instance DB reachable + migrated (prerequisite for every other check)",
+        verdict: "fail",
+        detail,
+        remediation: dbDownRemediation(kind, "doctor"),
+      },
+    ],
+    counts: { pass: 0, fail: 1, skip: 0 },
+  };
+}
+
+// Degraded `cinatra status` payload — stays machine-readable JSON on stdout
+// (the healthy path prints JSON, so the broken path must too).
+//
+// @param {{ runtimeMode: string, kind: "unreachable"|"unmigrated", target: string, message: string }} args
+// @returns {object}
+function buildDbDownStatusReport({ runtimeMode, kind, target, message }) {
+  return {
+    runtimeMode,
+    dbStatus: kind,
+    dbTarget: target,
+    dbError: message,
+    hint: dbDownRemediation(kind, "status"),
+  };
+}
+
 // Standalone `cinatra doctor` (alias: `cinatra mcp llm-access verify`). Opens its
 // own pg client, prints the report, and exits non-zero on any FAIL (the
 // authoritative post-boot gate). A SKIP alone warns + exits 0 unless --strict.
@@ -4000,10 +4143,35 @@ async function runDoctor(rest = []) {
     const env = collectEnvironment(repoRoot);
     const connectionString = requiredEnv(env, "SUPABASE_DB_URL");
     const schemaName = env.SUPABASE_SCHEMA?.trim() || "cinatra";
-    const client = await createClient(connectionString);
-    await client.connect();
+
+    // cinatra-cli#93: a down or un-migrated local DB must yield an ACTIONABLE
+    // failing report (mirroring runExtensionsVerifyProd's soft `dbError`),
+    // never a bare top-level `connect ECONNREFUSED` crash. Any OTHER gather
+    // error still propagates loudly.
+    let client = null;
+    try {
+      client = await createClient(connectionString);
+      await client.connect();
+    } catch (err) {
+      client = null;
+      if (!isDbUnreachableError(err)) throw err;
+      return buildDbDownDoctorReport({
+        kind: "unreachable",
+        target: describeDbTarget(connectionString),
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
     try {
       return await gatherDoctorReport({ client, schemaName, env, repoRoot });
+    } catch (err) {
+      if (isDbNotMigratedError(err)) {
+        return buildDbDownDoctorReport({
+          kind: "unmigrated",
+          target: describeDbTarget(connectionString),
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+      throw err;
     } finally {
       await client.end();
     }
@@ -10738,8 +10906,33 @@ async function runStatus(argv = []) {
   const runtimeMode = readConfiguredRuntimeMode(env);
   const connectionString = requiredEnv(env, "SUPABASE_DB_URL");
   const schemaName = env.SUPABASE_SCHEMA?.trim() || "cinatra";
-  const client = await createClient(connectionString);
-  await client.connect();
+
+  // cinatra-cli#93: a down or un-migrated local DB must yield an ACTIONABLE
+  // degraded JSON report + exit 1 (mirroring runExtensionsVerifyProd's soft
+  // `dbError`), never a bare top-level `connect ECONNREFUSED` crash. Any OTHER
+  // error still propagates loudly.
+  let client = null;
+  try {
+    client = await createClient(connectionString);
+    await client.connect();
+  } catch (err) {
+    client = null;
+    if (!isDbUnreachableError(err)) throw err;
+    console.log(
+      JSON.stringify(
+        buildDbDownStatusReport({
+          runtimeMode,
+          kind: "unreachable",
+          target: describeDbTarget(connectionString),
+          message: err instanceof Error ? err.message : String(err),
+        }),
+        null,
+        2,
+      ),
+    );
+    process.exitCode = 1;
+    return;
+  }
 
   try {
     const status = await gatherStatus(client, schemaName);
@@ -10747,6 +10940,21 @@ async function runStatus(argv = []) {
       runtimeMode,
       ...status,
     }, null, 2));
+  } catch (err) {
+    if (!isDbNotMigratedError(err)) throw err;
+    console.log(
+      JSON.stringify(
+        buildDbDownStatusReport({
+          runtimeMode,
+          kind: "unmigrated",
+          target: describeDbTarget(connectionString),
+          message: err instanceof Error ? err.message : String(err),
+        }),
+        null,
+        2,
+      ),
+    );
+    process.exitCode = 1;
   } finally {
     await client.end();
   }
@@ -11090,6 +11298,16 @@ export {
   extractSchemasFromDump,
   createBackupBundle,
   importBackupBundle,
+  // cinatra-cli#93 — graceful DB-down/un-migrated handling for status/doctor.
+  // `runStatus`/`runDoctor` are exported so the suite can drive the REAL
+  // command wiring (not just the helpers) against a mocked pg client.
+  runStatus,
+  runDoctor,
+  describeDbTarget,
+  isDbUnreachableError,
+  isDbNotMigratedError,
+  buildDbDownDoctorReport,
+  buildDbDownStatusReport,
 };
 
 /**
