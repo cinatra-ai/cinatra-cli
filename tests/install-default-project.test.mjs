@@ -252,7 +252,7 @@ describe("decideDefaultProjectOwnership (cinatra-cli#35)", () => {
     expect(d.action).toBe("refuse");
   });
 
-  // eng#513 real-host regression (v0.1.7 closeout CLI sweep): a legacy `cinatra`
+  // Real-host regression (CLI sweep): a legacy `cinatra`
   // stack from a DIFFERENT checkout — with NO legacy containers rooted here —
   // refused EVERY install into a dir named `cinatra` (the CLI's own suggested
   // default dir), even with an explicit `--instance` slug, and the refusal
