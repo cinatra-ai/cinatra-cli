@@ -1197,8 +1197,9 @@ function bringUpInfra({ targetDir, log = console.log, composeFiles = null, compo
  *  invocation). The recorded set is the authority (cinatra-cli#17 §C.8) so
  *  up/exec/down all target the same files+project. An `envFile` is threaded so
  *  the ISOLATED generated compose can resolve its scrubbed `${VAR}` placeholders
- *  from .env.local at up-time (review hardening #1) — the default path omits it, keeping
- *  compose's normal `.env` discovery (byte-identical to before). */
+ *  from .env.local at up-time (review hardening #1). The DEFAULT install `up`
+ *  passes it too (eng#513 — the base compose interpolates no-default secrets);
+ *  a null envFile keeps compose's normal `.env` discovery. */
 function composeArgsFor({ composeFiles = null, composeProject = null, envFile = null } = {}) {
   const files = composeFiles && composeFiles.length
     ? composeFiles
