@@ -285,7 +285,10 @@ describe("decideDefaultProjectOwnership (cinatra-cli#35)", () => {
     expect(d.project).toBe("cinatra_e2e513");
   });
 
-  it("USE-DEFAULT when the only legacy owner is UNATTRIBUTABLE (we never adopt, so no hijack is possible)", () => {
+  it("still REFUSES when the only legacy owner is UNATTRIBUTABLE (could be OUR OWN old stack — codex convergence)", () => {
+    // No working_dir label means the legacy stack cannot be proven foreign: it
+    // could be THIS checkout's own old legacy stack, and falling through would
+    // silently start a fresh candidate stack next to (and orphan) its data.
     const d = decideDefaultProjectOwnership({
       candidateProject,
       legacyProject,
@@ -293,8 +296,7 @@ describe("decideDefaultProjectOwnership (cinatra-cli#35)", () => {
       containerRows: [containerRow(legacyProject, null)],
       volumeRows: [],
     });
-    expect(d.action).toBe("use-default");
-    expect(d.project).toBe(candidateProject);
+    expect(d.action).toBe("refuse");
   });
 
   it("ADOPT-LEGACY when the legacy project is rooted ONLY here, even if a SEPARATE (foreign) candidate project also exists", () => {

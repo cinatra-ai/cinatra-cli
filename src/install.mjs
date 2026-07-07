@@ -2587,10 +2587,13 @@ export function decideDefaultProjectOwnership({
           `adopting it keeps the named volumes stable`,
       };
     }
-    if (legacyForeign.length > 0 && (!wantDir || dirs.has(wantDir))) {
+    if (legacyForeign.length > 0 && (!wantDir || dirs.has(wantDir) || dirs.has(null))) {
       // The legacy basename project is rooted here AND shared with a foreign/
-      // unknown owner (or we cannot attribute ownership at all) — never adopt it
-      // (codex blocker #3). REFUSE.
+      // unknown owner, has an UNATTRIBUTABLE owner (no working_dir label — it
+      // could be THIS checkout's own old stack, so falling through could orphan
+      // its data behind a fresh candidate stack; codex convergence on eng#513),
+      // or the target dir itself cannot be attributed. Never adopt it (codex
+      // blocker #3). REFUSE.
       const conflictDir = [...dirs].find((d) => d !== null && d !== wantDir);
       return {
         action: "refuse",
@@ -2602,10 +2605,11 @@ export function decideDefaultProjectOwnership({
           ` — adopting it could hijack that stack`,
       };
     }
-    // Otherwise the legacy basename project exists ONLY at foreign checkouts:
-    // there is nothing to adopt here, and the candidate `-p` project name is
-    // DISTINCT (`cinatra_<slug>` ≠ bare basename), so bringing up the candidate
-    // stack cannot touch the foreign legacy stack's containers or named volumes.
+    // Otherwise the legacy basename project exists ONLY at KNOWN foreign
+    // checkouts: there is nothing to adopt here, and the candidate `-p` project
+    // name is DISTINCT (`cinatra_<slug>` ≠ bare basename), so bringing up the
+    // candidate stack cannot touch the foreign legacy stack's containers or
+    // named volumes.
     // Refusing here bricked every install into a dir NAMED `cinatra` (the CLI's
     // own suggested default) on any host where a different checkout ever ran a
     // legacy default stack — with a remediation message advising the exact
