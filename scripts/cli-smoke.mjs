@@ -140,11 +140,25 @@ for (const path of visiblePaths) {
 // ---------------------------------------------------------------------------
 if (liveRoot) {
   const env = { CINATRA_REPO_ROOT: liveRoot };
+  // `extensions verify-prod` (added in the v0.1.7 milestone, cinatra-cli#92,
+  // runtime-mount resolution fixed by #101) legitimately reports FINDINGS on a
+  // dev checkout (a dev tree is not an acquisition-managed prod install), so
+  // the smoke bar is NOT exit 0 — it is "runs the full check and emits the
+  // structured JSON report" (never a bare crash; eng#513 sweep).
+  const verifyProdOk = (r) => {
+    try {
+      const parsed = JSON.parse(r.stdout);
+      return parsed && typeof parsed === "object" && Array.isArray(parsed.findings);
+    } catch {
+      return false;
+    }
+  };
   for (const [label, args, ok] of [
     ["live: status", ["status"], (r) => r.status === 0 && /runtimeMode|userCount|authReady/i.test(r.combined)],
     ["live: instance clone list", ["instance", "clone", "list"], (r) => r.status === 0],
     ["live: agents list", ["agents", "list", "--json"], (r) => r.status === 0],
     ["live: extensions list", ["extensions", "list", "--json"], (r) => r.status === 0],
+    ["live: extensions verify-prod", ["extensions", "verify-prod", "--json"], verifyProdOk],
   ]) {
     const r = runCli(args, { cwd: liveRoot, env });
     record(label, ok(r), `exit=${r.status}`);
