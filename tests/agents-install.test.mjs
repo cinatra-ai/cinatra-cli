@@ -683,7 +683,7 @@ describe.skipIf(!INTEGRATION_DB_URL)("checkAgentDbPreflight — real DB round-tr
 // ---------------------------------------------------------------------------
 // eng#513 — LIVE-SCHEMA writer/deleter round-trip.
 //
-// The v0.1.7 closeout real-host sweep (engineering#513) found BOTH agent DB
+// A real-host CLI sweep found BOTH agent DB
 // writers broken against the REAL app schema while every hermetic/mock test
 // stayed green, because the mocks (and the DDL above) modelled a uuid PK and a
 // FULL unique constraint. The live schema (cinatra monorepo main) has:
