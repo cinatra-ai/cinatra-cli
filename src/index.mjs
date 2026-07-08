@@ -3154,17 +3154,40 @@ async function doctorAssertLlmMcpAccess(client, schemaName) {
     detail = "no LLM provider credentials and no public MCP URL";
   }
 
+  const assertion = makeAssertion(
+    "llm-mcp-access",
+    "LLM MCP access (creds AND public URL — single AND)",
+    ok ? "pass" : "fail",
+    detail,
+    ok
+      ? null
+      : "Run `cinatra instance setup dev` (provisions provider creds), then `cinatra instance tunnel start` " +
+        "(or paste a public URL at /configuration/development?tab=tunnel) to set the public MCP URL.",
+  );
+
+  // cinatra-cli#104 — at the SETUP TAIL, "creds provisioned but no public MCP
+  // URL" is the EXPECTED pre-tunnel state: Tailscale has not been configured
+  // yet, so no public URL can be established. That gap is non-fatal by design (a
+  // local dev instance is fully usable without it), so the tail should render it
+  // as a single actionable NOTICE — not a ✗ FAIL that reads as a broken setup.
+  // The verdict stays "fail" so the STANDALONE `cinatra doctor` (which ignores
+  // `tailNotice`) remains the authoritative gate and still FAILs, and the tail's
+  // exit-code logic (which keys only on dev-apps-presence) is unaffected.
+  if (hasCredentials && !hasPublicUrl) {
+    assertion.tailNotice = {
+      label: "Hosted LLM-MCP access (Tailscale)",
+      detail:
+        `${providerIds.length} LLM provider(s) provisioned; hosted LLM-MCP access is unavailable ` +
+        "until Tailscale is configured and a public MCP URL is set",
+      hint:
+        "Run `cinatra instance tunnel start` to configure Tailscale and enable hosted LLM-MCP access " +
+        "(or paste an operator-managed public URL at /configuration/development?tab=tunnel). " +
+        "Local dev works without it.",
+    };
+  }
+
   return {
-    assertion: makeAssertion(
-      "llm-mcp-access",
-      "LLM MCP access (creds AND public URL — single AND)",
-      ok ? "pass" : "fail",
-      detail,
-      ok
-        ? null
-        : "Run `cinatra instance setup dev` (provisions provider creds), then `cinatra instance tunnel start` " +
-          "(or paste a public URL at /configuration/development?tab=tunnel) to set the public MCP URL.",
-    ),
+    assertion,
     // Surfaced to later assertions; never logged.
     providers: llmAccess?.providers ?? {},
     publicMcpUrl,
@@ -3759,7 +3782,16 @@ function defaultDoctorDockerImpl(args) {
 }
 
 // Pretty-print one assertion line. Statuses/booleans only — never a secret.
-function printDoctorAssertion(a) {
+// `asNotice` (setup tail only) renders an assertion carrying a `tailNotice` as
+// an actionable ℹ NOTICE instead of its underlying ✗ FAIL (cinatra-cli#104).
+function printDoctorAssertion(a, { asNotice = false } = {}) {
+  if (asNotice && a.tailNotice) {
+    console.log(`  ℹ [NOTICE] ${a.tailNotice.label ?? a.label}: ${a.tailNotice.detail}`);
+    if (a.tailNotice.hint) {
+      console.log(`        ↳ ${a.tailNotice.hint}`);
+    }
+    return;
+  }
   const glyph = a.verdict === "pass" ? "✓" : a.verdict === "fail" ? "✗" : "⚠";
   const tag = a.verdict.toUpperCase();
   console.log(`  ${glyph} [${tag}] ${a.label}: ${a.detail}`);
@@ -3770,17 +3802,33 @@ function printDoctorAssertion(a) {
 
 // Print the report. `tail` mode (setup tail) frames it as a non-fatal self-check;
 // standalone mode frames it as the authoritative gate.
+//
+// cinatra-cli#104 — in `tail` mode, any assertion carrying a `tailNotice`
+// (currently only the creds-present-but-no-public-URL / unconfigured-Tailscale
+// case) is rendered as an actionable ℹ NOTICE rather than a ✗ FAIL, and is
+// tallied under a separate `notice` bucket so the summary reads as a completed
+// setup, not a `1 fail / N skip` block. Standalone mode ignores `tailNotice`
+// entirely, so its rendering and counts are byte-for-byte unchanged.
 function printDoctorReport(report, { mode } = {}) {
+  const isTail = mode === "tail";
   console.log(
-    mode === "tail"
+    isTail
       ? "\n- Content-editor self-check (`cinatra doctor`):"
       : "Cinatra content-editor write-path self-check:",
   );
-  for (const a of report.assertions) printDoctorAssertion(a);
+  const shown = { pass: 0, fail: 0, skip: 0, notice: 0 };
+  for (const a of report.assertions) {
+    const asNotice = isTail && Boolean(a.tailNotice);
+    printDoctorAssertion(a, { asNotice });
+    if (asNotice) shown.notice += 1;
+    else shown[a.verdict] += 1;
+  }
   console.log(
-    `  Summary: ${report.counts.pass} pass, ${report.counts.fail} fail, ${report.counts.skip} skip.`,
+    `  Summary: ${shown.pass} pass, ${shown.fail} fail, ${shown.skip} skip` +
+      (shown.notice > 0 ? `, ${shown.notice} notice` : "") +
+      ".",
   );
-  if (report.counts.skip > 0) {
+  if (shown.skip > 0) {
     console.log(
       "  Some checks were SKIPPED (a dependency was down — they are NOT passes). " +
         "Re-run `cinatra doctor` after `pnpm dev` (and the CMS containers) are up; " +
@@ -11308,6 +11356,8 @@ export {
   deriveConfiguredPublicMcpUrl,
   doctorAssertLlmMcpAccess,
   doctorAssertDevAppsPresence,
+  printDoctorReport,
+  printDoctorAssertion,
   DOCTOR_CMS_WRITE_TOOLS,
   SELF_MCP_CLIENT_ID,
   SELF_MCP_CLIENT_SCOPE,
