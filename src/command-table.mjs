@@ -337,7 +337,8 @@ export const COMMAND_DESCRIPTORS = [
     id: "dev.start",
     path: ["instance", "start"],
     match: "command+mode",
-    summary: "Start the local dev main instance (host-native `pnpm dev` on port 3000).",
+    summary:
+      "Start the local dev main instance (host-native `pnpm dev` on port 3000; auto-purges a stale `.next` when the checkout HEAD moved — `--clean` to force, `--no-clean` to suppress).",
   },
   {
     id: "dev.stop",
@@ -349,7 +350,8 @@ export const COMMAND_DESCRIPTORS = [
     id: "dev.restart",
     path: ["instance", "restart"],
     match: "command+mode",
-    summary: "Restart the local dev main instance (`instance stop` then `instance start`).",
+    summary:
+      "Restart the local dev main instance (`instance stop` then `instance start`; `--clean` purges `.next` first, `--no-clean` suppresses the HEAD-moved auto-purge).",
   },
   {
     id: "dev.wordpress",

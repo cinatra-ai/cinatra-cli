@@ -1287,6 +1287,144 @@ function cleanBuildArtifacts(repoRoot) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// cinatra-cli#105 — HEAD-stamped `.next` auto-clean for the dev-main lifecycle.
+//
+// A stale Next.js/Turbopack `.next` build cache can keep serving OLD client
+// chunks after the app checkout is synced to a newer HEAD (the documented
+// remedy in the app repo is `rm -rf .next && pnpm dev`). These helpers move
+// that remedy into `instance start` / `restart`: stamp the full HEAD sha that
+// `.next` was built against, and on the next start/restart purge `.next` iff the
+// checkout HEAD has moved since (or an explicit `--clean` is passed). Detecting
+// staleness at the single choke point every start passes through covers
+// `cinatra update`, `cinatra install`, AND a manual `git pull` uniformly.
+//
+// Scope is `.next` ONLY — deliberately NOT `cleanBuildArtifacts` (which also
+// drops top-level `generated/`, not proven safe to remove on an ordinary dev
+// start). The stamp lives INSIDE `.next` so any purge — ours, `--clean`, or a
+// manual `rm -rf .next` — clears it, so a rebuild always re-stamps from scratch.
+// ---------------------------------------------------------------------------
+
+// Marker file, inside `.next`, holding the full HEAD sha `.next` was built at.
+const NEXT_BUILD_HEAD_STAMP = ".cinatra-build-head";
+
+function nextBuildDir(repoRoot) {
+  return path.join(repoRoot, ".next");
+}
+
+function nextBuildStampPath(repoRoot) {
+  return path.join(nextBuildDir(repoRoot), NEXT_BUILD_HEAD_STAMP);
+}
+
+// Full HEAD sha of the checkout, or null when it cannot be resolved (not a git
+// checkout / git unavailable). Pure read — never mutates the repo.
+function readCheckoutHeadSha(repoRoot) {
+  const res = spawnSync("git", ["-C", repoRoot, "rev-parse", "HEAD"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (res.status !== 0) return null;
+  const sha = (res.stdout ?? "").trim();
+  return /^[0-9a-f]{40}$/i.test(sha) ? sha : null;
+}
+
+// The HEAD sha `.next` was last built against, or null if unstamped/unreadable.
+function readNextBuildStamp(repoRoot) {
+  const stampPath = nextBuildStampPath(repoRoot);
+  if (!existsSync(stampPath)) return null;
+  try {
+    const sha = readFileSync(stampPath, "utf8").trim();
+    return /^[0-9a-f]{40}$/i.test(sha) ? sha : null;
+  } catch {
+    return null;
+  }
+}
+
+// Remove ONLY `.next` (never `generated/`). Idempotent; no-op when absent.
+// Returns true when a `.next` was actually removed.
+function cleanNextBuildCache(repoRoot) {
+  const dir = nextBuildDir(repoRoot);
+  if (!existsSync(dir)) return false;
+  rmSync(dir, { recursive: true, force: true });
+  return true;
+}
+
+// Record the current HEAD as the sha `.next` was built at. No-op unless `.next`
+// exists (the marker is written INTO it so a later purge clears it). Best-effort
+// — a missing stamp only costs one extra auto-clean on the next start.
+function stampNextBuildHead(repoRoot) {
+  if (!existsSync(nextBuildDir(repoRoot))) return;
+  const sha = readCheckoutHeadSha(repoRoot);
+  if (!sha) return;
+  try {
+    writeFileSync(nextBuildStampPath(repoRoot), `${sha}\n`, { mode: 0o600 });
+  } catch {
+    /* best-effort */
+  }
+}
+
+// Decide whether `.next` is stale relative to the checkout HEAD:
+//   - no `.next`              → nothing to clean            → { stale:false }
+//   - HEAD unresolvable       → cannot prove staleness      → { stale:false }
+//   - stamp absent OR != HEAD → the source moved since build → { stale:true }
+//   - stamp == HEAD           → fresh                       → { stale:false }
+function evaluateNextStaleness(repoRoot) {
+  if (!existsSync(nextBuildDir(repoRoot))) {
+    return { stale: false, reason: "no-next", currentHead: null, stampedHead: null };
+  }
+  const currentHead = readCheckoutHeadSha(repoRoot);
+  if (!currentHead) {
+    return { stale: false, reason: "head-unresolved", currentHead: null, stampedHead: null };
+  }
+  const stampedHead = readNextBuildStamp(repoRoot);
+  if (stampedHead == null) {
+    return { stale: true, reason: "unstamped", currentHead, stampedHead: null };
+  }
+  if (stampedHead !== currentHead) {
+    return { stale: true, reason: "head-moved", currentHead, stampedHead };
+  }
+  return { stale: false, reason: "fresh", currentHead, stampedHead };
+}
+
+// Parse the `.next` clean directive from an `instance start|restart` argv:
+//   `--clean`    → "force" (purge unconditionally)
+//   `--no-clean` → "off"   (suppress the HEAD-moved auto-purge)
+//   neither      → "auto"  (purge only when the checkout HEAD moved)
+// `--clean` and `--no-clean` together are contradictory and rejected.
+function parseNextCleanDirective(argv) {
+  const list = Array.isArray(argv) ? argv : [];
+  const force = list.includes("--clean");
+  const suppress = list.includes("--no-clean");
+  if (force && suppress) {
+    throw new Error("`--clean` and `--no-clean` are mutually exclusive.");
+  }
+  return force ? "force" : suppress ? "off" : "auto";
+}
+
+// Apply the clean directive right before a dev-main (re)start, once no managed
+// server holds `.next` (the caller guarantees stop-first / not-running). Prints
+// what it did. Never throws for the "already absent" case.
+function applyNextCleanBeforeStart(repoRoot, directive) {
+  if (directive === "off") return;
+  if (directive === "force") {
+    console.log(
+      cleanNextBuildCache(repoRoot)
+        ? "  Cleaned .next (forced by --clean)."
+        : "  .next already absent (--clean requested; nothing to remove).",
+    );
+    return;
+  }
+  // "auto" — purge only when the checkout HEAD moved since `.next` was built.
+  const { stale, reason } = evaluateNextStaleness(repoRoot);
+  if (!stale) return;
+  cleanNextBuildCache(repoRoot);
+  console.log(
+    reason === "head-moved"
+      ? "  Checkout HEAD moved since .next was built — cleaned stale .next before starting."
+      : "  .next was not HEAD-stamped — cleaned it to avoid serving stale client chunks.",
+  );
+}
+
 function reinstallDependencies(repoRoot) {
   const script = `rm -rf node_modules .pnpm-store && echo "  Removed node_modules/ and .pnpm-store/" && pnpm install`;
   const result = spawnSync("sh", ["-c", script], {
@@ -8664,9 +8802,11 @@ function resolveDevMainTarget() {
 }
 
 async function runDevStart(argv) {
-  // No flags consumed today; reject `--tailscale-authkey` for parity with the
-  // other lifecycle verbs (the main instance never takes the secret as an arg).
+  // Reject `--tailscale-authkey` for parity with the other lifecycle verbs (the
+  // main instance never takes the secret as an arg). `--clean` / `--no-clean`
+  // drive the `.next` auto-clean (cinatra-cli#105).
   rejectTailscaleAuthkeyFlag(argv);
+  const cleanDirective = parseNextCleanDirective(argv);
   const { repoRoot, port } = resolveDevMainTarget();
   const pidPath = clonePidPath(DEV_MAIN_SLUG);
   const logPath = cloneLogPath(DEV_MAIN_SLUG);
@@ -8689,9 +8829,29 @@ async function runDevStart(argv) {
           cwdMustEqual: repoRoot,
         });
         if (match.alive && match.ours) {
+          // `start` never stops a server it finds, so a `--clean` purge under a
+          // running managed server (healthy OR mid-restart-unhealthy) races /
+          // corrupts Turbopack — refuse for ANY alive-ours pid and direct to the
+          // stop-first verb `restart --clean` (cinatra-cli#105).
+          if (cleanDirective === "force") {
+            throw new Error(
+              `Dev main is already running (pid ${recordedPid}); refusing to purge .next under a running ` +
+                "dev server. Run `cinatra instance restart --clean` to stop, clean, and restart.",
+            );
+          }
           const probe = await probeHttp(healthUrl, { timeoutMs: 1_500, intervalMs: 500 });
           if (probe.ok) {
             console.log(`Dev main already running (pid ${recordedPid}) at http://localhost:${port}.`);
+            // The HEAD may have moved since `.next` was built (e.g. a manual
+            // `git pull` while the server kept running). We cannot purge under a
+            // live server, so surface it and point at `restart` — unless
+            // `--no-clean` opted out of the staleness signal (cinatra-cli#105).
+            if (cleanDirective !== "off" && evaluateNextStaleness(repoRoot).stale) {
+              console.warn(
+                "  Note: the checkout HEAD has moved since .next was built — run `cinatra instance restart` " +
+                  "to rebuild against the new HEAD (a live .next purge is unsafe, so start left it in place).",
+              );
+            }
             success = true;
             return;
           }
@@ -8726,6 +8886,13 @@ async function runDevStart(argv) {
         `Dev main: port ${port} is already bound by another process. Free it (or set PORT) before starting.`,
       );
     }
+
+    // cinatra-cli#105 — auto-clean a stale `.next` (or a `--clean`-forced purge)
+    // BEFORE spawning. We are past the idempotency/kill block and the port
+    // precheck, so no managed dev server is holding `.next` here (a healthy one
+    // already returned above; an unhealthy one was SIGKILLed) — the "never purge
+    // under a live server" invariant holds. `--no-clean` suppresses this.
+    applyNextCleanBeforeStart(repoRoot, cleanDirective);
 
     // Spawn host-native `pnpm dev`. Truncate log + write pid file. Process
     // group LEADER (detached=true) so `instance stop` SIGTERMs the whole tree
@@ -8775,6 +8942,15 @@ async function runDevStart(argv) {
     } else {
       console.log("  Next.js: OK");
     }
+
+    // Stamp `.next` with the current HEAD once a start attempt has PRODUCED it —
+    // regardless of the health-probe outcome (cinatra-cli#105). The stamp records
+    // WHICH HEAD `.next` was built against (a property of the checkout, not a
+    // health assertion), so a slow or unhealthy-but-still-building start still
+    // gets stamped; otherwise it would read as "unstamped → stale" and be
+    // gratuitously purged on EVERY subsequent start. `stampNextBuildHead` no-ops
+    // when `.next` was never produced (spawn failed) — nothing to stamp or purge.
+    stampNextBuildHead(repoRoot);
 
     success = true;
     console.log("");
@@ -8893,6 +9069,11 @@ async function runDevStop(argv) {
 }
 
 async function runDevRestart(argv) {
+  // Validate the clean directive BEFORE stopping so a contradictory
+  // `--clean --no-clean` fails fast rather than after tearing the server down.
+  // `restart --clean` = stop → clean `.next` → start; `restart` (no flag) =
+  // stop → auto-clean iff HEAD moved → start (cinatra-cli#105).
+  parseNextCleanDirective(argv);
   // Branch on the structured stop RESULT, not the global `process.exitCode`
   // side-channel: a restart must NOT start a second instance on top of a
   // possibly-live one (the start would refuse on the not-ours guard anyway,
@@ -11359,6 +11540,15 @@ export {
   printDoctorReport,
   printDoctorAssertion,
   DOCTOR_CMS_WRITE_TOOLS,
+  // cinatra-cli#105 — HEAD-stamped `.next` auto-clean (pure seams).
+  cleanNextBuildCache,
+  readNextBuildStamp,
+  stampNextBuildHead,
+  readCheckoutHeadSha,
+  evaluateNextStaleness,
+  parseNextCleanDirective,
+  applyNextCleanBeforeStart,
+  NEXT_BUILD_HEAD_STAMP,
   SELF_MCP_CLIENT_ID,
   SELF_MCP_CLIENT_SCOPE,
   SELF_MCP_CLIENT_SCOPES,
