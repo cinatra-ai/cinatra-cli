@@ -35,7 +35,16 @@
 // POLICY
 // ------
 //   - drizzle-store.ts absent (a baked standalone runtime image ships no TS
-//     source) → skip QUIETLY: boot remains the bootstrap authority there.
+//     source) BUT the image bakes its self-contained schema-bootstrap bundle
+//     (scripts/schema-bootstrap.bundle.mjs, built by the image from the SAME
+//     buildCreateStoreSchemaQueries) → run the BUNDLE. "Boot applies it" is
+//     NOT sufficient on the prod deploy path: the deploy runs `setup prod`
+//     (the versioned chain) BEFORE the new image ever boots, so an EXISTING
+//     database at the previous release's ledger hits chain migrations that
+//     reference tables only the new bootstrap creates (observed on a release
+//     deploy: `LOCK TABLE nango_connection` → relation does not exist).
+//   - drizzle-store.ts absent AND no baked bundle (images predating it) →
+//     skip QUIETLY: boot remains the bootstrap authority there.
 //   - `tsx` unresolvable from the checkout WITH the source present:
 //       - `required: true` (dev setup/refresh — the checkout must be able to
 //         run its own DDL; tsx is a devDependency of every dev checkout) →
@@ -61,6 +70,16 @@ export function resolveCheckoutDdlSource(repoRoot, { exists = existsSync } = {})
   return exists(source) ? source : null;
 }
 
+/** `<repoRoot>/scripts/schema-bootstrap.bundle.mjs` — the self-contained
+ *  schema-bootstrap DDL runner a baked runtime image builds from its own
+ *  buildCreateStoreSchemaQueries (the checkout's Dockerfile bakes it; the
+ *  deploy-compat bin applies it too, so a double-apply stays idempotent) —
+ *  or null when the image/checkout predates the bundle. */
+export function resolveBakedBootstrapBundle(repoRoot, { exists = existsSync } = {}) {
+  const bundle = path.join(repoRoot, "scripts", "schema-bootstrap.bundle.mjs");
+  return exists(bundle) ? bundle : null;
+}
+
 /** True when the checkout's own dependency tree resolves `tsx` (the loader the
  *  spawned entry runs under). Resolution is anchored at the CHECKOUT, never at
  *  this CLI's install location — the checkout's tsx transforms the checkout's
@@ -77,9 +96,11 @@ export function checkoutResolvesTsx(repoRoot, { resolve } = {}) {
 
 /**
  * Apply the checkout's schema-bootstrap DDL (buildCreateStoreSchemaQueries)
- * to the target database, in a spawned `node --import tsx` subprocess run
- * from the checkout root. Returns:
- *   { status: "applied" }
+ * to the target database — via a spawned `node --import tsx` subprocess for a
+ * checkout carrying the TS source, or via the image's baked self-contained
+ * bundle for a standalone runtime image. Returns:
+ *   { status: "applied" }                 (checkout TS source via tsx)
+ *   { status: "applied", via: "baked-bundle" }
  *   { status: "skipped", reason: "no-ddl-source" | "no-tsx" }
  * Throws when the spawned DDL run itself fails.
  */
@@ -92,9 +113,43 @@ export function applyCheckoutBootstrapDdl({
   warn = console.warn,
   deps = {},
 }) {
+  const run =
+    deps.run ??
+    ((cmd, args, options) => {
+      execFileSync(cmd, args, options);
+    });
+  const ddlEnv = {
+    ...process.env,
+    SUPABASE_DB_URL: connectionString,
+    SUPABASE_SCHEMA: schemaName,
+  };
+  const rethrow = (err) => {
+    throw new Error(
+      `Checkout bootstrap DDL failed — the versioned core migration chain assumes this baseline, so setup ` +
+        `stops here instead of aborting mid-chain. Underlying error: ${err && err.message ? err.message : err}`,
+    );
+  };
+
   const source = resolveCheckoutDdlSource(repoRoot, deps);
   if (!source) {
-    // Normal state for a baked standalone runtime image — not a warning.
+    // Baked standalone runtime image: no TS source. Prefer the image's own
+    // self-contained schema-bootstrap bundle — on the prod deploy path the
+    // versioned chain runs BEFORE the new image ever boots, so "boot applies
+    // it" is not a baseline here (see the POLICY header).
+    const bundle = resolveBakedBootstrapBundle(repoRoot, deps);
+    if (bundle) {
+      try {
+        run(process.execPath, [bundle], {
+          cwd: repoRoot,
+          stdio: ["ignore", "inherit", "inherit"],
+          env: ddlEnv,
+        });
+      } catch (err) {
+        rethrow(err);
+      }
+      return { status: "applied", via: "baked-bundle" };
+    }
+    // Normal state for a baked runtime image predating the bundle — not a warning.
     log("  Checkout bootstrap DDL: skipped (no src/lib/drizzle-store.ts in this checkout — boot applies it).");
     return { status: "skipped", reason: "no-ddl-source" };
   }
@@ -110,27 +165,17 @@ export function applyCheckoutBootstrapDdl({
   }
 
   const entry = path.join(path.dirname(fileURLToPath(import.meta.url)), ENTRY_BASENAME);
-  const run =
-    deps.run ??
-    ((cmd, args, options) => {
-      execFileSync(cmd, args, options);
-    });
   try {
     run(process.execPath, ["--import", "tsx", entry], {
       cwd: repoRoot,
       stdio: ["ignore", "inherit", "inherit"],
       env: {
-        ...process.env,
-        SUPABASE_DB_URL: connectionString,
-        SUPABASE_SCHEMA: schemaName,
+        ...ddlEnv,
         CINATRA_CHECKOUT_DDL_SOURCE: source,
       },
     });
   } catch (err) {
-    throw new Error(
-      `Checkout bootstrap DDL failed — the versioned core migration chain assumes this baseline, so setup ` +
-        `stops here instead of aborting mid-chain. Underlying error: ${err && err.message ? err.message : err}`,
-    );
+    rethrow(err);
   }
   return { status: "applied" };
 }

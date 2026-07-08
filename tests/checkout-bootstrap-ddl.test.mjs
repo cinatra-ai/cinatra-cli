@@ -15,10 +15,11 @@ import { fileURLToPath } from "node:url";
 import {
   applyCheckoutBootstrapDdl,
   checkoutResolvesTsx,
+  resolveBakedBootstrapBundle,
   resolveCheckoutDdlSource,
 } from "../src/checkout-bootstrap-ddl.mjs";
 
-function makeCheckout(withDdlSource) {
+function makeCheckout(withDdlSource, { withBakedBundle = false } = {}) {
   const root = mkdtempSync(path.join(tmpdir(), "cinatra-1136-ddl-"));
   writeFileSync(path.join(root, "package.json"), `{"name":"cinatra"}\n`);
   if (withDdlSource) {
@@ -27,6 +28,10 @@ function makeCheckout(withDdlSource) {
       path.join(root, "src", "lib", "drizzle-store.ts"),
       "export function buildCreateStoreSchemaQueries() { return []; }\n",
     );
+  }
+  if (withBakedBundle) {
+    mkdirSync(path.join(root, "scripts"), { recursive: true });
+    writeFileSync(path.join(root, "scripts", "schema-bootstrap.bundle.mjs"), "// baked bundle\n");
   }
   return root;
 }
@@ -180,6 +185,91 @@ describe("applyCheckoutBootstrapDdl — decision policy", () => {
           },
         }),
       ).toThrow(/Checkout bootstrap DDL failed/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("applyCheckoutBootstrapDdl — baked-image bundle (prod deploy surface)", () => {
+  const quiet = { log: () => {}, warn: () => {} };
+
+  it("no TS source + baked bundle present → runs the bundle at the checkout root with the DB env", () => {
+    const root = makeCheckout(false, { withBakedBundle: true });
+    const runs = [];
+    try {
+      const r = applyCheckoutBootstrapDdl({
+        repoRoot: root,
+        connectionString: "postgres://db-under-test",
+        schemaName: "cinatra_prod",
+        ...quiet,
+        deps: { run: (cmd, args, options) => runs.push({ cmd, args, options }) },
+      });
+      expect(r).toEqual({ status: "applied", via: "baked-bundle" });
+      expect(runs).toHaveLength(1);
+      const { cmd, args, options } = runs[0];
+      expect(cmd).toBe(process.execPath);
+      expect(args).toEqual([path.join(root, "scripts", "schema-bootstrap.bundle.mjs")]);
+      expect(options.cwd).toBe(root);
+      expect(options.env.SUPABASE_DB_URL).toBe("postgres://db-under-test");
+      expect(options.env.SUPABASE_SCHEMA).toBe("cinatra_prod");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("a FAILED bundle run throws (the chain must not start on a half-bootstrapped schema)", () => {
+    const root = makeCheckout(false, { withBakedBundle: true });
+    try {
+      expect(() =>
+        applyCheckoutBootstrapDdl({
+          repoRoot: root,
+          connectionString: "postgres://x",
+          schemaName: "cinatra",
+          ...quiet,
+          deps: {
+            run: () => {
+              throw new Error("exit 1");
+            },
+          },
+        }),
+      ).toThrow(/Checkout bootstrap DDL failed/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("resolveBakedBootstrapBundle: path when present, null when absent", () => {
+    const withBundle = makeCheckout(false, { withBakedBundle: true });
+    const withoutBundle = makeCheckout(false);
+    try {
+      expect(resolveBakedBootstrapBundle(withBundle)).toBe(
+        path.join(withBundle, "scripts", "schema-bootstrap.bundle.mjs"),
+      );
+      expect(resolveBakedBootstrapBundle(withoutBundle)).toBeNull();
+    } finally {
+      rmSync(withBundle, { recursive: true, force: true });
+      rmSync(withoutBundle, { recursive: true, force: true });
+    }
+  });
+
+  it("a checkout WITH the TS source never prefers the bundle (dev path unchanged)", () => {
+    const root = makeCheckout(true, { withBakedBundle: true });
+    const runs = [];
+    try {
+      const r = applyCheckoutBootstrapDdl({
+        repoRoot: root,
+        connectionString: "postgres://x",
+        schemaName: "cinatra",
+        ...quiet,
+        deps: {
+          run: (cmd, args, options) => runs.push({ cmd, args, options }),
+          resolve: () => "/fake/tsx",
+        },
+      });
+      expect(r).toEqual({ status: "applied" });
+      expect(runs).toHaveLength(1);
+      expect(runs[0].args.slice(0, 2)).toEqual(["--import", "tsx"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
