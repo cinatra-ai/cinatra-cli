@@ -17,11 +17,40 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Non-pinned dev extension sync tolerates a detached companion. (#100)
 - `extensions verify-prod` resolves the agent runtime mount instead of the
   deleted install-dir knob. (#101)
+- `agents install` / `agent import` / `agents uninstall` no longer crash
+  against the live app schema (partial-unique agent index, text ids); the
+  upsert and the uninstall lookup match the live schema shape. (#106)
+- `install --on-conflict=isolated` resolves the compose config with all
+  profiles, so profile-gated companion services (wayflow) move to the
+  isolated port band instead of keeping the donor instance's URL. (#107)
+- The default infra `up` passes `--env-file .env.local`, so
+  `NANGO_ENCRYPTION_KEY` no longer resolves blank. (#108)
+- `install` no longer refuses when a legacy basename project exists only in
+  other, known checkouts — that refusal bricked every install into a
+  directory named `cinatra` on hosts where a different checkout had run a
+  legacy default stack. A legacy project rooted in the target directory, or
+  with an unattributable owner, is still refused. (#109)
+- `status` and `doctor` degrade gracefully when the local database is down
+  or un-migrated — `status` emits a machine-readable degraded payload and
+  `doctor` a FAIL assertion with remediation — instead of crashing on a bare
+  connection error. (#112)
+- `instance refresh` / `instance setup` apply the checkout's schema
+  bootstrap before the core migration chain (matching the boot order), so
+  updating an existing instance no longer aborts mid-chain on tables only
+  the checkout's DDL creates; detached companion checkouts are reconciled
+  to the committed lock; and a same-version local-registry seed skew on
+  committed-lock pins warns without flipping the exit code. (#115)
 
 ### Added
 
 - Layer-1 artifact-parity screen in the kind gate (`produces` implies a
   runnable materialization). (#102)
+
+### Security
+
+- Hardened the scaffolded extension templates: the kind gate strips
+  comment/CDATA splices to a fixpoint, and every kind template's CI workflow
+  declares least-privilege `permissions: contents: read`. (#114)
 
 ## [0.1.7] - 2026-07-02
 
