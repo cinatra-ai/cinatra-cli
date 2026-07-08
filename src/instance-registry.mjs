@@ -258,6 +258,12 @@ export function allocateInstance(registry, slug, fields) {
     composeFiles,
     ports,
     appPort = null,
+    // cinatra-cli#113: the host-port band offset an ISOLATED instance used. Kept
+    // so a stale pre-profile-baking compose can be regenerated in place at the
+    // SAME offset (never moving a running service's port). Absent on default
+    // rows and on isolated rows recorded before this field existed (those derive
+    // the offset from the recorded ports vs the base band).
+    offset = null,
     repoUrl,
     ref,
     sha = null,
@@ -329,6 +335,8 @@ export function allocateInstance(registry, slug, fields) {
     composeFiles: [...composeFiles],
     ports: ports && typeof ports === "object" ? ports : {},
     appPort,
+    // Only isolated rows carry an offset; keep default rows byte-identical.
+    ...(Number.isInteger(offset) && offset > 0 ? { offset } : {}),
     repoUrl,
     ref,
     sha,
@@ -352,6 +360,23 @@ export function markInstanceReady(registry, slug, patch = {}) {
   }
   const next = cloneRegistryObject(registry);
   next.instances[slug] = { ...existing, ...patch, slug, state: "ready" };
+  return next;
+}
+
+/** Patch fields on an existing row WITHOUT changing its state (unlike
+ *  `markInstanceReady`). cinatra-cli#113: an in-place isolated-compose
+ *  regeneration updates the recorded remapped `ports` (now enlarged with the
+ *  profile-gated services) and persists the band `offset` for a legacy row that
+ *  lacked it — both without disturbing a `ready`/`provisioning` state. `slug` is
+ *  pinned so a patch can never rename the row. Returns a NEW registry (immutable,
+ *  mirrors `markInstanceReady`). Throws on an unknown slug. */
+export function updateInstance(registry, slug, patch = {}) {
+  const existing = registry.instances[slug];
+  if (!existing) {
+    throw new Error(`Cannot update unknown instance slug "${slug}".`);
+  }
+  const next = cloneRegistryObject(registry);
+  next.instances[slug] = { ...existing, ...patch, slug };
   return next;
 }
 

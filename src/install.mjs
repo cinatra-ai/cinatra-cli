@@ -55,6 +55,7 @@ import {
   writeInstanceRegistry,
   allocateInstance,
   markInstanceReady,
+  updateInstance,
   releaseInstance,
   getInstance,
   listInstances,
@@ -81,6 +82,17 @@ import {
   assertComposeHostUrlsRemapped,
   ISOLATED_COMPOSE_FILENAME,
 } from "./install-isolation.mjs";
+import {
+  A2A_PEERS_PROFILE,
+  A2A_PEER_ENV_KEY,
+  deriveA2aPeerServices,
+  isolatedComposeHasA2aPeers,
+  a2aPeerUrlsFromServices,
+  deriveBandOffsetFromRow,
+  sharedServicePortsAgree,
+  removeEnvKey,
+} from "./isolated-a2a.mjs";
+import { rejectTailscaleAuthkeyFlag } from "./clone-runtime.mjs";
 import {
   deriveCoUseSlug,
   coUseDbName,
@@ -2152,6 +2164,7 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       composeFiles,
       ports,
       appPort,
+      offset, // cinatra-cli#113: persist for deterministic in-place regeneration
       repoUrl: opts.repoUrl,
       ref: opts.ref,
       sha: resolvedSha,
@@ -3542,12 +3555,29 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     log(`  [dry-run] would bring up isolated project ${row.composeProject} from ${(row.composeFiles ?? []).join(", ")}`);
     return { infraPlan: "isolated", instance: row, done: false, dryRun: true };
   }
+  // cinatra-cli#113: an instance recorded BEFORE the profile-gated services were
+  // baked into the isolated compose keeps a profile-less file across every
+  // reconcile — it never gains the a2a-peers (or wordpress/drupal/twenty/plane)
+  // services without a manual reset + reinstall. Regenerate it in place FIRST
+  // (idempotent — a no-op once the file already carries them), so a plain
+  // `cinatra install` on such an instance picks the profile-gated services up.
+  // Best-effort: any failure leaves the recorded compose untouched and the
+  // reconcile proceeds with it. On success the enlarged remapped-port map drives
+  // the env re-point + Nango health probe below.
+  let effectivePorts = row.ports ?? {};
+  try {
+    const regen = await regenerateIsolatedComposeInPlace({ targetDir, row, log, deps });
+    if (regen.regenerated && regen.ports) effectivePorts = regen.ports;
+  } catch (err) {
+    log(`  ⚠ Isolated compose regeneration skipped (${err instanceof Error ? err.message : err}); using the recorded compose.`);
+  }
+
   // Re-point the env at the recorded remapped ports + bring up WITH
   // `--env-file .env.local` so the generated isolated compose's scrubbed
   // `${VAR}` placeholders resolve from the file (never blank/shell defaults) —
   // mirrors the primary isolated `up`. Without this an idempotent re-converge of
   // a stopped isolated stack would start with empty secrets/wrong URLs.
-  ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: row.ports ?? {}, log });
+  ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: effectivePorts, log });
   const reconvEnvFile = path.join(targetDir, ".env.local");
   startInfra({
     targetDir,
@@ -3555,7 +3585,7 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     composeFiles: row.composeFiles,
     composeProject: row.composeProject,
     envFile: existsSync(reconvEnvFile) ? reconvEnvFile : null,
-    nangoHealthUrl: nangoHealthUrlForPorts(row.ports),
+    nangoHealthUrl: nangoHealthUrlForPorts(effectivePorts),
   });
   // Promote a stale provisioning row to ready after a successful ensure.
   if (row.state !== "ready") {
@@ -3567,6 +3597,262 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     });
   }
   return { infraPlan: "isolated", instance: row, done: true };
+}
+
+/**
+ * cinatra-cli#113 — regenerate a recorded isolated stack's
+ * `docker-compose.cinatra-isolated.yml` IN PLACE so it carries the profile-gated
+ * services (a2a-peers / wordpress / drupal / twenty / plane). An instance
+ * recorded BEFORE those services were baked into the isolated compose keeps a
+ * profile-less file across every reconcile; this brings it up to parity without
+ * a reset + reinstall.
+ *
+ * Idempotent and safe:
+ *   - No-op when the file already carries an a2a-peers service with a published
+ *     port (the specific marker that the profile-gated services are present), or
+ *     when the file is missing/unparseable (best-effort — never clobber).
+ *   - Regenerates at the instance's ORIGINAL band offset (persisted on the row
+ *     for fresh installs; derived from the recorded ports vs the base band for a
+ *     legacy row, refusing on any ambiguity), so every already-remapped default
+ *     service keeps its EXACT host port. A determinism guard re-checks that no
+ *     shared service's port moved before overwriting; on any disagreement it
+ *     refuses (throws) rather than relocate a possibly-running service.
+ *   - Runs the same #57 (scrubbed-key resolution) + #97 (self-URL remap)
+ *     invariants the primary generator asserts.
+ *   - On success updates the recorded `ports` (enlarged) + persists `offset`.
+ *
+ * @returns {Promise<{ regenerated: boolean, ports?: object }>}
+ */
+async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.log, deps = {} }) {
+  const getConfig = deps.composeConfigForFiles ?? composeConfigForFiles;
+  const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
+  const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
+
+  const isoPath = path.join(targetDir, ISOLATED_COMPOSE_FILENAME);
+  if (!existsSync(isoPath)) return { regenerated: false };
+
+  // The generated isolated compose is JSON rendered into a `.yml` (YAML 1.2 is a
+  // JSON superset), so it parses straight back with JSON.parse — no YAML dep.
+  let existingDoc;
+  try {
+    existingDoc = JSON.parse(readFileSync(isoPath, "utf8"));
+  } catch {
+    // An unparseable file is left untouched (never clobber an operator edit).
+    return { regenerated: false };
+  }
+  // Already carries the profile-gated peers → nothing to do (the common case: a
+  // fresh install, or an instance already regenerated once).
+  if (isolatedComposeHasA2aPeers(existingDoc)) return { regenerated: false };
+
+  // Re-resolve the checkout's base config WITH every profile-gated service — the
+  // same resolution a fresh isolated install performs.
+  const resolvedConfig = getConfig(targetDir, ["docker-compose.yml", "docker-compose.dev.yml"], deps, { allProfiles: true });
+  if (!resolvedConfig) {
+    throw new Error("could not resolve `docker compose config` to regenerate the isolated compose");
+  }
+  const baseBand = parseComposePublishedPorts(resolvedConfig);
+  if (baseBand.length === 0) {
+    throw new Error("the checkout's compose config publishes no host ports");
+  }
+
+  // Offset: the recorded one (fresh installs persist it), else derived from the
+  // recorded remapped ports vs the base band — refusing on ambiguity. NEVER
+  // guess: a wrong offset would relocate a running service's host port.
+  let offset = Number.isInteger(row.offset) && row.offset > 0 ? row.offset : null;
+  if (offset == null) {
+    offset = deriveBandOffsetFromRow(row.ports ?? {}, baseBand);
+  }
+  if (!Number.isInteger(offset) || offset <= 0) {
+    throw new Error("could not derive the isolated band offset from the recorded ports (ambiguous); skipping regeneration");
+  }
+
+  const envFileKeys = computeIsolatedScrubAllowlist(targetDir);
+  const { doc, ports, scrubbedKeys } = generateIsolatedCompose({
+    resolvedConfig,
+    offset,
+    projectName: row.composeProject,
+    slug: row.slug,
+    appPort: row.appPort ?? null,
+    envFileKeys,
+  });
+
+  // Determinism guard: refuse to overwrite if ANY service present in BOTH the
+  // recorded and regenerated port maps would move — that would recreate a live
+  // container on a new host port. Holds by construction at a stable offset; this
+  // catches a shifted base band or a mis-derived offset.
+  if (!sharedServicePortsAgree(row.ports ?? {}, ports)) {
+    throw new Error(
+      "regeneration would move an already-remapped service's host port (base band shifted or offset ambiguous); " +
+        "leaving the recorded compose untouched",
+    );
+  }
+
+  // The same invariants the primary isolated generator asserts (fail loud on a
+  // regression, never a silent blank-secret or a self-URL leak to the main stack).
+  assertScrubbedKeysSupplied(targetDir, scrubbedKeys);
+  assertComposeHostUrlsRemapped(doc, new Set(baseBand.map((b) => b.port)));
+
+  writeIsolatedComposeFile(isoPath, doc);
+  log(
+    `  ↻ Regenerated ${ISOLATED_COMPOSE_FILENAME} to include the profile-gated services ` +
+      `(a2a-peers + wordpress/drupal/twenty/plane) at the recorded band offset.`,
+  );
+
+  // Persist the enlarged remapped-port map + the offset (so a legacy row's next
+  // regeneration is a cheap no-op that never re-derives).
+  await withAllocLock(lockPath, async () => {
+    const reg = requireUsableInstanceRegistry(registryPath);
+    if (getInstance(reg, row.slug)) {
+      writeInstanceRegistry(registryPath, updateInstance(reg, row.slug, { ports, offset }));
+    }
+  });
+
+  return { regenerated: true, ports };
+}
+
+/**
+ * cinatra-cli#113 — `cinatra instance a2a <start|stop>`: bring the A2A dev test
+ * peers (the `a2a-peers` compose profile) up on / down from THIS checkout's OWN
+ * isolated stack, and wire the app's `CINATRA_A2A_DEV_PEER_URLS` to the peers'
+ * REMAPPED host ports so the dev-boot auto-connect surfaces them at /agents —
+ * parity with a standard dev install, but scoped to the isolated project.
+ *
+ * Isolated-aware (parallels `instance wordpress|drupal` but targets the recorded
+ * `-p <project> -f docker-compose.cinatra-isolated.yml`, not the default stack):
+ *   start: `… --profile a2a-peers up -d --build <peer services>` then write the
+ *          peer URLs into `.env.local` (they are `build:` services → --build).
+ *   stop:  `… rm -sf <peer services>` — SCOPED to the peer services, never a
+ *          profile-wide `down` — then remove the env key.
+ * Self-heals a stale (pre-profile-baking) isolated compose by regenerating it in
+ * place first. A non-zero compose exit sets the process exit code (a failed
+ * start/stop is never reported as success); the env wiring FOLLOWS the container
+ * state (written only on a successful start, cleared only on a successful stop).
+ */
+export async function runIsolatedA2aPeers(argv = [], { targetDir = null, log = console.log, deps = {} } = {}) {
+  // cinatra-cli#113: reject `--tailscale-authkey` BEFORE any error path echoes
+  // argv — otherwise `cinatra instance a2a start --tailscale-authkey=…` would
+  // leak the secret in the "unexpected argument" / "unknown sub-command" message.
+  // Mirrors the sibling lifecycle/CMS paths, which guard argv as their first step.
+  rejectTailscaleAuthkeyFlag(argv);
+  const verb = String(argv[0] ?? "").trim();
+  if (verb !== "start" && verb !== "stop") {
+    throw new Error(
+      `Unknown 'cinatra instance a2a' sub-command "${argv[0] ?? ""}". ` +
+        `Expected: cinatra instance a2a <start|stop>.`,
+    );
+  }
+  // The verb is the ONLY accepted argument — reject any trailing token rather
+  // than silently perform a container action (mirrors `instance wordpress`).
+  const extra = argv.slice(1).filter((tok) => String(tok ?? "").trim() !== "");
+  if (extra.length > 0) {
+    throw new Error(
+      `Unexpected argument(s) for 'cinatra instance a2a ${verb}': ${extra.join(" ")}. ` +
+        `Expected: cinatra instance a2a <start|stop>.`,
+    );
+  }
+
+  const dir = targetDir ?? process.cwd();
+  const composeAvailable = deps.isComposeAvailable ?? (() => commandExists("docker", ["compose", "version"]));
+  if (!composeAvailable()) {
+    throw new Error(
+      "`docker compose` is not available on PATH. Install Docker + the compose plugin, then retry.",
+    );
+  }
+
+  const lookupRow = deps.lookupOwnIsolatedRow ?? lookupOwnIsolatedRow;
+  const row = lookupRow(dir);
+  if (!row) {
+    throw new Error(
+      "This checkout is not a recorded ISOLATED instance, so `cinatra instance a2a` has no isolated stack to target. " +
+        "Create one with `cinatra install --on-conflict=isolated`, then re-run. " +
+        "(A standard dev install runs the a2a-peers via the base compose profile directly.)",
+    );
+  }
+
+  const isoPath = path.join(dir, ISOLATED_COMPOSE_FILENAME);
+  const readDoc = () => {
+    try {
+      return JSON.parse(readFileSync(isoPath, "utf8"));
+    } catch {
+      return null;
+    }
+  };
+
+  // Self-heal a stale (pre-profile-baking) compose: regenerate in place so it
+  // carries the a2a-peer services before we try to start them (criterion 1's
+  // "a documented command does it in place" — reused shared code).
+  let doc = readDoc();
+  if (!doc || !isolatedComposeHasA2aPeers(doc)) {
+    try {
+      const regen = await regenerateIsolatedComposeInPlace({ targetDir: dir, row, log, deps });
+      if (regen.regenerated) doc = readDoc();
+    } catch (err) {
+      log(`  ⚠ Could not regenerate the isolated compose (${err instanceof Error ? err.message : err}).`);
+    }
+  }
+  if (!doc || !isolatedComposeHasA2aPeers(doc)) {
+    throw new Error(
+      "The isolated compose does not include the a2a-peers services and could not be regenerated in place. " +
+        "Re-run `cinatra install --on-conflict=isolated` on this checkout to rebuild it, then retry.",
+    );
+  }
+
+  const peers = deriveA2aPeerServices(doc);
+  if (peers.length === 0) {
+    throw new Error("No a2a-peers service publishes a host port in the isolated compose — nothing to start.");
+  }
+  const peerNames = peers.map((p) => p.name);
+
+  const envFile = path.join(dir, ".env.local");
+  const envArgs = existsSync(envFile) ? ["--env-file", ".env.local"] : [];
+  const baseArgs = ["compose", ...envArgs, "-p", row.composeProject, "-f", ISOLATED_COMPOSE_FILENAME];
+  const args =
+    verb === "start"
+      ? [...baseArgs, "--profile", A2A_PEERS_PROFILE, "up", "-d", "--build", ...peerNames]
+      : [...baseArgs, "rm", "-sf", ...peerNames];
+
+  const shownCmd = `docker ${args.join(" ")}`;
+  log(
+    verb === "start"
+      ? `Starting the isolated A2A dev peers (${shownCmd}) ...`
+      : `Stopping the isolated A2A dev peers (${shownCmd}) ...`,
+  );
+  const runCompose =
+    deps.runCompose ?? ((a, opts) => spawnSync("docker", a, { stdio: ["ignore", "inherit", "inherit"], ...opts }));
+  const result = runCompose(args, { cwd: dir, env: process.env });
+  const status = result?.error ? 1 : (result?.status ?? 1);
+  if (status !== 0) {
+    process.exitCode = status || 1;
+    log(`\`${shownCmd}\` failed (exit ${status}).` + (result?.error ? ` ${result.error.message}` : ""));
+    // Env wiring FOLLOWS the container state — never touch it on a failed run.
+    return;
+  }
+
+  // Wire (start) / clear (stop) CINATRA_A2A_DEV_PEER_URLS in .env.local so the
+  // dev-boot auto-connect (ensureA2ADevPeerConnections) reaches the peers.
+  if (existsSync(envFile)) {
+    let body = readFileSync(envFile, "utf8");
+    if (verb === "start") {
+      body = upsertEnvKey(body, A2A_PEER_ENV_KEY, a2aPeerUrlsFromServices(peers).join(","));
+    } else {
+      body = removeEnvKey(body, A2A_PEER_ENV_KEY);
+    }
+    writeFileSync(envFile, body);
+  } else if (verb === "start") {
+    log(
+      `  ⚠ ${envFile} not found — the A2A peers are up, but ${A2A_PEER_ENV_KEY} was not wired. ` +
+        `Run \`cinatra install\` to create .env.local, then re-run.`,
+    );
+  }
+
+  if (verb === "start") {
+    log(
+      `Isolated A2A dev peers started (${peerNames.length} container(s)); ${A2A_PEER_ENV_KEY} wired to ${peers.length} peer URL(s). ` +
+        `Restart the app (\`cinatra instance restart\`) so it auto-connects them — they then appear at /agents.`,
+    );
+  } else {
+    log(`Isolated A2A dev peers stopped (containers removed; ${A2A_PEER_ENV_KEY} cleared from .env.local).`);
+  }
 }
 
 /** T12 — attach / resume: converge on THIS checkout's OWN existing instance.

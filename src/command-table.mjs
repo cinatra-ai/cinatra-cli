@@ -366,6 +366,13 @@ export const COMMAND_DESCRIPTORS = [
     summary: "Manage the Drupal CMS dev container (start|stop) via the compose `drupal` profile.",
   },
   {
+    id: "dev.a2a",
+    path: ["instance", "a2a"],
+    match: "command+mode",
+    summary:
+      "Manage the isolated A2A dev peers (start|stop) via the compose `a2a-peers` profile; wires CINATRA_A2A_DEV_PEER_URLS so they surface at /agents.",
+  },
+  {
     id: "reset.dev",
     path: ["instance", "reset"],
     match: "command+mode",

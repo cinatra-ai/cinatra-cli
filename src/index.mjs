@@ -669,6 +669,7 @@ Usage:
   cinatra instance restart
   cinatra instance wordpress start|stop
   cinatra instance drupal start|stop
+  cinatra instance a2a start|stop
   cinatra instance backup create [--file <path>]
   cinatra instance backup import [--file <path>|<filename>] [--yes]
   cinatra instance backup export-api-configs [--file <path>]
@@ -712,6 +713,11 @@ Commands:
   instance wordpress start|stop / instance drupal start|stop
                       Start or stop ONLY the named CMS dev container (single
                       compose service; preserves its named volumes).
+  instance a2a start|stop
+                      Start or stop the A2A dev test peers on THIS checkout's
+                      ISOLATED stack (the \`a2a-peers\` compose profile), and wire
+                      CINATRA_A2A_DEV_PEER_URLS to their remapped ports so they
+                      surface at /agents. Requires an isolated install.
   instance backup create|import|export-api-configs|import-api-configs
                       Local backup bundle + API-config export/import (pg_dump/psql).
   instance reset      Reset the development environment. Requires --yes; dev only.
@@ -11765,6 +11771,15 @@ function buildHandlers() {
     },
     "dev.drupal": async (rest) => {
       await runDevCms("drupal", rest);
+    },
+    "dev.a2a": async (rest) => {
+      // cinatra-cli#113: isolated-aware A2A dev-peer start/stop. Anchored on the
+      // checkout root (same as `instance start`) so it resolves THIS checkout's
+      // recorded isolated stack. The orchestration lives in install.mjs (it owns
+      // the isolated-instance machinery); lazy-imported like the other install-
+      // engine commands to keep the thin CLI's startup light.
+      const { runIsolatedA2aPeers } = await import("./install.mjs");
+      await runIsolatedA2aPeers(rest, { targetDir: getRepoRoot() });
     },
     "reset.dev": async (rest) => {
       await runResetDev(rest);
