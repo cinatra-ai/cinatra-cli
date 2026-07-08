@@ -1950,6 +1950,14 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
   }
   const composeProject = `cinatra_${slug.replace(/-/g, "_")}`;
 
+  // cinatra-cli#111: snapshot `.env.local` BEFORE the FIRST mutation below — the
+  // `ensureEnvLocal` call may CREATE it (or, with --reset-env, regenerate it) and
+  // the later isolated re-point rewrites it. Capturing here (the true pre-install
+  // state) is what lets a failed bring-up's rollback restore correctly: REMOVE a
+  // file the install created, or rewrite the operator's original bytes — never
+  // "restore" a file that only ever existed because this install created it.
+  const envSnapshot = snapshotEnvLocal(targetDir);
+
   // cinatra-cli#57: ensure `.env.local` exists (with the minted operator secrets)
   // BEFORE resolving the compose config, so `docker compose config` interpolates
   // every `${VAR}` from the REAL instance env-file (not a blank/default). The
@@ -2240,7 +2248,7 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
     });
   } catch (err) {
     log(`  ✗ Isolated bring-up failed — rolling back the pending instance "${slug}".`);
-    await rollbackIsolatedInstance({ targetDir, slug, composeProject, composeFiles, log, deps }).catch((e) =>
+    await rollbackIsolatedInstance({ targetDir, slug, composeProject, composeFiles, envSnapshot, log, deps }).catch((e) =>
       log(`  ⚠ Rollback best-effort error: ${e.message}`),
     );
     throw err;
@@ -2392,10 +2400,45 @@ function nangoHealthUrlForPorts(ports) {
   return null;
 }
 
+/** cinatra-cli#111 — snapshot `.env.local` BEFORE an isolated install re-points
+ *  its infra URLs / app port, so a failed bring-up can restore it. Without this,
+ *  the rollback tears down the isolated stack but leaves `.env.local` aimed at
+ *  the now-removed remapped port band — a confusing intermediate state for
+ *  status/doctor until the next successful install rewrites it. Pure read;
+ *  captures whether the file existed and, if so, its exact bytes. */
+export function snapshotEnvLocal(targetDir) {
+  const envPath = path.join(targetDir, ".env.local");
+  return existsSync(envPath)
+    ? { path: envPath, existed: true, content: readFileSync(envPath, "utf8") }
+    : { path: envPath, existed: false, content: null };
+}
+
+/** Restore a `.env.local` snapshot taken by `snapshotEnvLocal`: rewrite the
+ *  original bytes if it existed, or remove the file the isolated install created
+ *  if it did not. Best-effort — a restore failure is surfaced but never masks
+ *  the install error that triggered the rollback. */
+export function restoreEnvLocal(snapshot, log = console.log) {
+  if (!snapshot) return;
+  const { path: envPath, existed, content } = snapshot;
+  try {
+    if (existed) {
+      // `.env.local` still exists here (re-pointed, 0600); overwrite its bytes.
+      writeFileSync(envPath, content, { mode: 0o600 });
+      log("  Restored .env.local to its pre-isolated-install contents.");
+    } else if (existsSync(envPath)) {
+      spawnSync("rm", ["-f", envPath]);
+      log("  Removed .env.local (it did not exist before the rolled-back isolated install).");
+    }
+  } catch (e) {
+    log(`  ⚠ Could not restore .env.local during rollback: ${e.message}`);
+  }
+}
+
 /** T9 — tagged rollback for a PRE-READY isolated instance: remove only THIS
  *  pending project (recorded -p + -f) + project-scoped volumes + registry row +
- *  marker + the generated compose file. "Drop only if owner metadata matches". */
-async function rollbackIsolatedInstance({ targetDir, slug, composeProject, composeFiles, log = console.log, deps = {} }) {
+ *  marker + the generated compose file + restore `.env.local` (cinatra-cli#111).
+ *  "Drop only if owner metadata matches". */
+export async function rollbackIsolatedInstance({ targetDir, slug, composeProject, composeFiles, envSnapshot = null, log = console.log, deps = {} }) {
   const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
   const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
   const runCompose = deps.runComposeDown ?? composeDown;
@@ -2442,6 +2485,13 @@ async function rollbackIsolatedInstance({ targetDir, slug, composeProject, compo
       const { registry: next } = releaseInstance(reg, slug);
       writeInstanceRegistry(registryPath, next);
     }
+    // cinatra-cli#111: restore `.env.local` UNDER the same held lock, before it
+    // is released — otherwise a concurrent retry that acquires the slug the
+    // instant the lock drops (and writes its own re-pointed env) could be
+    // clobbered by this rollback's restore. Gated by the down-success path here,
+    // so a failed `down` (row kept for retry) or a refused ready/foreign row
+    // never restores.
+    restoreEnvLocal(envSnapshot, log);
   });
   if (downAttempted && !downError) {
     try {
