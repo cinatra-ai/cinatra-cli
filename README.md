@@ -26,6 +26,7 @@ Requires Node.js >= 24.
 
     cinatra install --mode dev       # set up OR reconcile a dev instance (single entrypoint)
     cinatra install --mode prod      # set up OR reconcile a production instance
+    cinatra install --mode demo      # a dev superset: bundled apps + sample data, pre-connected
     cinatra status                   # check an instance's status
     cinatra doctor                   # diagnose your local setup
     cinatra agents install <name>    # add an agent to your instance
@@ -36,6 +37,16 @@ instance exist or make it healthy: run it on a clean machine to bootstrap from
 scratch, or re-run it on an existing checkout to reconcile it (it skips the clone
 and just re-runs the in-repo provisioning phase — there is no separate `setup`
 command to remember).
+
+`--mode demo` is a **strict superset of `--mode dev`**: identical dev base (same
+runtime, extensions, and setup), plus the demo overlay — it brings up the bundled
+third-party apps (WordPress, Drupal, Twenty, Plane), loads coherent sample data
+into Cinatra and each app, and leaves every app pre-connected, so a single command
+yields a fully-populated, click-around demo. It stays `CINATRA_RUNTIME_MODE=development`
+and rides an orthogonal `CINATRA_INSTALL_PROFILE=demo` signal, so `dev`/`prod`
+behaviour is unchanged. Demo requires a Cinatra checkout that ships the demo overlay;
+on a checkout that predates it, `--mode demo` refuses with a clear message rather
+than producing a half-populated instance.
 
 The other local host/monorepo bootstrap commands you run from inside a Cinatra
 checkout live under `cinatra instance …`:

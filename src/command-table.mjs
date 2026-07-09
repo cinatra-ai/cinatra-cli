@@ -75,7 +75,8 @@ export const COMMAND_DESCRIPTORS = [
     id: "install",
     path: ["install"],
     match: "command",
-    summary: "Bootstrap OR reconcile a Cinatra dev/prod instance — the single idempotent entrypoint.",
+    summary:
+      "Bootstrap OR reconcile a Cinatra dev/prod/demo instance — the single idempotent entrypoint (--mode demo = a dev superset with the bundled apps + sample data, pre-connected).",
   },
   {
     id: "update",

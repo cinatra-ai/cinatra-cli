@@ -60,7 +60,11 @@ const REGISTRY_VERSION = 1;
 //                    its resources are NOT install-owned → never auto-dropped.
 export const INSTANCE_STATES = new Set(["provisioning", "ready", "external"]);
 
-const VALID_MODES = new Set(["dev", "prod"]);
+// `demo` (cinatra-cli#122) is a recorded install mode — a dev superset that
+// additionally activates the demo overlay. It round-trips through the registry
+// + marker so a reconcile of a demo instance stays demo (re-applies the profile)
+// rather than silently downgrading to dev.
+const VALID_MODES = new Set(["dev", "prod", "demo"]);
 // infraMode:
 //   - "new"      → an install-owned Docker stack (default / isolated).
 //   - "external" → operator-supplied infra; resources are not install-owned.
@@ -282,7 +286,9 @@ export function allocateInstance(registry, slug, fields) {
     throw new Error("allocateInstance requires a non-empty composeFiles[].");
   }
   if (!VALID_MODES.has(mode)) {
-    throw new Error(`allocateInstance requires mode "dev" or "prod" (got ${JSON.stringify(mode)}).`);
+    throw new Error(
+      `allocateInstance requires mode one of ${JSON.stringify([...VALID_MODES])} (got ${JSON.stringify(mode)}).`,
+    );
   }
   if (!VALID_INFRA_MODES.has(infraMode)) {
     throw new Error(

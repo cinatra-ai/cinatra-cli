@@ -240,7 +240,32 @@ function readOption(argv, flag) {
   return value;
 }
 
-const VALID_MODES = new Set(["dev", "prod"]);
+// cinatra-cli#122: `demo` is a STRICT SUPERSET of `dev` — it is NOT a third
+// runtime mode. It resolves to the SAME `CINATRA_RUNTIME_MODE=development`
+// runtime (every dev-mode gate + dev-auto-setup connector wiring still fire) and
+// follows every dev install branch; the ONLY differences are an orthogonal
+// `CINATRA_INSTALL_PROFILE=demo` signal (the contract cinatra#1237 established),
+// the demo overlay it activates target-side (bundled apps + sample data +
+// auto-connect), and the marker/registry record. Keeping it a peer value of the
+// `--mode` enum (rather than a `--demo` flag) matches the documented
+// `--mode dev|prod` surface and lets the marker/reconcile round-trip it.
+const VALID_MODES = new Set(["dev", "prod", "demo"]);
+// The install profiles a `--mode` value maps to. `dev`/`prod` carry no profile
+// (the default, fixtures-off dev behaviour post-cinatra#1237); `demo` carries
+// the `demo` profile. Used to (1) drive the child `CINATRA_INSTALL_PROFILE`
+// env, (2) persist/clear the key in `.env.local`, and (3) gate the target
+// capability check. A single source of truth so no site special-cases "demo".
+const INSTALL_PROFILE_FOR_MODE = { dev: null, prod: null, demo: "demo" };
+/** True for the modes that take the DEV install path (clone dev extensions,
+ *  dev setup, dev-auto-setup). `demo` is dev-like everywhere except the profile
+ *  signal — so every `mode === "dev"` install branch must use this. */
+export function isDevLikeMode(mode) {
+  return mode === "dev" || mode === "demo";
+}
+/** The install profile literal for a mode (or null). */
+export function installProfileForMode(mode) {
+  return INSTALL_PROFILE_FOR_MODE[mode] ?? null;
+}
 // A git ref we are willing to `checkout`: a branch/tag name or a commit sha.
 // Conservative — no whitespace, no leading dash (option-injection), no `..`,
 // no refspec/glob metacharacters. Covers `main`, dotted release tags, and
@@ -299,9 +324,22 @@ export function parseInstallArgs(argv = []) {
   let mode = "dev";
   if (modeOpt != null) {
     if (!VALID_MODES.has(modeOpt)) {
-      throw new Error(`Invalid --mode "${modeOpt}". Use "dev" or "prod".`);
+      throw new Error(
+        `Invalid --mode "${modeOpt}". Use one of: ${[...VALID_MODES].join(", ")}.`,
+      );
     }
     mode = modeOpt;
+  }
+
+  // cinatra-cli#122: `--skip-dev-apps` skips cloning/bringing up the bundled dev
+  // apps — which are exactly what `demo` exists to populate. Silently honouring
+  // it would produce a hollow demo (no apps to seed/connect), so reject the
+  // combination loudly rather than quietly degrade the superset guarantee.
+  if (mode === "demo" && argv.includes("--skip-dev-apps")) {
+    throw new Error(
+      "--skip-dev-apps cannot be combined with --mode demo (demo exists to bring up + seed the bundled apps). " +
+        "Use --mode dev if you want the dev base without the demo apps.",
+    );
   }
 
   const repoUrl = repoUrlOpt ?? DEFAULT_REPO_URL;
@@ -1069,7 +1107,10 @@ export function normalizeRemote(url) {
 // node (no openssl dependency: randomBytes is cross-platform).
 // ---------------------------------------------------------------------------
 
-const RUNTIME_MODE = { dev: "development", prod: "production" };
+// `demo` maps to the SAME `development` runtime as `dev` (cinatra-cli#122): it is
+// a superset of dev, not a third runtime. The demo-specific behaviour rides the
+// orthogonal `CINATRA_INSTALL_PROFILE=demo` axis, never `CINATRA_RUNTIME_MODE`.
+const RUNTIME_MODE = { dev: "development", prod: "production", demo: "development" };
 
 // The setup subprocess overlays `process.env` over the target's `.env.local`
 // (collectEnvironment in index.mjs), so an EXPORTED runtime-mode var would win
@@ -1122,6 +1163,11 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
   const envPath = path.join(targetDir, ".env.local");
   const examplePath = path.join(targetDir, ".env.example");
   const wantMode = RUNTIME_MODE[mode];
+  // cinatra-cli#122: the install profile the mode implies (`demo` ⇒ "demo";
+  // dev/prod ⇒ null). Persisted to `.env.local` so it survives beyond the setup
+  // subprocess — the app's own dev-boot (`pnpm dev`) reads it from there to gate
+  // the demo fixtures seeder (cinatra#1237).
+  const profile = installProfileForMode(mode);
 
   if (existsSync(envPath) && !resetEnv) {
     const current = readEnvMode(envPath);
@@ -1137,6 +1183,20 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
         `.env.local has CINATRA_RUNTIME_MODE=${normalized} but --mode ${mode} was requested. ` +
           `Update or remove ${envPath}, or pass --reset-env to regenerate it.`,
       );
+    }
+    // Reconcile ONLY the install-profile line, in place. For a plain dev/prod
+    // reconcile with no profile key this is a no-op (byte-unchanged); for demo
+    // it ensures the key is present; downgrading demo → dev/prod clears it.
+    const { body: reconciled, changed } = reconcileInstallProfile(readFileSync(envPath, "utf8"), profile);
+    if (changed) {
+      writeFileSync(envPath, reconciled, { mode: 0o600 });
+      tightenEnvLocalPerms(envPath);
+      log(
+        profile
+          ? `  .env.local already exists (${normalized ?? "mode unset"}) — set CINATRA_INSTALL_PROFILE=${profile} (${mode}).`
+          : `  .env.local already exists (${normalized ?? "mode unset"}) — cleared CINATRA_INSTALL_PROFILE (${mode}).`,
+      );
+      return { created: false, envPath };
     }
     log(`  .env.local already exists (${normalized ?? "mode unset"}) — preserving it (pass --reset-env to regenerate).`);
     return { created: false, envPath };
@@ -1160,13 +1220,18 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
   body = upsertEnvKey(body, "NANGO_ENCRYPTION_KEY", nangoEncryptionKey);
   body = upsertEnvKey(body, "CINATRA_BRIDGE_TOKEN", bridgeToken);
   body = upsertEnvKey(body, "CINATRA_RUNTIME_MODE", wantMode);
+  // cinatra-cli#122: stamp the demo install profile so `pnpm dev` seeds the demo
+  // fixtures. dev/prod carry no profile line (default fixtures-off, cinatra#1237).
+  if (profile) body = upsertEnvKey(body, "CINATRA_INSTALL_PROFILE", profile);
   writeFileSync(envPath, body, { mode: 0o600 });
   // `.env.local` holds minted secrets (and, for an isolated instance, the infra
   // secret surface the generated compose resolves) — keep it owner-only. `mode`
   // applies on creation; copyFileSync above may have inherited a wider example
   // mode, so chmod explicitly (best-effort on platforms without chmod semantics).
   tightenEnvLocalPerms(envPath);
-  log(`  .env.local created from .env.example with fresh BETTER_AUTH_SECRET, NANGO_ENCRYPTION_KEY, CINATRA_BRIDGE_TOKEN, and CINATRA_RUNTIME_MODE=${wantMode}.`);
+  log(
+    `  .env.local created from .env.example with fresh BETTER_AUTH_SECRET, NANGO_ENCRYPTION_KEY, CINATRA_BRIDGE_TOKEN, and CINATRA_RUNTIME_MODE=${wantMode}${profile ? `, CINATRA_INSTALL_PROFILE=${profile}` : ""}.`,
+  );
   return { created: true, envPath };
 }
 
@@ -1188,6 +1253,17 @@ function upsertEnvKey(body, key, value) {
   if (re.test(body)) return body.replace(re, `${key}=${value}`);
   const sep = body.endsWith("\n") || body.length === 0 ? "" : "\n";
   return `${body}${sep}${key}=${value}\n`;
+}
+
+/** Reconcile the `CINATRA_INSTALL_PROFILE` line in `body` to match `profile`
+ *  (the demo literal, or null to clear it). Returns `{ body, changed }` and only
+ *  reports `changed` when the resulting bytes differ — so a plain dev/prod
+ *  reconcile (no profile, key already absent) is a no-op and never rewrites
+ *  `.env.local` (cinatra-cli#122 AC8: dev/prod behaviour byte-unchanged). */
+export function reconcileInstallProfile(body, profile) {
+  const KEY = "CINATRA_INSTALL_PROFILE";
+  const next = profile ? upsertEnvKey(body, KEY, profile) : removeEnvKey(body, KEY);
+  return { body: next, changed: next !== body };
 }
 
 // ---------------------------------------------------------------------------
@@ -1316,25 +1392,84 @@ function acquireProdExtensions({ targetDir, log = console.log }) {
   );
 }
 
+/** Capability gate for `--mode demo` (cinatra-cli#122).
+ *
+ *  `demo` is only meaningful when the RESOLVED checkout ships the demo overlay:
+ *  the target-side `setup` support that reads `CINATRA_INSTALL_PROFILE=demo` to
+ *  bring up the bundled apps (WordPress/Drupal/Twenty/Plane), seed their sample
+ *  data, seed the Cinatra fixtures dataset, and pre-connect each app. That
+ *  overlay lands in cinatra-ai/cinatra; the CLI cannot manufacture it. So rather
+ *  than let `--mode demo` silently produce a HOLLOW result (a dev install with
+ *  no apps) on a checkout that predates the overlay, refuse LOUDLY and early.
+ *
+ *  Contract: the target declares support via `package.json` →
+ *  `cinatra.installProfiles`, a string array that MUST include `"demo"`. dev/prod
+ *  need no declaration (they are unconditional). Absent/short array ⇒ the ref
+ *  does not yet support demo. This is the single, documented capability signal
+ *  the cinatra demo-overlay work adds alongside the overlay itself. */
+export function assertTargetSupportsDemo(targetDir) {
+  const pkgPath = path.join(targetDir, "package.json");
+  const hint =
+    "`--mode demo` needs a Cinatra checkout that ships the demo overlay " +
+    "(bundled apps + sample data + auto-connect). Point --ref at a ref that " +
+    "includes it, or use --mode dev for the plain dev base.";
+  if (!existsSync(pkgPath)) {
+    throw new Error(`Cannot verify demo support: ${pkgPath} is missing from the checkout. ${hint}`);
+  }
+  let profiles;
+  try {
+    profiles = JSON.parse(readFileSync(pkgPath, "utf8"))?.cinatra?.installProfiles;
+  } catch (err) {
+    throw new Error(`Cannot verify demo support: ${pkgPath} is not valid JSON (${err.message}). ${hint}`);
+  }
+  if (!Array.isArray(profiles) || !profiles.includes("demo")) {
+    throw new Error(
+      `This Cinatra checkout does not support \`--mode demo\` yet ` +
+        `(package.json \`cinatra.installProfiles\` does not include "demo"). ${hint}`,
+    );
+  }
+}
+
 function runSetupInTarget({ targetDir, mode, skipDevApps, log = console.log }) {
   // The command-routing contract (renamed cinatra-cli#61): invoke the CANONICAL namespaced form
   // (`cinatra instance setup <mode>`) — the only form that resolves (the bare
   // `setup <mode>` was removed in cinatra-cli#81).
-  const setupArgs = [PUBLISHED_CLI_BIN, "instance", "setup", mode];
-  if (mode === "dev" && skipDevApps) setupArgs.push("--skip-dev-apps");
-  log(`- Running \`cinatra instance setup ${mode}\` inside ${targetDir}…`);
-  runOrThrow(process.execPath, setupArgs, `cinatra instance setup ${mode} failed inside the target.`, {
+  //
+  // cinatra-cli#122: `demo` drives the DEV setup path (it is a dev superset, and
+  // there is no `instance setup demo` subcommand — the demo behaviour rides the
+  // orthogonal `CINATRA_INSTALL_PROFILE=demo` env, cinatra#1237). So the child
+  // command is `instance setup dev`; the demo-ness is carried by the profile env
+  // + the target's own demo overlay, not by the setup subcommand name.
+  const setupMode = mode === "demo" ? "dev" : mode;
+  const profile = installProfileForMode(mode);
+  const setupArgs = [PUBLISHED_CLI_BIN, "instance", "setup", setupMode];
+  if (setupMode === "dev" && skipDevApps) setupArgs.push("--skip-dev-apps");
+  const label = profile ? `${setupMode} (${profile} profile)` : setupMode;
+  log(`- Running \`cinatra instance setup ${setupMode}\` inside ${targetDir}${profile ? ` [${profile} profile]` : ""}…`);
+  runOrThrow(process.execPath, setupArgs, `cinatra instance setup ${label} failed inside the target.`, {
     cwd: targetDir,
-    // Defensive belt-and-braces: the cwd-walk already resolves the root, but
-    // pin CINATRA_REPO_ROOT so a stray ambient value can't redirect the child,
-    // and pin the runtime mode to the one we just wrote into .env.local so an
-    // (unset-but-later-exported) ambient value can never mis-mode the child.
-    env: {
-      ...process.env,
-      CINATRA_REPO_ROOT: targetDir,
-      CINATRA_RUNTIME_MODE: RUNTIME_MODE[mode],
-    },
+    env: buildSetupChildEnv({ mode, targetDir }),
   });
+}
+
+/** Build the environment for the target `instance setup` child (cinatra-cli#122).
+ *
+ *  - `CINATRA_REPO_ROOT` / `CINATRA_RUNTIME_MODE` pins: defensive belt-and-braces
+ *    so a stray ambient value can't redirect the child or mis-mode it.
+ *  - `CINATRA_INSTALL_PROFILE` is pinned for EVERY mode: set to the mode's profile
+ *    literal (demo ⇒ "demo") and otherwise DELETED — so an ambient
+ *    `CINATRA_INSTALL_PROFILE=demo` in the operator's shell can never leak into a
+ *    plain dev/prod setup child (which would wrongly seed demo fixtures). */
+export function buildSetupChildEnv({ mode, targetDir, baseEnv = process.env }) {
+  const childEnv = {
+    ...baseEnv,
+    CINATRA_REPO_ROOT: targetDir,
+    CINATRA_RUNTIME_MODE: RUNTIME_MODE[mode],
+  };
+  delete childEnv.CINATRA_INSTALL_PROFILE;
+  const profile = installProfileForMode(mode);
+  if (profile) childEnv.CINATRA_INSTALL_PROFILE = profile;
+  return childEnv;
 }
 
 // ---------------------------------------------------------------------------
@@ -1790,7 +1925,7 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
   //      run BEFORE setup (which needs the installed deps); a failure there
   //      rolls back the (DB-less) provisioning slot rather than orphaning it.
   try {
-    if (opts.mode === "dev" && deps.skipCoUseInstall !== true) {
+    if (isDevLikeMode(opts.mode) && deps.skipCoUseInstall !== true) {
       log("- Cloning declared companion extension repos (cinatra.devExtensions)…");
       const extResult = await syncCinatraDevExtensions({
         repoRoot: targetDir,
@@ -4247,6 +4382,15 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   }
   log(`✓ Cinatra checked out at ${targetDir} @ ${resolvedSha} (ref: ${opts.ref}).`);
 
+  // cinatra-cli#122: `--mode demo` requires the resolved checkout to ship the
+  // demo overlay (bundled apps + sample data + auto-connect). Verify it NOW —
+  // right after the checkout materializes, before writing .env.local, bringing
+  // up infra, or running setup — so a checkout that predates the overlay fails
+  // LOUDLY and early rather than silently producing a hollow "dev + fixtures"
+  // instance. Covers every install path (default / isolated / attach) since the
+  // clone above is common to all of them.
+  if (opts.mode === "demo") assertTargetSupportsDemo(targetDir);
+
   // Locally git-ignore the per-checkout marker dir + the generated isolated
   // compose so neither dirties the working tree (keeps idempotent re-runs clean;
   // needs no change to the cinatra repo). cinatra-cli#17.
@@ -4449,7 +4593,8 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   //    first `pnpm install` resolves the workspace.
   const usePnpmDirect = !commandExists("corepack", ["--version"]) && commandExists("pnpm", ["--version"]);
 
-  if (opts.mode === "dev") {
+  if (isDevLikeMode(opts.mode)) {
+    // (demo overlay support was verified right after checkout, above.)
     log("- Cloning declared companion extension repos (cinatra.devExtensions)…");
     const extResult = await syncCinatraDevExtensions({
       repoRoot: targetDir,
@@ -4463,16 +4608,17 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     }
 
     if (opts.noInstall) {
-      log("- Skipping dependency install + setup (--no-install). Checkout + env are ready; re-run `cinatra install --mode dev` (it reconciles in place — skips the clone, runs deps + setup) when ready.");
+      log(`- Skipping dependency install + setup (--no-install). Checkout + env are ready; re-run \`cinatra install --mode ${opts.mode}\` (it reconciles in place — skips the clone, runs deps + setup) when ready.`);
     } else {
       pnpmInstall({ targetDir, usePnpmDirect, log });
       if (opts.noSetup) {
-        log("- Skipping setup (--no-setup). Checkout + deps are ready; re-run `cinatra install --mode dev` (it reconciles in place — runs the setup phase) when ready.");
+        log(`- Skipping setup (--no-setup). Checkout + deps are ready; re-run \`cinatra install --mode ${opts.mode}\` (it reconciles in place — runs the setup phase) when ready.`);
       } else {
         // devApps are cloned by `setup dev` itself; passing --skip-dev-apps
         // through honors the operator's choice. (We do NOT sync devApps here to
-        // avoid double-cloning.)
-        runSetupInTarget({ targetDir, mode: "dev", skipDevApps: opts.skipDevApps, log });
+        // avoid double-cloning.) `demo` drives the same dev setup path + the
+        // orthogonal CINATRA_INSTALL_PROFILE=demo signal (see runSetupInTarget).
+        runSetupInTarget({ targetDir, mode: opts.mode, skipDevApps: opts.skipDevApps, log });
       }
     }
   } else if (opts.noInstall) {

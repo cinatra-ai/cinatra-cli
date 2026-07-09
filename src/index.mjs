@@ -356,7 +356,7 @@ function printHelp() {
   console.log(`Cinatra setup CLI
 
 Usage:
-  cinatra install [--dir <path>] [--ref <main|tag|sha>] [--mode dev|prod]
+  cinatra install [--dir <path>] [--ref <main|tag|sha>] [--mode dev|prod|demo]
                   [--repo-url <url>] [--yes] [--force] [--reset-env]
                   [--skip-dev-apps] [--no-infra] [--no-install] [--no-setup]
                   [--on-conflict fail|prompt|isolated|stop-existing|attach|external|co-use]
@@ -411,7 +411,12 @@ Commands:
                     phase; a dirty checkout is refused unless --force (stashes).
                     --dir <path>      Install location (default: ./cinatra; prompts on a TTY).
                     --ref <ref>       Branch, tag, or commit to install (default: main).
-                    --mode dev|prod   Install mode (default: dev).
+                    --mode dev|prod|demo
+                                      Install mode (default: dev). "demo" is a
+                                      strict superset of dev: the same dev base
+                                      plus the bundled apps (WordPress/Drupal/
+                                      Twenty/Plane) with sample data, pre-connected
+                                      (needs a checkout shipping the demo overlay).
                     --repo-url <url>  Override the cinatra repo remote (HTTPS-token or SSH).
                     --yes             Accept defaults / confirmations (non-interactive / CI).
                     --force           Update a DIRTY checkout (stash first); clone into a non-empty dir.
@@ -638,7 +643,7 @@ These run from inside a cinatra checkout and manage a local Cinatra instance
 the app server is down.
 
 To create OR reconcile an instance, use the single idempotent bootstrap command:
-  cinatra install --mode dev|prod   (from-zero OR re-runnable reconcile)
+  cinatra install --mode dev|prod|demo   (from-zero OR re-runnable reconcile)
 The in-repo provisioning phase (\`setup\`) is now folded into \`install\`; the
 commands below manage an EXISTING instance / env slice.
 
