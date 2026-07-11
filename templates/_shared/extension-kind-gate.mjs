@@ -1444,6 +1444,10 @@ export function collectArtifactParityFindings(packageRoot, pkg) {
 /** Validate an agent extension at packageRoot. Pure: returns string[] errors. */
 export function validateAgent(packageRoot) {
   const errors = [];
+  // Typed project-template sidecar (optional; validated hard when present —
+  // the install pipeline REFUSES a violating package, so the local gate must
+  // catch it pre-publish).
+  errors.push(...validateProjectTemplateSidecar(packageRoot));
   const oasPath = join(packageRoot, "cinatra", "oas.json");
   // OAS optional at this gate: an agent without a generated OAS has no
   // LLM-visible prompt strings to scan. Marketplace-side owns "agent MUST ship OAS".
@@ -1458,6 +1462,279 @@ export function validateAgent(packageRoot) {
   const findings = [];
   walkLlmStrings(parsed, (field, text) => scanOasString(field, text, findings));
   for (const f of findings) errors.push(`cinatra/oas.json [${f.field}] ${f.token}: ${f.reason}`);
+  return errors;
+}
+
+// ===========================================================================
+// agent gate — typed PROJECT-TEMPLATE sidecar (cinatra/project-template.json).
+// Mirror of the AUTHORITATIVE host enforcers in the cinatra monorepo:
+// packages/sdk-extensions/src/project-template-contract.ts
+// (validateProjectTemplate — collect-ALL structural violations — plus the
+// exact-match "one truth source" worker-ref rule
+// checkTemplateWorkerRefsAgainstDependencies), wired into the install
+// pipeline by packages/agents/src/install-from-package.ts. An agent package
+// that ships a template the host would refuse must fail HERE, pre-publish.
+// The bracketed [code] tokens mirror the host violation codes one-to-one so
+// the parity fixtures can pin both sides.
+// ===========================================================================
+export const PROJECT_TEMPLATE_FORMAT_VERSION = "cinatra.ai/project-template@1";
+const PROJECT_TEMPLATE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+function isValidTemplateStableId(v) {
+  return typeof v === "string" && PROJECT_TEMPLATE_ID_RE.test(v);
+}
+
+function isValidTemplateVersionConstraint(v) {
+  if (!isObj(v)) return false;
+  if (v.kind === "semver-range") return typeof v.range === "string";
+  if (v.kind === "exact") return typeof v.version === "string";
+  if (v.kind === "git-ref") return typeof v.ref === "string";
+  return false;
+}
+
+function templateVersionConstraintsEqual(a, b) {
+  if (!isObj(a) || !isObj(b) || a.kind !== b.kind) return false;
+  if (a.kind === "semver-range") return a.range === b.range;
+  if (a.kind === "exact") return a.version === b.version;
+  if (a.kind === "git-ref") return a.ref === b.ref;
+  return false;
+}
+
+/** DFS cycle detection over well-formed dependsOn edges (mirrors the host's
+ * findDependencyCycle: only follows edges to known ids, never self). */
+function findTemplateDependencyCycle(tasks, knownIds) {
+  const edges = new Map();
+  for (const t of tasks) {
+    if (!isObj(t) || typeof t.id !== "string") continue;
+    const deps = Array.isArray(t.dependsOn)
+      ? t.dependsOn.filter((d) => typeof d === "string" && knownIds.has(d) && d !== t.id)
+      : [];
+    edges.set(t.id, deps);
+  }
+  const color = new Map(); // 0 white, 1 gray, 2 black
+  const stack = [];
+  const visit = (id) => {
+    color.set(id, 1);
+    stack.push(id);
+    for (const next of edges.get(id) ?? []) {
+      const c = color.get(next) ?? 0;
+      if (c === 1) return [...stack.slice(stack.indexOf(next)), next];
+      if (c === 0) {
+        const found = visit(next);
+        if (found) return found;
+      }
+    }
+    stack.pop();
+    color.set(id, 2);
+    return null;
+  };
+  for (const id of edges.keys()) {
+    if ((color.get(id) ?? 0) === 0) {
+      const found = visit(id);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+/** Structural template validation — mirror of the host validateProjectTemplate
+ * (collect-ALL, deterministic order). Pure: returns string[] errors. */
+export function validateProjectTemplateObject(input) {
+  const errors = [];
+  const push = (code, path, message) => errors.push(`[${code}] ${path || "(root)"}: ${message}`);
+  if (!isObj(input)) {
+    push("not_object", "", "template must be an object");
+    return errors;
+  }
+  if (input.formatVersion !== PROJECT_TEMPLATE_FORMAT_VERSION) {
+    push("bad_format_version", "formatVersion", `formatVersion must be "${PROJECT_TEMPLATE_FORMAT_VERSION}"`);
+  }
+  if (!isValidTemplateStableId(input.id)) push("bad_template_id", "id", "id must be a stable token");
+  if (typeof input.name !== "string" || input.name.trim() === "") {
+    push("bad_template_name", "name", "name must be a non-empty string");
+  }
+  if (!isObj(input.anchor) || !isValidTemplateStableId(input.anchor.id)) {
+    push("bad_anchor", "anchor.id", "anchor.id must be a stable token");
+  }
+  const tasks = input.tasks;
+  if (!Array.isArray(tasks) || tasks.length === 0) {
+    push("no_tasks", "tasks", "tasks must be a non-empty array");
+    return errors;
+  }
+  const taskIds = new Set();
+  const roleToBinding = new Map();
+  tasks.forEach((task, i) => {
+    if (!isObj(task)) {
+      push("bad_task", `tasks[${i}]`, "task must be an object");
+      return;
+    }
+    if (!isValidTemplateStableId(task.id)) {
+      push("bad_task_id", `tasks[${i}].id`, "task id must be a stable token (no path separator)");
+    } else if (taskIds.has(task.id)) {
+      push("duplicate_task_id", `tasks[${i}].id`, `duplicate task id "${task.id}"`);
+    } else {
+      taskIds.add(task.id);
+    }
+    if (typeof task.title !== "string" || task.title.trim() === "") {
+      push("bad_task_title", `tasks[${i}].title`, "task title must be a non-empty string");
+    }
+  });
+  tasks.forEach((task, i) => {
+    if (!isObj(task)) return;
+    const at = `tasks[${i}]`;
+    if (task.dependsOn !== undefined) {
+      if (!Array.isArray(task.dependsOn)) {
+        push("bad_depends_on", `${at}.dependsOn`, "dependsOn must be an array of task ids");
+      } else {
+        const seen = new Set();
+        task.dependsOn.forEach((dep, j) => {
+          if (typeof dep !== "string" || !taskIds.has(dep)) {
+            push("unknown_dependency", `${at}.dependsOn[${j}]`, `dependsOn "${String(dep)}" is not a task id`);
+          } else if (dep === task.id) {
+            push("self_dependency", `${at}.dependsOn[${j}]`, "a task cannot depend on itself");
+          } else if (seen.has(dep)) {
+            push("duplicate_dependency", `${at}.dependsOn[${j}]`, `duplicate dependency "${dep}"`);
+          } else {
+            seen.add(dep);
+          }
+        });
+      }
+    }
+    if (task.schedule !== undefined && task.schedule !== null) {
+      if (!isObj(task.schedule)) {
+        push("bad_schedule", `${at}.schedule`, "schedule must be an object");
+      } else {
+        const s = task.schedule.startOffsetDays;
+        const d = task.schedule.dueOffsetDays;
+        if (s !== undefined && s !== null && !Number.isInteger(s)) {
+          push("bad_offset", `${at}.schedule.startOffsetDays`, "startOffsetDays must be an integer");
+        }
+        if (d !== undefined && d !== null && !Number.isInteger(d)) {
+          push("bad_offset", `${at}.schedule.dueOffsetDays`, "dueOffsetDays must be an integer");
+        }
+        if (
+          typeof s === "number" && Number.isFinite(s) &&
+          typeof d === "number" && Number.isFinite(d) &&
+          d < s
+        ) {
+          push("due_before_start", `${at}.schedule.dueOffsetDays`, "dueOffsetDays must be >= startOffsetDays");
+        }
+      }
+    }
+    if (task.worker !== undefined && task.worker !== null) {
+      const w = task.worker;
+      const wAt = `${at}.worker`;
+      const roleOk = isObj(w) && isValidTemplateStableId(w.role);
+      if (!roleOk) push("bad_worker_role", `${wAt}.role`, "worker.role must be a stable token");
+      if (!isObj(w) || typeof w.packageName !== "string" || w.packageName.trim() === "") {
+        push("bad_worker_package", `${wAt}.packageName`, "worker.packageName must be a non-empty string");
+      }
+      if (!isObj(w) || !isValidTemplateVersionConstraint(w.versionConstraint)) {
+        push("bad_worker_version", `${wAt}.versionConstraint`, "worker.versionConstraint is malformed");
+      }
+      if (roleOk && typeof w.packageName === "string" && isValidTemplateVersionConstraint(w.versionConstraint)) {
+        const prev = roleToBinding.get(w.role);
+        if (!prev) {
+          roleToBinding.set(w.role, { packageName: w.packageName, versionConstraint: w.versionConstraint });
+        } else if (
+          prev.packageName !== w.packageName ||
+          !templateVersionConstraintsEqual(prev.versionConstraint, w.versionConstraint)
+        ) {
+          push("inconsistent_worker_role", `${wAt}.role`, `role "${w.role}" is bound to more than one package/version`);
+        }
+      }
+    }
+    if (task.approval !== undefined && task.approval !== null) {
+      if (!isObj(task.approval) || !isValidTemplateStableId(task.approval.id)) {
+        push("bad_approval", `${at}.approval.id`, "approval.id must be a stable token");
+      }
+    }
+    if (task.acceptance !== undefined) {
+      if (!Array.isArray(task.acceptance)) {
+        push("bad_acceptance", `${at}.acceptance`, "acceptance must be an array");
+      } else {
+        const seen = new Set();
+        task.acceptance.forEach((c, j) => {
+          const cAt = `${at}.acceptance[${j}]`;
+          if (!isObj(c) || !isValidTemplateStableId(c.id)) {
+            push("bad_acceptance_id", `${cAt}.id`, "acceptance.id must be a stable token");
+          } else if (seen.has(c.id)) {
+            push("duplicate_acceptance_id", `${cAt}.id`, `duplicate acceptance id "${c.id}"`);
+          } else {
+            seen.add(c.id);
+          }
+          if (isObj(c) && (typeof c.description !== "string" || c.description.trim() === "")) {
+            push("bad_acceptance_desc", `${cAt}.description`, "acceptance.description must be non-empty");
+          }
+        });
+      }
+    }
+  });
+  const cycle = findTemplateDependencyCycle(tasks, taskIds);
+  if (cycle) push("cyclic_dependencies", "tasks", `dependency cycle: ${cycle.join(" -> ")}`);
+  return errors;
+}
+
+/** The exact-match "one truth source" worker-ref rule — mirror of the host
+ * checkTemplateWorkerRefsAgainstDependencies: every template worker ref MUST
+ * exact-match a manifest cinatra.dependencies edge by BOTH packageName AND
+ * versionConstraint. Pure: returns string[] errors. */
+export function checkTemplateWorkerRefsAgainstManifest(template, dependencies) {
+  const errors = [];
+  const byPackage = new Map();
+  for (const dep of Array.isArray(dependencies) ? dependencies : []) {
+    if (isObj(dep) && typeof dep.packageName === "string") byPackage.set(dep.packageName, dep);
+  }
+  const tasks = Array.isArray(template?.tasks) ? template.tasks : [];
+  tasks.forEach((task, i) => {
+    const w = isObj(task) ? task.worker : null;
+    if (!w || !isObj(w)) return;
+    const at = `tasks[${i}].worker`;
+    const edge = byPackage.get(w.packageName);
+    if (!edge) {
+      errors.push(`[worker_not_in_dependencies] ${at}.packageName: worker "${w.packageName}" is not declared in cinatra.dependencies`);
+      return;
+    }
+    if (!templateVersionConstraintsEqual(w.versionConstraint, edge.versionConstraint)) {
+      errors.push(`[worker_version_mismatch] ${at}.versionConstraint: worker "${w.packageName}" version does not exact-match its cinatra.dependencies edge`);
+    }
+  });
+  return errors;
+}
+
+/** Validate the optional cinatra/project-template.json sidecar of an agent
+ * package. Absent file → no errors (not a project-template package). Present →
+ * structural validation + the exact-match worker-ref rule against the
+ * manifest's cinatra.dependencies. Returns string[] errors, each prefixed with
+ * the sidecar path. */
+export function validateProjectTemplateSidecar(packageRoot) {
+  const templatePath = join(packageRoot, "cinatra", "project-template.json");
+  if (!existsSync(templatePath)) return [];
+  const prefix = "cinatra/project-template.json";
+  let raw;
+  try {
+    raw = readFileSync(templatePath, "utf8");
+  } catch (err) {
+    return [`${prefix} [template_unreadable]: ${err instanceof Error ? err.message : String(err)}`];
+  }
+  let candidate;
+  try {
+    candidate = JSON.parse(raw);
+  } catch (err) {
+    return [`${prefix} [template_unparsable]: not valid JSON: ${err instanceof Error ? err.message : String(err)}`];
+  }
+  const errors = validateProjectTemplateObject(candidate).map((e) => `${prefix} ${e}`);
+  if (errors.length > 0) return errors;
+  let pkg;
+  try {
+    pkg = readPackageJson(packageRoot);
+  } catch {
+    // The common gate already reports an unreadable package.json; the
+    // worker-ref rule simply cannot run without it.
+    return errors;
+  }
+  const deps = Array.isArray(pkg?.cinatra?.dependencies) ? pkg.cinatra.dependencies : [];
+  errors.push(...checkTemplateWorkerRefsAgainstManifest(candidate, deps).map((e) => `${prefix} ${e}`));
   return errors;
 }
 
