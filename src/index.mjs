@@ -666,6 +666,7 @@ Usage:
   cinatra instance clone list
   cinatra instance db migrate [--down] [--count=N] [--dir <abs> --namespace <ns>]
   cinatra instance db upgrade-preflight [--instance <slug>] [--service <name>] [--target <service>=<version>] [--json]
+  cinatra instance db upgrade-major --service <compose-service> [--instance <slug>] [--json]
   cinatra instance refresh [--docker=auto|always|--no-docker] [--with-dev-apps]
   cinatra instance tunnel start
   cinatra instance tunnel stop
@@ -712,6 +713,12 @@ Commands:
                       data-format version (ledger → probe → marker) and report
                       whether recreating its container is safe. Fails CLOSED on
                       unknown/unreadable versions; never recreates anything.
+  instance db upgrade-major
+                      Guarded logical dump→fresh-volume→restore for a Postgres
+                      instance whose supported major upgrade is pending (matrix-
+                      driven; the preflight's STOP names this command). Trans-
+                      actional: any failure rolls back onto the intact source
+                      volume; the retired volume + backups are preserved.
   instance refresh    Reconcile your local dev environment (deps + dev DB schema)
                       to the code on disk. Dev mode only; never touches git.
                       --with-dev-apps: opt in to dev-app reconciliation (skipped
@@ -827,6 +834,30 @@ Options:
   --service <name>             Check only this service (repeatable).
   --target <service>=<version> Model a proposed hop (overrides the derived target).
   --json                       Emit the raw structured report.`,
+  "db.upgrade-major": `Guarded Postgres major upgrade — logical dump→fresh-volume→restore (cinatra-cli#129).
+
+One command covers every Postgres instance in the stack (--service postgres |
+nango-db | twenty-db | plane-db), driven by the supported upgrade matrix: only
+a hop the matrix supports (including the case-scoped nango pg15 exception) is
+executable; everything else is refused with the preflight's fail-closed
+message. The transaction: preflight handshake → disk-space prechecks → quiesce
+running dependents → checksummed globals + per-database dumps (direct file
+writes — a dump failure aborts, never a silent truncation) → fresh target-major
+volume + deployed-version ledger journal → restore into a scratch target
+container (the deployment's own declared mount layout) → per-table content
+read-backs → cutover (the compose volume key is rebound to the restored volume
+via the CLI-managed docker-compose.db-volumes.yml override, recorded in the
+instance row) → ledger COMMIT only after post-verify → dependents restarted.
+Any failure rolls back onto the INTACT source volume with the source ledger
+entry restored. The retired volume and the backup directory are PRESERVED —
+remove them manually only after the upgraded deployment has proven itself.
+After the upgrade, boot the app: it self-bootstraps and runs its own ledgered
+migrations.
+
+Options:
+  --service <compose-service>  Which Postgres instance to upgrade (required).
+  --instance <slug>            Instance (default: resolved from the checkout).
+  --json                       Emit the raw structured result.`,
 };
 
 // cinatra-cli#62: the in-repo provisioning phase ids that are now folded into
@@ -5299,18 +5330,22 @@ async function runDbMigrate(rest) {
 // still checked (integrity-only, target null). Outside a checkout, discovery is
 // ledger-only. `--target <svc>=<ver>` overrides either.
 //
-// FENCED SEAMS (fail-closed stubs here; wired by the upgrade-execution lanes,
-// epic sub-issues 3-4): the live version probe (`SELECT version()`) and the raw
-// PG_VERSION read from the deployment's actual data path. A null probe/marker
-// on a non-empty, un-ledgered volume FAILS CLOSED rather than guessing. The
-// empty-volume check IS real: `docker run --pull=never` over the service's own
-// (already-pulled) image lists the volume root; any failure counts as
+// REAL FALLBACK ADAPTERS (cinatra-cli#128 residual, landed with the #129
+// upgrade-major slice): the live version probe (`SHOW server_version` over the
+// running container's unix socket) and the raw PG_VERSION marker read from the
+// deployment's ACTUAL data path over the service's own already-pulled image
+// (pg18 parent-mount layout handled — see src/pg-adapters.mjs). Both sit BELOW
+// the recorded ledger in the chain and return null on ANY failure, so a
+// non-empty, un-ledgered, unreachable volume still FAILS CLOSED rather than
+// guessing. The empty-volume check is likewise real: `docker run --pull=never`
+// over the service's own image lists the volume root; any failure counts as
 // non-empty (the fail-closed direction).
 // ---------------------------------------------------------------------------
 async function runDbUpgradePreflight(rest) {
   const { runPreflightCommand } = await import("./upgrade-preflight.mjs");
   const { readLedger } = await import("./version-ledger.mjs");
-  const { resolveComposeConfig, statefulServicesFromComposeConfig } = await import("./version-ledger-capture.mjs");
+  const { resolveComposeConfig, statefulServicesFromComposeConfig, resolveRunningServices } = await import("./version-ledger-capture.mjs");
+  const { buildPgProbeAdapter, buildPgMarkerAdapter } = await import("./pg-adapters.mjs");
   const { imageParts } = await import("./upgrade-matrix.mjs");
   const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, findInstanceByInstallDir, getInstance } =
     await import("./instance-registry.mjs");
@@ -5365,22 +5400,28 @@ async function runDbUpgradePreflight(rest) {
   // service's axis carries its RAW tag as the target so the comparison fails
   // closed instead of collapsing into an integrity-only pass.
   const volumeImages = new Map(); // volumeName → image (for the emptiness probe)
+  // service → { containerName, pgUser, volumeName, image } for the REAL
+  // fallback adapters (probe needs a running container + the deployment's
+  // bootstrap user; marker needs the actual volume + an already-pulled image).
+  const serviceMeta = new Map();
   const discover = () => {
     const specs = new Map();
     const { ledger } = readLedger(slug);
     for (const e of Object.values(ledger.services)) {
       specs.set(e.service, { service: e.service, volumeName: e.volume?.name ?? null, target: null });
       if (e.volume?.name && e.image) volumeImages.set(e.volume.name, e.image);
+      serviceMeta.set(e.service, { volumeName: e.volume?.name ?? null, image: e.image ?? null, containerName: null, pgUser: null });
     }
     const configDir = row?.installDir ?? repoRoot;
     if (configDir) {
       const rowProject = row?.composeProject && row.composeProject !== "cinatra" ? row.composeProject : null;
-      const config = resolveComposeConfig({
+      const composeCtx = {
         targetDir: configDir,
         composeFiles: row?.composeFiles ?? null,
         composeProject: rowProject,
         capture: (cmd, args, opts) => (cmd === "docker" ? dockerCapture(args, opts) : null),
-      });
+      };
+      const config = resolveComposeConfig(composeCtx);
       if (!config) {
         throw new Error(
           `could not resolve the compose config for ${configDir} — refusing a partial preflight. ` +
@@ -5388,10 +5429,20 @@ async function runDbUpgradePreflight(rest) {
         );
       }
       const { found, skipped } = statefulServicesFromComposeConfig(config);
+      // Running containers (best-effort): the live probe only fires for a
+      // service that is actually RUNNING; a null listing just means no probe.
+      const running = resolveRunningServices(composeCtx);
       for (const s of found) {
         const target = s.dataFormatVersion ?? imageParts(s.image).tag ?? "unknown";
         specs.set(s.service, { service: s.service, volumeName: s.volumeName, target });
         volumeImages.set(s.volumeName, s.image);
+        const user = typeof s.environment?.POSTGRES_USER === "string" && s.environment.POSTGRES_USER.length ? s.environment.POSTGRES_USER : null;
+        serviceMeta.set(s.service, {
+          volumeName: s.volumeName,
+          image: s.image,
+          containerName: running?.get(s.service)?.name ?? null,
+          pgUser: user,
+        });
       }
       for (const s of skipped) {
         specs.set(s.service, { service: s.service, volumeName: null, target: null, volumeUnidentified: s.reason });
@@ -5449,14 +5500,235 @@ async function runDbUpgradePreflight(rest) {
       if (listing === null) return "present";
       return listing.length === 0 ? "empty" : "present";
     },
-    // Fenced seams (see the header note) — stubbed to the safe default here.
-    probeVersion: () => null,
-    readMarker: () => null,
+    // REAL fallback adapters (src/pg-adapters.mjs): live `SHOW server_version`
+    // probe over the running container, then the raw PG_VERSION marker read
+    // from the deployment's actual data path (pg18 parent-mount layout aware).
+    // Null on any failure — the fail-closed default is preserved.
+    probeVersion: buildPgProbeAdapter({ dockerCapture: (args, opts) => dockerCapture(args, opts), serviceMeta }),
+    readMarker: buildPgMarkerAdapter({ dockerCapture: (args, opts) => dockerCapture(args, opts), serviceMeta }),
     profileEnabled: () => true,
   };
 
   const code = runPreflightCommand(rest, { slug, discover, transport });
   if (code) process.exitCode = code;
+}
+
+// ---------------------------------------------------------------------------
+// `cinatra instance db upgrade-major` — the guarded logical dump→fresh-volume→
+// restore Postgres major upgrade (cinatra-cli#129; engine + transaction frame
+// in src/upgrade-major.mjs). This handler is WIRING ONLY: resolve the instance
+// row (required — the cutover records the volume-rebind override in the row's
+// composeFiles), discover the requested service from the deployment's resolved
+// compose config (image pin = target, actual volume + mount target + bootstrap
+// env — never assumptions), compute the RUNNING reverse-dependents to quiesce,
+// then hand the real docker/compose transport to the engine.
+// ---------------------------------------------------------------------------
+async function runDbUpgradeMajor(rest) {
+  const { parseUpgradeMajorArgs, runUpgradeMajor, buildDockerUpgradeTransport, formatUpgradeResult } =
+    await import("./upgrade-major.mjs");
+  const { runPreflight } = await import("./upgrade-preflight.mjs");
+  const { resolveComposeConfig, statefulServicesFromComposeConfig, resolveRunningServices } =
+    await import("./version-ledger-capture.mjs");
+  const { imageParts } = await import("./upgrade-matrix.mjs");
+  const {
+    requireUsableInstanceRegistry,
+    defaultInstanceRegistryPath,
+    findInstanceByInstallDir,
+    getInstance,
+    updateInstance,
+    writeInstanceRegistry,
+  } = await import("./instance-registry.mjs");
+  const { withAllocLock, defaultAllocLockPath } = await import("./instance-alloc.mjs");
+
+  let parsed;
+  try {
+    parsed = parseUpgradeMajorArgs(rest);
+  } catch (err) {
+    console.error(err.message);
+    process.exitCode = 2;
+    return;
+  }
+
+  let repoRoot = null;
+  try {
+    repoRoot = getRepoRoot();
+  } catch {
+    /* not inside an install checkout — rely on --instance */
+  }
+  const registryPath = defaultInstanceRegistryPath();
+  const registry = requireUsableInstanceRegistry(registryPath);
+  const row = parsed.slug ? getInstance(registry, parsed.slug) : repoRoot ? findInstanceByInstallDir(registry, repoRoot) : null;
+  if (!row) {
+    console.error(
+      "upgrade-major: could not resolve a REGISTERED instance — pass --instance <slug> or run inside an install " +
+        "checkout. (The cutover records the restored volume in the instance row, so an unregistered checkout cannot " +
+        "be upgraded by this command.)",
+    );
+    process.exitCode = 2;
+    return;
+  }
+  const slug = row.slug;
+  const targetDir = row.installDir ?? repoRoot;
+  const rowProject = row.composeProject && row.composeProject !== "cinatra" ? row.composeProject : null;
+  const composeCtx = { targetDir, composeFiles: row.composeFiles ?? null, composeProject: rowProject, envFile: null };
+
+  const dockerCapture = (args, opts = {}) => {
+    try {
+      const r = spawnSync("docker", args, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
+        ...opts,
+      });
+      if (r.status !== 0) return null;
+      return (r.stdout ?? "").trim();
+    } catch {
+      return null;
+    }
+  };
+  const captureSeam = (cmd, args, opts) => (cmd === "docker" ? dockerCapture(args, { cwd: opts?.cwd }) : null);
+
+  const config = resolveComposeConfig({ ...composeCtx, capture: captureSeam });
+  if (!config) {
+    console.error(`upgrade-major: could not resolve the compose config for ${targetDir} — refusing to proceed.`);
+    process.exitCode = 2;
+    return;
+  }
+  const { found } = statefulServicesFromComposeConfig(config);
+  const spec = found.find((s) => s.service === parsed.service) ?? null;
+  if (!spec) {
+    console.error(
+      `upgrade-major: service "${parsed.service}" is not a matrix-known stateful service with an identifiable data ` +
+        `volume in this deployment's resolved compose config. Run \`cinatra instance db upgrade-preflight\` to see ` +
+        `what is checkable here.`,
+    );
+    process.exitCode = 2;
+    return;
+  }
+  const target = spec.dataFormatVersion ?? imageParts(spec.image).tag ?? "unknown";
+
+  // RUNNING reverse-dependents (transitive) — the writers/queue consumers the
+  // transaction quiesces. depends_on edges come from the resolved config; the
+  // running set from `docker compose ps` (a failure to list = fail closed).
+  const running = resolveRunningServices({ ...composeCtx, capture: captureSeam });
+  if (running === null) {
+    console.error("upgrade-major: could not list the running compose services — refusing to plan a quiesce blind.");
+    process.exitCode = 2;
+    return;
+  }
+  const reverse = new Map(); // service → dependents
+  for (const [name, svc] of Object.entries(config.services ?? {})) {
+    const deps = svc?.depends_on;
+    const depNames = Array.isArray(deps) ? deps : deps && typeof deps === "object" ? Object.keys(deps) : [];
+    for (const d of depNames) {
+      if (!reverse.has(d)) reverse.set(d, []);
+      reverse.get(d).push(name);
+    }
+  }
+  const dependents = [];
+  const queue = [parsed.service];
+  const seen = new Set(queue);
+  while (queue.length) {
+    for (const dep of reverse.get(queue.shift()) ?? []) {
+      if (seen.has(dep)) continue;
+      seen.add(dep);
+      queue.push(dep);
+      if (running.has(dep)) dependents.push(dep);
+    }
+  }
+
+  // The engine's preflight handshake: the SAME fail-closed preflight, scoped to
+  // this one service, over a real inspect/emptiness transport plus the real
+  // probe/marker fallback adapters.
+  const { buildPgProbeAdapter, buildPgMarkerAdapter } = await import("./pg-adapters.mjs");
+  const serviceMeta = new Map([
+    [
+      parsed.service,
+      {
+        volumeName: spec.volumeName,
+        image: spec.image,
+        containerName: running.get(parsed.service)?.name ?? null,
+        pgUser:
+          typeof spec.environment?.POSTGRES_USER === "string" && spec.environment.POSTGRES_USER.length
+            ? spec.environment.POSTGRES_USER
+            : null,
+      },
+    ],
+  ]);
+  const inspectVolumeThreeWay = (name) => {
+    try {
+      const r = spawnSync("docker", ["volume", "inspect", name], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
+      });
+      if (r.status === 0) {
+        try {
+          const parsedRow = JSON.parse((r.stdout ?? "").trim());
+          const inspectRow = Array.isArray(parsedRow) ? parsedRow[0] ?? null : parsedRow;
+          return inspectRow ? { status: "ok", row: inspectRow } : { status: "error", row: null };
+        } catch {
+          return { status: "error", row: null };
+        }
+      }
+      if (/no such volume/i.test(`${r.stderr ?? ""}${r.stdout ?? ""}`)) return { status: "absent", row: null };
+      return { status: "error", row: null };
+    } catch {
+      return { status: "error", row: null };
+    }
+  };
+  const preflightTransport = {
+    inspectVolume: (name) => {
+      if (!name) return null;
+      const res = inspectVolumeThreeWay(name);
+      return res.status === "ok" ? res.row : null;
+    },
+    volumeState: (name) => {
+      if (!name) return "absent";
+      const res = inspectVolumeThreeWay(name);
+      if (res.status === "absent") return "absent";
+      if (res.status === "error") return "present";
+      const listing = dockerCapture(
+        ["run", "--rm", "--pull=never", "--entrypoint", "/bin/sh", "-v", `${name}:/__preflight_probe:ro`, spec.image, "-c", "ls -A /__preflight_probe"],
+        { timeout: 60_000 },
+      );
+      if (listing === null) return "present";
+      return listing.length === 0 ? "empty" : "present";
+    },
+    probeVersion: buildPgProbeAdapter({ dockerCapture, serviceMeta }),
+    readMarker: buildPgMarkerAdapter({ dockerCapture, serviceMeta }),
+    profileEnabled: () => true,
+  };
+  const preflight = () =>
+    runPreflight({
+      slug,
+      services: [{ service: parsed.service, volumeName: spec.volumeName, target }],
+      transport: preflightTransport,
+    });
+
+  const updateComposeFiles = async (filesList) =>
+    withAllocLock(defaultAllocLockPath(), async () => {
+      const reg = requireUsableInstanceRegistry(registryPath);
+      writeInstanceRegistry(registryPath, updateInstance(reg, slug, { composeFiles: filesList }));
+    });
+
+  console.log(`==> ${parsed.service}: guarded major upgrade (instance "${slug}")`);
+  const transport = buildDockerUpgradeTransport({
+    slug,
+    spec: { ...spec, target, dependents },
+    composeCtx,
+    preflight,
+    registry: { updateComposeFiles },
+    log: (l) => console.log(l),
+  });
+  const result = await runUpgradeMajor({ slug, service: parsed.service, transport, log: (l) => console.log(l) });
+
+  if (parsed.json) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    console.log(formatUpgradeResult(result));
+  }
+  if (result.status === "failed" || result.status === "refused") process.exitCode = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -11990,6 +12262,9 @@ function buildHandlers() {
     },
     "db.upgrade-preflight": async (rest) => {
       await runDbUpgradePreflight(rest);
+    },
+    "db.upgrade-major": async (rest) => {
+      await runDbUpgradeMajor(rest);
     },
     "dev.refresh": async (rest) => {
       await runDevRefresh(rest);

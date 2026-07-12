@@ -282,6 +282,12 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode+sub",
         },
         {
+          "command": "instance db upgrade-major",
+          "hidden": false,
+          "id": "db.upgrade-major",
+          "match": "command+mode+sub",
+        },
+        {
           "command": "instance refresh",
           "hidden": false,
           "id": "dev.refresh",
@@ -469,6 +475,8 @@ describe("command table — routing (longest-match)", () => {
     [["instance", "db", "migrate", "--down"], "db.migrate"],
     [["instance", "db", "upgrade-preflight"], "db.upgrade-preflight"],
     [["instance", "db", "upgrade-preflight", "--json"], "db.upgrade-preflight"],
+    [["instance", "db", "upgrade-major"], "db.upgrade-major"],
+    [["instance", "db", "upgrade-major", "--service", "postgres"], "db.upgrade-major"],
     [["instance", "refresh"], "dev.refresh"],
     [["instance", "tunnel"], "dev.tunnel"],
     [["instance", "tunnel", "start"], "dev.tunnel"],

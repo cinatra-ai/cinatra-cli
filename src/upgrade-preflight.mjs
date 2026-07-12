@@ -265,14 +265,22 @@ export function decideService({
       migration: transition.migration,
     });
   }
+  // A supported hop whose mechanism has no sanctioned CLI command yet
+  // (migration: null — e.g. the in-place mariadb/neo4j paths owned by the
+  // non-Postgres family lanes) still STOPS, but the remediation points at the
+  // runbook's mechanism steps instead of a command.
+  const migrationPointer = transition.migration
+    ? `run \`${transition.migration}\``
+    : `follow the ${transition.mechanism ?? "documented"} steps in the runbook`;
   return verdict(service, VERDICTS.STOP, `supported upgrade pending (detected ${detected} → target ${target})`, {
     detected,
     target,
     detectionSource,
-    migration: transition.migration,
+    migration: transition.migration ?? null,
+    mechanism: transition.mechanism ?? null,
     caseScoped: Boolean(transition.caseScoped),
     remediation:
-      `Back up ${service} first, then run \`${transition.migration}\` to migrate ${detected} → ${target} before ` +
+      `Back up ${service} first, then ${migrationPointer} to migrate ${detected} → ${target} before ` +
       `recreating the container. See ${UPGRADE_RUNBOOK_URL}.`,
   });
 }

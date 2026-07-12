@@ -4,16 +4,33 @@
 // cinatra-ai/cinatra#1419).
 //
 // SCOPE / OWNERSHIP. The AUTHORITATIVE definition of the supported matrix + the
-// pinned floating tags is epic sub-issue 1 (cinatra-ai/cinatra#1420), which lands
-// in the `cinatra` product (compose pins + the shipped matrix data). This module
-// is the CLI's SHIPPED-WITH copy of that decision table: the installed CLI must
-// be able to reason about "is this (service, source→target) hop supported?"
-// WITHOUT reaching back to a running instance (the preflight runs BEFORE any
-// container is recreated, precisely when the app may be down). The preflight
-// consumes a matrix OBJECT (injectable) — this module supplies the default one
-// plus the PURE lookups over it; when #1420 pins the authoritative data the two
-// reconcile to one shape (this is the client half of that contract, mirroring
-// how `extensions reconcile` shipped the client half of its host contract).
+// pinned floating tags is epic sub-issue 1 (cinatra-ai/cinatra#1420), which
+// LANDED in the `cinatra` product as docs/architecture/upgrade-matrix.json
+// (revision 1, baseline release 0.1.9; merged via cinatra PR #1438, squash
+// 4e89bf4a). This module is the CLI's SHIPPED-WITH copy of that decision table,
+// RECONCILED against that revision: the installed CLI must be able to reason
+// about "is this (service, source→target) hop supported?" WITHOUT reaching back
+// to a running instance (the preflight runs BEFORE any container is recreated,
+// precisely when the app may be down). The preflight consumes a matrix OBJECT
+// (injectable) — this module supplies the default one plus the PURE lookups
+// over it. AUTHORITATIVE_MATRIX_REVISION below is the skew pin (the product
+// side's scripts/lib/upgrade-matrix.mjs MATRIX_REVISION is the same contract on
+// the other half): when the authoritative matrix bumps its revision, this copy
+// must be re-reconciled and the pin bumped in the same change.
+//
+// COVERAGE NOTE (deliberate subset, fail-closed direction): this copy carries
+// exactly the DB-engine-style compose services whose data volumes the preflight
+// guards today (the set the #131 recorder already ships). Authoritative entries
+// for coupled FILE/object-store volumes (twenty-server files, wordpress/drupal
+// content trees, plane-minio uploads, graphiti's volume-less derived state) are
+// NOT mirrored yet — those services simply stay outside preflight discovery
+// (statefulServicesFromComposeConfig only surfaces matrix-known services), so
+// nothing is silently passed; widening the guarded set rides epic sub-issue 4
+// with the non-Postgres family paths. For the services carried here the version
+// axes, supported hops, mechanisms, and the single case-scoped exception are
+// reconciled 1:1 with revision 1 (transitions the authoritative matrix lists
+// with supported=false are simply NOT listed here — an unlisted hop already
+// fails closed, same outcome).
 //
 // SERVICE KEYS ARE THE REAL COMPOSE SERVICE NAMES (docker-compose.yml at the
 // product root — grounded against origin/main): `postgres` (platform),
@@ -44,9 +61,14 @@
 //                                        //   service mounts more than one.
 //         transitions: [                 // EXPLICITLY supported forward hops. A
 //           { from: "17", to: "18",      //   forward-ordered hop that is NOT listed
+//             mechanism: "logical-dump-restore",
 //             migration: "cinatra instance db upgrade-major",
 //             caseScoped: false },       //   is an UNSUPPORTED hop → fail closed.
-//         ],
+//         ],                             //   `migration` is the sanctioned CLI
+//                                        //   command, or null when the mechanism
+//                                        //   has no executable CLI command yet
+//                                        //   (the stop message then points at the
+//                                        //   runbook instead of a command).
 //       },
 //     },
 //   }
@@ -66,34 +88,68 @@ export const PG_UPGRADE_MAJOR_COMMAND = "cinatra instance db upgrade-major";
 export const UPGRADE_RUNBOOK_URL =
   "https://docs.cinatra.ai/self-hosting/upgrading-stateful-services";
 
-// The CLI's shipped-with copy of the supported matrix. Version-axis orders and
-// the supported forward hops reflect the stack pins the 0.1.x product line ships
-// (platform pg 18, nango pg 17, twenty pg 16, plane pg 15.7, mariadb 11.4,
-// neo4j 2026.05, redis 8 / twenty-redis 7, valkey 7.2.11, rabbitmq 3.13,
-// verdaccio 6); the authoritative pin + matrix data is cinatra-ai/cinatra#1420.
-// Services with no listed transition currently support NO in-place major hop
-// (fail closed until a guarded path lands — epic sub-issues 3 & 4).
+// The authoritative matrix revision + baseline this shipped copy is reconciled
+// against (cinatra docs/architecture/upgrade-matrix.json — the product side pins
+// the same pair in scripts/lib/upgrade-matrix.mjs and its works-after fixtures
+// resolve through it, so both halves of the cross-repo pair act on the same
+// decision table by construction). Bump ONLY together with a re-reconcile.
+export const AUTHORITATIVE_MATRIX_REVISION = 1;
+export const AUTHORITATIVE_MATRIX_BASELINE = "0.1.9";
+
+// The CLI's shipped-with copy of the supported matrix, reconciled to the
+// authoritative revision above. Version-axis orders and the supported forward
+// hops mirror the authoritative data for every service carried here (platform
+// pg 18, nango pg 17 + the case-scoped pg15 exception, twenty pg 16, plane pg
+// 15.7, mariadb 11.4→11.8 in-place, neo4j 5.26→2026.05 in-place store-format,
+// redis 7→8 discard-recreate, valkey 7.2.11 / rabbitmq 3.13 / verdaccio 6
+// holds). A transition whose mechanism has no sanctioned CLI command yet
+// carries migration: null (the preflight stop then points at the runbook);
+// hops the authoritative matrix marks supported=false are not listed (an
+// unlisted hop fails closed — same outcome, one representation).
 export const DEFAULT_UPGRADE_MATRIX = Object.freeze({
-  version: "0.1.x-shipped",
+  version: `${AUTHORITATIVE_MATRIX_BASELINE}-shipped`,
+  revision: AUTHORITATIVE_MATRIX_REVISION,
+  baselineRelease: AUTHORITATIVE_MATRIX_BASELINE,
   services: {
     // Four Postgres instances share the same guarded logical dump→restore path
-    // (epic sub-issue 3); each is a distinct compose service so its OWN volume +
-    // detected major is evaluated independently. The nango 15→17 hop is the
-    // cinatra-ai/cinatra#1417 concrete case, carried as a case-scoped exception.
+    // (epic sub-issue 3 — `cinatra instance db upgrade-major`); each is a
+    // distinct compose service so its OWN volume + detected major is evaluated
+    // independently. The nango 15→17 hop is the cinatra-ai/cinatra#1417 Case B
+    // concrete case, carried as a case-scoped exception (it does NOT widen the
+    // general nango baseline, which holds at 17); the platform 17→18 hop is the
+    // Case A supported baseline transition.
     postgres: pgService("/var/lib/postgresql", [{ from: "17", to: "18" }]),
-    "nango-db": pgService("/var/lib/postgresql", [
-      { from: "15", to: "17", caseScoped: true },
-      { from: "16", to: "17" },
-    ]),
+    "nango-db": pgService("/var/lib/postgresql", [{ from: "15", to: "17", caseScoped: true }]),
     "twenty-db": pgService("/var/lib/postgresql", []),
     "plane-db": pgService("/var/lib/postgresql", []),
-    // Non-Postgres stateful families (epic sub-issue 4) — ordered axes are known
-    // so downgrades/unknown hops are CLASSIFIED (blocked / fail-closed), but no
-    // in-place major transition is supported yet (empty `transitions`).
-    "wordpress-db": { order: ["11.4"], marker: null, dataMount: "/var/lib/mysql", transitions: [] },
-    "drupal-db": { order: ["11.4"], marker: null, dataMount: "/var/lib/mysql", transitions: [] },
-    neo4j: { order: ["5", "2026.05"], marker: null, dataMount: "/data", transitions: [] },
-    redis: { order: ["7", "8"], marker: null, dataMount: "/data", transitions: [] },
+    // Non-Postgres stateful families (epic sub-issue 4): axes are ordered so
+    // downgrades/unknown hops are CLASSIFIED (blocked / fail-closed); the hops
+    // the authoritative matrix supports are listed with their mechanism but NO
+    // executable CLI command yet (migration: null → runbook-guided stop).
+    "wordpress-db": {
+      order: ["11.4", "11.8"],
+      marker: null,
+      dataMount: "/var/lib/mysql",
+      transitions: [{ from: "11.4", to: "11.8", mechanism: "in-place-store-format", migration: null }],
+    },
+    "drupal-db": {
+      order: ["11.4", "11.8"],
+      marker: null,
+      dataMount: "/var/lib/mysql",
+      transitions: [{ from: "11.4", to: "11.8", mechanism: "in-place-store-format", migration: null }],
+    },
+    neo4j: {
+      order: ["5.26", "2026.05"],
+      marker: null,
+      dataMount: "/data",
+      transitions: [{ from: "5.26", to: "2026.05", mechanism: "in-place-store-format", migration: null }],
+    },
+    redis: {
+      order: ["7", "8"],
+      marker: null,
+      dataMount: "/data",
+      transitions: [{ from: "7", to: "8", mechanism: "discard-recreate", migration: null }],
+    },
     "twenty-redis": { order: ["7", "8"], marker: null, dataMount: "/data", transitions: [] },
     "plane-redis": { order: ["7.2.11"], marker: null, dataMount: "/data", transitions: [] },
     "plane-mq": { order: ["3.13"], marker: null, dataMount: "/var/lib/rabbitmq", transitions: [] },
@@ -103,7 +159,8 @@ export const DEFAULT_UPGRADE_MATRIX = Object.freeze({
 
 /** Build a Postgres service entry: the pg major axis, the authoritative
  *  `PG_VERSION` raw marker, and the supported forward hops (all routed through
- *  the sanctioned `db upgrade-major` command). */
+ *  the sanctioned `db upgrade-major` command via the logical dump→restore
+ *  mechanism — pg_dump crosses any source major in one hop). */
 function pgService(dataMount, hops) {
   return {
     order: ["15", "16", "17", "18"],
@@ -112,6 +169,7 @@ function pgService(dataMount, hops) {
     transitions: hops.map((h) => ({
       from: h.from,
       to: h.to,
+      mechanism: "logical-dump-restore",
       migration: h.migration ?? PG_UPGRADE_MAJOR_COMMAND,
       caseScoped: Boolean(h.caseScoped),
     })),
@@ -187,6 +245,9 @@ export function imageParts(imageRef) {
  * Derive the data-format version a service's IMAGE ships, normalized onto the
  * service's ordered axis. Pure. From the image tag ("18-alpine",
  * "3.13.6-management-alpine", "2026.05-community"):
+ *   0. try the RAW tag on the axis first (an axis entry may BE a full tag —
+ *      e.g. a dated object-store release — which the variant-strip below would
+ *      mangle),
  *   1. strip the variant suffix (everything from the first "-"),
  *   2. try the full dotted version, then progressively shorter dotted prefixes
  *      ("3.13.6" → "3.13" → "3"), returning the FIRST one on the axis.
@@ -198,6 +259,7 @@ export function deriveDataFormatVersion(matrix, service, imageRef) {
   if (!entry || !Array.isArray(entry.order)) return null;
   const { tag } = imageParts(imageRef);
   if (!tag) return null;
+  if (entry.order.includes(tag)) return tag;
   const base = tag.split("-")[0];
   if (!base) return null;
   const parts = base.split(".");

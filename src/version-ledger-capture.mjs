@@ -140,6 +140,15 @@ export function statefulServicesFromComposeConfig(configJson, matrix = DEFAULT_U
       dataFormatVersion: deriveDataFormatVersion(matrix, service, image),
       volumeSource: source,
       volumeName,
+      // The DATA mount's container-side target (e.g. /var/lib/postgresql vs the
+      // legacy …/data) — the deployment's OWN declared layout, which is what the
+      // raw-marker adapter and `db upgrade-major`'s restore container must use
+      // (the pg18 images changed the layout; never assume it).
+      mountTarget: typeof dataMounts[0].target === "string" ? dataMounts[0].target : null,
+      // The service's resolved environment (compose interpolates it) — the
+      // bootstrap POSTGRES_* credentials the upgrade transaction re-uses for the
+      // fresh target cluster so the restored stack boots unchanged.
+      environment: svc?.environment && typeof svc.environment === "object" ? svc.environment : {},
       profiles: Array.isArray(svc?.profiles) ? svc.profiles : [],
     });
   }
@@ -249,8 +258,9 @@ export function dockerVolumeIdentity(volumeName, capture = defaultCapture) {
 }
 
 /** The leading `docker compose` argv for the SAME file/project/env-file set an
- *  `up` used. */
-function composeBaseArgs({ composeFiles = null, composeProject = null, envFile = null }) {
+ *  `up` used. Exported for the other compose-driving flows (`db upgrade-major`)
+ *  so there is exactly ONE place that assembles the -f/-p/--env-file set. */
+export function composeBaseArgs({ composeFiles = null, composeProject = null, envFile = null }) {
   const files = composeFiles && composeFiles.length ? composeFiles : ["docker-compose.yml", "docker-compose.dev.yml"];
   const args = ["compose"];
   if (envFile) args.push("--env-file", envFile);
@@ -280,7 +290,20 @@ export function resolveComposeConfig({ targetDir, composeFiles = null, composePr
  *  recording requires. A service with several running containers (replicas)
  *  is included only when they all agree on one image. Null on any failure
  *  (the caller then refuses to record rather than recording blind). */
-export function resolveRunningServiceImages({ targetDir, composeFiles = null, composeProject = null, envFile = null, capture = defaultCapture }) {
+export function resolveRunningServiceImages(opts) {
+  const rows = resolveRunningServices(opts);
+  if (rows === null) return null;
+  const images = new Map();
+  for (const [service, r] of rows) images.set(service, r.image);
+  return images;
+}
+
+/** Map of compose service → { image, name } for RUNNING containers under this
+ *  files/project set (superset of resolveRunningServiceImages: also carries the
+ *  container NAME, which the live version probe needs for `docker exec`).
+ *  Same conflict rule (replicas disagreeing on an image are dropped); null on
+ *  any failure. */
+export function resolveRunningServices({ targetDir, composeFiles = null, composeProject = null, envFile = null, capture = defaultCapture }) {
   const args = [...composeBaseArgs({ composeFiles, composeProject, envFile }), "ps", "--format", "json"];
   const raw = capture("docker", args, { cwd: targetDir });
   if (raw === null) return null;
@@ -301,18 +324,18 @@ export function resolveRunningServiceImages({ targetDir, composeFiles = null, co
       }
     }
   }
-  const images = new Map();
+  const services = new Map();
   const conflicted = new Set();
   for (const r of rows) {
     if (!r || r.State !== "running") continue;
     const service = r.Service;
     const image = r.Image;
     if (typeof service !== "string" || !service.length || typeof image !== "string" || !image.length) continue;
-    if (images.has(service) && images.get(service) !== image) conflicted.add(service);
-    images.set(service, image);
+    if (services.has(service) && services.get(service).image !== image) conflicted.add(service);
+    services.set(service, { image, name: typeof r.Name === "string" && r.Name.length ? r.Name : null });
   }
-  for (const s of conflicted) images.delete(s);
-  return images;
+  for (const s of conflicted) services.delete(s);
+  return services;
 }
 
 /**
@@ -375,10 +398,12 @@ export async function captureDeployedVersions({
 
 export const __test = {
   defaultCapture,
+  composeBaseArgs,
   statefulServicesFromComposeConfig,
   recordDeployedStack,
   dockerVolumeIdentity,
   resolveComposeConfig,
   resolveRunningServiceImages,
+  resolveRunningServices,
   captureDeployedVersions,
 };

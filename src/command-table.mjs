@@ -330,6 +330,13 @@ export const COMMAND_DESCRIPTORS = [
       "Read-only: detect each stateful service's deployed data-format version and report whether recreating its container is safe (fail-closed on unknowns).",
   },
   {
+    id: "db.upgrade-major",
+    path: ["instance", "db", "upgrade-major"],
+    match: "command+mode+sub",
+    summary:
+      "Guarded logical dump->fresh-volume->restore Postgres major upgrade (matrix-driven, transactional; any failure rolls back onto the intact source volume).",
+  },
+  {
     id: "dev.refresh",
     path: ["instance", "refresh"],
     match: "command+mode",
