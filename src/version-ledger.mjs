@@ -47,12 +47,12 @@
 // clone-registry (one implementation, not a fork). Never imports index.mjs.
 // ---------------------------------------------------------------------------
 
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
-import { isValidSlug } from "./clone-registry.mjs";
+import { isValidSlug, withRegistryLock } from "./clone-registry.mjs";
 
 const LEDGER_VERSION = 1;
 
@@ -186,10 +186,6 @@ export function writeLedger(ledger, dir = defaultLedgerDir()) {
 
 // --- per-slug write lock ----------------------------------------------------
 
-const LOCK_RETRY_MS = 150;
-const LOCK_WAIT_MS = 10_000;
-const LOCK_STALE_MS = 120_000;
-
 /**
  * Serialize a read-modify-write of one slug's ledger against concurrent
  * writers (a capture racing a migration's beginMigration must never clobber
@@ -198,97 +194,15 @@ const LOCK_STALE_MS = 120_000;
  * capture; the migration flows (begin/commit/rollback, cinatra-cli#129) must
  * take it too.
  *
- * SYNCHRONOUS mkdir-based lock (atomic on POSIX) with OWNERSHIP:
- *   - acquire = mkdir + write an owner token file into the lock dir;
- *   - release = only the holder whose token matches removes the lock (a
- *     successor's fresh lock is never removed by a slow ex-holder);
- *   - stale break (older than 2 min — a crashed holder) is RENAME-based:
- *     rename is atomic, so of N waiters exactly ONE claims the stale dir and
- *     deletes it; the rest simply retry the mkdir.
- * Bounded wait; `fn` runs under the lock and its result is returned.
+ * Delegates to the repo's hardened advisory file lock (withRegistryLock:
+ * O_EXCL create, pid-liveness stale detection, inode-stable TOCTOU-safe
+ * steal with no-clobber restore, inode-checked release) rather than
+ * maintaining a second lock implementation. Locks `<ledger file>.lock`.
  */
-export function withLedgerLock(slug, dir = defaultLedgerDir(), fn) {
+export async function withLedgerLock(slug, dir = defaultLedgerDir(), fn) {
   mkdirSync(dir, { recursive: true });
-  if (!isValidSlug(slug)) {
-    throw new Error(`Invalid instance slug "${slug}". Must match /^[a-z0-9][a-z0-9-]{0,29}$/.`);
-  }
-  const lockDir = path.join(dir, `.${slug}.lock`);
-  const ownerFile = path.join(lockDir, "owner");
-  const token = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  let acquiredAt = 0;
-  for (;;) {
-    try {
-      mkdirSync(lockDir);
-      writeFileSync(ownerFile, token);
-      acquiredAt = Date.now();
-      break;
-    } catch {
-      try {
-        const age = Date.now() - statSync(lockDir).mtimeMs;
-        if (age > LOCK_STALE_MS) {
-          // A crashed holder. Claim-by-rename: exactly one waiter wins the
-          // rename (atomic). RE-VERIFY the claim actually took a stale dir —
-          // if a live holder slipped in between the stat and the rename, put
-          // its lock straight back (compensation for the stat→rename window).
-          const claimed = `${lockDir}.stale.${token}`;
-          try {
-            renameSync(lockDir, claimed);
-            let claimedStale = true;
-            try {
-              claimedStale = Date.now() - statSync(claimed).mtimeMs > LOCK_STALE_MS;
-            } catch {
-              /* vanished — nothing to compensate */
-            }
-            if (claimedStale) {
-              rmSync(claimed, { recursive: true, force: true });
-            } else {
-              try {
-                renameSync(claimed, lockDir); // restore the live holder's lock
-              } catch {
-                // Original name re-taken already — the renamed copy is
-                // consulted by nobody; discard it.
-                rmSync(claimed, { recursive: true, force: true });
-              }
-            }
-          } catch {
-            /* another waiter claimed it — fall through to wait */
-          }
-        }
-      } catch {
-        /* lock vanished between mkdir and stat — fall through and retry */
-      }
-      // ALWAYS deadline-checked + slept (a persistently failing stale-break
-      // must never turn into an unbounded busy-spin).
-      if (Date.now() > deadline) {
-        throw new Error(
-          `Timed out waiting for the version-ledger lock for "${slug}" (${lockDir}). ` +
-            `If no other cinatra process is running, remove the lock directory and retry.`,
-        );
-      }
-      // Synchronous sleep without burning CPU (Atomics.wait on a throwaway
-      // buffer — the standard sync-sleep idiom; lock windows are milliseconds).
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCK_RETRY_MS);
-    }
-  }
-  try {
-    return fn();
-  } finally {
-    // Release ONLY within the window where displacement is impossible: a
-    // breaker may displace a lock only once it is STALE, so a hold shorter
-    // than the stale threshold (minus margin) plus a matching owner token
-    // proves the dir is still ours. A pathological over-long hold leaves the
-    // lock for the next waiter's stale-break instead of risking the removal
-    // of a successor's live lock (token-read→rm window).
-    const heldTooLong = Date.now() - acquiredAt > LOCK_STALE_MS - 5_000;
-    try {
-      if (!heldTooLong && readFileSync(ownerFile, "utf8") === token) {
-        rmSync(lockDir, { recursive: true, force: true });
-      }
-    } catch {
-      /* broken/claimed by a successor — nothing safe to remove */
-    }
-  }
+  const file = ledgerPath(slug, dir); // validates the slug
+  return withRegistryLock(file, fn);
 }
 
 // --- pure ledger operations (return a NEW ledger; caller persists) ---------

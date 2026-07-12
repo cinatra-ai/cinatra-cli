@@ -160,7 +160,7 @@ export function statefulServicesFromComposeConfig(configJson, matrix = DEFAULT_U
  * Returns { status: "ok"|"malformed"|"empty", recorded: [service…],
  *           skipped: [{ service, reason }] }.
  */
-export function recordDeployedStack({
+export async function recordDeployedStack({
   slug,
   configJson,
   matrix = DEFAULT_UPGRADE_MATRIX,
@@ -325,7 +325,7 @@ export function resolveRunningServiceImages({ targetDir, composeFiles = null, co
  * resolved config does not — the caller's `up` targeted a different stack
  * than the instance row records, so recording would bind the wrong volumes).
  */
-export function captureDeployedVersions({
+export async function captureDeployedVersions({
   slug,
   targetDir,
   composeFiles = null,
@@ -351,7 +351,7 @@ export function captureDeployedVersions({
       return { status: "project-mismatch", recorded: [], skipped: [] };
     }
     const runningImages = resolveRunningServiceImages({ targetDir, composeFiles, composeProject, envFile, capture });
-    const result = recordDeployedStack({
+    const result = await recordDeployedStack({
       slug,
       configJson,
       matrix,

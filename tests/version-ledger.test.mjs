@@ -189,22 +189,34 @@ describe("malformed ledger safety", () => {
 });
 
 describe("withLedgerLock", () => {
-  it("runs the fn under the lock, returns its result, and releases (re-acquirable)", () => {
-    expect(withLedgerLock(SLUG, dir, () => "one")).toBe("one");
-    expect(existsSync(path.join(dir, `.${SLUG}.lock`))).toBe(false);
-    expect(withLedgerLock(SLUG, dir, () => "two")).toBe("two");
+  const lockFile = () => path.join(dir, `${SLUG}.json.lock`);
+
+  it("runs the fn under the lock, returns its result, and releases (re-acquirable)", async () => {
+    await expect(withLedgerLock(SLUG, dir, () => "one")).resolves.toBe("one");
+    expect(existsSync(lockFile())).toBe(false);
+    await expect(withLedgerLock(SLUG, dir, () => "two")).resolves.toBe("two");
   });
 
-  it("releases the lock even when fn throws", () => {
-    expect(() =>
+  it("releases the lock even when fn throws", async () => {
+    await expect(
       withLedgerLock(SLUG, dir, () => {
         throw new Error("boom");
       }),
-    ).toThrow(/boom/);
-    expect(existsSync(path.join(dir, `.${SLUG}.lock`))).toBe(false);
+    ).rejects.toThrow(/boom/);
+    expect(existsSync(lockFile())).toBe(false);
   });
 
-  it("rejects an invalid slug (never mkdirs an attacker-shaped path)", () => {
-    expect(() => withLedgerLock("../evil", dir, () => {})).toThrow(/Invalid instance slug/);
+  it("mutually excludes a second writer while held", async () => {
+    let order = [];
+    await withLedgerLock(SLUG, dir, async () => {
+      order.push("first-in");
+      expect(existsSync(lockFile())).toBe(true);
+    });
+    await withLedgerLock(SLUG, dir, () => order.push("second-in"));
+    expect(order).toEqual(["first-in", "second-in"]);
+  });
+
+  it("rejects an invalid slug (never locks an attacker-shaped path)", async () => {
+    await expect(withLedgerLock("../evil", dir, () => {})).rejects.toThrow(/Invalid instance slug/);
   });
 });

@@ -30,14 +30,14 @@ afterEach(() => {
 });
 
 describe("imageParts", () => {
-  it("splits repo / tag / digest of a pinned reference", () => {
+  it("splits repo / tag / digest of a pinned reference", async () => {
     expect(imageParts("postgres:18-alpine@sha256:9a8afc")).toEqual({
       repo: "postgres",
       tag: "18-alpine",
       digest: "sha256:9a8afc",
     });
   });
-  it("handles registry ports and missing tags", () => {
+  it("handles registry ports and missing tags", async () => {
     expect(imageParts("reg.example:5000/team/img:1.2")).toEqual({
       repo: "reg.example:5000/team/img",
       tag: "1.2",
@@ -64,7 +64,7 @@ describe("deriveDataFormatVersion — image tag normalized onto the service axis
       expect(deriveDataFormatVersion(DEFAULT_UPGRADE_MATRIX, service, image)).toBe(expected);
     });
   }
-  it("returns null off-axis / untagged / unknown service (fail-closed upstream)", () => {
+  it("returns null off-axis / untagged / unknown service (fail-closed upstream)", async () => {
     expect(deriveDataFormatVersion(DEFAULT_UPGRADE_MATRIX, "postgres", "postgres:14-alpine")).toBeNull();
     expect(deriveDataFormatVersion(DEFAULT_UPGRADE_MATRIX, "postgres", "postgres")).toBeNull();
     expect(deriveDataFormatVersion(DEFAULT_UPGRADE_MATRIX, "nope", "postgres:18")).toBeNull();
@@ -104,7 +104,7 @@ function configDoc() {
 }
 
 describe("statefulServicesFromComposeConfig", () => {
-  it("extracts matrix-known services with resolved volume names + derived versions", () => {
+  it("extracts matrix-known services with resolved volume names + derived versions", async () => {
     const { found, skipped } = statefulServicesFromComposeConfig(configDoc());
     const byService = Object.fromEntries(found.map((s) => [s.service, s]));
     expect(Object.keys(byService).sort()).toEqual(["nango-db", "postgres", "wordpress-db"]);
@@ -119,7 +119,7 @@ describe("statefulServicesFromComposeConfig", () => {
     expect(skipped).toEqual([]);
   });
 
-  it("picks the DATA volume by dataMount when a service mounts several volumes", () => {
+  it("picks the DATA volume by dataMount when a service mounts several volumes", async () => {
     const doc = configDoc();
     doc.services.postgres.volumes.push({ type: "volume", source: "pg-scratch", target: "/scratch" });
     doc.volumes["pg-scratch"] = { name: "cinatra_main_pg-scratch" };
@@ -127,7 +127,7 @@ describe("statefulServicesFromComposeConfig", () => {
     expect(found.find((s) => s.service === "postgres").volumeName).toBe("cinatra_main_postgres-data");
   });
 
-  it("dataMount matches on path boundaries only — /data never matches /data-cache", () => {
+  it("dataMount matches on path boundaries only — /data never matches /data-cache", async () => {
     const doc = {
       name: "p",
       services: {
@@ -146,7 +146,7 @@ describe("statefulServicesFromComposeConfig", () => {
     expect(skipped[0].reason).toMatch(/no named data-volume/i);
   });
 
-  it("NEVER binds an auxiliary volume when the data path itself is bind-mounted", () => {
+  it("NEVER binds an auxiliary volume when the data path itself is bind-mounted", async () => {
     // postgres data dir on a bind mount + one unrelated named volume: recording
     // that volume would attach the ledger entry to the WRONG volume identity.
     const doc = configDoc();
@@ -160,7 +160,7 @@ describe("statefulServicesFromComposeConfig", () => {
     expect(skipped.find((s) => s.service === "postgres").reason).toMatch(/no named data-volume/i);
   });
 
-  it("skips (loudly) a service whose data volume cannot be identified", () => {
+  it("skips (loudly) a service whose data volume cannot be identified", async () => {
     const doc = configDoc();
     doc.services.postgres.volumes = []; // no named volume at all
     delete doc.volumes["nango-data"]; // unresolvable name
@@ -184,8 +184,8 @@ describe("recordDeployedStack", () => {
     ["nango-db", "postgres:17-alpine"],
   ]);
 
-  it("records live-volume-bound entries for RUNNING services; the rest are skipped, not guessed", () => {
-    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningImages: RUNNING });
+  it("records live-volume-bound entries for RUNNING services; the rest are skipped, not guessed", async () => {
+    const res = await recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningImages: RUNNING });
     expect(res.status).toBe("ok");
     expect(res.recorded.sort()).toEqual(["nango-db", "postgres"]);
     expect(res.skipped.map((s) => s.service)).toEqual(["wordpress-db"]);
@@ -200,49 +200,49 @@ describe("recordDeployedStack", () => {
     expect(ledger.services["wordpress-db"]).toBeUndefined();
   });
 
-  it("a dormant profile's EXISTING volume is never re-stamped (container not running)", () => {
+  it("a dormant profile's EXISTING volume is never re-stamped (container not running)", async () => {
     // wordpress-db volume exists live, but the service is not running: the old
     // volume must keep its (absent) entry rather than gaining the new pin.
     const inspectWithWp = (name) =>
       name === "explicit-wp-vol" ? { name, createdAt: "2025-01-01T00:00:00Z" } : inspect(name);
-    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspectWithWp, runningImages: RUNNING });
+    const res = await recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspectWithWp, runningImages: RUNNING });
     expect(res.recorded).not.toContain("wordpress-db");
     expect(res.skipped.find((s) => s.service === "wordpress-db").reason).toMatch(/not running/i);
     expect(readLedger("main", dir).ledger.services["wordpress-db"]).toBeUndefined();
   });
 
-  it("refuses to record ANYTHING without deployment proof (running set unavailable)", () => {
-    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningImages: null });
+  it("refuses to record ANYTHING without deployment proof (running set unavailable)", async () => {
+    const res = await recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningImages: null });
     expect(res.status).toBe("no-deployment-proof");
     expect(res.recorded).toEqual([]);
     expect(readLedger("main", dir).status).toBe("missing"); // nothing written
   });
 
-  it("re-recording updates entries once the container actually runs the new pin", () => {
-    recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningImages: RUNNING });
+  it("re-recording updates entries once the container actually runs the new pin", async () => {
+    await recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningImages: RUNNING });
     const doc = configDoc();
     doc.services.postgres.image = "postgres:18.1-alpine";
     const running = new Map(RUNNING);
     running.set("postgres", "postgres:18.1-alpine"); // the up recreated it on the new pin
-    const res = recordDeployedStack({ slug: "main", configJson: doc, ledgerDir: dir, inspectVolume: inspect, runningImages: running });
+    const res = await recordDeployedStack({ slug: "main", configJson: doc, ledgerDir: dir, inspectVolume: inspect, runningImages: running });
     expect(res.status).toBe("ok");
     expect(readLedger("main", dir).ledger.services.postgres.image).toBe("postgres:18.1-alpine");
   });
 
-  it("a STALE running container (old image, new pin) is never re-stamped", () => {
+  it("a STALE running container (old image, new pin) is never re-stamped", async () => {
     const doc = configDoc();
     doc.services.postgres.image = "postgres:18.1-alpine"; // config moved forward…
     // …but the running container still carries the previous pin.
-    const res = recordDeployedStack({ slug: "main", configJson: doc, ledgerDir: dir, inspectVolume: inspect, runningImages: RUNNING });
+    const res = await recordDeployedStack({ slug: "main", configJson: doc, ledgerDir: dir, inspectVolume: inspect, runningImages: RUNNING });
     expect(res.recorded).toEqual(["nango-db"]);
     expect(res.skipped.find((s) => s.service === "postgres").reason).toMatch(/stale container/i);
     expect(readLedger("main", dir).ledger.services.postgres).toBeUndefined();
   });
 
-  it("NEVER overwrites a malformed ledger", () => {
+  it("NEVER overwrites a malformed ledger", async () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(path.join(dir, "main.json"), "{not json");
-    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningImages: RUNNING });
+    const res = await recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningImages: RUNNING });
     expect(res.status).toBe("malformed");
     expect(res.recorded).toEqual([]);
     expect(readLedger("main", dir).status).toBe("malformed"); // untouched
@@ -269,7 +269,7 @@ describe("recordDeployedStack", () => {
     });
     writeLedger(ledger, dir);
 
-    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningImages: RUNNING });
+    const res = await recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningImages: RUNNING });
     expect(res.recorded).toEqual(["nango-db"]);
     expect(res.skipped.find((s) => s.service === "postgres").reason).toMatch(/migration in flight/i);
     // The live postgres entry is still the SOURCE (the journal was not clobbered).
@@ -299,10 +299,10 @@ describe("captureDeployedVersions — the install/refresh hook over the shell se
     return null;
   };
 
-  it("resolves config + running set and records through injected docker captures", () => {
+  it("resolves config + running set and records through injected docker captures", async () => {
     const calls = [];
     const logs = [];
-    const res = captureDeployedVersions({
+    const res = await captureDeployedVersions({
       slug: "main",
       targetDir: "/nonexistent",
       composeProject: "cinatra_main",
@@ -322,8 +322,8 @@ describe("captureDeployedVersions — the install/refresh hook over the shell se
     expect(readLedger("main", dir).ledger.services.postgres.volume.createdAt).toBe("2026-03-01T00:00:00Z");
   });
 
-  it("reports config-unavailable (and records nothing) when compose config fails; never throws", () => {
-    const res = captureDeployedVersions({
+  it("reports config-unavailable (and records nothing) when compose config fails; never throws", async () => {
+    const res = await captureDeployedVersions({
       slug: "main",
       targetDir: "/nonexistent",
       ledgerDir: dir,
@@ -334,8 +334,8 @@ describe("captureDeployedVersions — the install/refresh hook over the shell se
     expect(readLedger("main", dir).status).toBe("missing");
   });
 
-  it("refuses to record when the resolved project differs from the instance's recorded project", () => {
-    const res = captureDeployedVersions({
+  it("refuses to record when the resolved project differs from the instance's recorded project", async () => {
+    const res = await captureDeployedVersions({
       slug: "main",
       targetDir: "/nonexistent",
       ledgerDir: dir,
@@ -347,8 +347,8 @@ describe("captureDeployedVersions — the install/refresh hook over the shell se
     expect(readLedger("main", dir).status).toBe("missing");
   });
 
-  it("refuses to record when the running-service listing fails (deployment proof required)", () => {
-    const res = captureDeployedVersions({
+  it("refuses to record when the running-service listing fails (deployment proof required)", async () => {
+    const res = await captureDeployedVersions({
       slug: "main",
       targetDir: "/nonexistent",
       ledgerDir: dir,
@@ -359,8 +359,8 @@ describe("captureDeployedVersions — the install/refresh hook over the shell se
     expect(readLedger("main", dir).status).toBe("missing");
   });
 
-  it("an EMPTY running listing is proof of nothing running — nothing recorded, not a failure", () => {
-    const res = captureDeployedVersions({
+  it("an EMPTY running listing is proof of nothing running — nothing recorded, not a failure", async () => {
+    const res = await captureDeployedVersions({
       slug: "main",
       targetDir: "/nonexistent",
       ledgerDir: dir,

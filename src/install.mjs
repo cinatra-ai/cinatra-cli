@@ -1275,7 +1275,7 @@ export function reconcileInstallProfile(body, profile) {
  *  instance's version ledger after a SUCCESSFUL bring-up. Best-effort by
  *  contract (captureDeployedVersions never throws); `deps.captureDeployedVersions`
  *  is the test seam (same pattern as `deps.bringUpInfra`). */
-function recordVersions({ slug, targetDir, composeFiles = null, composeProject = null, envFile = null, log = console.log, deps = {} }) {
+async function recordVersions({ slug, targetDir, composeFiles = null, composeProject = null, envFile = null, log = console.log, deps = {} }) {
   const record = deps.captureDeployedVersions ?? captureDeployedVersions;
   return record({ slug, targetDir, composeFiles, composeProject, envFile, log });
 }
@@ -2355,7 +2355,7 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       });
       // cinatra-cli#128: record the deployed stateful-service versions in the
       // instance's ledger (best-effort — a re-up is an install-shaped event too).
-      recordVersions({
+      await recordVersions({
         slug,
         targetDir,
         composeFiles: slot.composeFiles,
@@ -2417,7 +2417,7 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
     });
     // cinatra-cli#128: record the deployed stateful-service versions in the
     // instance's ledger — AFTER ready (a rolled-back install records nothing).
-    recordVersions({
+    await recordVersions({
       slug,
       targetDir,
       composeFiles,
@@ -3756,7 +3756,7 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
   });
   // cinatra-cli#128: a re-converge re-ups whatever the moved checkout now pins —
   // record it (best-effort).
-  recordVersions({
+  await recordVersions({
     slug: row.slug,
     targetDir,
     composeFiles: row.composeFiles,
@@ -4100,7 +4100,7 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
       // cinatra-cli#128: an attach re-up deploys whatever the moved checkout
       // now pins — record it (best-effort).
       if (row?.slug) {
-        recordVersions({ slug: row.slug, targetDir, composeFiles, composeProject, envFile: attachEnvFile, log, deps });
+        await recordVersions({ slug: row.slug, targetDir, composeFiles, composeProject, envFile: attachEnvFile, log, deps });
       }
     } catch (err) {
       log(`  ⚠ Attach bring-up reported: ${err.message}`);
@@ -4708,7 +4708,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   //     isolated/attach executors record inside their own flows; external has
   //     no install-managed local stack to record.
   if (infraPlan === "default" && recordedSlug) {
-    recordVersions({ slug: recordedSlug, targetDir, composeProject: defaultProject, log, deps });
+    await recordVersions({ slug: recordedSlug, targetDir, composeProject: defaultProject, log, deps });
   }
 
   // 8. Done.

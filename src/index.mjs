@@ -5887,7 +5887,7 @@ async function runDevRefresh(rest) {
           // the project-match guard instead.
           const rowProject =
             instRow.composeProject && instRow.composeProject !== "cinatra" ? instRow.composeProject : null;
-          captureDeployedVersions({
+          await captureDeployedVersions({
             slug: instRow.slug,
             targetDir: repoRoot,
             requireProjectMatch: rowProject,
