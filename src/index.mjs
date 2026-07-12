@@ -374,6 +374,8 @@ Usage:
   cinatra extensions purge <packageName> --confirm <packageName> --digest <d>
                           [--reason <r>] [--app-url <url>] --yes
   cinatra extensions submit <tarball.tgz> [--description "<text>"]
+  cinatra extensions reconcile [--plan|--apply] (--app-url <url>|--profile <name>)
+                          [--json] [--plan-digest <digest>]
   cinatra extensions list [--json]
   cinatra create-extension <kind> [name] [--scope <scope>] [--display-name <name>]
                            [--description <text>] [--dir <path>] [--force] [--yes]
@@ -492,6 +494,22 @@ Commands:
                     <tarball.tgz>     Path to the built .tgz.
                     --description     Optional short description recorded on
                                       the submission row.
+
+  extensions reconcile
+                    Plan (default; dry-run) or apply the NON-REQUIRED extension
+                    updates the instance's auto-update loop would perform —
+                    driven from the same read model + fail-closed gates. A thin
+                    authenticated client of the instance's server-side plan/apply
+                    surface; it never re-derives the gates locally.
+                    --plan            [default] Dry run; print candidates +
+                                      per-skip reasons. Read-only; changes nothing.
+                    --apply           Execute the planned set (re-planned + fresh
+                                      recheck server-side; per-candidate isolated).
+                    --app-url <url>   Target instance base URL (or --profile).
+                    --profile <name>  Named saved login profile.
+                    --plan-digest <d> (--apply) Pin the exact set (CAS); refuse
+                                      on drift. Omit to always re-plan.
+                    --json            Emit the raw structured result.
 
   extensions list   List the extensions installed under the extensions/ tree
                     (the layout acquire-prod materializes and dev clones into):
@@ -786,6 +804,37 @@ Examples:
   cinatra update --instance      # update the instance (dev→origin/main, prod→release)
   cinatra update --ref <tag-or-sha>  # update the instance to a specific ref
   cinatra update --cli --dry-run     # show what the CLI update would run`,
+  "extensions.reconcile": `Operator-facing planner/executor for the instance's NON-REQUIRED extension
+updates — the same set the boot-seeded auto-update loop would touch, driven from
+the same read model + fail-closed gates. This command is a THIN AUTHENTICATED
+CLIENT of the instance's server-side plan/apply surface; it never re-derives the
+gates locally, so a dry run cannot be faked by stubbing execution.
+
+Modes:
+  --plan     [default] Dry run — print the would-update candidates
+             (package → current → target) and each skipped package with its
+             reason. Read-only (GET); changes NOTHING. Add --json for the
+             stable/parseable form an external dispatch lever gates on.
+  --apply    Execute the planned set through the instance's merged update
+             dispatch. The server RE-PLANS immediately before dispatch (fresh
+             pre-dispatch recheck; may only SHRINK the set), applies each
+             candidate in ISOLATION, and audits both the initiating operator
+             and the system executor. Runs on demand even when the daily
+             auto-update scheduler is OFF; every per-target gate still applies.
+
+Options:
+  --app-url <url>      Target instance base URL (e.g. https://instance, or a
+                       loopback dev box). Required (or --profile).
+  --profile <name>     Use a named saved login profile instead of --app-url.
+  --plan-digest <d>    (--apply) Pin the exact candidate set: the server refuses
+                       to apply if the recomputed plan's digest differs (a
+                       lightweight CAS). Omit to always re-plan against live state.
+  --json               Emit the raw structured plan/apply result.
+
+Fail-closed reasons surfaced (never silent): read-model-unwired, ambiguous-install-scope,
+state-drift, sdk-abi-incompatible, signature-not-ready, org-row-fence, and more.
+Exit code: an --apply with any FAILED candidate exits 1 (audit-write failures are
+non-fatal and only reported).`,
   "create-extension": `Kinds:
   agent       An OpenAgentSpec Flow + co-located skills (first-party scope).
   connector   A capability/MCP provider with a register(ctx) server entry (any scope).
@@ -11909,6 +11958,14 @@ function buildHandlers() {
     "extensions.submit": async (rest) => {
       const { runExtensionsSubmit } = await import("./extensions-submit.mjs");
       await runExtensionsSubmit(rest);
+    },
+    "extensions.reconcile": async (rest) => {
+      const { runExtensionsReconcile } = await import("./extensions-reconcile.mjs");
+      const code = await runExtensionsReconcile(rest);
+      // A non-zero return is NOT a thrown error (the apply succeeded partially,
+      // per-candidate isolated); surface it as the process exit code so an
+      // external dispatch lever can gate on "did any candidate fail".
+      if (Number.isInteger(code) && code > 0) process.exitCode = code;
     },
     "extensions.list": async (rest) => {
       await runExtensionsList(rest);
