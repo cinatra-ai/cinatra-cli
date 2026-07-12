@@ -799,6 +799,22 @@ Examples:
   cinatra create-extension agent invoice-extractor
   cinatra create-extension connector stripe --scope acme
   cinatra create-extension skill pdf-tools --scope anthropics`,
+  "db.upgrade-preflight": `Read-only preflight for a stateful-service major upgrade (cinatra-cli#128).
+
+For each stateful service (Postgres/MariaDB/Neo4j/redis/valkey/rabbitmq/…) it
+detects the DEPLOYED data-format version — recorded ledger version first (the
+PRIMARY source, bound to the volume's identity), then a live probe, then an
+authoritative raw on-disk marker (Postgres PG_VERSION) — and reports whether
+recreating that container is safe. A supported pending upgrade STOPS with the
+sanctioned migration command; a downgrade is BLOCKED; an unknown/unreadable
+version, a ledger/volume mismatch, or an interrupted migration FAILS CLOSED. An
+empty volume or a disabled profile is an explicit non-finding. Never recreates a
+container — it only inspects. Exit code: 0 = safe, 1 = at least one blocking
+finding.
+
+Options:
+  --service <name>   Check only this service (repeatable).
+  --json             Emit the raw structured report.`,
 };
 
 // cinatra-cli#62: the in-repo provisioning phase ids that are now folded into
@@ -5251,6 +5267,108 @@ async function runDbMigrate(rest) {
       `${label} migrations (${schemaName}): ${down ? "reverted" : "applied"} ${result.ranNames.length} — ${result.ranNames.join(", ")}`,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// `cinatra instance db upgrade-preflight` — fail-closed upgrade preflight
+// (cinatra-cli#128, upgrade-paths epic cinatra-ai/cinatra#1419).
+//
+// Read-only. Resolves the instance, then drives the pure preflight
+// (src/upgrade-preflight.mjs) over an INJECTED docker-backed transport +
+// ledger-driven service discovery. The preflight detects each stateful
+// service's deployed data-format version (recorded ledger version → probe →
+// authoritative on-disk marker) and reports whether recreating its container is
+// safe; it NEVER recreates anything.
+//
+// E2E-WIRED SEAM (host-fenced this lane — no container boot). The offline path
+// (ledger-recorded versions + volume-identity integrity + modeled `--target`
+// hops) is fully exercised by the unit + mocked-transport tests. The REAL live
+// probe (`SELECT version()`), the authoritative raw PG_VERSION read from the
+// deployment's actual data path, the empty-volume content check, and
+// compose-based discovery of un-ledgered legacy services are the seams the
+// headn-room E2E lane wires against a running verify stack — they are stubbed to
+// the SAFE (fail-closed) default here (a null probe/marker on a non-empty,
+// un-ledgered volume STOPS a recreate rather than guessing).
+// ---------------------------------------------------------------------------
+async function runDbUpgradePreflight(rest) {
+  const { runPreflightCommand } = await import("./upgrade-preflight.mjs");
+  const { readLedger } = await import("./version-ledger.mjs");
+  const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, findInstanceByInstallDir } =
+    await import("./instance-registry.mjs");
+
+  const flagSlug = readOptionValue(rest, "--instance");
+  let repoRoot = null;
+  try {
+    repoRoot = getRepoRoot();
+  } catch {
+    /* not inside an install checkout — rely on --instance */
+  }
+  const registry = requireUsableInstanceRegistry(defaultInstanceRegistryPath());
+  let slug = flagSlug;
+  if (!slug && repoRoot) {
+    const found = findInstanceByInstallDir(registry, repoRoot);
+    if (found) slug = found.slug;
+  }
+  if (!slug) {
+    console.error(
+      "upgrade-preflight: could not resolve an instance — pass --instance <slug> or run inside an install checkout.",
+    );
+    process.exitCode = 2;
+    return;
+  }
+
+  // Best-effort read-only docker capture; ANY failure yields null so the
+  // preflight fails closed rather than proceeding on a guess.
+  const dockerCapture = (args) => {
+    try {
+      const r = spawnSync("docker", args, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
+      });
+      if (r.status !== 0) return null;
+      return (r.stdout ?? "").trim();
+    } catch {
+      return null;
+    }
+  };
+
+  // Discover the services to check from the recorded ledger — each entry carries
+  // the ACTUAL volume name backing it (never an assumed name). Target defaults to
+  // null (integrity-only) unless the operator supplies `--target <svc>=<ver>`.
+  const discover = () => {
+    const { ledger } = readLedger(slug);
+    return Object.values(ledger.services).map((e) => ({
+      service: e.service,
+      volumeName: e.volume?.name ?? null,
+      target: null,
+    }));
+  };
+
+  const transport = {
+    inspectVolume: (name) => {
+      if (!name) return null;
+      const raw = dockerCapture(["volume", "inspect", name]);
+      if (!raw) return null;
+      try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed[0] ?? null : parsed;
+      } catch {
+        return null;
+      }
+    },
+    volumeState: (name) => {
+      if (!name) return "absent";
+      return dockerCapture(["volume", "inspect", name]) ? "present" : "absent";
+    },
+    // E2E-wired seams (see the header note) — stubbed to the safe default here.
+    probeVersion: () => null,
+    readMarker: () => null,
+    profileEnabled: () => true,
+  };
+
+  const code = runPreflightCommand(rest, { slug, discover, transport });
+  if (code) process.exitCode = code;
 }
 
 // ---------------------------------------------------------------------------
@@ -11755,6 +11873,9 @@ function buildHandlers() {
     },
     "db.migrate": async (rest) => {
       await runDbMigrate(rest);
+    },
+    "db.upgrade-preflight": async (rest) => {
+      await runDbUpgradePreflight(rest);
     },
     "dev.refresh": async (rest) => {
       await runDevRefresh(rest);

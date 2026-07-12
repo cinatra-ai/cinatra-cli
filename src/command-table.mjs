@@ -323,6 +323,13 @@ export const COMMAND_DESCRIPTORS = [
     summary: "Apply the additive bootstrap + versioned core migration chain (server-down-safe).",
   },
   {
+    id: "db.upgrade-preflight",
+    path: ["instance", "db", "upgrade-preflight"],
+    match: "command+mode+sub",
+    summary:
+      "Read-only: detect each stateful service's deployed data-format version and report whether recreating its container is safe (fail-closed on unknowns).",
+  },
+  {
     id: "dev.refresh",
     path: ["instance", "refresh"],
     match: "command+mode",
