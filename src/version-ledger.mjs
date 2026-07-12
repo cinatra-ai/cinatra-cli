@@ -216,29 +216,50 @@ export function withLedgerLock(slug, dir = defaultLedgerDir(), fn) {
   const ownerFile = path.join(lockDir, "owner");
   const token = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
   const deadline = Date.now() + LOCK_WAIT_MS;
+  let acquiredAt = 0;
   for (;;) {
     try {
       mkdirSync(lockDir);
       writeFileSync(ownerFile, token);
+      acquiredAt = Date.now();
       break;
     } catch {
       try {
         const age = Date.now() - statSync(lockDir).mtimeMs;
         if (age > LOCK_STALE_MS) {
           // A crashed holder. Claim-by-rename: exactly one waiter wins the
-          // rename (atomic), deletes the claimed dir, and everyone retries.
+          // rename (atomic). RE-VERIFY the claim actually took a stale dir —
+          // if a live holder slipped in between the stat and the rename, put
+          // its lock straight back (compensation for the stat→rename window).
           const claimed = `${lockDir}.stale.${token}`;
           try {
             renameSync(lockDir, claimed);
-            rmSync(claimed, { recursive: true, force: true });
+            let claimedStale = true;
+            try {
+              claimedStale = Date.now() - statSync(claimed).mtimeMs > LOCK_STALE_MS;
+            } catch {
+              /* vanished — nothing to compensate */
+            }
+            if (claimedStale) {
+              rmSync(claimed, { recursive: true, force: true });
+            } else {
+              try {
+                renameSync(claimed, lockDir); // restore the live holder's lock
+              } catch {
+                // Original name re-taken already — the renamed copy is
+                // consulted by nobody; discard it.
+                rmSync(claimed, { recursive: true, force: true });
+              }
+            }
           } catch {
-            /* another waiter claimed it — just retry */
+            /* another waiter claimed it — fall through to wait */
           }
-          continue;
         }
       } catch {
-        /* lock vanished between mkdir and stat — retry */
+        /* lock vanished between mkdir and stat — fall through and retry */
       }
+      // ALWAYS deadline-checked + slept (a persistently failing stale-break
+      // must never turn into an unbounded busy-spin).
       if (Date.now() > deadline) {
         throw new Error(
           `Timed out waiting for the version-ledger lock for "${slug}" (${lockDir}). ` +
@@ -253,11 +274,15 @@ export function withLedgerLock(slug, dir = defaultLedgerDir(), fn) {
   try {
     return fn();
   } finally {
+    // Release ONLY within the window where displacement is impossible: a
+    // breaker may displace a lock only once it is STALE, so a hold shorter
+    // than the stale threshold (minus margin) plus a matching owner token
+    // proves the dir is still ours. A pathological over-long hold leaves the
+    // lock for the next waiter's stale-break instead of risking the removal
+    // of a successor's live lock (token-read→rm window).
+    const heldTooLong = Date.now() - acquiredAt > LOCK_STALE_MS - 5_000;
     try {
-      // Release ONLY our own lock: if we somehow held past the stale window
-      // and a successor claimed + re-acquired, the owner token differs and we
-      // must not remove their lock.
-      if (readFileSync(ownerFile, "utf8") === token) {
+      if (!heldTooLong && readFileSync(ownerFile, "utf8") === token) {
         rmSync(lockDir, { recursive: true, force: true });
       }
     } catch {
