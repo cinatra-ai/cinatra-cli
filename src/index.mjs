@@ -665,6 +665,7 @@ Usage:
   cinatra instance clone prune [--worktree-path <path>] [--slug <slug>] --yes
   cinatra instance clone list
   cinatra instance db migrate [--down] [--count=N] [--dir <abs> --namespace <ns>]
+  cinatra instance db upgrade-preflight [--instance <slug>] [--service <name>] [--target <service>=<version>] [--json]
   cinatra instance refresh [--docker=auto|always|--no-docker] [--with-dev-apps]
   cinatra instance tunnel start
   cinatra instance tunnel stop
@@ -706,6 +707,11 @@ Commands:
                       chain. WORKS WHEN THE APP IS DOWN — talks to Postgres
                       directly, so it can repair a broken-schema instance.
                       --down / --count=N / --dir <abs> --namespace <ns>.
+  instance db upgrade-preflight
+                      Read-only: detect each stateful service's deployed
+                      data-format version (ledger → probe → marker) and report
+                      whether recreating its container is safe. Fails CLOSED on
+                      unknown/unreadable versions; never recreates anything.
   instance refresh    Reconcile your local dev environment (deps + dev DB schema)
                       to the code on disk. Dev mode only; never touches git.
                       --with-dev-apps: opt in to dev-app reconciliation (skipped
@@ -799,6 +805,28 @@ Examples:
   cinatra create-extension agent invoice-extractor
   cinatra create-extension connector stripe --scope acme
   cinatra create-extension skill pdf-tools --scope anthropics`,
+  "db.upgrade-preflight": `Read-only preflight for a stateful-service major upgrade (cinatra-cli#128).
+
+For each stateful service (Postgres/MariaDB/Neo4j/redis/valkey/rabbitmq/…) it
+detects the DEPLOYED data-format version — recorded ledger version first (the
+PRIMARY source, bound to the volume's identity), then a live probe, then an
+authoritative raw on-disk marker (Postgres PG_VERSION) — and reports whether
+recreating that container is safe. A supported pending upgrade STOPS with the
+sanctioned migration command; a downgrade is BLOCKED; an unknown/unreadable
+version, a ledger/volume mismatch, or an interrupted migration FAILS CLOSED. An
+empty volume or a disabled profile is an explicit non-finding. Never recreates a
+container — it only inspects. Exit code: 0 = safe, 1 = at least one blocking
+finding.
+
+Detection targets come from the checkout's own compose config (the image each
+service WOULD deploy on a recreate) merged over the recorded ledger; outside a
+checkout, pass --instance and (optionally) --target hops to model.
+
+Options:
+  --instance <slug>            Instance to check (default: resolved from the checkout).
+  --service <name>             Check only this service (repeatable).
+  --target <service>=<version> Model a proposed hop (overrides the derived target).
+  --json                       Emit the raw structured report.`,
 };
 
 // cinatra-cli#62: the in-repo provisioning phase ids that are now folded into
@@ -5254,6 +5282,184 @@ async function runDbMigrate(rest) {
 }
 
 // ---------------------------------------------------------------------------
+// `cinatra instance db upgrade-preflight` — fail-closed upgrade preflight
+// (cinatra-cli#128, upgrade-paths epic cinatra-ai/cinatra#1419).
+//
+// Read-only. Resolves the instance, then drives the pure preflight
+// (src/upgrade-preflight.mjs) over an INJECTED docker-backed transport. The
+// preflight detects each stateful service's deployed data-format version
+// (recorded ledger version → probe → authoritative on-disk marker) and reports
+// whether recreating its container is safe; it NEVER recreates anything.
+//
+// DISCOVERY = the checkout's resolved compose config ∪ the recorded ledger.
+// Inside an install checkout, `docker compose config` (the row's recorded
+// files/project) is the recreate INTENT: per stateful service it yields the
+// image a recreate WOULD deploy (→ the natural TARGET version) and the ACTUAL
+// resolved volume name. Ledger entries for services no longer in the config are
+// still checked (integrity-only, target null). Outside a checkout, discovery is
+// ledger-only. `--target <svc>=<ver>` overrides either.
+//
+// FENCED SEAMS (fail-closed stubs here; wired by the upgrade-execution lanes,
+// epic sub-issues 3-4): the live version probe (`SELECT version()`) and the raw
+// PG_VERSION read from the deployment's actual data path. A null probe/marker
+// on a non-empty, un-ledgered volume FAILS CLOSED rather than guessing. The
+// empty-volume check IS real: `docker run --pull=never` over the service's own
+// (already-pulled) image lists the volume root; any failure counts as
+// non-empty (the fail-closed direction).
+// ---------------------------------------------------------------------------
+async function runDbUpgradePreflight(rest) {
+  const { runPreflightCommand } = await import("./upgrade-preflight.mjs");
+  const { readLedger } = await import("./version-ledger.mjs");
+  const { resolveComposeConfig, statefulServicesFromComposeConfig } = await import("./version-ledger-capture.mjs");
+  const { imageParts } = await import("./upgrade-matrix.mjs");
+  const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, findInstanceByInstallDir, getInstance } =
+    await import("./instance-registry.mjs");
+
+  const flagSlug = readOptionValue(rest, "--instance");
+  let repoRoot = null;
+  try {
+    repoRoot = getRepoRoot();
+  } catch {
+    /* not inside an install checkout — rely on --instance */
+  }
+  const registry = requireUsableInstanceRegistry(defaultInstanceRegistryPath());
+  let row = null;
+  if (flagSlug) {
+    row = getInstance(registry, flagSlug) ?? null;
+  } else if (repoRoot) {
+    row = findInstanceByInstallDir(registry, repoRoot);
+  }
+  const slug = flagSlug ?? row?.slug ?? null;
+  if (!slug) {
+    console.error(
+      "upgrade-preflight: could not resolve an instance — pass --instance <slug> or run inside an install checkout.",
+    );
+    process.exitCode = 2;
+    return;
+  }
+
+  // Best-effort read-only docker capture; ANY failure yields null so the
+  // preflight fails closed rather than proceeding on a guess.
+  const dockerCapture = (args, opts = {}) => {
+    try {
+      const r = spawnSync("docker", args, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
+        ...opts,
+      });
+      if (r.status !== 0) return null;
+      return (r.stdout ?? "").trim();
+    } catch {
+      return null;
+    }
+  };
+
+  // Discover services: ledger entries first (integrity-only), then the
+  // checkout's compose-config intent (adds/overrides the volume the deployment
+  // ACTUALLY resolves + the target version the pinned image ships). Fail-closed
+  // discovery: an unresolvable compose config inside a checkout ABORTS (exit 2,
+  // via the discover-throw path) rather than silently degrading to ledger-only;
+  // a matrix-known service whose data volume cannot be identified surfaces as a
+  // fail-closed finding; a pinned image whose version does not land on the
+  // service's axis carries its RAW tag as the target so the comparison fails
+  // closed instead of collapsing into an integrity-only pass.
+  const volumeImages = new Map(); // volumeName → image (for the emptiness probe)
+  const discover = () => {
+    const specs = new Map();
+    const { ledger } = readLedger(slug);
+    for (const e of Object.values(ledger.services)) {
+      specs.set(e.service, { service: e.service, volumeName: e.volume?.name ?? null, target: null });
+      if (e.volume?.name && e.image) volumeImages.set(e.volume.name, e.image);
+    }
+    const configDir = row?.installDir ?? repoRoot;
+    if (configDir) {
+      const rowProject = row?.composeProject && row.composeProject !== "cinatra" ? row.composeProject : null;
+      const config = resolveComposeConfig({
+        targetDir: configDir,
+        composeFiles: row?.composeFiles ?? null,
+        composeProject: rowProject,
+        capture: (cmd, args, opts) => (cmd === "docker" ? dockerCapture(args, opts) : null),
+      });
+      if (!config) {
+        throw new Error(
+          `could not resolve the compose config for ${configDir} — refusing a partial preflight. ` +
+            `Ensure Docker Compose v2 is available and the checkout is intact, then retry.`,
+        );
+      }
+      const { found, skipped } = statefulServicesFromComposeConfig(config);
+      for (const s of found) {
+        const target = s.dataFormatVersion ?? imageParts(s.image).tag ?? "unknown";
+        specs.set(s.service, { service: s.service, volumeName: s.volumeName, target });
+        volumeImages.set(s.volumeName, s.image);
+      }
+      for (const s of skipped) {
+        specs.set(s.service, { service: s.service, volumeName: null, target: null, volumeUnidentified: s.reason });
+      }
+    }
+    return [...specs.values()];
+  };
+
+  // `docker volume inspect` with an explicit three-way outcome: only docker's
+  // own "no such volume" counts as ABSENT; any other failure is an ERROR (and
+  // the transport treats it fail-closed, never as an empty/fresh volume).
+  const inspectVolumeThreeWay = (name) => {
+    try {
+      const r = spawnSync("docker", ["volume", "inspect", name], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
+      });
+      if (r.status === 0) {
+        try {
+          const parsed = JSON.parse((r.stdout ?? "").trim());
+          const inspectRow = Array.isArray(parsed) ? parsed[0] ?? null : parsed;
+          return inspectRow ? { status: "ok", row: inspectRow } : { status: "error", row: null };
+        } catch {
+          return { status: "error", row: null };
+        }
+      }
+      if (/no such volume/i.test(`${r.stderr ?? ""}${r.stdout ?? ""}`)) return { status: "absent", row: null };
+      return { status: "error", row: null };
+    } catch {
+      return { status: "error", row: null };
+    }
+  };
+
+  const transport = {
+    inspectVolume: (name) => {
+      if (!name) return null;
+      const res = inspectVolumeThreeWay(name);
+      return res.status === "ok" ? res.row : null;
+    },
+    volumeState: (name) => {
+      if (!name) return "absent";
+      const res = inspectVolumeThreeWay(name);
+      if (res.status === "absent") return "absent";
+      if (res.status === "error") return "present"; // fail closed on a docker error
+      // Real emptiness check over the service's own already-pulled image
+      // (--pull=never: a read-only preflight never reaches the network). Any
+      // failure → "present" (fail closed, never "empty" on a guess).
+      const image = volumeImages.get(name);
+      if (!image) return "present";
+      const listing = dockerCapture(
+        ["run", "--rm", "--pull=never", "--entrypoint", "/bin/sh", "-v", `${name}:/__preflight_probe:ro`, image, "-c", "ls -A /__preflight_probe"],
+        { timeout: 60_000 },
+      );
+      if (listing === null) return "present";
+      return listing.length === 0 ? "empty" : "present";
+    },
+    // Fenced seams (see the header note) — stubbed to the safe default here.
+    probeVersion: () => null,
+    readMarker: () => null,
+    profileEnabled: () => true,
+  };
+
+  const code = runPreflightCommand(rest, { slug, discover, transport });
+  if (code) process.exitCode = code;
+}
+
+// ---------------------------------------------------------------------------
 // Update (`cinatra update` / `cinatra upgrade`) — cinatra-cli#11, #60.
 // ---------------------------------------------------------------------------
 //
@@ -5665,6 +5871,32 @@ async function runDevRefresh(rest) {
       waitForRedis(repoRoot);
       waitForNango(repoRoot);
       console.log("  Postgres, Redis, and Nango are ready.");
+      // cinatra-cli#128: this `up` deployed whatever the checkout now pins —
+      // record the stateful-service versions in the instance's ledger
+      // (best-effort; skipped when this checkout has no registered instance).
+      // Recorded against the SAME project this refresh upped (no -p above).
+      try {
+        const { captureDeployedVersions } = await import("./version-ledger-capture.mjs");
+        const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, findInstanceByInstallDir } =
+          await import("./instance-registry.mjs");
+        const instRow = findInstanceByInstallDir(requireUsableInstanceRegistry(defaultInstanceRegistryPath()), repoRoot);
+        if (instRow?.slug) {
+          // This refresh upped the BARE project (no -p above); when the row
+          // records a different explicit project, recording would bind another
+          // stack's volumes to this slug — captureDeployedVersions refuses via
+          // the project-match guard instead.
+          const rowProject =
+            instRow.composeProject && instRow.composeProject !== "cinatra" ? instRow.composeProject : null;
+          await captureDeployedVersions({
+            slug: instRow.slug,
+            targetDir: repoRoot,
+            requireProjectMatch: rowProject,
+            log: console.log,
+          });
+        }
+      } catch {
+        /* best-effort — a recording failure never fails the refresh */
+      }
     } catch (err) {
       if (dockerMode === "always") {
         throw err;
@@ -11755,6 +11987,9 @@ function buildHandlers() {
     },
     "db.migrate": async (rest) => {
       await runDbMigrate(rest);
+    },
+    "db.upgrade-preflight": async (rest) => {
+      await runDbUpgradePreflight(rest);
     },
     "dev.refresh": async (rest) => {
       await runDevRefresh(rest);

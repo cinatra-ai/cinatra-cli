@@ -276,6 +276,12 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode+sub",
         },
         {
+          "command": "instance db upgrade-preflight",
+          "hidden": false,
+          "id": "db.upgrade-preflight",
+          "match": "command+mode+sub",
+        },
+        {
           "command": "instance refresh",
           "hidden": false,
           "id": "dev.refresh",
@@ -461,6 +467,8 @@ describe("command table — routing (longest-match)", () => {
     [["instance", "clone", "slug-for-worktree"], "clone.slug-for-worktree"],
     [["instance", "db", "migrate"], "db.migrate"],
     [["instance", "db", "migrate", "--down"], "db.migrate"],
+    [["instance", "db", "upgrade-preflight"], "db.upgrade-preflight"],
+    [["instance", "db", "upgrade-preflight", "--json"], "db.upgrade-preflight"],
     [["instance", "refresh"], "dev.refresh"],
     [["instance", "tunnel"], "dev.tunnel"],
     [["instance", "tunnel", "start"], "dev.tunnel"],
