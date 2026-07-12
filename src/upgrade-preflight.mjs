@@ -211,6 +211,10 @@ export function decideService({
       detectionSource,
     });
   }
+  // DELIBERATE: identical detected/target strings pass even off the matrix
+  // axis — equal versions mean the recreate deploys the very version the
+  // volume already runs, i.e. NO data-format transition exists to guard. The
+  // axis only orders NON-equal pairs (below), where unknown = fail closed.
   if (String(detected) === String(target)) {
     return verdict(service, VERDICTS.PASS, `matching versions (${detected})`, { detected, target, detectionSource });
   }

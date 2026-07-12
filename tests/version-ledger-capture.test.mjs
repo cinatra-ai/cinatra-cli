@@ -127,6 +127,25 @@ describe("statefulServicesFromComposeConfig", () => {
     expect(found.find((s) => s.service === "postgres").volumeName).toBe("cinatra_main_postgres-data");
   });
 
+  it("dataMount matches on path boundaries only — /data never matches /data-cache", () => {
+    const doc = {
+      name: "p",
+      services: {
+        redis: {
+          image: "redis:8-alpine",
+          volumes: [
+            { type: "bind", source: "/host/data", target: "/data" }, // real data dir bind-mounted
+            { type: "volume", source: "cache", target: "/data-cache" }, // lexical prefix trap
+          ],
+        },
+      },
+      volumes: { cache: { name: "p_cache" } },
+    };
+    const { found, skipped } = statefulServicesFromComposeConfig(doc);
+    expect(found).toEqual([]);
+    expect(skipped[0].reason).toMatch(/no named data-volume/i);
+  });
+
   it("NEVER binds an auxiliary volume when the data path itself is bind-mounted", () => {
     // postgres data dir on a bind mount + one unrelated named volume: recording
     // that volume would attach the ledger entry to the WRONG volume identity.
@@ -158,11 +177,15 @@ describe("recordDeployedStack", () => {
     // wordpress volume NOT live (profile never enabled)
   };
   const inspect = (name) => LIVE[name] ?? null;
-  // Deployment proof: postgres + nango-db running; wordpress-db profile dormant.
-  const RUNNING = new Set(["postgres", "nango-db"]);
+  // Deployment proof: postgres + nango-db running THE CONFIGURED pins;
+  // wordpress-db profile dormant.
+  const RUNNING = new Map([
+    ["postgres", "postgres:18-alpine@sha256:9a8afc"],
+    ["nango-db", "postgres:17-alpine"],
+  ]);
 
   it("records live-volume-bound entries for RUNNING services; the rest are skipped, not guessed", () => {
-    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningServices: RUNNING });
+    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningImages: RUNNING });
     expect(res.status).toBe("ok");
     expect(res.recorded.sort()).toEqual(["nango-db", "postgres"]);
     expect(res.skipped.map((s) => s.service)).toEqual(["wordpress-db"]);
@@ -182,32 +205,44 @@ describe("recordDeployedStack", () => {
     // volume must keep its (absent) entry rather than gaining the new pin.
     const inspectWithWp = (name) =>
       name === "explicit-wp-vol" ? { name, createdAt: "2025-01-01T00:00:00Z" } : inspect(name);
-    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspectWithWp, runningServices: RUNNING });
+    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspectWithWp, runningImages: RUNNING });
     expect(res.recorded).not.toContain("wordpress-db");
     expect(res.skipped.find((s) => s.service === "wordpress-db").reason).toMatch(/not running/i);
     expect(readLedger("main", dir).ledger.services["wordpress-db"]).toBeUndefined();
   });
 
   it("refuses to record ANYTHING without deployment proof (running set unavailable)", () => {
-    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningServices: null });
+    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningImages: null });
     expect(res.status).toBe("no-deployment-proof");
     expect(res.recorded).toEqual([]);
     expect(readLedger("main", dir).status).toBe("missing"); // nothing written
   });
 
-  it("re-recording updates entries (idempotent installs converge)", () => {
-    recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningServices: RUNNING });
+  it("re-recording updates entries once the container actually runs the new pin", () => {
+    recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningImages: RUNNING });
     const doc = configDoc();
     doc.services.postgres.image = "postgres:18.1-alpine";
-    const res = recordDeployedStack({ slug: "main", configJson: doc, ledgerDir: dir, inspectVolume: inspect, runningServices: RUNNING });
+    const running = new Map(RUNNING);
+    running.set("postgres", "postgres:18.1-alpine"); // the up recreated it on the new pin
+    const res = recordDeployedStack({ slug: "main", configJson: doc, ledgerDir: dir, inspectVolume: inspect, runningImages: running });
     expect(res.status).toBe("ok");
     expect(readLedger("main", dir).ledger.services.postgres.image).toBe("postgres:18.1-alpine");
+  });
+
+  it("a STALE running container (old image, new pin) is never re-stamped", () => {
+    const doc = configDoc();
+    doc.services.postgres.image = "postgres:18.1-alpine"; // config moved forward…
+    // …but the running container still carries the previous pin.
+    const res = recordDeployedStack({ slug: "main", configJson: doc, ledgerDir: dir, inspectVolume: inspect, runningImages: RUNNING });
+    expect(res.recorded).toEqual(["nango-db"]);
+    expect(res.skipped.find((s) => s.service === "postgres").reason).toMatch(/stale container/i);
+    expect(readLedger("main", dir).ledger.services.postgres).toBeUndefined();
   });
 
   it("NEVER overwrites a malformed ledger", () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(path.join(dir, "main.json"), "{not json");
-    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningServices: RUNNING });
+    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningImages: RUNNING });
     expect(res.status).toBe("malformed");
     expect(res.recorded).toEqual([]);
     expect(readLedger("main", dir).status).toBe("malformed"); // untouched
@@ -234,7 +269,7 @@ describe("recordDeployedStack", () => {
     });
     writeLedger(ledger, dir);
 
-    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningServices: RUNNING });
+    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningImages: RUNNING });
     expect(res.recorded).toEqual(["nango-db"]);
     expect(res.skipped.find((s) => s.service === "postgres").reason).toMatch(/migration in flight/i);
     // The live postgres entry is still the SOURCE (the journal was not clobbered).
@@ -245,10 +280,17 @@ describe("recordDeployedStack", () => {
 });
 
 describe("captureDeployedVersions — the install/refresh hook over the shell seam", () => {
+  // `compose ps --format json` NDJSON lines (compose stamps the exact
+  // configured ref, digest pin included).
+  const PS_NDJSON = [
+    JSON.stringify({ Service: "postgres", Image: "postgres:18-alpine@sha256:9a8afc", State: "running" }),
+    JSON.stringify({ Service: "nango-db", Image: "postgres:17-alpine", State: "running" }),
+  ].join("\n");
+
   const fakeDocker = (overrides = {}) => (cmd, args) => {
     if (overrides.calls) overrides.calls.push([cmd, ...args]);
     if (args.includes("config")) return overrides.config ?? JSON.stringify(configDoc());
-    if (args.includes("ps")) return overrides.ps ?? "postgres\nnango-db";
+    if (args.includes("ps")) return overrides.ps ?? PS_NDJSON;
     if (args[0] === "volume" && args[1] === "inspect") {
       const name = args[2];
       if (name === "explicit-wp-vol") return null;

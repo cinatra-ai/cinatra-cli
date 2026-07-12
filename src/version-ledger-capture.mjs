@@ -104,7 +104,13 @@ export function statefulServicesFromComposeConfig(configJson, matrix = DEFAULT_U
     // ledger entry to the wrong volume's identity and defeat the mismatch check).
     let dataMounts = mounts;
     if (typeof entry.dataMount === "string" && entry.dataMount.length) {
-      dataMounts = mounts.filter((m) => typeof m.target === "string" && m.target.startsWith(entry.dataMount));
+      // Path-boundary match, not lexical: "/data" must match "/data" and
+      // "/data/db" but NEVER "/data-cache".
+      dataMounts = mounts.filter(
+        (m) =>
+          typeof m.target === "string" &&
+          (m.target === entry.dataMount || m.target.startsWith(`${entry.dataMount}/`)),
+      );
     }
     if (dataMounts.length !== 1) {
       skipped.push({
@@ -160,15 +166,18 @@ export function recordDeployedStack({
   matrix = DEFAULT_UPGRADE_MATRIX,
   ledgerDir,
   inspectVolume,
-  runningServices = null,
+  runningImages = null,
 }) {
   const { found, skipped } = statefulServicesFromComposeConfig(configJson, matrix);
-  // A wrong record is worse than no record: without deployment proof (the
-  // service's container actually RUNNING under this project right after the
-  // `up`), record nothing. The resolved config carries every profile-gated
-  // service, so a dormant profile's OLD volume must never be re-stamped with
-  // the new compose-derived version (its container never ran the new image).
-  if (!(runningServices instanceof Set)) {
+  // A wrong record is worse than no record: without deployment proof, record
+  // nothing. Proof is per-service: a container RUNNING under this project
+  // whose image reference EQUALS the configured pin (`runningImages`:
+  // service → running image ref). The resolved config carries every
+  // profile-gated service, so a dormant profile's OLD volume must never be
+  // re-stamped — and neither may a STALE container still running a previous
+  // pin (compose leaves an excluded profile's container running with its old
+  // image; only an image-exact match proves THIS config was deployed).
+  if (!(runningImages instanceof Map)) {
     return {
       status: "no-deployment-proof",
       recorded: [],
@@ -183,8 +192,16 @@ export function recordDeployedStack({
     let ledger = read.ledger;
     const recorded = [];
     for (const s of found) {
-      if (!runningServices.has(s.service)) {
+      const runningImage = runningImages.get(s.service);
+      if (!runningImage) {
         skipped.push({ service: s.service, reason: "container not running under this project (profile off / not deployed)" });
+        continue;
+      }
+      if (runningImage !== s.image) {
+        skipped.push({
+          service: s.service,
+          reason: `running container image (${runningImage}) differs from the configured pin — stale container, not recording`,
+        });
         continue;
       }
       const live = inspectVolume(s.volumeName);
@@ -257,20 +274,45 @@ export function resolveComposeConfig({ targetDir, composeFiles = null, composePr
   }
 }
 
-/** The set of compose services with a RUNNING container under this
- *  files/project set (`compose ps --services --status running`) — the
- *  deployment proof recording requires. Null on any failure (the caller then
- *  refuses to record rather than recording blind). */
-export function resolveRunningServices({ targetDir, composeFiles = null, composeProject = null, envFile = null, capture = defaultCapture }) {
-  const args = [...composeBaseArgs({ composeFiles, composeProject, envFile }), "ps", "--services", "--status", "running"];
+/** Map of compose service → RUNNING container's image reference under this
+ *  files/project set (`compose ps --format json`; compose stamps the container
+ *  with the exact configured ref, digest pin included) — the deployment proof
+ *  recording requires. A service with several running containers (replicas)
+ *  is included only when they all agree on one image. Null on any failure
+ *  (the caller then refuses to record rather than recording blind). */
+export function resolveRunningServiceImages({ targetDir, composeFiles = null, composeProject = null, envFile = null, capture = defaultCapture }) {
+  const args = [...composeBaseArgs({ composeFiles, composeProject, envFile }), "ps", "--format", "json"];
   const raw = capture("docker", args, { cwd: targetDir });
   if (raw === null) return null;
-  return new Set(
-    raw
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean),
-  );
+  // Compose v2 emits NDJSON (one container per line); some builds emit an array.
+  let rows;
+  try {
+    const parsed = JSON.parse(raw || "[]");
+    rows = Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    rows = [];
+    for (const line of raw.split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      try {
+        rows.push(JSON.parse(t));
+      } catch {
+        return null; // unparsable listing — no proof
+      }
+    }
+  }
+  const images = new Map();
+  const conflicted = new Set();
+  for (const r of rows) {
+    if (!r || r.State !== "running") continue;
+    const service = r.Service;
+    const image = r.Image;
+    if (typeof service !== "string" || !service.length || typeof image !== "string" || !image.length) continue;
+    if (images.has(service) && images.get(service) !== image) conflicted.add(service);
+    images.set(service, image);
+  }
+  for (const s of conflicted) images.delete(s);
+  return images;
 }
 
 /**
@@ -308,14 +350,14 @@ export function captureDeployedVersions({
       );
       return { status: "project-mismatch", recorded: [], skipped: [] };
     }
-    const runningServices = resolveRunningServices({ targetDir, composeFiles, composeProject, envFile, capture });
+    const runningImages = resolveRunningServiceImages({ targetDir, composeFiles, composeProject, envFile, capture });
     const result = recordDeployedStack({
       slug,
       configJson,
       matrix,
       ledgerDir,
       inspectVolume: (name) => dockerVolumeIdentity(name, capture),
-      runningServices,
+      runningImages,
     });
     if (result.status === "malformed") {
       log(`  ⚠ version ledger for "${slug}" is malformed — NOT overwritten; repair it by hand (deployed versions not recorded).`);
@@ -337,6 +379,6 @@ export const __test = {
   recordDeployedStack,
   dockerVolumeIdentity,
   resolveComposeConfig,
-  resolveRunningServices,
+  resolveRunningServiceImages,
   captureDeployedVersions,
 };

@@ -47,7 +47,7 @@
 // clone-registry (one implementation, not a fork). Never imports index.mjs.
 // ---------------------------------------------------------------------------
 
-import { existsSync, mkdirSync, readFileSync, rmdirSync, statSync, writeFileSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, renameSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -170,7 +170,9 @@ export function requireUsableLedger(slug, dir = defaultLedgerDir()) {
 }
 
 /** Atomic write: temp file in the same dir + rename; mode 0600. Creates the
- *  ledger dir if absent. */
+ *  ledger dir if absent. CONTRACT: any read→modify→writeLedger sequence must
+ *  run inside withLedgerLock (see above) so concurrent writers can never
+ *  clobber each other's journal. */
 export function writeLedger(ledger, dir = defaultLedgerDir()) {
   mkdirSync(dir, { recursive: true });
   const file = ledgerPath(ledger.slug, dir);
@@ -191,10 +193,19 @@ const LOCK_STALE_MS = 120_000;
 /**
  * Serialize a read-modify-write of one slug's ledger against concurrent
  * writers (a capture racing a migration's beginMigration must never clobber
- * the pending journal). SYNCHRONOUS mkdir-based lock (atomic on POSIX):
- * bounded busy-wait, stale locks (older than 2 min — a crashed holder) are
- * broken with a note, and the lock is always released in `finally`. `fn` runs
- * under the lock and its result is returned.
+ * the pending journal). CONTRACT: EVERY ledger mutation (read → modify →
+ * writeLedger) runs inside this lock — today's only writer is the install
+ * capture; the migration flows (begin/commit/rollback, cinatra-cli#129) must
+ * take it too.
+ *
+ * SYNCHRONOUS mkdir-based lock (atomic on POSIX) with OWNERSHIP:
+ *   - acquire = mkdir + write an owner token file into the lock dir;
+ *   - release = only the holder whose token matches removes the lock (a
+ *     successor's fresh lock is never removed by a slow ex-holder);
+ *   - stale break (older than 2 min — a crashed holder) is RENAME-based:
+ *     rename is atomic, so of N waiters exactly ONE claims the stale dir and
+ *     deletes it; the rest simply retry the mkdir.
+ * Bounded wait; `fn` runs under the lock and its result is returned.
  */
 export function withLedgerLock(slug, dir = defaultLedgerDir(), fn) {
   mkdirSync(dir, { recursive: true });
@@ -202,17 +213,27 @@ export function withLedgerLock(slug, dir = defaultLedgerDir(), fn) {
     throw new Error(`Invalid instance slug "${slug}". Must match /^[a-z0-9][a-z0-9-]{0,29}$/.`);
   }
   const lockDir = path.join(dir, `.${slug}.lock`);
+  const ownerFile = path.join(lockDir, "owner");
+  const token = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
   const deadline = Date.now() + LOCK_WAIT_MS;
   for (;;) {
     try {
       mkdirSync(lockDir);
+      writeFileSync(ownerFile, token);
       break;
     } catch {
       try {
         const age = Date.now() - statSync(lockDir).mtimeMs;
         if (age > LOCK_STALE_MS) {
-          // A crashed holder — break the stale lock and retry immediately.
-          rmdirSync(lockDir);
+          // A crashed holder. Claim-by-rename: exactly one waiter wins the
+          // rename (atomic), deletes the claimed dir, and everyone retries.
+          const claimed = `${lockDir}.stale.${token}`;
+          try {
+            renameSync(lockDir, claimed);
+            rmSync(claimed, { recursive: true, force: true });
+          } catch {
+            /* another waiter claimed it — just retry */
+          }
           continue;
         }
       } catch {
@@ -233,9 +254,14 @@ export function withLedgerLock(slug, dir = defaultLedgerDir(), fn) {
     return fn();
   } finally {
     try {
-      rmdirSync(lockDir);
+      // Release ONLY our own lock: if we somehow held past the stale window
+      // and a successor claimed + re-acquired, the owner token differs and we
+      // must not remove their lock.
+      if (readFileSync(ownerFile, "utf8") === token) {
+        rmSync(lockDir, { recursive: true, force: true });
+      }
     } catch {
-      /* released by a stale-break — nothing to do */
+      /* broken/claimed by a successor — nothing safe to remove */
     }
   }
 }
