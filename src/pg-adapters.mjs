@@ -63,15 +63,23 @@ export function parsePgVersionFile(content) {
 }
 
 /** The POSIX sh script the marker scratch container runs over the read-only
- *  volume mounted at `mountPoint`. Prefers a root PG_VERSION (legacy cluster —
- *  including a legacy cluster rebound under a parent mount, the #1417 hazard),
- *  else EXACTLY ONE `<major>/docker/PG_VERSION` (the pg18 parent layout);
- *  anything else exits 3 (→ capture null → fail closed upstream). Pure. */
+ *  volume mounted at `mountPoint`. Accepts EXACTLY ONE cluster marker:
+ *    * a root PG_VERSION with NO `<major>/docker` cluster beside it (a legacy
+ *      cluster — including one rebound under a parent mount, the #1417
+ *      hazard), OR
+ *    * exactly one `<major>/docker/PG_VERSION` with NO root marker (the pg18
+ *      parent layout).
+ *  BOTH layouts present, several parent-layout clusters, or neither → exit 3
+ *  (ambiguous/absent → capture null → the preflight FAILS CLOSED upstream —
+ *  it must never guess which cluster the deployment considers live). Pure. */
 export function pgMarkerShellScript(mountPoint = "/wa_probe") {
   return (
-    `if [ -f ${mountPoint}/PG_VERSION ]; then cat ${mountPoint}/PG_VERSION; exit 0; fi; ` +
     `set -- ${mountPoint}/*/docker/PG_VERSION; ` +
-    `if [ "$#" -eq 1 ] && [ -f "$1" ]; then cat "$1"; exit 0; fi; ` +
+    `d=0; if [ -f "$1" ]; then d=$#; fi; ` +
+    `if [ -f ${mountPoint}/PG_VERSION ]; then ` +
+    `if [ "$d" -gt 0 ]; then exit 3; fi; ` +
+    `cat ${mountPoint}/PG_VERSION; exit 0; fi; ` +
+    `if [ "$d" -eq 1 ]; then cat "$1"; exit 0; fi; ` +
     `exit 3`
   );
 }

@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   compareContentStats,
+  filterGlobalsForBootstrap,
   isSafeDbIdentifier,
   parseDfAvailableBytes,
   parseUpgradeMajorArgs,
@@ -135,6 +136,33 @@ describe("runUpgradeMajor — happy path", () => {
     expect(idx("writeCutoverOverride")).toBeLessThan(idx("upServices", ["app", "worker"]));
     // The old volume is never touched: no op ever names it destructively (the
     // transport has no remove-volume op at all — retirement is manual by design).
+  });
+
+  it("a dependent-restart failure AFTER the ledger commit is a WARNING, never a rollback", async () => {
+    // Once the cutover is live-verified and the ledger committed, unwinding
+    // would split the committed ledger from the mounted volume — the resume
+    // failure must surface as a warning with the manual command instead.
+    let resumes = 0;
+    const { transport, called } = makeTransport({
+      overrides: {
+        upServices: (names) => {
+          if (names.includes("app")) {
+            resumes += 1;
+            throw new Error("compose up flaked");
+          }
+        },
+      },
+    });
+    const result = await runUpgradeMajor({ slug: SLUG, service: SERVICE, transport, ledgerDir });
+    expect(result.status).toBe("ok");
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]).toContain("docker compose up -d app worker");
+    expect(resumes).toBe(1);
+    // COMMITTED — not rolled back.
+    const ledger = ledgerNow();
+    expect(ledger.pending).toBeNull();
+    expect(getEntry(ledger, SERVICE).dataFormatVersion).toBe("18");
+    expect(called("removeCutoverOverride")).toBe(false);
   });
 
   it("nothing to do when the preflight already passes", async () => {
@@ -305,6 +333,26 @@ describe("pure helpers", () => {
   it("rolesFromGlobalsDump extracts quoted and bare role names", () => {
     const sql = 'CREATE ROLE postgres;\nALTER ROLE postgres WITH SUPERUSER;\nCREATE ROLE "app-reader";\n';
     expect(rolesFromGlobalsDump(sql).sort()).toEqual(["app-reader", "postgres"]);
+  });
+
+  it("filterGlobalsForBootstrap drops ONLY the bootstrap role's CREATE/ALTER lines (strict apply of the rest)", () => {
+    const sql = [
+      "CREATE ROLE postgres;",
+      "ALTER ROLE postgres WITH SUPERUSER PASSWORD 'md5x';",
+      'CREATE ROLE "app-reader";',
+      "ALTER ROLE \"app-reader\" WITH NOSUPERUSER;",
+      'GRANT "app-reader" TO postgres;',
+      "CREATE TABLESPACE ts LOCATION '/x';",
+    ].join("\n");
+    const filtered = filterGlobalsForBootstrap(sql, "postgres");
+    expect(filtered).not.toContain("CREATE ROLE postgres;");
+    expect(filtered).not.toContain("ALTER ROLE postgres");
+    expect(filtered).toContain('CREATE ROLE "app-reader";');
+    expect(filtered).toContain('ALTER ROLE "app-reader"');
+    expect(filtered).toContain('GRANT "app-reader" TO postgres;');
+    expect(filtered).toContain("CREATE TABLESPACE");
+    // A quoted bootstrap role is matched in its quoted form too.
+    expect(filterGlobalsForBootstrap('CREATE ROLE "nango";\nCREATE ROLE other;', "nango")).toBe("CREATE ROLE other;");
   });
 
   it("isSafeDbIdentifier gates the shelled identifier set", () => {

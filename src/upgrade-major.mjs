@@ -91,12 +91,14 @@ import {
 import {
   beginMigration,
   commitMigration,
+  ledgerPath,
   makeEntry,
   requireUsableLedger,
   rollbackMigration,
   withLedgerLock,
   writeLedger,
 } from "./version-ledger.mjs";
+import { withRegistryLock } from "./clone-registry.mjs";
 import { composeBaseArgs } from "./version-ledger-capture.mjs";
 import { VERDICTS } from "./upgrade-preflight.mjs";
 
@@ -183,6 +185,27 @@ export function rolesFromGlobalsDump(sql) {
   return [...roles];
 }
 
+/**
+ * The DEFINED fresh-cluster-collision strategy, as a pure transform: drop the
+ * CREATE ROLE / ALTER ROLE statements for the BOOTSTRAP role (the fresh target
+ * cluster's initdb already created it, with its password from the same compose
+ * environment), so the remaining globals can be applied STRICTLY
+ * (ON_ERROR_STOP) — any OTHER failure (extra roles, memberships, tablespaces)
+ * aborts loudly instead of being tolerated. Never a blind lenient replay.
+ */
+export function filterGlobalsForBootstrap(sql, bootstrapRole) {
+  if (typeof sql !== "string") return "";
+  const quoted = `"${String(bootstrapRole).replace(/"/g, '""')}"`;
+  return sql
+    .split("\n")
+    .filter((line) => {
+      const m = line.match(/^(?:CREATE|ALTER) ROLE ("[^"]+"|[^\s;]+)/);
+      if (!m) return true;
+      return m[1] !== bootstrapRole && m[1] !== quoted;
+    })
+    .join("\n");
+}
+
 /** Conservative identifier gate for database/role names this engine shells
  *  through. Anything outside it aborts the transaction (fail closed) rather
  *  than risking mis-quoted shell interpolation. */
@@ -208,6 +231,31 @@ export function isSafeDbIdentifier(name) {
  * @returns {Promise<object>} result — { status: "noop"|"refused"|"ok"|"failed", … }
  */
 export async function runUpgradeMajor({ slug, service, transport, matrix = DEFAULT_UPGRADE_MATRIX, ledgerDir, log = () => {} }) {
+  // SINGLE-WRITER-PER-SLUG MUTEX for the WHOLE transaction (held from before
+  // the handshake until commit/rollback). Without it, two invocations could
+  // both pass the pending-journal check and quiesce/dump concurrently — the
+  // loser would then restart the shared dependents while the winner is still
+  // migrating, invalidating the winner's quiesced snapshot. The repo's
+  // hardened advisory lock (pid-liveness, no live-holder steal) anchors on the
+  // slug's ledger path; the INNER ledger lock uses a different lock file, so
+  // begin/commit/rollback inside do not self-deadlock. A second invocation
+  // times out waiting and is REFUSED without touching anything.
+  const lockAnchor = `${ledgerPath(slug, ledgerDir ?? undefined)}.upgrade-major`;
+  try {
+    return await withRegistryLock(lockAnchor, () => runUpgradeMajorLocked({ slug, service, transport, matrix, ledgerDir, log }));
+  } catch (err) {
+    if (/lock/i.test(err?.message ?? "")) {
+      return {
+        status: "refused",
+        steps: [],
+        reason: `another db upgrade for instance "${slug}" appears to be in progress (${err.message}) — not starting a second one.`,
+      };
+    }
+    throw err;
+  }
+}
+
+async function runUpgradeMajorLocked({ slug, service, transport, matrix, ledgerDir, log }) {
   const steps = [];
   const step = (name, detail = null) => { steps.push({ step: name, ...(detail ? { detail } : {}) }); log(`  • ${name}${detail ? ` — ${detail}` : ""}`); };
 
@@ -218,6 +266,7 @@ export async function runUpgradeMajor({ slug, service, transport, matrix = DEFAU
     scratchStarted: false,
     cutover: null,
     newVolume: null,
+    committed: false,
   };
 
   // ── 1. Preflight handshake ─────────────────────────────────────────────────
@@ -367,8 +416,11 @@ export async function runUpgradeMajor({ slug, service, transport, matrix = DEFAU
     step("stop-source", service);
 
     failedStep = "restore";
-    transport.startScratchTarget(state.newVolume.name);
+    // Marked BEFORE the start call: a partially-created scratch container
+    // (e.g. `docker run` succeeded but the readiness wait threw inside the
+    // transport) must still be removed by the rollback.
     state.scratchStarted = true;
+    transport.startScratchTarget(state.newVolume.name);
     const globalsOutcome = transport.restoreGlobals();
     for (const d of dbs) {
       transport.ensureDatabase(d);
@@ -383,7 +435,12 @@ export async function runUpgradeMajor({ slug, service, transport, matrix = DEFAU
     if (mismatches.length) {
       throw new Error(`content read-back mismatch after restore:\n    - ${mismatches.slice(0, 20).join("\n    - ")}`);
     }
-    transport.stopScratchTarget();
+    // STRICT stop: the cutover mounts this same volume into the compose
+    // service — a scratch server that survived `rm -f` would hold the data
+    // directory open concurrently. The strict form VERIFIES the container is
+    // gone and throws otherwise (→ rollback), unlike the best-effort form the
+    // rollback path itself uses.
+    transport.stopScratchTarget(true);
     state.scratchStarted = false;
     step("verify", `read-backs OK (${Object.keys(sourceStats).length} database(s), table sets + exact counts equal)`);
 
@@ -406,15 +463,34 @@ export async function runUpgradeMajor({ slug, service, transport, matrix = DEFAU
       writeLedger(commitMigration(ledger, service), ledgerDir);
     });
     state.journalOpen = false;
+    state.committed = true;
     step("ledger-commit", `deployed-version entry now ${to}, bound to ${state.newVolume.name}`);
 
-    failedStep = "resume-dependents";
-    if (state.quiesced.length) transport.upServices(state.quiesced);
-    step("resume-dependents", state.quiesced.length ? state.quiesced.join(", ") : "none");
+    // POINT OF NO ROLLBACK: the cutover is live-verified and the ledger is
+    // committed. A dependent-restart hiccup must NOT unwind the migration
+    // (removing the override / restoring the source entry here would split the
+    // committed ledger from the mounted volume) — it becomes a WARNING with
+    // the manual command instead.
+    const warnings = [];
+    if (state.quiesced.length) {
+      try {
+        transport.upServices(state.quiesced);
+        step("resume-dependents", state.quiesced.join(", "));
+      } catch (resumeErr) {
+        warnings.push(
+          `resume-dependents failed (${resumeErr?.message ?? resumeErr}) — the upgrade itself is COMMITTED and live; ` +
+            `restart them manually: docker compose up -d ${state.quiesced.join(" ")}`,
+        );
+        step("resume-dependents", "FAILED — see warnings (upgrade committed)");
+      }
+    } else {
+      step("resume-dependents", "none");
+    }
 
     return {
       status: "ok",
       steps,
+      warnings,
       service,
       from,
       to,
@@ -428,6 +504,24 @@ export async function runUpgradeMajor({ slug, service, transport, matrix = DEFAU
         `(docker volume rm ${transport.oldVolumeName}). See ${UPGRADE_RUNBOOK_URL}.`,
     };
   } catch (err) {
+    // Defensive: nothing after the ledger commit may reach this rollback (the
+    // resume step above converts its failures to warnings), but if it ever
+    // did, unwinding a COMMITTED cutover would split the ledger from the
+    // mounted volume — refuse and surface instead.
+    if (state.committed) {
+      return {
+        status: "ok",
+        steps,
+        warnings: [`post-commit step failed (${err?.message ?? err}) — the upgrade is committed and live; resolve manually.`],
+        service,
+        from,
+        to,
+        oldVolume: transport.oldVolumeName,
+        newVolume: state.newVolume?.name ?? null,
+        backupDir: transport.backupDir,
+        retention: `Retired volume "${transport.oldVolumeName}" and the backups under ${transport.backupDir} are PRESERVED. See ${UPGRADE_RUNBOOK_URL}.`,
+      };
+    }
     // ── rollback — land back on the intact old volume + source ledger entry ──
     const rollbackErrors = [];
     const attempt = async (label, fn) => {
@@ -744,12 +838,19 @@ export function buildDockerUpgradeTransport({
 
     restoreGlobals() {
       const src = path.join(backupDir, "globals.sql");
-      must(docker(["cp", src, `${scratchName}:/tmp/globals.sql`]), "docker cp globals.sql");
-      // Tolerant apply: the fresh cluster's bootstrap already created the
-      // bootstrap role (an EXPECTED collision), so this runs WITHOUT
-      // ON_ERROR_STOP — and the outcome is then VERIFIED: every role the dump
-      // creates must exist afterwards. Defined strategy, never a blind pass.
-      must(docker(["exec", scratchName, "psql", "-U", pgUser, "-d", "postgres", "-f", "/tmp/globals.sql"]), "globals restore");
+      // The defined fresh-cluster-collision strategy: strip ONLY the bootstrap
+      // role's CREATE/ALTER statements (initdb already created it from the
+      // same compose env), then apply the remainder STRICTLY — any other
+      // failure (extra roles, memberships, tablespaces) aborts → rollback.
+      const filtered = path.join(backupDir, "globals.filtered.sql");
+      writeFileSync(filtered, filterGlobalsForBootstrap(readFileSync(src, "utf8"), pgUser), { mode: 0o600 });
+      must(docker(["cp", filtered, `${scratchName}:/tmp/globals.sql`]), "docker cp globals.sql");
+      must(
+        docker(["exec", scratchName, "psql", "-U", pgUser, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-f", "/tmp/globals.sql"]),
+        "globals restore (strict)",
+      );
+      // Outcome read-back: every role the ORIGINAL dump names (bootstrap
+      // included) must exist on the target.
       const wanted = rolesFromGlobalsDump(readFileSync(src, "utf8"));
       const have = new Set(
         must(docker(["exec", scratchName, "psql", "-U", pgUser, "-d", "postgres", "-tA", "-c", "SELECT rolname FROM pg_roles"]), "role read-back")
@@ -782,8 +883,19 @@ export function buildDockerUpgradeTransport({
       );
     },
 
-    stopScratchTarget() {
-      docker(["rm", "-f", scratchName]); // best-effort by design (idempotent)
+    stopScratchTarget(strict = false) {
+      const r = docker(["rm", "-f", scratchName]);
+      if (!strict) return; // rollback path: best-effort by design (idempotent)
+      // Pre-cutover: the compose service is about to mount the SAME volume —
+      // a surviving scratch server would open the data dir concurrently.
+      // VERIFY it is gone; anything else aborts (→ rollback).
+      if (r.status !== 0 && !/no such container/i.test(`${r.stderr}${r.stdout}`)) {
+        throw new Error(`could not remove the scratch container ${scratchName}: ${(r.stderr || r.stdout || "").trim().slice(0, 300)}`);
+      }
+      const gone = docker(["container", "inspect", scratchName]);
+      if (gone.status === 0) {
+        throw new Error(`scratch container ${scratchName} is still present after removal — refusing to cut over while it could hold the restored volume open.`);
+      }
     },
 
     async writeCutoverOverride(newVolumeName) {
@@ -806,11 +918,28 @@ export function buildDockerUpgradeTransport({
       doc.volumes[volumeSource] = { external: true, name: newVolumeName };
       writeFileSync(overridePath, JSON.stringify(doc, null, 2) + "\n");
 
+      // ATOMIC from the engine's point of view: if the registry update throws
+      // AFTER the file/file-list mutation, SELF-UNDO before rethrowing — the
+      // engine has not recorded a cutover yet (state.cutover unset), so its
+      // rollback would otherwise restart the service through the mutated file
+      // list on the NEW volume while restoring the SOURCE ledger entry.
       let filesUpdated = false;
-      if (!files.includes(DB_VOLUME_OVERRIDE_FILE)) {
-        files.push(DB_VOLUME_OVERRIDE_FILE);
-        await registry.updateComposeFiles([...files]);
-        filesUpdated = true;
+      try {
+        if (!files.includes(DB_VOLUME_OVERRIDE_FILE)) {
+          files.push(DB_VOLUME_OVERRIDE_FILE);
+          await registry.updateComposeFiles([...files]);
+          filesUpdated = true;
+        }
+      } catch (err) {
+        const idx = files.indexOf(DB_VOLUME_OVERRIDE_FILE);
+        if (idx !== -1) files.splice(idx, 1);
+        try {
+          if (hadFile && previousRaw != null) writeFileSync(overridePath, previousRaw);
+          else if (existsSync(overridePath)) unlinkSync(overridePath);
+        } catch {
+          /* the throw below carries the primary failure */
+        }
+        throw err;
       }
       log(`    cutover override: ${volumeSource} → ${newVolumeName} (${DB_VOLUME_OVERRIDE_FILE})`);
       return { overridePath, hadFile, previousRaw, previousBinding, filesUpdated };
@@ -866,6 +995,7 @@ export const __test = {
   parseUpgradeMajorArgs,
   compareContentStats,
   rolesFromGlobalsDump,
+  filterGlobalsForBootstrap,
   isSafeDbIdentifier,
   parseDfAvailableBytes,
   runUpgradeMajor,

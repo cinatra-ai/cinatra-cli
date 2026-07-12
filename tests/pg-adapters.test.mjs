@@ -3,7 +3,7 @@
 // deployment's actual data path (pg18 parent-mount layout aware). Every failure
 // path must yield null — the preflight's fail-closed default.
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   buildPgMarkerAdapter,
@@ -40,13 +40,48 @@ describe("parsePgVersionFile", () => {
   });
 });
 
-describe("pgMarkerShellScript", () => {
-  it("prefers a root PG_VERSION, accepts exactly one <major>/docker/PG_VERSION, else exits 3", () => {
-    const s = pgMarkerShellScript("/wa_probe");
-    expect(s).toContain("/wa_probe/PG_VERSION");
-    expect(s).toContain("/wa_probe/*/docker/PG_VERSION");
-    expect(s).toContain('[ "$#" -eq 1 ]');
-    expect(s).toContain("exit 3");
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+describe("pgMarkerShellScript — executed against real layouts (host sh)", () => {
+  const run = (root) => {
+    try {
+      const out = execFileSync("/bin/sh", ["-c", pgMarkerShellScript(root)], { encoding: "utf8" });
+      return { status: 0, out: out.trim() };
+    } catch (e) {
+      return { status: e.status, out: "" };
+    }
+  };
+  let root;
+  beforeEach(() => { root = mkdtempSync(path.join(os.tmpdir(), "pgmarker-")); });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("legacy layout: root PG_VERSION wins", () => {
+    writeFileSync(path.join(root, "PG_VERSION"), "17\n");
+    expect(run(root)).toEqual({ status: 0, out: "17" });
+  });
+  it("pg18 parent layout: exactly one <major>/docker/PG_VERSION", () => {
+    mkdirSync(path.join(root, "18", "docker"), { recursive: true });
+    writeFileSync(path.join(root, "18", "docker", "PG_VERSION"), "18\n");
+    expect(run(root)).toEqual({ status: 0, out: "18" });
+  });
+  it("BOTH layouts present → ambiguous → exit 3 (never guess)", () => {
+    writeFileSync(path.join(root, "PG_VERSION"), "17\n");
+    mkdirSync(path.join(root, "18", "docker"), { recursive: true });
+    writeFileSync(path.join(root, "18", "docker", "PG_VERSION"), "18\n");
+    expect(run(root).status).toBe(3);
+  });
+  it("several parent-layout clusters → ambiguous → exit 3", () => {
+    for (const major of ["17", "18"]) {
+      mkdirSync(path.join(root, major, "docker"), { recursive: true });
+      writeFileSync(path.join(root, major, "docker", "PG_VERSION"), `${major}\n`);
+    }
+    expect(run(root).status).toBe(3);
+  });
+  it("empty volume → exit 3", () => {
+    expect(run(root).status).toBe(3);
   });
 });
 
