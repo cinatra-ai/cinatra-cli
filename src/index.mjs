@@ -5608,14 +5608,12 @@ async function runDbUpgradeMajor(rest) {
   const target = spec.dataFormatVersion ?? imageParts(spec.image).tag ?? "unknown";
 
   // RUNNING reverse-dependents (transitive) — the writers/queue consumers the
-  // transaction quiesces. depends_on edges come from the resolved config; the
-  // running set from `docker compose ps` (a failure to list = fail closed).
-  const running = resolveRunningServices({ ...composeCtx, capture: captureSeam });
-  if (running === null) {
-    console.error("upgrade-major: could not list the running compose services — refusing to plan a quiesce blind.");
-    process.exitCode = 2;
-    return;
-  }
+  // transaction quiesces. depends_on edges come from the resolved config
+  // (static topology of THIS checkout); the RUNNING set is re-queried from
+  // `docker compose ps` at CALL time — the engine invokes this INSIDE its
+  // per-slug mutex, so a list captured before the lock (possibly while another
+  // invocation had the writers stopped) can never be acted on. A failed
+  // listing throws = fail closed (never quiesce blind).
   const reverse = new Map(); // service → dependents
   for (const [name, svc] of Object.entries(config.services ?? {})) {
     const deps = svc?.depends_on;
@@ -5625,17 +5623,26 @@ async function runDbUpgradeMajor(rest) {
       reverse.get(d).push(name);
     }
   }
-  const dependents = [];
-  const queue = [parsed.service];
-  const seen = new Set(queue);
-  while (queue.length) {
-    for (const dep of reverse.get(queue.shift()) ?? []) {
-      if (seen.has(dep)) continue;
-      seen.add(dep);
-      queue.push(dep);
-      if (running.has(dep)) dependents.push(dep);
+  const computeRunningDependents = () => {
+    const runningNow = resolveRunningServices({ ...composeCtx, capture: captureSeam });
+    if (runningNow === null) {
+      throw new Error("could not list the running compose services — refusing to plan a quiesce blind.");
     }
-  }
+    const dependents = [];
+    const queue = [parsed.service];
+    const seen = new Set(queue);
+    while (queue.length) {
+      for (const dep of reverse.get(queue.shift()) ?? []) {
+        if (seen.has(dep)) continue;
+        seen.add(dep);
+        queue.push(dep);
+        if (runningNow.has(dep)) dependents.push(dep);
+      }
+    }
+    return dependents;
+  };
+  // Detection-only snapshot (probe container name); never used for quiesce.
+  const running = resolveRunningServices({ ...composeCtx, capture: captureSeam }) ?? new Map();
 
   // The engine's preflight handshake: the SAME fail-closed preflight, scoped to
   // this one service, over a real inspect/emptiness transport plus the real
@@ -5715,9 +5722,10 @@ async function runDbUpgradeMajor(rest) {
   console.log(`==> ${parsed.service}: guarded major upgrade (instance "${slug}")`);
   const transport = buildDockerUpgradeTransport({
     slug,
-    spec: { ...spec, target, dependents },
+    spec: { ...spec, target },
     composeCtx,
     preflight,
+    resolveDependents: computeRunningDependents,
     registry: { updateComposeFiles },
     log: (l) => console.log(l),
   });

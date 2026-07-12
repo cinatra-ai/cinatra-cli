@@ -633,6 +633,11 @@ export function defaultBackupRoot() {
  *     environment, dependents: [running reverse-dependent services] }
  * @param {{targetDir: string, composeFiles: string[], composeProject: string|null, envFile: string|null}} a.composeCtx
  * @param {() => object} a.preflight  runs the shared fail-closed preflight for this service
+ * @param {() => string[]} [a.resolveDependents]  RE-QUERIES the running
+ *   reverse-dependents at call time (the engine invokes it INSIDE the
+ *   per-slug mutex — a list captured before the lock could be stale: another
+ *   invocation may have stopped/restarted writers in between). Throws when the
+ *   running set cannot be listed (fail closed — never quiesce blind).
  * @param {{updateComposeFiles: (files: string[]) => void}} a.registry  persists the
  *   instance row's composeFiles (index.mjs wires the locked registry write)
  * @param {(cmd, args, opts?) => object} [a.run]
@@ -646,6 +651,7 @@ export function buildDockerUpgradeTransport({
   composeCtx,
   preflight,
   registry,
+  resolveDependents = null,
   run = defaultRun,
   log = () => {},
   backupRoot = defaultBackupRoot(),
@@ -759,7 +765,8 @@ export function buildDockerUpgradeTransport({
     },
 
     runningDependents() {
-      return [...dependents];
+      // Fresh at call time (inside the engine's mutex) — see resolveDependents.
+      return resolveDependents ? resolveDependents() : [...dependents];
     },
 
     stopServices(names) {
@@ -980,6 +987,7 @@ export function formatUpgradeResult(result) {
     lines.push(`  new volume:     ${result.newVolume}`);
     lines.push(`  retired volume: ${result.oldVolume} (preserved)`);
     lines.push(`  backups:        ${result.backupDir}`);
+    for (const w of result.warnings ?? []) lines.push(`  WARNING: ${w}`);
     lines.push(`  ${result.retention}`);
     lines.push("  Restart/boot the app now — it self-bootstraps and runs its own ledgered migrations.");
   } else {
