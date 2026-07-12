@@ -3754,6 +3754,17 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     envFile: existsSync(reconvEnvFile) ? reconvEnvFile : null,
     nangoHealthUrl: nangoHealthUrlForPorts(effectivePorts),
   });
+  // cinatra-cli#128: a re-converge re-ups whatever the moved checkout now pins —
+  // record it (best-effort).
+  recordVersions({
+    slug: row.slug,
+    targetDir,
+    composeFiles: row.composeFiles,
+    composeProject: row.composeProject,
+    envFile: existsSync(reconvEnvFile) ? reconvEnvFile : null,
+    log,
+    deps,
+  });
   // Promote a stale provisioning row to ready after a successful ensure.
   if (row.state !== "ready") {
     await withAllocLock(lockPath, async () => {

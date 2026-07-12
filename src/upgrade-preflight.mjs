@@ -361,6 +361,20 @@ export function runPreflight({
       continue;
     }
 
+    // Discovery could not identify the service's DATA volume (bind-mounted
+    // data path / ambiguous mounts / unresolvable volume name): the service
+    // cannot be checked, so recreating it cannot be cleared — fail closed.
+    if (spec.volumeUnidentified) {
+      results.push(
+        verdict(service, VERDICTS.FAIL_CLOSED, `data volume could not be identified (${spec.volumeUnidentified})`, {
+          remediation:
+            `Refusing to clear a ${service} recreate while its data volume cannot be identified. ` +
+            `See ${UPGRADE_RUNBOOK_URL}.`,
+        }),
+      );
+      continue;
+    }
+
     const inspectRow = volumeName && transport.inspectVolume ? transport.inspectVolume(volumeName) : null;
     const liveVolumeIdentity = volumeIdentityFromInspect(inspectRow);
     const volumeState = transport.volumeState ? transport.volumeState(volumeName) : inspectRow ? "present" : "absent";

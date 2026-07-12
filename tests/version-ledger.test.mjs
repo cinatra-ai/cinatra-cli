@@ -18,6 +18,7 @@ import {
   recordDeployed,
   requireUsableLedger,
   rollbackMigration,
+  withLedgerLock,
   writeLedger,
 } from "../src/version-ledger.mjs";
 
@@ -184,5 +185,26 @@ describe("malformed ledger safety", () => {
     writeFileSync(ledgerPath(SLUG, dir), "garbage");
     expect(() => requireUsableLedger(SLUG, dir)).toThrow(/malformed/);
     expect(readFileSync(ledgerPath(SLUG, dir), "utf8")).toBe("garbage");
+  });
+});
+
+describe("withLedgerLock", () => {
+  it("runs the fn under the lock, returns its result, and releases (re-acquirable)", () => {
+    expect(withLedgerLock(SLUG, dir, () => "one")).toBe("one");
+    expect(existsSync(path.join(dir, `.${SLUG}.lock`))).toBe(false);
+    expect(withLedgerLock(SLUG, dir, () => "two")).toBe("two");
+  });
+
+  it("releases the lock even when fn throws", () => {
+    expect(() =>
+      withLedgerLock(SLUG, dir, () => {
+        throw new Error("boom");
+      }),
+    ).toThrow(/boom/);
+    expect(existsSync(path.join(dir, `.${SLUG}.lock`))).toBe(false);
+  });
+
+  it("rejects an invalid slug (never mkdirs an attacker-shaped path)", () => {
+    expect(() => withLedgerLock("../evil", dir, () => {})).toThrow(/Invalid instance slug/);
   });
 });

@@ -47,13 +47,15 @@ import {
   pendingFor,
   readLedger,
   recordDeployed,
+  withLedgerLock,
   writeLedger,
 } from "./version-ledger.mjs";
 
 const DOCKER_CAPTURE_TIMEOUT_MS = 30_000;
 
-/** Default shell seam: run a command, return trimmed stdout on exit 0, else
- *  null. Never throws. */
+/** Default shell seam: run a command, return trimmed stdout (possibly "") on
+ *  exit 0, else null — so callers can tell "empty output" from "failed".
+ *  Never throws. */
 export function defaultCapture(cmd, args, { cwd } = {}) {
   try {
     const r = spawnSync(cmd, args, {
@@ -63,7 +65,7 @@ export function defaultCapture(cmd, args, { cwd } = {}) {
       timeout: DOCKER_CAPTURE_TIMEOUT_MS,
     });
     if (r.status !== 0) return null;
-    return (r.stdout ?? "").trim() || null;
+    return (r.stdout ?? "").trim();
   } catch {
     return null;
   }
@@ -95,8 +97,13 @@ export function statefulServicesFromComposeConfig(configJson, matrix = DEFAULT_U
       continue;
     }
     const mounts = (Array.isArray(svc?.volumes) ? svc.volumes : []).filter((m) => m?.type === "volume");
+    // The DATA mount is selected by the matrix entry's dataMount prefix WHENEVER
+    // one is declared — even for a single-mount service. A service whose data
+    // path is bind-mounted while some auxiliary named volume exists must be
+    // SKIPPED, never recorded against the auxiliary volume (that would bind the
+    // ledger entry to the wrong volume's identity and defeat the mismatch check).
     let dataMounts = mounts;
-    if (mounts.length > 1 && typeof entry.dataMount === "string" && entry.dataMount.length) {
+    if (typeof entry.dataMount === "string" && entry.dataMount.length) {
       dataMounts = mounts.filter((m) => typeof m.target === "string" && m.target.startsWith(entry.dataMount));
     }
     if (dataMounts.length !== 1) {
@@ -147,39 +154,64 @@ export function statefulServicesFromComposeConfig(configJson, matrix = DEFAULT_U
  * Returns { status: "ok"|"malformed"|"empty", recorded: [service…],
  *           skipped: [{ service, reason }] }.
  */
-export function recordDeployedStack({ slug, configJson, matrix = DEFAULT_UPGRADE_MATRIX, ledgerDir, inspectVolume }) {
+export function recordDeployedStack({
+  slug,
+  configJson,
+  matrix = DEFAULT_UPGRADE_MATRIX,
+  ledgerDir,
+  inspectVolume,
+  runningServices = null,
+}) {
   const { found, skipped } = statefulServicesFromComposeConfig(configJson, matrix);
-  const read = readLedger(slug, ledgerDir);
-  if (read.status === "malformed") {
-    return { status: "malformed", recorded: [], skipped };
+  // A wrong record is worse than no record: without deployment proof (the
+  // service's container actually RUNNING under this project right after the
+  // `up`), record nothing. The resolved config carries every profile-gated
+  // service, so a dormant profile's OLD volume must never be re-stamped with
+  // the new compose-derived version (its container never ran the new image).
+  if (!(runningServices instanceof Set)) {
+    return {
+      status: "no-deployment-proof",
+      recorded: [],
+      skipped: found.map((s) => ({ service: s.service, reason: "running-service listing unavailable — not recording blind" })),
+    };
   }
-  let ledger = read.ledger;
-  const recorded = [];
-  for (const s of found) {
-    const live = inspectVolume(s.volumeName);
-    if (!live) {
-      skipped.push({ service: s.service, reason: `volume ${s.volumeName} not present (profile off / not created)` });
-      continue;
+  return withLedgerLock(slug, ledgerDir, () => {
+    const read = readLedger(slug, ledgerDir);
+    if (read.status === "malformed") {
+      return { status: "malformed", recorded: [], skipped };
     }
-    if (pendingFor(ledger, s.service)) {
-      skipped.push({ service: s.service, reason: "migration in flight (pending journal) — not blind-recording" });
-      continue;
+    let ledger = read.ledger;
+    const recorded = [];
+    for (const s of found) {
+      if (!runningServices.has(s.service)) {
+        skipped.push({ service: s.service, reason: "container not running under this project (profile off / not deployed)" });
+        continue;
+      }
+      const live = inspectVolume(s.volumeName);
+      if (!live) {
+        skipped.push({ service: s.service, reason: `volume ${s.volumeName} not present` });
+        continue;
+      }
+      if (pendingFor(ledger, s.service)) {
+        skipped.push({ service: s.service, reason: "migration in flight (pending journal) — not blind-recording" });
+        continue;
+      }
+      ledger = recordDeployed(
+        ledger,
+        makeEntry({
+          service: s.service,
+          image: s.image,
+          digest: s.digest,
+          dataFormatVersion: s.dataFormatVersion,
+          volume: live,
+        }),
+      );
+      recorded.push(s.service);
     }
-    ledger = recordDeployed(
-      ledger,
-      makeEntry({
-        service: s.service,
-        image: s.image,
-        digest: s.digest,
-        dataFormatVersion: s.dataFormatVersion,
-        volume: live,
-      }),
-    );
-    recorded.push(s.service);
-  }
-  if (recorded.length === 0) return { status: "empty", recorded, skipped };
-  writeLedger(ledger, ledgerDir);
-  return { status: "ok", recorded, skipped };
+    if (recorded.length === 0) return { status: "empty", recorded, skipped };
+    writeLedger(ledger, ledgerDir);
+    return { status: "ok", recorded, skipped };
+  });
 }
 
 /** Live volume identity via `docker volume inspect` (name + CreatedAt — the
@@ -199,17 +231,23 @@ export function dockerVolumeIdentity(volumeName, capture = defaultCapture) {
   }
 }
 
-/** Resolve the compose config (json) with the SAME file/project/env-file set an
- *  `up` used. `--profile "*"` keeps profile-gated stateful services visible —
- *  whether one is actually deployed is decided by its live volume's existence,
- *  not by its profile flag. Null on any failure. */
-export function resolveComposeConfig({ targetDir, composeFiles = null, composeProject = null, envFile = null, capture = defaultCapture }) {
+/** The leading `docker compose` argv for the SAME file/project/env-file set an
+ *  `up` used. */
+function composeBaseArgs({ composeFiles = null, composeProject = null, envFile = null }) {
   const files = composeFiles && composeFiles.length ? composeFiles : ["docker-compose.yml", "docker-compose.dev.yml"];
   const args = ["compose"];
   if (envFile) args.push("--env-file", envFile);
   if (composeProject) args.push("-p", composeProject);
   for (const f of files) args.push("-f", f);
-  args.push("--profile", "*", "config", "--format", "json");
+  return args;
+}
+
+/** Resolve the compose config (json) with the SAME file/project/env-file set an
+ *  `up` used. `--profile "*"` keeps profile-gated stateful services visible in
+ *  the document (deployment proof is the RUNNING container, never the profile
+ *  flag). Null on any failure. */
+export function resolveComposeConfig({ targetDir, composeFiles = null, composeProject = null, envFile = null, capture = defaultCapture }) {
+  const args = [...composeBaseArgs({ composeFiles, composeProject, envFile }), "--profile", "*", "config", "--format", "json"];
   const raw = capture("docker", args, { cwd: targetDir });
   if (!raw) return null;
   try {
@@ -219,12 +257,31 @@ export function resolveComposeConfig({ targetDir, composeFiles = null, composePr
   }
 }
 
+/** The set of compose services with a RUNNING container under this
+ *  files/project set (`compose ps --services --status running`) — the
+ *  deployment proof recording requires. Null on any failure (the caller then
+ *  refuses to record rather than recording blind). */
+export function resolveRunningServices({ targetDir, composeFiles = null, composeProject = null, envFile = null, capture = defaultCapture }) {
+  const args = [...composeBaseArgs({ composeFiles, composeProject, envFile }), "ps", "--services", "--status", "running"];
+  const raw = capture("docker", args, { cwd: targetDir });
+  if (raw === null) return null;
+  return new Set(
+    raw
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+}
+
 /**
- * The install/refresh hook: resolve the compose config, then record the
- * deployed stack into the slug's ledger. BEST-EFFORT — never throws; every
- * outcome is logged through `log` in one summary line (and skips at detail).
- * Returns the recordDeployedStack result (status "config-unavailable" when the
- * compose config could not be resolved).
+ * The install/refresh hook: resolve the compose config + the running-service
+ * set (deployment proof), then record the deployed stack into the slug's
+ * ledger. BEST-EFFORT — never throws; every outcome is logged through `log`
+ * in one summary line (and skips at detail). Returns the recordDeployedStack
+ * result (status "config-unavailable" when the compose config could not be
+ * resolved; "project-mismatch" when `requireProjectMatch` names a project the
+ * resolved config does not — the caller's `up` targeted a different stack
+ * than the instance row records, so recording would bind the wrong volumes).
  */
 export function captureDeployedVersions({
   slug,
@@ -234,6 +291,7 @@ export function captureDeployedVersions({
   envFile = null,
   matrix = DEFAULT_UPGRADE_MATRIX,
   ledgerDir,
+  requireProjectMatch = null,
   capture = defaultCapture,
   log = () => {},
 }) {
@@ -243,15 +301,26 @@ export function captureDeployedVersions({
       log("  ⚠ version ledger: could not resolve the compose config — deployed versions not recorded.");
       return { status: "config-unavailable", recorded: [], skipped: [] };
     }
+    if (requireProjectMatch && configJson.name !== requireProjectMatch) {
+      log(
+        `  ⚠ version ledger: this up targeted project "${configJson.name}" but instance "${slug}" records ` +
+          `"${requireProjectMatch}" — not recording against the wrong stack.`,
+      );
+      return { status: "project-mismatch", recorded: [], skipped: [] };
+    }
+    const runningServices = resolveRunningServices({ targetDir, composeFiles, composeProject, envFile, capture });
     const result = recordDeployedStack({
       slug,
       configJson,
       matrix,
       ledgerDir,
       inspectVolume: (name) => dockerVolumeIdentity(name, capture),
+      runningServices,
     });
     if (result.status === "malformed") {
       log(`  ⚠ version ledger for "${slug}" is malformed — NOT overwritten; repair it by hand (deployed versions not recorded).`);
+    } else if (result.status === "no-deployment-proof") {
+      log(`  ⚠ version ledger: could not list running services — deployed versions not recorded (never recording blind).`);
     } else if (result.recorded.length) {
       log(`  Version ledger: recorded ${result.recorded.length} stateful service(s) for "${slug}" (${result.recorded.join(", ")}).`);
     }
@@ -268,5 +337,6 @@ export const __test = {
   recordDeployedStack,
   dockerVolumeIdentity,
   resolveComposeConfig,
+  resolveRunningServices,
   captureDeployedVersions,
 };

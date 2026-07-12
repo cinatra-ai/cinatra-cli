@@ -47,7 +47,7 @@
 // clone-registry (one implementation, not a fork). Never imports index.mjs.
 // ---------------------------------------------------------------------------
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmdirSync, statSync, writeFileSync, renameSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -182,6 +182,64 @@ export function writeLedger(ledger, dir = defaultLedgerDir()) {
   return file;
 }
 
+// --- per-slug write lock ----------------------------------------------------
+
+const LOCK_RETRY_MS = 150;
+const LOCK_WAIT_MS = 10_000;
+const LOCK_STALE_MS = 120_000;
+
+/**
+ * Serialize a read-modify-write of one slug's ledger against concurrent
+ * writers (a capture racing a migration's beginMigration must never clobber
+ * the pending journal). SYNCHRONOUS mkdir-based lock (atomic on POSIX):
+ * bounded busy-wait, stale locks (older than 2 min — a crashed holder) are
+ * broken with a note, and the lock is always released in `finally`. `fn` runs
+ * under the lock and its result is returned.
+ */
+export function withLedgerLock(slug, dir = defaultLedgerDir(), fn) {
+  mkdirSync(dir, { recursive: true });
+  if (!isValidSlug(slug)) {
+    throw new Error(`Invalid instance slug "${slug}". Must match /^[a-z0-9][a-z0-9-]{0,29}$/.`);
+  }
+  const lockDir = path.join(dir, `.${slug}.lock`);
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      mkdirSync(lockDir);
+      break;
+    } catch {
+      try {
+        const age = Date.now() - statSync(lockDir).mtimeMs;
+        if (age > LOCK_STALE_MS) {
+          // A crashed holder — break the stale lock and retry immediately.
+          rmdirSync(lockDir);
+          continue;
+        }
+      } catch {
+        /* lock vanished between mkdir and stat — retry */
+      }
+      if (Date.now() > deadline) {
+        throw new Error(
+          `Timed out waiting for the version-ledger lock for "${slug}" (${lockDir}). ` +
+            `If no other cinatra process is running, remove the lock directory and retry.`,
+        );
+      }
+      // Synchronous sleep without burning CPU (Atomics.wait on a throwaway
+      // buffer — the standard sync-sleep idiom; lock windows are milliseconds).
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCK_RETRY_MS);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      rmdirSync(lockDir);
+    } catch {
+      /* released by a stale-break — nothing to do */
+    }
+  }
+}
+
 // --- pure ledger operations (return a NEW ledger; caller persists) ---------
 
 function cloneLedger(ledger) {
@@ -314,6 +372,7 @@ export function pendingFor(ledger, service) {
 
 export const __test = {
   LEDGER_VERSION,
+  withLedgerLock,
   defaultLedgerDir,
   ledgerPath,
   emptyLedger,

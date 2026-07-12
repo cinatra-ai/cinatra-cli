@@ -264,4 +264,32 @@ describe("runPreflightCommand — entrypoint exit codes + rendering", () => {
     expect(parsed.results).toHaveLength(1);
     expect(parsed.results[0].service).toBe("postgres");
   });
+
+  it("a discovery spec whose data volume is unidentifiable FAILS CLOSED", () => {
+    const rep = runPreflight({
+      slug: SLUG,
+      ledgerDir: dir,
+      services: [{ service: "postgres", volumeName: null, target: null, volumeUnidentified: "data path is bind-mounted" }],
+      transport: transportFor(),
+    });
+    expect(rep.ok).toBe(false);
+    expect(rep.results[0].verdict).toBe(VERDICTS.FAIL_CLOSED);
+    expect(rep.results[0].reason).toMatch(/could not be identified/);
+    expect(rep.results[0].reason).toMatch(/bind-mounted/);
+  });
+
+  it("an off-axis pinned target (raw tag) FAILS CLOSED instead of passing integrity-only", () => {
+    seedLedger("postgres", "18");
+    const rep = runPreflight({
+      slug: SLUG,
+      ledgerDir: dir,
+      // A pin like postgres:19-alpine before the matrix knows "19": discovery
+      // carries the raw tag so the ordered comparison is INCOMPARABLE.
+      services: [{ service: "postgres", target: "19-alpine", volumeName: VOL.name }],
+      transport: transportFor(),
+    });
+    expect(rep.ok).toBe(false);
+    expect(rep.results[0].verdict).toBe(VERDICTS.FAIL_CLOSED);
+    expect(rep.results[0].reason).toMatch(/unknown\/unordered/);
+  });
 });

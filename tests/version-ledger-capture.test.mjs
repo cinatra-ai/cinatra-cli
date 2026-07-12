@@ -127,6 +127,20 @@ describe("statefulServicesFromComposeConfig", () => {
     expect(found.find((s) => s.service === "postgres").volumeName).toBe("cinatra_main_postgres-data");
   });
 
+  it("NEVER binds an auxiliary volume when the data path itself is bind-mounted", () => {
+    // postgres data dir on a bind mount + one unrelated named volume: recording
+    // that volume would attach the ledger entry to the WRONG volume identity.
+    const doc = configDoc();
+    doc.services.postgres.volumes = [
+      { type: "bind", source: "/host/pgdata", target: "/var/lib/postgresql" },
+      { type: "volume", source: "pg-scratch", target: "/scratch" },
+    ];
+    doc.volumes["pg-scratch"] = { name: "cinatra_main_pg-scratch" };
+    const { found, skipped } = statefulServicesFromComposeConfig(doc);
+    expect(found.find((s) => s.service === "postgres")).toBeUndefined();
+    expect(skipped.find((s) => s.service === "postgres").reason).toMatch(/no named data-volume/i);
+  });
+
   it("skips (loudly) a service whose data volume cannot be identified", () => {
     const doc = configDoc();
     doc.services.postgres.volumes = []; // no named volume at all
@@ -144,9 +158,11 @@ describe("recordDeployedStack", () => {
     // wordpress volume NOT live (profile never enabled)
   };
   const inspect = (name) => LIVE[name] ?? null;
+  // Deployment proof: postgres + nango-db running; wordpress-db profile dormant.
+  const RUNNING = new Set(["postgres", "nango-db"]);
 
-  it("records live-volume-bound entries; absent volumes are skipped, not guessed", () => {
-    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect });
+  it("records live-volume-bound entries for RUNNING services; the rest are skipped, not guessed", () => {
+    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningServices: RUNNING });
     expect(res.status).toBe("ok");
     expect(res.recorded.sort()).toEqual(["nango-db", "postgres"]);
     expect(res.skipped.map((s) => s.service)).toEqual(["wordpress-db"]);
@@ -161,11 +177,29 @@ describe("recordDeployedStack", () => {
     expect(ledger.services["wordpress-db"]).toBeUndefined();
   });
 
+  it("a dormant profile's EXISTING volume is never re-stamped (container not running)", () => {
+    // wordpress-db volume exists live, but the service is not running: the old
+    // volume must keep its (absent) entry rather than gaining the new pin.
+    const inspectWithWp = (name) =>
+      name === "explicit-wp-vol" ? { name, createdAt: "2025-01-01T00:00:00Z" } : inspect(name);
+    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspectWithWp, runningServices: RUNNING });
+    expect(res.recorded).not.toContain("wordpress-db");
+    expect(res.skipped.find((s) => s.service === "wordpress-db").reason).toMatch(/not running/i);
+    expect(readLedger("main", dir).ledger.services["wordpress-db"]).toBeUndefined();
+  });
+
+  it("refuses to record ANYTHING without deployment proof (running set unavailable)", () => {
+    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningServices: null });
+    expect(res.status).toBe("no-deployment-proof");
+    expect(res.recorded).toEqual([]);
+    expect(readLedger("main", dir).status).toBe("missing"); // nothing written
+  });
+
   it("re-recording updates entries (idempotent installs converge)", () => {
-    recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect });
+    recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningServices: RUNNING });
     const doc = configDoc();
     doc.services.postgres.image = "postgres:18.1-alpine";
-    const res = recordDeployedStack({ slug: "main", configJson: doc, ledgerDir: dir, inspectVolume: inspect });
+    const res = recordDeployedStack({ slug: "main", configJson: doc, ledgerDir: dir, inspectVolume: inspect, runningServices: RUNNING });
     expect(res.status).toBe("ok");
     expect(readLedger("main", dir).ledger.services.postgres.image).toBe("postgres:18.1-alpine");
   });
@@ -173,7 +207,7 @@ describe("recordDeployedStack", () => {
   it("NEVER overwrites a malformed ledger", () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(path.join(dir, "main.json"), "{not json");
-    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect });
+    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningServices: RUNNING });
     expect(res.status).toBe("malformed");
     expect(res.recorded).toEqual([]);
     expect(readLedger("main", dir).status).toBe("malformed"); // untouched
@@ -200,7 +234,7 @@ describe("recordDeployedStack", () => {
     });
     writeLedger(ledger, dir);
 
-    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect });
+    const res = recordDeployedStack({ slug: "main", configJson: configDoc(), ledgerDir: dir, inspectVolume: inspect, runningServices: RUNNING });
     expect(res.recorded).toEqual(["nango-db"]);
     expect(res.skipped.find((s) => s.service === "postgres").reason).toMatch(/migration in flight/i);
     // The live postgres entry is still the SOURCE (the journal was not clobbered).
@@ -211,33 +245,37 @@ describe("recordDeployedStack", () => {
 });
 
 describe("captureDeployedVersions — the install/refresh hook over the shell seam", () => {
-  it("resolves the compose config and records through injected docker captures", () => {
+  const fakeDocker = (overrides = {}) => (cmd, args) => {
+    if (overrides.calls) overrides.calls.push([cmd, ...args]);
+    if (args.includes("config")) return overrides.config ?? JSON.stringify(configDoc());
+    if (args.includes("ps")) return overrides.ps ?? "postgres\nnango-db";
+    if (args[0] === "volume" && args[1] === "inspect") {
+      const name = args[2];
+      if (name === "explicit-wp-vol") return null;
+      return JSON.stringify([{ Name: name, CreatedAt: "2026-03-01T00:00:00Z" }]);
+    }
+    return null;
+  };
+
+  it("resolves config + running set and records through injected docker captures", () => {
     const calls = [];
-    const capture = (cmd, args) => {
-      calls.push([cmd, ...args]);
-      if (args.includes("config")) return JSON.stringify(configDoc());
-      if (args[0] === "volume" && args[1] === "inspect") {
-        const name = args[2];
-        if (name === "explicit-wp-vol") return null;
-        return JSON.stringify([{ Name: name, CreatedAt: "2026-03-01T00:00:00Z" }]);
-      }
-      return null;
-    };
     const logs = [];
     const res = captureDeployedVersions({
       slug: "main",
       targetDir: "/nonexistent",
       composeProject: "cinatra_main",
       ledgerDir: dir,
-      capture,
+      capture: fakeDocker({ calls }),
       log: (l) => logs.push(l),
     });
     expect(res.status).toBe("ok");
     expect(res.recorded.sort()).toEqual(["nango-db", "postgres"]);
-    // The config call carried the SAME -p the `up` used.
-    const configCall = calls.find((c) => c.includes("config"));
-    expect(configCall).toContain("-p");
-    expect(configCall).toContain("cinatra_main");
+    // The config AND ps calls carried the SAME -p the `up` used.
+    for (const probe of ["config", "ps"]) {
+      const call = calls.find((c) => c.includes(probe));
+      expect(call).toContain("-p");
+      expect(call).toContain("cinatra_main");
+    }
     expect(logs.join("\n")).toMatch(/recorded 2 stateful service\(s\)/);
     expect(readLedger("main", dir).ledger.services.postgres.volume.createdAt).toBe("2026-03-01T00:00:00Z");
   });
@@ -251,6 +289,44 @@ describe("captureDeployedVersions — the install/refresh hook over the shell se
       log: () => {},
     });
     expect(res.status).toBe("config-unavailable");
+    expect(readLedger("main", dir).status).toBe("missing");
+  });
+
+  it("refuses to record when the resolved project differs from the instance's recorded project", () => {
+    const res = captureDeployedVersions({
+      slug: "main",
+      targetDir: "/nonexistent",
+      ledgerDir: dir,
+      requireProjectMatch: "cinatra_main_explicit",
+      capture: fakeDocker({}), // config resolves name "cinatra_main"
+      log: () => {},
+    });
+    expect(res.status).toBe("project-mismatch");
+    expect(readLedger("main", dir).status).toBe("missing");
+  });
+
+  it("refuses to record when the running-service listing fails (deployment proof required)", () => {
+    const res = captureDeployedVersions({
+      slug: "main",
+      targetDir: "/nonexistent",
+      ledgerDir: dir,
+      capture: (cmd, args) => (args.includes("ps") ? null : fakeDocker({})(cmd, args)),
+      log: () => {},
+    });
+    expect(res.status).toBe("no-deployment-proof");
+    expect(readLedger("main", dir).status).toBe("missing");
+  });
+
+  it("an EMPTY running listing is proof of nothing running — nothing recorded, not a failure", () => {
+    const res = captureDeployedVersions({
+      slug: "main",
+      targetDir: "/nonexistent",
+      ledgerDir: dir,
+      capture: fakeDocker({ ps: "" }),
+      log: () => {},
+    });
+    expect(res.status).toBe("empty");
+    expect(res.skipped.every((s) => /not running/i.test(s.reason))).toBe(true);
     expect(readLedger("main", dir).status).toBe("missing");
   });
 });

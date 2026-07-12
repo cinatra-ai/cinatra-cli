@@ -5311,6 +5311,7 @@ async function runDbUpgradePreflight(rest) {
   const { runPreflightCommand } = await import("./upgrade-preflight.mjs");
   const { readLedger } = await import("./version-ledger.mjs");
   const { resolveComposeConfig, statefulServicesFromComposeConfig } = await import("./version-ledger-capture.mjs");
+  const { imageParts } = await import("./upgrade-matrix.mjs");
   const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, findInstanceByInstallDir, getInstance } =
     await import("./instance-registry.mjs");
 
@@ -5356,7 +5357,13 @@ async function runDbUpgradePreflight(rest) {
 
   // Discover services: ledger entries first (integrity-only), then the
   // checkout's compose-config intent (adds/overrides the volume the deployment
-  // ACTUALLY resolves + the target version the pinned image ships).
+  // ACTUALLY resolves + the target version the pinned image ships). Fail-closed
+  // discovery: an unresolvable compose config inside a checkout ABORTS (exit 2,
+  // via the discover-throw path) rather than silently degrading to ledger-only;
+  // a matrix-known service whose data volume cannot be identified surfaces as a
+  // fail-closed finding; a pinned image whose version does not land on the
+  // service's axis carries its RAW tag as the target so the comparison fails
+  // closed instead of collapsing into an integrity-only pass.
   const volumeImages = new Map(); // volumeName → image (for the emptiness probe)
   const discover = () => {
     const specs = new Map();
@@ -5374,32 +5381,62 @@ async function runDbUpgradePreflight(rest) {
         composeProject: rowProject,
         capture: (cmd, args, opts) => (cmd === "docker" ? dockerCapture(args, opts) : null),
       });
-      if (config) {
-        const { found } = statefulServicesFromComposeConfig(config);
-        for (const s of found) {
-          specs.set(s.service, { service: s.service, volumeName: s.volumeName, target: s.dataFormatVersion });
-          volumeImages.set(s.volumeName, s.image);
-        }
+      if (!config) {
+        throw new Error(
+          `could not resolve the compose config for ${configDir} — refusing a partial preflight. ` +
+            `Ensure Docker Compose v2 is available and the checkout is intact, then retry.`,
+        );
+      }
+      const { found, skipped } = statefulServicesFromComposeConfig(config);
+      for (const s of found) {
+        const target = s.dataFormatVersion ?? imageParts(s.image).tag ?? "unknown";
+        specs.set(s.service, { service: s.service, volumeName: s.volumeName, target });
+        volumeImages.set(s.volumeName, s.image);
+      }
+      for (const s of skipped) {
+        specs.set(s.service, { service: s.service, volumeName: null, target: null, volumeUnidentified: s.reason });
       }
     }
     return [...specs.values()];
   };
 
+  // `docker volume inspect` with an explicit three-way outcome: only docker's
+  // own "no such volume" counts as ABSENT; any other failure is an ERROR (and
+  // the transport treats it fail-closed, never as an empty/fresh volume).
+  const inspectVolumeThreeWay = (name) => {
+    try {
+      const r = spawnSync("docker", ["volume", "inspect", name], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
+      });
+      if (r.status === 0) {
+        try {
+          const parsed = JSON.parse((r.stdout ?? "").trim());
+          const inspectRow = Array.isArray(parsed) ? parsed[0] ?? null : parsed;
+          return inspectRow ? { status: "ok", row: inspectRow } : { status: "error", row: null };
+        } catch {
+          return { status: "error", row: null };
+        }
+      }
+      if (/no such volume/i.test(`${r.stderr ?? ""}${r.stdout ?? ""}`)) return { status: "absent", row: null };
+      return { status: "error", row: null };
+    } catch {
+      return { status: "error", row: null };
+    }
+  };
+
   const transport = {
     inspectVolume: (name) => {
       if (!name) return null;
-      const raw = dockerCapture(["volume", "inspect", name]);
-      if (!raw) return null;
-      try {
-        const parsed = JSON.parse(raw);
-        return Array.isArray(parsed) ? parsed[0] ?? null : parsed;
-      } catch {
-        return null;
-      }
+      const res = inspectVolumeThreeWay(name);
+      return res.status === "ok" ? res.row : null;
     },
     volumeState: (name) => {
       if (!name) return "absent";
-      if (!dockerCapture(["volume", "inspect", name])) return "absent";
+      const res = inspectVolumeThreeWay(name);
+      if (res.status === "absent") return "absent";
+      if (res.status === "error") return "present"; // fail closed on a docker error
       // Real emptiness check over the service's own already-pulled image
       // (--pull=never: a read-only preflight never reaches the network). Any
       // failure → "present" (fail closed, never "empty" on a guess).
@@ -5844,7 +5881,18 @@ async function runDevRefresh(rest) {
           await import("./instance-registry.mjs");
         const instRow = findInstanceByInstallDir(requireUsableInstanceRegistry(defaultInstanceRegistryPath()), repoRoot);
         if (instRow?.slug) {
-          captureDeployedVersions({ slug: instRow.slug, targetDir: repoRoot, log: console.log });
+          // This refresh upped the BARE project (no -p above); when the row
+          // records a different explicit project, recording would bind another
+          // stack's volumes to this slug — captureDeployedVersions refuses via
+          // the project-match guard instead.
+          const rowProject =
+            instRow.composeProject && instRow.composeProject !== "cinatra" ? instRow.composeProject : null;
+          captureDeployedVersions({
+            slug: instRow.slug,
+            targetDir: repoRoot,
+            requireProjectMatch: rowProject,
+            log: console.log,
+          });
         }
       } catch {
         /* best-effort — a recording failure never fails the refresh */
