@@ -48,11 +48,11 @@ function transportFor(volume = VOL, overrides = {}) {
 
 describe("runPreflight — ledger-driven detection over a mocked transport", () => {
   it("recorded version matching the target → OK (safe to recreate)", () => {
-    seedLedger("postgres-platform", "18");
+    seedLedger("postgres", "18");
     const rep = runPreflight({
       slug: SLUG,
       ledgerDir: dir,
-      services: [{ service: "postgres-platform", target: "18", volumeName: VOL.name }],
+      services: [{ service: "postgres", target: "18", volumeName: VOL.name }],
       transport: transportFor(),
     });
     expect(rep.ok).toBe(true);
@@ -61,11 +61,11 @@ describe("runPreflight — ledger-driven detection over a mocked transport", () 
   });
 
   it("recorded older major facing a supported target → STOP, report NOT ok", () => {
-    seedLedger("postgres-nango", "15");
+    seedLedger("nango-db", "15");
     const rep = runPreflight({
       slug: SLUG,
       ledgerDir: dir,
-      services: [{ service: "postgres-nango", target: "17", volumeName: VOL.name }],
+      services: [{ service: "nango-db", target: "17", volumeName: VOL.name }],
       transport: transportFor(),
     });
     expect(rep.ok).toBe(false);
@@ -74,11 +74,11 @@ describe("runPreflight — ledger-driven detection over a mocked transport", () 
   });
 
   it("a volume recreated out-of-band (identity mismatch) → FAIL CLOSED", () => {
-    seedLedger("postgres-platform", "17", VOL);
+    seedLedger("postgres", "17", VOL);
     const rep = runPreflight({
       slug: SLUG,
       ledgerDir: dir,
-      services: [{ service: "postgres-platform", target: "18", volumeName: VOL.name }],
+      services: [{ service: "postgres", target: "18", volumeName: VOL.name }],
       transport: transportFor({ name: VOL.name, createdAt: "2026-12-31T00:00:00Z" }),
     });
     expect(rep.ok).toBe(false);
@@ -87,11 +87,11 @@ describe("runPreflight — ledger-driven detection over a mocked transport", () 
   });
 
   it("a disabled profile is skipped (no probe/inspect consulted)", () => {
-    seedLedger("postgres-platform", "18");
+    seedLedger("postgres", "18");
     const rep = runPreflight({
       slug: SLUG,
       ledgerDir: dir,
-      services: [{ service: "postgres-platform", target: "18", volumeName: VOL.name }],
+      services: [{ service: "postgres", target: "18", volumeName: VOL.name }],
       transport: transportFor(VOL, { profileEnabled: () => false }),
     });
     expect(rep.results[0].verdict).toBe(VERDICTS.SKIPPED);
@@ -103,7 +103,7 @@ describe("runPreflight — ledger-driven detection over a mocked transport", () 
     const rep = runPreflight({
       slug: SLUG,
       ledgerDir: dir,
-      services: [{ service: "postgres-nango", target: "17", volumeName: VOL.name }],
+      services: [{ service: "nango-db", target: "17", volumeName: VOL.name }],
       transport: transportFor(VOL, { probeVersion: () => "15" }),
     });
     expect(rep.results[0].verdict).toBe(VERDICTS.STOP); // 15 → 17 supported, pending
@@ -113,7 +113,7 @@ describe("runPreflight — ledger-driven detection over a mocked transport", () 
     const rep = runPreflight({
       slug: SLUG,
       ledgerDir: dir,
-      services: [{ service: "postgres-platform", target: "18", volumeName: VOL.name }],
+      services: [{ service: "postgres", target: "18", volumeName: VOL.name }],
       transport: transportFor(VOL, { probeVersion: () => null, readMarker: () => "17" }),
     });
     expect(rep.results[0].verdict).toBe(VERDICTS.STOP);
@@ -122,12 +122,12 @@ describe("runPreflight — ledger-driven detection over a mocked transport", () 
 
   it("a malformed ledger fails EVERY service closed (never treated as no-record)", () => {
     // Corrupt the ledger file directly on disk.
-    seedLedger("postgres-platform", "18");
+    seedLedger("postgres", "18");
     writeFileSync(path.join(dir, `${SLUG}.json`), "{ corrupt");
     const rep = runPreflight({
       slug: SLUG,
       ledgerDir: dir,
-      services: [{ service: "postgres-platform", target: "18", volumeName: VOL.name }],
+      services: [{ service: "postgres", target: "18", volumeName: VOL.name }],
       transport: transportFor(),
     });
     expect(rep.ok).toBe(false);
@@ -135,20 +135,20 @@ describe("runPreflight — ledger-driven detection over a mocked transport", () 
   });
 
   it("mixed services report the worst as blocking while clean ones pass", () => {
-    seedLedger("postgres-platform", "18");
-    seedLedger("postgres-nango", "15");
+    seedLedger("postgres", "18");
+    seedLedger("nango-db", "15");
     const rep = runPreflight({
       slug: SLUG,
       ledgerDir: dir,
       services: [
-        { service: "postgres-platform", target: "18", volumeName: VOL.name },
-        { service: "postgres-nango", target: "17", volumeName: VOL.name },
+        { service: "postgres", target: "18", volumeName: VOL.name },
+        { service: "nango-db", target: "17", volumeName: VOL.name },
       ],
       transport: transportFor(),
     });
     expect(rep.ok).toBe(false);
     expect(rep.findings).toHaveLength(1);
-    expect(rep.findings[0].service).toBe("postgres-nango");
+    expect(rep.findings[0].service).toBe("nango-db");
   });
 });
 
@@ -183,7 +183,7 @@ describe("runPreflightCommand — entrypoint exit codes + rendering", () => {
   }
 
   it("integrity-only run (no --target) exits 0 and renders an OK line", () => {
-    seedLedger("postgres-platform", "18");
+    seedLedger("postgres", "18");
     const out = [];
     const code = runPreflightCommand([], {
       slug: SLUG,
@@ -197,9 +197,9 @@ describe("runPreflightCommand — entrypoint exit codes + rendering", () => {
   });
 
   it("a modeled --target hop that STOPS exits 1", () => {
-    seedLedger("postgres-nango", "15");
+    seedLedger("nango-db", "15");
     const out = [];
-    const code = runPreflightCommand(["--target", "postgres-nango=17"], {
+    const code = runPreflightCommand(["--target", "nango-db=17"], {
       slug: SLUG,
       ledgerDir: dir,
       discover: discoverFrom(dir, SLUG),
@@ -211,9 +211,9 @@ describe("runPreflightCommand — entrypoint exit codes + rendering", () => {
   });
 
   it("--json emits the raw structured report", () => {
-    seedLedger("postgres-platform", "17");
+    seedLedger("postgres", "17");
     const out = [];
-    const code = runPreflightCommand(["--json", "--target", "postgres-platform=18"], {
+    const code = runPreflightCommand(["--json", "--target", "postgres=18"], {
       slug: SLUG,
       ledgerDir: dir,
       discover: discoverFrom(dir, SLUG),
@@ -227,14 +227,14 @@ describe("runPreflightCommand — entrypoint exit codes + rendering", () => {
   });
 
   it("a scoped authorization flips the STOP to authorized-proceed (exit 0)", () => {
-    seedLedger("postgres-platform", "17");
+    seedLedger("postgres", "17");
     const out = [];
-    const code = runPreflightCommand(["--target", "postgres-platform=18"], {
+    const code = runPreflightCommand(["--target", "postgres=18"], {
       slug: SLUG,
       ledgerDir: dir,
       discover: discoverFrom(dir, SLUG),
       transport: transportFor(),
-      authorizations: [{ service: "postgres-platform", source: "17", target: "18" }],
+      authorizations: [{ service: "postgres", source: "17", target: "18" }],
       log: (s) => out.push(s),
     });
     expect(code).toBe(0);
@@ -249,10 +249,10 @@ describe("runPreflightCommand — entrypoint exit codes + rendering", () => {
   });
 
   it("--service filters discovery to the named service", () => {
-    seedLedger("postgres-platform", "18");
-    seedLedger("postgres-nango", "15");
+    seedLedger("postgres", "18");
+    seedLedger("nango-db", "15");
     const out = [];
-    const code = runPreflightCommand(["--json", "--service", "postgres-platform"], {
+    const code = runPreflightCommand(["--json", "--service", "postgres"], {
       slug: SLUG,
       ledgerDir: dir,
       discover: discoverFrom(dir, SLUG),
@@ -262,6 +262,6 @@ describe("runPreflightCommand — entrypoint exit codes + rendering", () => {
     expect(code).toBe(0);
     const parsed = JSON.parse(out.join("\n"));
     expect(parsed.results).toHaveLength(1);
-    expect(parsed.results[0].service).toBe("postgres-platform");
+    expect(parsed.results[0].service).toBe("postgres");
   });
 });

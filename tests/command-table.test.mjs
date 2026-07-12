@@ -276,6 +276,12 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode+sub",
         },
         {
+          "command": "instance db upgrade-preflight",
+          "hidden": false,
+          "id": "db.upgrade-preflight",
+          "match": "command+mode+sub",
+        },
+        {
           "command": "instance refresh",
           "hidden": false,
           "id": "dev.refresh",

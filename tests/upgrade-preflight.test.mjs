@@ -44,8 +44,8 @@ describe("volume identity", () => {
 describe("detectVersion — adapter precedence", () => {
   it("recorded ledger version is PRIMARY (short-circuits probe/marker)", () => {
     const d = detectVersion({
-      service: "postgres-platform",
-      ledger: ledgerWith("postgres-platform", "17"),
+      service: "postgres",
+      ledger: ledgerWith("postgres", "17"),
       liveVolumeIdentity: VOL,
       probeVersion: "18",
       markerVersion: "16",
@@ -55,8 +55,8 @@ describe("detectVersion — adapter precedence", () => {
 
   it("a ledger/volume identity mismatch is a HARD finding (no fall-through to probe)", () => {
     const d = detectVersion({
-      service: "postgres-platform",
-      ledger: ledgerWith("postgres-platform", "17"),
+      service: "postgres",
+      ledger: ledgerWith("postgres", "17"),
       liveVolumeIdentity: VOL_RECREATED,
       probeVersion: "18",
       markerVersion: "18",
@@ -66,18 +66,18 @@ describe("detectVersion — adapter precedence", () => {
   });
 
   it("an interrupted migration (pending journal) is a HARD finding", () => {
-    let l = ledgerWith("postgres-platform", "17");
-    l = beginMigration(l, { service: "postgres-platform", target: { image: "postgres:18", dataFormatVersion: "18", volume: VOL_RECREATED } });
-    const d = detectVersion({ service: "postgres-platform", ledger: l, liveVolumeIdentity: VOL, probeVersion: "18" });
+    let l = ledgerWith("postgres", "17");
+    l = beginMigration(l, { service: "postgres", target: { image: "postgres:18", dataFormatVersion: "18", volume: VOL_RECREATED } });
+    const d = detectVersion({ service: "postgres", ledger: l, liveVolumeIdentity: VOL, probeVersion: "18" });
     expect(d.finding).toBe("interrupted-migration");
   });
 
   it("a LEGACY install (no ledger entry) falls through probe → marker", () => {
-    expect(detectVersion({ service: "postgres-platform", ledger: emptyLedger, liveVolumeIdentity: VOL, probeVersion: "17" }))
+    expect(detectVersion({ service: "postgres", ledger: emptyLedger, liveVolumeIdentity: VOL, probeVersion: "17" }))
       .toEqual({ version: "17", source: "probe", finding: null });
-    expect(detectVersion({ service: "postgres-platform", ledger: emptyLedger, liveVolumeIdentity: VOL, probeVersion: null, markerVersion: "16" }))
+    expect(detectVersion({ service: "postgres", ledger: emptyLedger, liveVolumeIdentity: VOL, probeVersion: null, markerVersion: "16" }))
       .toEqual({ version: "16", source: "marker", finding: null });
-    expect(detectVersion({ service: "postgres-platform", ledger: emptyLedger, liveVolumeIdentity: VOL }))
+    expect(detectVersion({ service: "postgres", ledger: emptyLedger, liveVolumeIdentity: VOL }))
       .toEqual({ version: null, source: null, finding: null });
   });
 });
@@ -85,7 +85,7 @@ describe("detectVersion — adapter precedence", () => {
 // --- decision core: every acceptance scenario -----------------------------
 
 describe("decideService — acceptance scenarios", () => {
-  const base = { service: "postgres-platform", matrix: DEFAULT_UPGRADE_MATRIX };
+  const base = { service: "postgres", matrix: DEFAULT_UPGRADE_MATRIX };
 
   it("fresh/empty volume → PASS", () => {
     expect(decideService({ ...base, detected: null, target: "18", volumeState: "empty" }).verdict).toBe(VERDICTS.PASS);
@@ -106,7 +106,7 @@ describe("decideService — acceptance scenarios", () => {
 
   it("the #1417 scenario class (older-major data dir + naive recreate) becomes a guided STOP, never a crash-loop", () => {
     // nango pg15 volume facing a pg17 image recreate.
-    const r = decideService({ service: "postgres-nango", matrix: DEFAULT_UPGRADE_MATRIX, detected: "15", target: "17" });
+    const r = decideService({ service: "nango-db", matrix: DEFAULT_UPGRADE_MATRIX, detected: "15", target: "17" });
     expect(r.verdict).toBe(VERDICTS.STOP);
     expect(blocks(r.verdict)).toBe(true);
     expect(r.migration).toBe("cinatra instance db upgrade-major");
@@ -114,7 +114,7 @@ describe("decideService — acceptance scenarios", () => {
 
   it("unsupported hop → FAIL CLOSED", () => {
     // twenty has no in-place path listed.
-    const r = decideService({ service: "postgres-twenty", matrix: DEFAULT_UPGRADE_MATRIX, detected: "16", target: "18" });
+    const r = decideService({ service: "twenty-db", matrix: DEFAULT_UPGRADE_MATRIX, detected: "16", target: "18" });
     expect(r.verdict).toBe(VERDICTS.FAIL_CLOSED);
     expect(r.reason).toMatch(/unsupported/i);
   });
@@ -168,27 +168,27 @@ describe("decideService — acceptance scenarios", () => {
 // --- scoped escape path ----------------------------------------------------
 
 describe("scoped authorization — bypasses ONLY the exact supported STOP", () => {
-  const base = { service: "postgres-platform", matrix: DEFAULT_UPGRADE_MATRIX, detected: "17", target: "18" };
+  const base = { service: "postgres", matrix: DEFAULT_UPGRADE_MATRIX, detected: "17", target: "18" };
 
   it("an EXACT (service, source, target) authorization turns the STOP into AUTHORIZED-PROCEED", () => {
-    const r = decideService({ ...base, authorization: { service: "postgres-platform", source: "17", target: "18" } });
+    const r = decideService({ ...base, authorization: { service: "postgres", source: "17", target: "18" } });
     expect(r.verdict).toBe(VERDICTS.AUTHORIZED_PROCEED);
     expect(blocks(r.verdict)).toBe(false);
     expect(r.migration).toBe("cinatra instance db upgrade-major");
   });
 
   it("a non-matching authorization does NOT bypass (still STOP)", () => {
-    expect(decideService({ ...base, authorization: { service: "postgres-platform", source: "16", target: "18" } }).verdict).toBe(VERDICTS.STOP);
-    expect(decideService({ ...base, authorization: { service: "postgres-nango", source: "17", target: "18" } }).verdict).toBe(VERDICTS.STOP);
+    expect(decideService({ ...base, authorization: { service: "postgres", source: "16", target: "18" } }).verdict).toBe(VERDICTS.STOP);
+    expect(decideService({ ...base, authorization: { service: "nango-db", source: "17", target: "18" } }).verdict).toBe(VERDICTS.STOP);
   });
 
   it("authorization can NEVER bypass an unsupported hop, unknown version, or downgrade (eligibility is not bypassable)", () => {
     // unsupported hop
-    expect(decideService({ service: "postgres-twenty", matrix: DEFAULT_UPGRADE_MATRIX, detected: "16", target: "18", authorization: { service: "postgres-twenty", source: "16", target: "18" } }).verdict).toBe(VERDICTS.FAIL_CLOSED);
+    expect(decideService({ service: "twenty-db", matrix: DEFAULT_UPGRADE_MATRIX, detected: "16", target: "18", authorization: { service: "twenty-db", source: "16", target: "18" } }).verdict).toBe(VERDICTS.FAIL_CLOSED);
     // downgrade
-    expect(decideService({ ...base, detected: "18", target: "17", authorization: { service: "postgres-platform", source: "18", target: "17" } }).verdict).toBe(VERDICTS.BLOCKED);
+    expect(decideService({ ...base, detected: "18", target: "17", authorization: { service: "postgres", source: "18", target: "17" } }).verdict).toBe(VERDICTS.BLOCKED);
     // off-axis unknown
-    expect(decideService({ ...base, detected: "14", authorization: { service: "postgres-platform", source: "14", target: "18" } }).verdict).toBe(VERDICTS.FAIL_CLOSED);
+    expect(decideService({ ...base, detected: "14", authorization: { service: "postgres", source: "14", target: "18" } }).verdict).toBe(VERDICTS.FAIL_CLOSED);
   });
 
   it("authorizationMatches is exact-string on all three fields", () => {
@@ -202,12 +202,12 @@ describe("scoped authorization — bypasses ONLY the exact supported STOP", () =
 
 describe("parsePreflightArgs", () => {
   it("parses --json, repeatable --service, --instance, and --target pairs", () => {
-    const p = parsePreflightArgs(["--json", "--service", "postgres-platform", "--service=redis-cache", "--instance", "acme", "--target", "postgres-platform=18"]);
-    expect(p).toEqual({ json: true, only: ["postgres-platform", "redis-cache"], slug: "acme", targets: { "postgres-platform": "18" } });
+    const p = parsePreflightArgs(["--json", "--service", "postgres", "--service=redis", "--instance", "acme", "--target", "postgres=18"]);
+    expect(p).toEqual({ json: true, only: ["postgres", "redis"], slug: "acme", targets: { "postgres": "18" } });
   });
   it("rejects an unknown flag and a malformed --target", () => {
     expect(() => parsePreflightArgs(["--bogus"])).toThrow(/Unexpected argument/);
-    expect(() => parsePreflightArgs(["--target", "postgres-platform"])).toThrow(/<service>=<version>/);
+    expect(() => parsePreflightArgs(["--target", "postgres"])).toThrow(/<service>=<version>/);
     expect(() => parsePreflightArgs(["--service"])).toThrow(/Missing value/);
   });
 });

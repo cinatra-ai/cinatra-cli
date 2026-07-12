@@ -39,7 +39,7 @@ afterEach(() => {
 
 function pgEntry(v = "17", volume = VOL) {
   return makeEntry({
-    service: "postgres-platform",
+    service: "postgres",
     image: `postgres:${v}`,
     digest: "sha256:aaa",
     dataFormatVersion: v,
@@ -63,12 +63,12 @@ describe("recordDeployed", () => {
   it("records a service entry immutably (input ledger untouched)", () => {
     const base = readLedger(SLUG, dir).ledger;
     const next = recordDeployed(base, pgEntry("18"));
-    expect(getEntry(next, "postgres-platform").dataFormatVersion).toBe("18");
-    expect(getEntry(base, "postgres-platform")).toBeNull();
+    expect(getEntry(next, "postgres").dataFormatVersion).toBe("18");
+    expect(getEntry(base, "postgres")).toBeNull();
   });
   it("refuses to overwrite a service with a migration in flight", () => {
     let l = recordDeployed(readLedger(SLUG, dir).ledger, pgEntry("17"));
-    l = beginMigration(l, { service: "postgres-platform", target: { image: "postgres:18", dataFormatVersion: "18", volume: VOL } });
+    l = beginMigration(l, { service: "postgres", target: { image: "postgres:18", dataFormatVersion: "18", volume: VOL } });
     expect(() => recordDeployed(l, pgEntry("18"))).toThrow(/migration is in flight/);
   });
 });
@@ -77,12 +77,12 @@ describe("transactional migration journal", () => {
   it("beginMigration stages the target WITHOUT moving the live entry", () => {
     let l = recordDeployed(readLedger(SLUG, dir).ledger, pgEntry("17"));
     l = beginMigration(l, {
-      service: "postgres-platform",
+      service: "postgres",
       target: { image: "postgres:18", dataFormatVersion: "18", volume: VOL2 },
     });
     // Live entry is still the SOURCE (17) while pending holds the target.
-    expect(getEntry(l, "postgres-platform").dataFormatVersion).toBe("17");
-    const p = pendingFor(l, "postgres-platform");
+    expect(getEntry(l, "postgres").dataFormatVersion).toBe("17");
+    const p = pendingFor(l, "postgres");
     expect(p.source.dataFormatVersion).toBe("17");
     expect(p.target.dataFormatVersion).toBe("18");
   });
@@ -90,45 +90,45 @@ describe("transactional migration journal", () => {
   it("commitMigration promotes the target ONLY after verify (commit-only-after-verify)", () => {
     let l = recordDeployed(readLedger(SLUG, dir).ledger, pgEntry("17"));
     l = beginMigration(l, {
-      service: "postgres-platform",
+      service: "postgres",
       target: { image: "postgres:18", dataFormatVersion: "18", volume: VOL2 },
     });
-    l = commitMigration(l, "postgres-platform");
-    expect(getEntry(l, "postgres-platform").dataFormatVersion).toBe("18");
-    expect(pendingFor(l, "postgres-platform")).toBeNull();
+    l = commitMigration(l, "postgres");
+    expect(getEntry(l, "postgres").dataFormatVersion).toBe("18");
+    expect(pendingFor(l, "postgres")).toBeNull();
   });
 
   it("rollbackMigration restores the SOURCE entry (never leaves the target beside a restored volume)", () => {
     let l = recordDeployed(readLedger(SLUG, dir).ledger, pgEntry("17", VOL));
     l = beginMigration(l, {
-      service: "postgres-platform",
+      service: "postgres",
       target: { image: "postgres:18", dataFormatVersion: "18", volume: VOL2 },
     });
-    l = rollbackMigration(l, "postgres-platform");
-    const entry = getEntry(l, "postgres-platform");
+    l = rollbackMigration(l, "postgres");
+    const entry = getEntry(l, "postgres");
     expect(entry.dataFormatVersion).toBe("17");
     expect(entry.volume).toEqual(VOL); // bound back to the ORIGINAL volume identity
-    expect(pendingFor(l, "postgres-platform")).toBeNull();
+    expect(pendingFor(l, "postgres")).toBeNull();
   });
 
   it("rollback of a first-ever record (no source) removes the entry entirely", () => {
     let l = readLedger(SLUG, dir).ledger;
     l = beginMigration(l, {
-      service: "postgres-nango",
+      service: "nango-db",
       target: { image: "postgres:17", dataFormatVersion: "17", volume: VOL },
     });
-    l = rollbackMigration(l, "postgres-nango");
-    expect(getEntry(l, "postgres-nango")).toBeNull();
-    expect(pendingFor(l, "postgres-nango")).toBeNull();
+    l = rollbackMigration(l, "nango-db");
+    expect(getEntry(l, "nango-db")).toBeNull();
+    expect(pendingFor(l, "nango-db")).toBeNull();
   });
 
   it("refuses a second concurrent migration", () => {
     let l = beginMigration(readLedger(SLUG, dir).ledger, {
-      service: "postgres-platform",
+      service: "postgres",
       target: { image: "postgres:18", dataFormatVersion: "18", volume: VOL },
     });
     expect(() =>
-      beginMigration(l, { service: "postgres-nango", target: { image: "postgres:17", dataFormatVersion: "17", volume: VOL } }),
+      beginMigration(l, { service: "nango-db", target: { image: "postgres:17", dataFormatVersion: "17", volume: VOL } }),
     ).toThrow(/already in flight/);
   });
 
@@ -147,19 +147,19 @@ describe("file IO — atomic write + read roundtrip", () => {
     expect(existsSync(file)).toBe(true);
     const re = readLedger(SLUG, dir);
     expect(re.status).toBe("ok");
-    expect(getEntry(re.ledger, "postgres-platform").dataFormatVersion).toBe("18");
+    expect(getEntry(re.ledger, "postgres").dataFormatVersion).toBe("18");
   });
 
   it("a pending journal survives a write/read roundtrip (crash-mid-migration is durable)", () => {
     let l = recordDeployed(readLedger(SLUG, dir).ledger, pgEntry("17"));
     l = beginMigration(l, {
-      service: "postgres-platform",
+      service: "postgres",
       target: { image: "postgres:18", dataFormatVersion: "18", volume: VOL2 },
     });
     writeLedger(l, dir);
     const re = readLedger(SLUG, dir);
     expect(re.status).toBe("ok");
-    expect(pendingFor(re.ledger, "postgres-platform")).not.toBeNull();
+    expect(pendingFor(re.ledger, "postgres")).not.toBeNull();
   });
 });
 

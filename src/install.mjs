@@ -49,6 +49,7 @@ import { fileURLToPath } from "node:url";
 
 import { syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
 import { isValidSlug } from "./clone-registry.mjs";
+import { captureDeployedVersions } from "./version-ledger-capture.mjs";
 import {
   defaultInstanceRegistryPath,
   requireUsableInstanceRegistry,
@@ -1270,6 +1271,15 @@ export function reconcileInstallProfile(body, profile) {
 // Infra (docker compose up + wait), pre-install-safe.
 // ---------------------------------------------------------------------------
 
+/** cinatra-cli#128: record the deployed stateful-service versions into the
+ *  instance's version ledger after a SUCCESSFUL bring-up. Best-effort by
+ *  contract (captureDeployedVersions never throws); `deps.captureDeployedVersions`
+ *  is the test seam (same pattern as `deps.bringUpInfra`). */
+function recordVersions({ slug, targetDir, composeFiles = null, composeProject = null, envFile = null, log = console.log, deps = {} }) {
+  const record = deps.captureDeployedVersions ?? captureDeployedVersions;
+  return record({ slug, targetDir, composeFiles, composeProject, envFile, log });
+}
+
 function bringUpInfra({ targetDir, log = console.log, composeFiles = null, composeProject = null, envFile = null, nangoHealthUrl = null }) {
   log("- Starting infrastructure (Postgres + Redis + Nango)…");
   composeUpOrThrow(targetDir, { composeFiles, composeProject, envFile });
@@ -2343,6 +2353,17 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
         envFile: existsSync(envFile) ? envFile : null,
         nangoHealthUrl: nangoHealthUrlForPorts(slot.ports),
       });
+      // cinatra-cli#128: record the deployed stateful-service versions in the
+      // instance's ledger (best-effort — a re-up is an install-shaped event too).
+      recordVersions({
+        slug,
+        targetDir,
+        composeFiles: slot.composeFiles,
+        composeProject: slot.composeProject,
+        envFile: existsSync(envFile) ? envFile : null,
+        log,
+        deps,
+      });
     }
     return {
       slug,
@@ -2393,6 +2414,17 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       sha: resolvedSha,
       infraMode: "new",
       state: "ready",
+    });
+    // cinatra-cli#128: record the deployed stateful-service versions in the
+    // instance's ledger — AFTER ready (a rolled-back install records nothing).
+    recordVersions({
+      slug,
+      targetDir,
+      composeFiles,
+      composeProject,
+      envFile: existsSync(envFile) ? envFile : null,
+      log,
+      deps,
     });
   } catch (err) {
     log(`  ✗ Isolated bring-up failed — rolling back the pending instance "${slug}".`);
@@ -4054,6 +4086,11 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
       log("- Ensuring this checkout's own infra is up (attach)…");
       startInfra({ targetDir, log, composeFiles, composeProject, envFile: attachEnvFile, nangoHealthUrl: nangoHealthUrlForPorts(row?.ports) });
       broughtUp = true;
+      // cinatra-cli#128: an attach re-up deploys whatever the moved checkout
+      // now pins — record it (best-effort).
+      if (row?.slug) {
+        recordVersions({ slug: row.slug, targetDir, composeFiles, composeProject, envFile: attachEnvFile, log, deps });
+      }
     } catch (err) {
       log(`  ⚠ Attach bring-up reported: ${err.message}`);
       // Re-throw a hard failure so we never proceed (or promote) on a broken stack.
@@ -4653,6 +4690,14 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
       log,
       deps,
     });
+  }
+
+  // 7c. cinatra-cli#128: record the deployed stateful-service versions for the
+  //     DEFAULT stack into the instance's version ledger (best-effort). The
+  //     isolated/attach executors record inside their own flows; external has
+  //     no install-managed local stack to record.
+  if (infraPlan === "default" && recordedSlug) {
+    recordVersions({ slug: recordedSlug, targetDir, composeProject: defaultProject, log, deps });
   }
 
   // 8. Done.
