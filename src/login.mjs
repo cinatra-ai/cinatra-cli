@@ -55,6 +55,12 @@ export const CLI_OAUTH_SCOPES = [
   "cli:status",
   "cli:agent:read",
   "cli:agent:write",
+  // The extensions reconcile control plane (cinatra-cli#126): `--plan` (read)
+  // and `--apply` (operator write). The host's verified-bearer guard requires
+  // the EXACT endpoint scope (no `cli:*` fallback), so a remote-profile
+  // `cinatra extensions reconcile` needs these requested at login.
+  "cli:extensions:read",
+  "cli:extensions:write",
 ];
 
 const CLIENT_NAME = "Cinatra CLI";

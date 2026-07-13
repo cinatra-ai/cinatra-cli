@@ -32,12 +32,17 @@
 //         initiatingOperator: string, systemExecutor: string }
 //
 // GATES the SERVER enforces and this command surfaces VERBATIM (never silent):
-// non-required (`isSystemExtension`) only; platform-scoped NULL-org only; the
-// instance-wide org-row compensation fence (any org-scoped install row blocks
-// every update); exactly one NULL-org row per package (else
-// `ambiguous-install-scope`); verdaccio-live (`active|locked`) rows only;
-// sdk-ABI compatibility; fleet signature-readiness; and a pre-dispatch TOCTOU
-// recheck that may only SHRINK the candidate set (drift → `state-drift`).
+// non-required (`isSystemExtension`) only; platform-scoped NULL-org only;
+// exactly one NULL-org row per package (else `ambiguous-install-scope`);
+// verdaccio-live (`active|locked`) rows only (`non-verdaccio-source`); the
+// operator deny list (`deny-listed`); sdk-ABI compatibility
+// (`abi-incompatible`); the fleet signature-readiness fence
+// (`signature-readiness` — when the fleet would not survive
+// `require-signatures=true`, ZERO candidates execute); and a pre-dispatch
+// TOCTOU recheck + expected-version CAS that may only SHRINK the candidate set
+// (drift → `state-drift`; a concurrent update winning → `cas-version-lost`).
+// (The org-row compensation fence was LIFTED by the host's row-scoped
+// compensation — cinatra#1042 slice-2 — and is no longer emitted.)
 //
 // READ-MODEL-UNWIRED: until the instance's persistent update read-model store
 // adapter is wired, PLAN reports every row as `read-model-unwired` rather than

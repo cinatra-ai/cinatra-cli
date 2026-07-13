@@ -832,7 +832,7 @@ Options:
   --json               Emit the raw structured plan/apply result.
 
 Fail-closed reasons surfaced (never silent): read-model-unwired, ambiguous-install-scope,
-state-drift, sdk-abi-incompatible, signature-not-ready, org-row-fence, and more.
+state-drift, abi-incompatible, signature-readiness, deny-listed, and more.
 Exit code: an --apply with any FAILED candidate exits 1 (audit-write failures are
 non-fatal and only reported).`,
   "create-extension": `Kinds:

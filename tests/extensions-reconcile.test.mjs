@@ -79,7 +79,7 @@ describe("formatPlan", () => {
     ],
     skipped: [
       { packageName: "@cinatra-ai/baz", reason: "ambiguous-install-scope" },
-      { packageName: "@cinatra-ai/qux", reason: "sdk-abi-incompatible", detail: "host 2.x, needs 3.x" },
+      { packageName: "@cinatra-ai/qux", reason: "abi-incompatible", detail: "host 2.x, needs 3.x" },
     ],
     fences: [],
   };
@@ -92,7 +92,7 @@ describe("formatPlan", () => {
     expect(out).toContain("1.2.0 → 1.3.0");
     expect(out).toContain("Skipped (2):");
     expect(out).toContain("ambiguous-install-scope");
-    expect(out).toContain("sdk-abi-incompatible  (host 2.x, needs 3.x)");
+    expect(out).toContain("abi-incompatible  (host 2.x, needs 3.x)");
     expect(out).toContain("Plan digest: sha256:deadbeef");
     expect(out).toContain("Dry run — no changes were made.");
   });
@@ -122,12 +122,14 @@ describe("formatPlan", () => {
       readModelStatus: "wired",
       candidates: [],
       skipped: [],
-      fences: [{ fence: "org-row-fence", detail: "1 org-scoped install row present" }],
+      // The only instance-wide fence the merged host emits today (cinatra#1418):
+      // fleet signature-readiness NOT-READY holds every update, fail-closed.
+      fences: [{ fence: "signature-readiness", detail: "the fleet signature-readiness predicate is NOT-READY" }],
     };
     const out = formatPlan(fenced);
     expect(out).toContain("FENCED");
-    expect(out).toContain("org-row-fence");
-    expect(out).toContain("1 org-scoped install row present");
+    expect(out).toContain("signature-readiness");
+    expect(out).toContain("the fleet signature-readiness predicate is NOT-READY");
   });
 
   it("reports genuinely up-to-date when there is nothing to do", () => {
