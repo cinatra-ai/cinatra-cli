@@ -125,6 +125,10 @@ describe("RFC 8707 resource on interactive login", () => {
     expect(startArgs.scope).toContain("cli:status");
     expect(startArgs.scope).toContain("cli:agent:read");
     expect(startArgs.scope).toContain("cli:agent:write");
+    // The reconcile control plane (cinatra-cli#126) — the host guard requires
+    // the EXACT endpoint scope (no cli:* fallback), so login requests the pair.
+    expect(startArgs.scope).toContain("cli:extensions:read");
+    expect(startArgs.scope).toContain("cli:extensions:write");
 
     expect(sdkMocks.exchangeAuthorization).toHaveBeenCalledTimes(1);
     const exchangeArgs = sdkMocks.exchangeAuthorization.mock.calls[0][1];

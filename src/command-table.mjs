@@ -133,6 +133,13 @@ export const COMMAND_DESCRIPTORS = [
     summary: "Submit a built extension tarball to the Cinatra Marketplace for review.",
   },
   {
+    id: "extensions.reconcile",
+    path: ["extensions", "reconcile"],
+    match: "command+mode",
+    summary:
+      "Plan (default, dry-run) or apply the non-required extension updates the instance's auto-update loop would perform.",
+  },
+  {
     id: "extensions.list",
     path: ["extensions", "list"],
     match: "command+mode",

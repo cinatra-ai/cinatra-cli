@@ -108,6 +108,12 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode",
         },
         {
+          "command": "extensions reconcile",
+          "hidden": false,
+          "id": "extensions.reconcile",
+          "match": "command+mode",
+        },
+        {
           "command": "extensions list",
           "hidden": false,
           "id": "extensions.list",

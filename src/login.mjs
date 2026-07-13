@@ -55,6 +55,12 @@ export const CLI_OAUTH_SCOPES = [
   "cli:status",
   "cli:agent:read",
   "cli:agent:write",
+  // The extensions reconcile control plane (cinatra-cli#126): `--plan` (read)
+  // and `--apply` (operator write). The host's verified-bearer guard requires
+  // the EXACT endpoint scope (no `cli:*` fallback), so a remote-profile
+  // `cinatra extensions reconcile` needs these requested at login.
+  "cli:extensions:read",
+  "cli:extensions:write",
 ];
 
 const CLIENT_NAME = "Cinatra CLI";
@@ -564,16 +570,27 @@ export function redactTokens(text, accessToken) {
   return out;
 }
 
-/** Build a token-redacted error from a non-2xx response. */
+/**
+ * Build a token-redacted error from a non-2xx response. The HTTP `status` and
+ * any server-supplied machine `code` are attached to the Error (additive — the
+ * message-only callers ignore them) so a caller can branch on them (e.g. the
+ * reconcile command distinguishing a 404 "surface not served" from a 409
+ * "plan-digest-mismatch").
+ */
 async function httpError(res, accessToken) {
   let detail = "";
+  let code = null;
   try {
     const body = await res.json();
     if (body?.error) detail = `: ${redactTokens(body.error, accessToken)}`;
+    if (typeof body?.code === "string") code = body.code;
   } catch {
     // non-JSON body — ignore.
   }
-  return new Error(`Request failed (${res.status} ${res.statusText})${detail}`);
+  const err = new Error(`Request failed (${res.status} ${res.statusText})${detail}`);
+  err.status = res.status;
+  if (code) err.code = code;
+  return err;
 }
 
 /** `cinatra status` remote path — GET /api/cli/status. */
@@ -651,6 +668,51 @@ export async function cliApiPostBytes(
     method: "POST",
     headers: { ...headers, "content-type": contentType, accept: "application/json" },
     body,
+  });
+  if (!res.ok) {
+    throw await httpError(res, accessToken);
+  }
+  return await res.json();
+}
+
+/**
+ * Authenticated JSON GET returning parsed JSON — the loopback-aware sibling of
+ * `cliApiGet` (which always sends a Bearer). Sends NO Authorization header on a
+ * loopback target (the server dev-bypass authorizes), so a local verify stack
+ * is zero-login. Token-redacted errors carry `.status` / `.code`.
+ */
+export async function cliApiGetJson(path, { appUrl, profile, env, fetchFn = fetch } = {}) {
+  const { origin, headers, accessToken } = await resolveRequestContext({
+    appUrl,
+    profile,
+    env,
+  });
+  const res = await fetchFn(`${origin}${path}`, {
+    method: "GET",
+    headers: { ...headers, accept: "application/json" },
+  });
+  if (!res.ok) {
+    throw await httpError(res, accessToken);
+  }
+  return await res.json();
+}
+
+/**
+ * Authenticated JSON POST of a JSON-serializable body, returning parsed JSON.
+ * Loopback-aware (no Authorization header on a loopback target). Token-redacted
+ * errors carry `.status` / `.code`. The body is `JSON.stringify`-d with a
+ * `content-type: application/json` header.
+ */
+export async function cliApiPostJson(path, jsonBody, { appUrl, profile, env, fetchFn = fetch } = {}) {
+  const { origin, headers, accessToken } = await resolveRequestContext({
+    appUrl,
+    profile,
+    env,
+  });
+  const res = await fetchFn(`${origin}${path}`, {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify(jsonBody ?? {}),
   });
   if (!res.ok) {
     throw await httpError(res, accessToken);
