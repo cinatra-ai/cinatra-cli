@@ -103,12 +103,62 @@ describe("runLedgerHook — the guarded frame's transactional wiring", () => {
     expect(r.code).toBe(6);
   });
 
+  it("begin FAILS CLOSED when the recorded source entry is bound to a different volume identity", async () => {
+    const dir = ledgerDir();
+    await hook(dir, "record", { image: "postgres:17-alpine", targetMajor: "17" }); // bound to VOL
+    // The live volume was destroyed+recreated (new createdAt) — begin must refuse.
+    const recreated = { name: "cinatra-postgres", createdAt: "2026-09-09T00:00:00Z" };
+    const r = await hook(dir, "begin", { image: "postgres:18-alpine", targetMajor: "18", volumeIdentityOf: () => recreated });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe(6);
+    expect(r.message).toMatch(/identity mismatch/);
+    // The ledger was not mutated — still the source entry, no pending journal.
+    const l = readLedgerFile(dir);
+    expect(l.pending).toBeNull();
+    expect(l.services.postgres.image).toBe("postgres:17-alpine");
+  });
+
+  it("record DELIBERATELY rebinds a recreated volume (a fresh-init re-record is legitimate, unlike begin)", async () => {
+    const dir = ledgerDir();
+    await hook(dir, "record", { image: "postgres:17-alpine", targetMajor: "17" }); // bound to VOL
+    const recreated = { name: "cinatra-postgres", createdAt: "2026-09-09T00:00:00Z" };
+    const r = await hook(dir, "record", { image: "postgres:17-alpine", targetMajor: "17", volumeIdentityOf: () => recreated });
+    expect(r.ok).toBe(true);
+    expect(readLedgerFile(dir).services.postgres.volume.createdAt).toBe("2026-09-09T00:00:00Z");
+  });
+
+  it("commit/rollback FAIL CLOSED when the live volume identity is unresolvable (never silently finish a journal)", async () => {
+    const dir = ledgerDir();
+    await hook(dir, "record", { image: "postgres:17-alpine", targetMajor: "17" });
+    await hook(dir, "begin", { image: "postgres:18-alpine", targetMajor: "18" });
+    expect((await hook(dir, "commit", { volumeIdentityOf: () => null })).code).toBe(6);
+    // The journal is untouched — still pending, still finishable with a real identity.
+    expect(readLedgerFile(dir).pending.service).toBe("postgres");
+    expect((await hook(dir, "commit")).ok).toBe(true);
+  });
+
+  it("commit FAILS CLOSED when the volume was destroyed+recreated mid-migration", async () => {
+    const dir = ledgerDir();
+    await hook(dir, "record", { image: "postgres:17-alpine", targetMajor: "17" });
+    await hook(dir, "begin", { image: "postgres:18-alpine", targetMajor: "18" }); // pending target bound to VOL
+    const recreated = { name: "cinatra-postgres", createdAt: "2026-09-09T00:00:00Z" };
+    const r = await hook(dir, "commit", { volumeIdentityOf: () => recreated });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe(6);
+    expect(r.message).toMatch(/destroyed\+recreated mid-migration/);
+    // Still pending — the journal is retained (interrupted), never committed.
+    expect(readLedgerFile(dir).pending.service).toBe("postgres");
+  });
+
   it("validates op + required env (usage, code 2)", async () => {
     const dir = ledgerDir();
     expect((await hook(dir, "bogus", {})).code).toBe(2);
     expect((await runLedgerHook({ op: "begin", service: "postgres", slug: null, ledgerDir: dir })).code).toBe(2);
     expect((await runLedgerHook({ op: "begin", service: null, slug: SLUG, ledgerDir: dir })).code).toBe(2);
     expect((await hook(dir, "begin", { image: null })).code).toBe(2);
+    // A begin with no target data-format version must fail closed (would record
+    // an unknown version — the naive-recreate hazard).
+    expect((await hook(dir, "begin", { image: "postgres:18-alpine", targetMajor: undefined })).code).toBe(2);
   });
 });
 

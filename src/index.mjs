@@ -5558,6 +5558,16 @@ const PG_MATRIX_SERVICE_ID = Object.freeze({
   "twenty-db": "twenty-postgres",
   "plane-db": "plane-postgres",
 });
+// The cluster SUPERUSER each Postgres service is initialised with (compose
+// POSTGRES_USER; default `postgres`). The guarded frame dumps/restores as this
+// role — nango-db runs as `nango`, plane-db as `plane` — so a mismatched
+// default would make the dump/verify fail against the real cluster.
+const PG_SERVICE_SUPERUSER = Object.freeze({
+  postgres: "postgres",
+  "nango-db": "nango",
+  "twenty-db": "postgres",
+  "plane-db": "plane",
+});
 
 async function runDbUpgradeMajor(rest) {
   const { runUpgradeMajorCommand, UPGRADE_EXIT } = await import("./upgrade-major.mjs");
@@ -5715,6 +5725,7 @@ async function runDbUpgradeMajor(rest) {
     const ledgerDir = process.env.CINATRA_VERSION_LEDGER_DIR || defaultLedgerDir();
     const hookPath = fileURLToPath(new URL("./upgrade-ledger-hook.mjs", import.meta.url));
     const targetTag = ctx.targetImage ? imageRefTagWithDigest(imageParts(ctx.targetImage)) : `${ctx.plan.to}-alpine`;
+    const superuser = PG_SERVICE_SUPERUSER[ctx.service] ?? "postgres";
     const args = [
       mechanism,
       "--service", matrixId,
@@ -5724,6 +5735,7 @@ async function runDbUpgradeMajor(rest) {
       "--from-tag", `${ctx.plan.from}-alpine`,
       "--to-tag", targetTag,
       "--backup-dir", backupDir,
+      "--superuser", superuser,
     ];
     console.log(`Delegating to the guarded frame: ${matrixId} ${ctx.plan.from} -> ${ctx.plan.to} on '${ctx.sourceVolume}'`);
     const r = spawnSync("bash", args, {

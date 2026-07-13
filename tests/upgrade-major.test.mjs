@@ -88,10 +88,10 @@ describe("planTransition — matrix eligibility (fail-closed)", () => {
 // A mock transport: every method returns { ok:true } and records its call in
 // order, unless `fail` names it. Tracks created/removed volumes so a test can
 // assert the retention/cleanup + rollback rules.
-function mockTransport(fail = new Set()) {
+function mockTransport(fail = new Set(), created = { candidate: true, target: true }) {
   const calls = [];
   const removed = [];
-  const step = (name) => (args) => {
+  const step = (name) => () => {
     calls.push(name);
     return { ok: !fail.has(name), users: name === "quiesced" && fail.has(name) ? ["holder-1"] : undefined };
   };
@@ -100,8 +100,8 @@ function mockTransport(fail = new Set()) {
     removed,
     quiesced: step("quiesced"),
     diskPrecheck: step("diskPrecheck"),
-    verifiedBackup: step("verifiedBackup"),
-    restoreFresh: step("restoreFresh"),
+    verifiedBackup: () => (calls.push("verifiedBackup"), { ok: !fail.has("verifiedBackup"), candidateCreated: created.candidate }),
+    restoreFresh: () => (calls.push("restoreFresh"), { ok: !fail.has("restoreFresh"), targetCreated: created.target }),
     verifyTarget: step("verifyTarget"),
     cutover: step("cutover"),
     verifyCutover: step("verifyCutover"),
@@ -128,8 +128,8 @@ const PLAN_A = {
   targetMount: PG_PARENT_MOUNT,
 };
 
-function guarded({ fail = new Set(), ledger = mockLedger(), inject = () => false } = {}) {
-  const transport = mockTransport(fail);
+function guarded({ fail = new Set(), ledger = mockLedger(), inject = () => false, created } = {}) {
+  const transport = mockTransport(fail, created);
   const result = runGuardedUpgrade({
     plan: PLAN_A,
     sourceVolume: "cinatra-postgres",
@@ -213,14 +213,23 @@ describe("runGuardedUpgrade — failure injection at each pre-commit step rolls 
     expect(result.code).toBe(UPGRADE_EXIT.ROLLED_BACK);
     expect(ledger.rollback).toHaveBeenCalledOnce();
   });
+  it("rollback removes ONLY volumes this run created — a refused pre-existing volume is kept", () => {
+    // verifiedBackup refuses because a same-named RETAINED recovery candidate
+    // already exists (candidateCreated:false) — rollback must not destroy it.
+    const { result, transport } = guarded({ fail: new Set(["verifiedBackup"]), created: { candidate: false, target: false } });
+    expect(result.code).toBe(UPGRADE_EXIT.ROLLED_BACK);
+    expect(transport.removed).toEqual([]);
+  });
 });
 
 describe("runGuardedUpgrade — a FAILED rollback is the fail-closed interrupted state (exit 4)", () => {
-  it("keeps the pending journal when rollback itself fails", () => {
+  it("keeps the pending journal AND the recovery volumes when rollback itself fails", () => {
     const ledger = mockLedger({ rollback: vi.fn(() => ({ ok: false })) });
-    const { result } = guarded({ inject: (p) => p === "post-verify", ledger });
+    const { result, transport } = guarded({ inject: (p) => p === "post-verify", ledger });
     expect(result.code).toBe(UPGRADE_EXIT.INTERRUPTED);
     expect(result.message).toMatch(/LEDGER ROLLBACK FAILED/);
+    // The candidate/target must NOT be destroyed — they are recovery material.
+    expect(transport.removed).toEqual([]);
   });
 });
 

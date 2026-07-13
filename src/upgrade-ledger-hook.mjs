@@ -81,6 +81,12 @@ export async function runLedgerHook({ op, service, image, volumeName, slug, targ
   if ((op === "begin" || op === "record") && !image) {
     return { ok: false, code: 2, message: `--image is required for "${op}"` };
   }
+  // A begin/record with no target data-format version would commit a ledger
+  // entry whose recorded version is unknown — the exact naive-recreate hazard
+  // this whole feature closes. Require it (fail closed).
+  if ((op === "begin" || op === "record") && !targetMajor) {
+    return { ok: false, code: 2, message: `missing target data-format version (CINATRA_UPGRADE_TARGET_MAJOR) for "${op}"` };
+  }
   const resolveIdentity = volumeIdentityOf ?? ((v) => dockerVolumeIdentity(v));
 
   return withLedgerLock(slug, ledgerDir, () => {
@@ -95,12 +101,55 @@ export async function runLedgerHook({ op, service, image, volumeName, slug, targ
       if (op === "begin" || op === "record") {
         const volume = resolveIdentity(volumeName);
         if (!volume) return { ok: false, code: 6, message: `could not resolve the identity of volume "${volumeName}"` };
+        // Volume-identity binding at BEGIN ONLY: a recorded source entry that
+        // does NOT describe the live volume (renamed, or destroyed+recreated =>
+        // new createdAt) is a fail-closed finding — its data-format claim is
+        // about a volume that no longer exists (version-ledger.beginMigration
+        // captures the source but does not enforce this; the hook does,
+        // mirroring the harness file ledger). `record` is the plain
+        // (re)install/upgrade record — it DELIBERATELY rebinds to the live
+        // volume (a fresh-init on a recreated volume legitimately re-records),
+        // so it is exempt from the source-identity guard.
+        if (op === "begin") {
+          const existing = ledger.services[service];
+          if (existing && (existing.volume.name !== volume.name || existing.volume.createdAt !== volume.createdAt)) {
+            return {
+              ok: false,
+              code: 6,
+              message:
+                `recorded ${service} entry is bound to volume { ${existing.volume.name}, ${existing.volume.createdAt} } but the live volume is ` +
+                `{ ${volume.name}, ${volume.createdAt} } — identity mismatch (fail-closed; the recorded version describes a volume that no longer exists).`,
+            };
+          }
+        }
         const entry = makeEntry({ service, image, dataFormatVersion: targetMajor ?? null, volume });
         next = op === "begin" ? beginMigration(ledger, { service, target: entry }) : recordDeployed(ledger, entry);
-      } else if (op === "commit") {
-        next = commitMigration(ledger, service);
       } else {
-        next = rollbackMigration(ledger, service);
+        // commit / rollback FINISH the exact migration the journal records. When
+        // a journal is pending it can only be finished by naming its EXACT target
+        // volume identity — a resolvable live identity is REQUIRED (an
+        // unresolvable one is fail-closed, never silently finished), and a volume
+        // destroyed+recreated MID-migration (new createdAt) can never be
+        // committed/rolled-back over (fail-closed interrupted; mirrors the harness
+        // file ledger's assertFinishesPending).
+        const pending = ledger.pending;
+        if (pending && pending.service === service) {
+          const live = resolveIdentity(volumeName);
+          if (!live) {
+            return { ok: false, code: 6, message: `could not resolve the identity of volume "${volumeName}" — refusing to ${op} the pending ${service} migration` };
+          }
+          const want = pending.target?.volume;
+          if (want && (live.name !== want.name || live.createdAt !== want.createdAt)) {
+            return {
+              ok: false,
+              code: 6,
+              message:
+                `${op} sees live volume { ${live.name}, ${live.createdAt} } but the pending journal records ` +
+                `{ ${want.name}, ${want.createdAt} } — the volume was destroyed+recreated mid-migration (fail-closed).`,
+            };
+          }
+        }
+        next = op === "commit" ? commitMigration(ledger, service) : rollbackMigration(ledger, service);
       }
       writeLedger(next, ledgerDir);
       return { ok: true, code: 0, message: `ledger ${op} for ${service}` };

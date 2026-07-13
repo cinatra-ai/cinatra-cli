@@ -191,11 +191,14 @@ function unknownRemediation(service) {
  *   true iff NO container references the data volume.
  * @property {(args: object) => {ok:boolean, detail?:string}} diskPrecheck
  *   room for the candidate clone + the dump (fail-closed BEFORE any mutation).
- * @property {(args: object) => {ok:boolean, detail?:string}} verifiedBackup
+ * @property {(args: object) => {ok:boolean, candidateCreated?:boolean, detail?:string}} verifiedBackup
  *   clone source->candidate (read-only), run the SOURCE server on the clone,
- *   dump + checksum. The ORIGINAL is only opened read-only here.
- * @property {(args: object) => {ok:boolean, detail?:string}} restoreFresh
+ *   dump + checksum. The ORIGINAL is only opened read-only here. `candidateCreated`
+ *   is true iff THIS run created the candidate volume (false when it refused a
+ *   pre-existing one), so rollback removes only what it created.
+ * @property {(args: object) => {ok:boolean, targetCreated?:boolean, detail?:string}} restoreFresh
  *   create the FRESH target-major volume + restore the verified dump.
+ *   `targetCreated` is true iff THIS run created the target volume.
  * @property {(args: object) => {ok:boolean, detail?:string}} verifyTarget
  *   server-version + content read-back on the restored target volume.
  * @property {(args: object) => {ok:boolean, detail?:string}} cutover
@@ -233,21 +236,24 @@ export function runGuardedUpgrade({
 
   const done = (code, message, extra = {}) => ({ code, phase, service, message, ...extra });
 
-  // Roll back a PRE-COMMIT abort: remove only what THIS run created, restore the
-  // ledger source entry, and VERIFY the rollback (a failed rollback is a retained
-  // journal — the fail-closed interrupted state, exit 4).
+  // Roll back a PRE-COMMIT abort. The ledger rollback is attempted+VERIFIED
+  // FIRST: a FAILED rollback is a retained journal — the fail-closed interrupted
+  // state (exit 4) — and in that case the candidate/target volumes are KEPT as
+  // recovery material (never destroyed before the journal is resolved). Only a
+  // VERIFIED rollback removes the volumes THIS run created and reports exit 5.
   const rollback = (reason) => {
     log(`pre-commit abort (${reason}) — rolling back; the source volume '${sourceVolume}' was only opened read-only and is intact`);
-    if (candidateCreated) transport.removeVolume(candidateVolume);
-    if (targetCreated) transport.removeVolume(targetVolume);
     const r = ledger.rollback();
     if (!r || !r.ok) {
       return done(
         UPGRADE_EXIT.INTERRUPTED,
         `LEDGER ROLLBACK FAILED after ${reason} — the pending journal is RETAINED (fail-closed interrupted state). ` +
-          `The source volume '${sourceVolume}' is intact; resolve the ledger before any retry. See ${UPGRADE_RUNBOOK_URL}.`,
+          `The source volume '${sourceVolume}' is intact; the candidate/target volumes are KEPT as recovery material. ` +
+          `Resolve the ledger before any retry. See ${UPGRADE_RUNBOOK_URL}.`,
       );
     }
+    if (candidateCreated) transport.removeVolume(candidateVolume);
+    if (targetCreated) transport.removeVolume(targetVolume);
     return done(
       UPGRADE_EXIT.ROLLED_BACK,
       `aborted pre-commit (${reason}): rolled back — '${sourceVolume}' is intact and the ledger carries the ${plan.from} source entry again.`,
@@ -292,7 +298,10 @@ export function runGuardedUpgrade({
   ledgerBegun = true;
 
   // ── 4. verified backup OFF THE CANDIDATE CLONE ─────────────────────────────
-  candidateCreated = true; // the transport creates the candidate; own it for cleanup
+  // The transport reports whether IT created the candidate (it REFUSES a
+  // pre-existing same-named volume — retained recovery material — rather than
+  // overlaying it), so a later rollback removes ONLY a volume this run created,
+  // never a pre-existing artifact.
   const backup = transport.verifiedBackup({
     sourceImage,
     sourceVolume,
@@ -301,12 +310,12 @@ export function runGuardedUpgrade({
     dumpFile,
     expectMajor: plan.from,
   });
+  if (backup && backup.candidateCreated) candidateCreated = true;
   if (!backup || !backup.ok || inject("backup-verify")) {
     return rollback("verified backup failed");
   }
 
   // ── 5. fresh target-major volume + restore ─────────────────────────────────
-  targetCreated = true;
   const restore = transport.restoreFresh({
     targetImage,
     targetVolume,
@@ -314,6 +323,7 @@ export function runGuardedUpgrade({
     dumpFile,
     expectMajor: plan.to,
   });
+  if (restore && restore.targetCreated) targetCreated = true;
   if (!restore || !restore.ok || inject("restore")) {
     return rollback("restore into the fresh target volume failed");
   }
@@ -421,8 +431,8 @@ export function previewSteps(plan) {
     transport: {
       quiesced: record("quiesce writers"),
       diskPrecheck: record("disk-space precheck (clone + dump)"),
-      verifiedBackup: record(`verified backup off a read-only clone (pg_dump ${plan.from}, checksummed)`),
-      restoreFresh: record(`fresh pg${plan.to} volume at ${plan.targetMount} + restore`),
+      verifiedBackup: (a) => (record(`verified backup off a read-only clone (pg_dump ${plan.from}, checksummed)`)(a), { ok: true, candidateCreated: true }),
+      restoreFresh: (a) => (record(`fresh pg${plan.to} volume at ${plan.targetMount} + restore`)(a), { ok: true, targetCreated: true }),
       verifyTarget: record("post-verify the restored target (server version + content read-back)"),
       cutover: record("COMMIT BOUNDARY: cut over onto the original volume (identity preserved)"),
       verifyCutover: record("post-cutover verify"),
