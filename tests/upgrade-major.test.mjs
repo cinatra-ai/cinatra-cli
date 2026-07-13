@@ -57,6 +57,8 @@ describe("planTransition — matrix eligibility (fail-closed)", () => {
     expect(p.ok).toBe(false);
     expect(p.code).toBe(UPGRADE_EXIT.REFUSED);
     expect(p.reason).toMatch(/downgrade blocked/);
+    // The refusal deep-links the Postgres family runbook anchor (cinatra-ai/cinatra#1421).
+    expect(p.remediation).toContain("/self-hosting/upgrading-stateful-services#postgres");
   });
   it("refuses an unsupported forward hop fail-closed (nango 17 -> 18)", () => {
     const p = planTransition({ service: "nango-db", detected: "17", target: "18" });
@@ -189,6 +191,11 @@ describe("runGuardedUpgrade — pre-commit refusals (no ledger, no mutation)", (
     expect(result.code).toBe(UPGRADE_EXIT.REFUSED);
     expect(ledger.rollback).not.toHaveBeenCalled();
     expect(ledger.commit).not.toHaveBeenCalled();
+    // Regression (cinatra-ai/cinatra#1421): PLAN_A omits `runbookUrl`, so the
+    // executor MUST fall back to the default-matrix per-family anchor rather than
+    // render "See undefined." in the failure message.
+    expect(result.message).toContain("/self-hosting/upgrading-stateful-services#postgres");
+    expect(result.message).not.toContain("undefined");
   });
 });
 

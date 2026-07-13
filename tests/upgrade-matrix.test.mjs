@@ -5,9 +5,11 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_UPGRADE_MATRIX,
   PG_UPGRADE_MAJOR_COMMAND,
+  UPGRADE_RUNBOOK_URL,
   compareVersions,
   serviceEntry,
   serviceMarkerFile,
+  serviceRunbookUrl,
   supportedTransition,
 } from "../src/upgrade-matrix.mjs";
 
@@ -20,6 +22,38 @@ describe("serviceEntry / serviceMarkerFile", () => {
     expect(serviceMarkerFile(DEFAULT_UPGRADE_MATRIX, "postgres")).toBe("PG_VERSION");
     expect(serviceMarkerFile(DEFAULT_UPGRADE_MATRIX, "redis")).toBeNull();
     expect(serviceMarkerFile(DEFAULT_UPGRADE_MATRIX, "neo4j")).toBeNull();
+  });
+});
+
+describe("serviceRunbookUrl — deep-links the reserved per-family anchor (cinatra-ai/cinatra#1421)", () => {
+  // The anchors reserved by the runbook (cinatra-ai/docs
+  // guides/hosting/upgrading-stateful-services.md, docs#135). Each guarded
+  // stateful service maps to its family's section.
+  const cases = [
+    ["postgres", "postgres"],
+    ["nango-db", "postgres"],
+    ["twenty-db", "postgres"],
+    ["plane-db", "postgres"],
+    ["wordpress-db", "mariadb"],
+    ["drupal-db", "mariadb"],
+    ["neo4j", "neo4j"],
+    ["redis", "redis-and-valkey"],
+    ["twenty-redis", "redis-and-valkey"],
+    ["plane-redis", "redis-and-valkey"],
+    ["plane-mq", "rabbitmq"],
+    ["verdaccio", "verdaccio"],
+  ];
+  it.each(cases)("%s → #%s", (service, anchor) => {
+    expect(serviceRunbookUrl(DEFAULT_UPGRADE_MATRIX, service)).toBe(`${UPGRADE_RUNBOOK_URL}#${anchor}`);
+  });
+  it("every service the matrix knows carries a runbook anchor", () => {
+    for (const service of Object.keys(DEFAULT_UPGRADE_MATRIX.services)) {
+      expect(serviceRunbookUrl(DEFAULT_UPGRADE_MATRIX, service)).toMatch(/#[a-z0-9-]+$/);
+    }
+  });
+  it("an unknown service (no family) falls back to the BARE page URL — never a broken fragment", () => {
+    expect(serviceRunbookUrl(DEFAULT_UPGRADE_MATRIX, "not-a-service")).toBe(UPGRADE_RUNBOOK_URL);
+    expect(serviceRunbookUrl(DEFAULT_UPGRADE_MATRIX, "not-a-service")).not.toContain("#");
   });
 });
 
