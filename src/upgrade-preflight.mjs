@@ -43,10 +43,10 @@
 
 import {
   DEFAULT_UPGRADE_MATRIX,
-  UPGRADE_RUNBOOK_URL,
   compareVersions,
   serviceEntry,
   serviceMarkerFile,
+  serviceRunbookUrl,
   supportedTransition,
 } from "./upgrade-matrix.mjs";
 import { getEntry, pendingFor, readLedger } from "./version-ledger.mjs";
@@ -167,27 +167,31 @@ export function decideService({
   matrix = DEFAULT_UPGRADE_MATRIX,
   authorization = null,
 }) {
+  // The runbook URL is deep-linked to the service's reserved per-family anchor
+  // (cinatra-ai/cinatra#1421); an unknown service (no matrix entry) falls back to
+  // the bare page URL.
+  const runbookUrl = serviceRunbookUrl(matrix, service);
   if (profileEnabled === false) {
     return verdict(service, VERDICTS.SKIPPED, "profile disabled — service not deployed here");
   }
   // A service the matrix does not know cannot be reasoned about → fail closed.
   if (!serviceEntry(matrix, service)) {
     return verdict(service, VERDICTS.FAIL_CLOSED, `unknown service "${service}" — not in the supported matrix`, {
-      remediation: unknownRemediation(service),
+      remediation: unknownRemediation(service, runbookUrl),
     });
   }
   if (detectionFinding === "interrupted-migration") {
     return verdict(service, VERDICTS.FAIL_CLOSED, "a migration was interrupted (pending journal present)", {
       remediation:
         `Restore ${service} from backup (or complete/roll back the in-flight migration) before recreating the ` +
-        `container. See ${UPGRADE_RUNBOOK_URL}.`,
+        `container. See ${runbookUrl}.`,
     });
   }
   if (detectionFinding === "ledger-volume-mismatch") {
     return verdict(service, VERDICTS.FAIL_CLOSED, "recorded ledger version does not match the live volume identity", {
       remediation:
         `The ${service} volume was recreated out-of-band — its data-format version is unknown. Back up and verify ` +
-        `it before recreating the container. See ${UPGRADE_RUNBOOK_URL}.`,
+        `it before recreating the container. See ${runbookUrl}.`,
     });
   }
   // Empty / absent volume → fresh init, always safe (explicit non-finding).
@@ -196,7 +200,7 @@ export function decideService({
   }
   if (detected == null) {
     return verdict(service, VERDICTS.FAIL_CLOSED, "deployed version is unknown/unreadable on a non-empty volume", {
-      remediation: unknownRemediation(service),
+      remediation: unknownRemediation(service, runbookUrl),
     });
   }
   // INTEGRITY-ONLY mode: no target supplied (a standalone `upgrade-preflight`
@@ -224,7 +228,7 @@ export function decideService({
       service,
       VERDICTS.FAIL_CLOSED,
       `unknown/unordered version (detected ${detected} → target ${target})`,
-      { detected, target, detectionSource, remediation: unknownRemediation(service) },
+      { detected, target, detectionSource, remediation: unknownRemediation(service, runbookUrl) },
     );
   }
   if (cmp > 0) {
@@ -234,7 +238,7 @@ export function decideService({
       detectionSource,
       remediation:
         `Downgrading ${service} from ${detected} to ${target} is unsafe and unsupported. Pin the previous image ` +
-        `or restore a matching backup. See ${UPGRADE_RUNBOOK_URL}.`,
+        `or restore a matching backup. See ${runbookUrl}.`,
     });
   }
   // Forward hop. Must be an EXPLICITLY supported transition (adjacency is not
@@ -251,7 +255,7 @@ export function decideService({
         detectionSource,
         remediation:
           `No supported ${service} upgrade path from ${detected} to ${target}. Back up your data and consult ` +
-          `${UPGRADE_RUNBOOK_URL}.`,
+          `${runbookUrl}.`,
       },
     );
   }
@@ -273,14 +277,14 @@ export function decideService({
     caseScoped: Boolean(transition.caseScoped),
     remediation:
       `Back up ${service} first, then run \`${transition.migration}\` to migrate ${detected} → ${target} before ` +
-      `recreating the container. See ${UPGRADE_RUNBOOK_URL}.`,
+      `recreating the container. See ${runbookUrl}.`,
   });
 }
 
-function unknownRemediation(service) {
+function unknownRemediation(service, runbookUrl) {
   return (
     `Refusing to recreate the ${service} container while its data-format version is unknown — a mismatched major ` +
-    `would crash-loop. Back up the volume and determine its version. See ${UPGRADE_RUNBOOK_URL}.`
+    `would crash-loop. Back up the volume and determine its version. See ${runbookUrl}.`
   );
 }
 
@@ -373,7 +377,7 @@ export function runPreflight({
         verdict(service, VERDICTS.FAIL_CLOSED, `data volume could not be identified (${spec.volumeUnidentified})`, {
           remediation:
             `Refusing to clear a ${service} recreate while its data volume cannot be identified. ` +
-            `See ${UPGRADE_RUNBOOK_URL}.`,
+            `See ${serviceRunbookUrl(matrix, service)}.`,
         }),
       );
       continue;

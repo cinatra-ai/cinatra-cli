@@ -108,15 +108,18 @@ export const DEFAULT_UPGRADE_MATRIX = Object.freeze({
     "plane-db": pgService("/var/lib/postgresql", []),
     // Non-Postgres stateful families (epic sub-issue 4) — ordered axes are known
     // so downgrades/unknown hops are CLASSIFIED (blocked / fail-closed), but no
-    // in-place major transition is supported yet (empty `transitions`).
-    "wordpress-db": { order: ["11.4"], marker: null, dataMount: "/var/lib/mysql", transitions: [] },
-    "drupal-db": { order: ["11.4"], marker: null, dataMount: "/var/lib/mysql", transitions: [] },
-    neo4j: { order: ["5", "2026.05"], marker: null, dataMount: "/data", transitions: [] },
-    redis: { order: ["7", "8"], marker: null, dataMount: "/data", transitions: [] },
-    "twenty-redis": { order: ["7", "8"], marker: null, dataMount: "/data", transitions: [] },
-    "plane-redis": { order: ["7.2.11"], marker: null, dataMount: "/data", transitions: [] },
-    "plane-mq": { order: ["3.13"], marker: null, dataMount: "/var/lib/rabbitmq", transitions: [] },
-    verdaccio: { order: ["6"], marker: null, dataMount: "/verdaccio/storage", transitions: [] },
+    // in-place major transition is supported yet (empty `transitions`). Each
+    // carries its RESERVED per-family runbook anchor (cinatra-ai/cinatra#1421):
+    // a fail-closed stop message for one of these services deep-links the exact
+    // runbook section that documents its (manual, out-of-CLI) guarded path.
+    "wordpress-db": { order: ["11.4"], marker: null, dataMount: "/var/lib/mysql", runbookAnchor: "mariadb", transitions: [] },
+    "drupal-db": { order: ["11.4"], marker: null, dataMount: "/var/lib/mysql", runbookAnchor: "mariadb", transitions: [] },
+    neo4j: { order: ["5", "2026.05"], marker: null, dataMount: "/data", runbookAnchor: "neo4j", transitions: [] },
+    redis: { order: ["7", "8"], marker: null, dataMount: "/data", runbookAnchor: "redis-and-valkey", transitions: [] },
+    "twenty-redis": { order: ["7", "8"], marker: null, dataMount: "/data", runbookAnchor: "redis-and-valkey", transitions: [] },
+    "plane-redis": { order: ["7.2.11"], marker: null, dataMount: "/data", runbookAnchor: "redis-and-valkey", transitions: [] },
+    "plane-mq": { order: ["3.13"], marker: null, dataMount: "/var/lib/rabbitmq", runbookAnchor: "rabbitmq", transitions: [] },
+    verdaccio: { order: ["6"], marker: null, dataMount: "/verdaccio/storage", runbookAnchor: "verdaccio", transitions: [] },
   },
 });
 
@@ -128,6 +131,8 @@ function pgService(dataMount, hops) {
     order: ["15", "16", "17", "18"],
     marker: "PG_VERSION",
     dataMount,
+    // All four Postgres instances share the runbook's "Postgres" family section.
+    runbookAnchor: "postgres",
     transitions: hops.map((h) => ({
       from: h.from,
       to: h.to,
@@ -149,6 +154,25 @@ export function serviceEntry(matrix, service) {
 export function serviceMarkerFile(matrix, service) {
   const entry = serviceEntry(matrix, service);
   return entry && typeof entry.marker === "string" && entry.marker.length ? entry.marker : null;
+}
+
+/**
+ * The runbook URL a service's guided stop / fail-closed message should link.
+ * Deep-linked to the service's RESERVED per-family anchor in the upgrade runbook
+ * (cinatra-ai/cinatra#1421 acceptance; the reserved anchors landed in
+ * cinatra-ai/docs `guides/hosting/upgrading-stateful-services.md`, docs#135) so
+ * an operator lands directly on the section that documents their family's path
+ * — `#postgres`, `#mariadb`, `#neo4j`, `#redis-and-valkey`, `#rabbitmq`,
+ * `#verdaccio`. A service the matrix does not know has no family, so it falls
+ * back to the bare page URL (never a broken fragment).
+ */
+export function serviceRunbookUrl(matrix, service) {
+  const entry = serviceEntry(matrix, service);
+  const anchor =
+    entry && typeof entry.runbookAnchor === "string" && entry.runbookAnchor.length
+      ? entry.runbookAnchor
+      : null;
+  return anchor ? `${UPGRADE_RUNBOOK_URL}#${anchor}` : UPGRADE_RUNBOOK_URL;
 }
 
 /**
@@ -231,6 +255,7 @@ export const __test = {
   pgService,
   serviceEntry,
   serviceMarkerFile,
+  serviceRunbookUrl,
   compareVersions,
   supportedTransition,
   imageParts,

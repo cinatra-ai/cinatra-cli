@@ -102,6 +102,8 @@ describe("decideService — acceptance scenarios", () => {
     expect(r.migration).toBe("cinatra instance db upgrade-major");
     expect(r.remediation).toMatch(/Back up/i);
     expect(r.remediation).toMatch(/docs\.cinatra\.ai/);
+    // Deep-links the reserved per-family anchor (cinatra-ai/cinatra#1421).
+    expect(r.remediation).toContain("/self-hosting/upgrading-stateful-services#postgres");
   });
 
   it("the #1417 scenario class (older-major data dir + naive recreate) becomes a guided STOP, never a crash-loop", () => {
@@ -162,6 +164,45 @@ describe("decideService — acceptance scenarios", () => {
     const r = decideService({ ...base, detected: "18", target: null });
     expect(r.verdict).toBe(VERDICTS.PASS);
     expect(r.reason).toMatch(/integrity check/i);
+  });
+});
+
+// --- per-family runbook anchors (cinatra-ai/cinatra#1421) -------------------
+
+describe("remediation messages deep-link the reserved per-family runbook anchor", () => {
+  const M = DEFAULT_UPGRADE_MATRIX;
+  const frag = "/self-hosting/upgrading-stateful-services";
+
+  it("a non-Postgres family's fail-closed message links ITS family anchor, not #postgres", () => {
+    // wordpress-db (MariaDB) has no supported hop → any major change fails
+    // closed; the message should point at the runbook's MariaDB section.
+    const r = decideService({ service: "wordpress-db", matrix: M, detected: "11.4", target: "11.8" });
+    expect(r.verdict).toBe(VERDICTS.FAIL_CLOSED);
+    expect(r.remediation).toContain(`${frag}#mariadb`);
+    expect(r.remediation).not.toContain("#postgres");
+  });
+
+  it("a redis/valkey fail-closed message links #redis-and-valkey", () => {
+    const r = decideService({ service: "twenty-redis", matrix: M, detected: "7", target: "8" });
+    expect(r.verdict).toBe(VERDICTS.FAIL_CLOSED);
+    expect(r.remediation).toContain(`${frag}#redis-and-valkey`);
+  });
+
+  it("every blocking verdict for a known family carries its family fragment", () => {
+    // downgrade (BLOCKED) and unknown-version (FAIL_CLOSED) both anchor.
+    const down = decideService({ service: "postgres", matrix: M, detected: "18", target: "17" });
+    expect(down.verdict).toBe(VERDICTS.BLOCKED);
+    expect(down.remediation).toContain(`${frag}#postgres`);
+    const unknown = decideService({ service: "neo4j", matrix: M, detected: null, target: "2026.05", volumeState: "present" });
+    expect(unknown.verdict).toBe(VERDICTS.FAIL_CLOSED);
+    expect(unknown.remediation).toContain(`${frag}#neo4j`);
+  });
+
+  it("an unknown SERVICE (no family) links the BARE page URL — never a broken fragment", () => {
+    const r = decideService({ service: "mystery", matrix: M, detected: "1", target: "2" });
+    expect(r.verdict).toBe(VERDICTS.FAIL_CLOSED);
+    expect(r.remediation).toContain("docs.cinatra.ai/self-hosting/upgrading-stateful-services");
+    expect(r.remediation).not.toContain(`${frag}#`);
   });
 });
 

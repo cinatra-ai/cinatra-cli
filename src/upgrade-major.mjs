@@ -69,9 +69,9 @@
 
 import {
   DEFAULT_UPGRADE_MATRIX,
-  UPGRADE_RUNBOOK_URL,
   compareVersions,
   serviceEntry,
+  serviceRunbookUrl,
   supportedTransition,
 } from "./upgrade-matrix.mjs";
 
@@ -117,17 +117,17 @@ export function pgMountTargetForMajor(major) {
  */
 export function planTransition({ service, detected, target, matrix = DEFAULT_UPGRADE_MATRIX }) {
   if (!serviceEntry(matrix, service)) {
-    return refuse(UPGRADE_EXIT.REFUSED, `unknown service "${service}" — not in the supported matrix`, unknownRemediation(service));
+    return refuse(UPGRADE_EXIT.REFUSED, `unknown service "${service}" — not in the supported matrix`, unknownRemediation(service, matrix));
   }
   if (detected == null || detected === "") {
     return refuse(
       UPGRADE_EXIT.REFUSED,
       `the deployed version of ${service} is unknown/unreadable — refusing to upgrade a store whose source major cannot be established`,
-      unknownRemediation(service),
+      unknownRemediation(service, matrix),
     );
   }
   if (target == null || target === "") {
-    return refuse(UPGRADE_EXIT.REFUSED, `no target version resolved for ${service} — nothing to upgrade to`, unknownRemediation(service));
+    return refuse(UPGRADE_EXIT.REFUSED, `no target version resolved for ${service} — nothing to upgrade to`, unknownRemediation(service, matrix));
   }
   if (String(detected) === String(target)) {
     return refuse(UPGRADE_EXIT.OK, `${service} is already at ${target} — nothing to upgrade`, null);
@@ -137,14 +137,14 @@ export function planTransition({ service, detected, target, matrix = DEFAULT_UPG
     return refuse(
       UPGRADE_EXIT.REFUSED,
       `unknown/unordered version for ${service} (detected ${detected} -> target ${target})`,
-      unknownRemediation(service),
+      unknownRemediation(service, matrix),
     );
   }
   if (cmp > 0) {
     return refuse(
       UPGRADE_EXIT.REFUSED,
       `downgrade blocked for ${service} (detected ${detected} -> target ${target})`,
-      `Downgrading ${service} from ${detected} to ${target} is unsafe and unsupported. Pin the previous image or restore a matching backup. See ${UPGRADE_RUNBOOK_URL}.`,
+      `Downgrading ${service} from ${detected} to ${target} is unsafe and unsupported. Pin the previous image or restore a matching backup. See ${serviceRunbookUrl(matrix, service)}.`,
     );
   }
   const transition = supportedTransition(matrix, service, detected, target);
@@ -152,7 +152,7 @@ export function planTransition({ service, detected, target, matrix = DEFAULT_UPG
     return refuse(
       UPGRADE_EXIT.REFUSED,
       `unsupported upgrade hop for ${service} (detected ${detected} -> target ${target})`,
-      `No supported ${service} upgrade path from ${detected} to ${target}. Back up your data and consult ${UPGRADE_RUNBOOK_URL}.`,
+      `No supported ${service} upgrade path from ${detected} to ${target}. Back up your data and consult ${serviceRunbookUrl(matrix, service)}.`,
     );
   }
   return {
@@ -162,6 +162,11 @@ export function planTransition({ service, detected, target, matrix = DEFAULT_UPG
     to: String(target),
     caseScoped: Boolean(transition.caseScoped),
     migration: transition.migration,
+    // The runbook URL deep-linked to this service's reserved per-family anchor
+    // (cinatra-ai/cinatra#1421), resolved from the SAME matrix the plan was built
+    // from so the guarded executor's messages stay consistent with a
+    // caller-injected matrix (never re-derived against a different default).
+    runbookUrl: serviceRunbookUrl(matrix, service),
     // Layout is dictated by each SIDE's major: the source clone mounts at the
     // source-major target; the fresh restore volume mounts at the target-major
     // target (the 17->18 hop is the layout MOVE; the nango 15->17 case stays
@@ -175,10 +180,10 @@ function refuse(code, reason, remediation) {
   return { ok: false, code, reason, remediation: remediation ?? null };
 }
 
-function unknownRemediation(service) {
+function unknownRemediation(service, matrix = DEFAULT_UPGRADE_MATRIX) {
   return (
     `Refusing to upgrade ${service} while its source data-format version is unknown — a mismatched major would ` +
-    `crash-loop. Back up the volume and determine its version (run \`cinatra instance db upgrade-preflight\`). See ${UPGRADE_RUNBOOK_URL}.`
+    `crash-loop. Back up the volume and determine its version (run \`cinatra instance db upgrade-preflight\`). See ${serviceRunbookUrl(matrix, service)}.`
   );
 }
 
@@ -229,6 +234,11 @@ export function runGuardedUpgrade({
   log = () => {},
 }) {
   const service = plan.service;
+  // Prefer the plan's matrix-resolved per-family runbook URL; fall back to the
+  // default-matrix anchor for the service so a caller-built plan that omits
+  // `runbookUrl` never renders "See undefined." (upgrade-major is Postgres-only,
+  // so the fallback resolves to the same `#postgres` anchor).
+  const runbookUrl = plan.runbookUrl ?? serviceRunbookUrl(DEFAULT_UPGRADE_MATRIX, service);
   let phase = PHASE.PRE_COMMIT;
   let ledgerBegun = false;
   let candidateCreated = false;
@@ -249,7 +259,7 @@ export function runGuardedUpgrade({
         UPGRADE_EXIT.INTERRUPTED,
         `LEDGER ROLLBACK FAILED after ${reason} — the pending journal is RETAINED (fail-closed interrupted state). ` +
           `The source volume '${sourceVolume}' is intact; the candidate/target volumes are KEPT as recovery material. ` +
-          `Resolve the ledger before any retry. See ${UPGRADE_RUNBOOK_URL}.`,
+          `Resolve the ledger before any retry. See ${runbookUrl}.`,
       );
     }
     if (candidateCreated) transport.removeVolume(candidateVolume);
@@ -267,7 +277,7 @@ export function runGuardedUpgrade({
     done(
       UPGRADE_EXIT.INTERRUPTED,
       `POST-COMMIT INTERRUPTION (${reason}): the pending ledger journal is RETAINED (fail-closed 'interrupted migration'); ` +
-        `the target volume '${targetVolume}' and the checksummed dump '${dumpFile}' are kept as recovery material. See ${UPGRADE_RUNBOOK_URL}.`,
+        `the target volume '${targetVolume}' and the checksummed dump '${dumpFile}' are kept as recovery material. See ${runbookUrl}.`,
       { dumpFile, targetVolume },
     );
 
@@ -293,7 +303,7 @@ export function runGuardedUpgrade({
     // A refused begin (pending journal already present, volume-identity
     // mismatch, malformed ledger) is a fail-closed refusal — nothing was
     // mutated and nothing is rolled back (the pre-existing journal stays as-is).
-    return done(UPGRADE_EXIT.REFUSED, `ledger begin refused for ${service}${begun?.detail ? ` — ${begun.detail}` : ""}. No mutation was performed. See ${UPGRADE_RUNBOOK_URL}.`);
+    return done(UPGRADE_EXIT.REFUSED, `ledger begin refused for ${service}${begun?.detail ? ` — ${begun.detail}` : ""}. No mutation was performed. See ${runbookUrl}.`);
   }
   ledgerBegun = true;
 
@@ -528,7 +538,7 @@ export function runUpgradeMajorCommand(argv, deps = {}) {
       "  steps (each gates the next; the source volume is intact until the commit boundary):",
       ...ctx.steps.map((s, i) => `    ${i + 1}. ${s}`),
       `  Backup retained under your retention window; the old volume is preserved until post-verify passes.`,
-      `  Re-run with --yes to execute. See ${UPGRADE_RUNBOOK_URL}.`,
+      `  Re-run with --yes to execute. See ${plan.runbookUrl}.`,
     ];
     if (parsed.json) log(JSON.stringify({ dryRun: true, ...ctx }, null, 2));
     else log(lines.join("\n"));
