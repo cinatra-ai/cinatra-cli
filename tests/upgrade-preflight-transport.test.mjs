@@ -134,6 +134,52 @@ describe("runPreflight — ledger-driven detection over a mocked transport", () 
     expect(rep.results.every((r) => r.verdict === VERDICTS.FAIL_CLOSED)).toBe(true);
   });
 
+  it("cinatra-cli#140 TOCTOU: a volume CREATED during the check (absent→present) FAILS CLOSED", () => {
+    // First inspect → absent (liveVolumeIdentity null); a concurrent actor creates
+    // the volume, so the post-probe recheck → present. The identity change must
+    // override any reading and fail closed rather than trust the absent-at-start
+    // "fresh" PASS.
+    let inspectN = 0;
+    const rep = runPreflight({
+      slug: SLUG,
+      ledgerDir: dir,
+      services: [{ service: "postgres", target: "18", volumeName: VOL.name }],
+      transport: {
+        inspectVolume: () => {
+          inspectN += 1;
+          return inspectN === 1 ? null : { Name: VOL.name, CreatedAt: VOL.createdAt };
+        },
+        volumeState: () => "absent",
+        probeVersion: () => null,
+        readMarker: () => null,
+        profileEnabled: () => true,
+      },
+    });
+    expect(rep.ok).toBe(false);
+    expect(rep.results[0].verdict).toBe(VERDICTS.FAIL_CLOSED);
+  });
+
+  it("cinatra-cli#140: a version READ off a volume reported absent/empty (self-inconsistent facts) NEVER passes", () => {
+    // No ledger; the emptiness fact says absent but a marker/probe resolved a real
+    // version — a version implies the volume is NOT empty. The empty/absent→PASS
+    // shortcut must not win over a real detection: the 17→18 hop is caught.
+    const rep = runPreflight({
+      slug: SLUG,
+      ledgerDir: dir,
+      services: [{ service: "postgres", target: "18", volumeName: VOL.name }],
+      transport: {
+        inspectVolume: () => null, // absent both times → identity "stable" (both absent)
+        volumeState: () => "absent",
+        probeVersion: () => null,
+        readMarker: () => "17", // yet a version was read
+        profileEnabled: () => true,
+      },
+    });
+    expect(rep.ok).toBe(false);
+    expect(rep.results[0].verdict).not.toBe(VERDICTS.PASS);
+    expect(rep.results[0].verdict).toBe(VERDICTS.STOP); // 17 → 18 supported, pending
+  });
+
   it("mixed services report the worst as blocking while clean ones pass", () => {
     seedLedger("postgres", "18");
     seedLedger("nango-db", "15");

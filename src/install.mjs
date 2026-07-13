@@ -49,6 +49,7 @@ import { fileURLToPath } from "node:url";
 
 import { syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
 import { isValidSlug } from "./clone-registry.mjs";
+import { defaultAssertRecreateSafe, RecreatePreflightError } from "./recreate-preflight.mjs";
 import { captureDeployedVersions } from "./version-ledger-capture.mjs";
 import {
   defaultInstanceRegistryPath,
@@ -1280,7 +1281,43 @@ async function recordVersions({ slug, targetDir, composeFiles = null, composePro
   return record({ slug, targetDir, composeFiles, composeProject, envFile, log });
 }
 
-function bringUpInfra({ targetDir, log = console.log, composeFiles = null, composeProject = null, envFile = null, nangoHealthUrl = null }) {
+/**
+ * cinatra-cli#140 — the RECREATE-path upgrade GATE. Run BEFORE any recreate
+ * (`docker compose up -d`) that could replace a stateful service's container
+ * across a major data-format boundary against existing data volumes — the exact
+ * silent crash-loop of cinatra-ai/cinatra#1417. Consults the fail-closed upgrade
+ * preflight (recreate-preflight.mjs → upgrade-preflight.mjs) over the
+ * deployment's ACTUAL volumes; a blocking verdict (STOP / BLOCKED / FAIL-CLOSED)
+ * throws a RecreatePreflightError that ABORTS the bring-up (each recreate site's
+ * own rollback then unwinds cleanly), with the per-family runbook deep link.
+ *
+ * FAIL CLOSED, not fail open: a blocking verdict (RecreatePreflightError) aborts,
+ * AND an INCONCLUSIVE check — the gate itself erroring — also aborts rather than
+ * silently recreating (which would reopen the crash-loop hole). A fresh install
+ * (absent/empty volumes) always passes. `deps.assertRecreateSafe` is the
+ * injectable test seam. */
+export function preflightRecreate({ slug, targetDir, composeFiles = null, composeProject = null, envFile = null, log = console.log, deps = {} }) {
+  const gate = deps.assertRecreateSafe ?? defaultAssertRecreateSafe;
+  try {
+    gate({ slug, targetDir, composeFiles, composeProject, envFile, log });
+  } catch (err) {
+    if (err instanceof RecreatePreflightError) throw err;
+    // An inconclusive gate (an unexpected internal error, never a verdict) must
+    // not proceed into a recreate — re-raise as a blocking refusal (fail closed).
+    throw new RecreatePreflightError(
+      `Refusing to recreate stateful containers — the upgrade preflight could not be evaluated (${err?.message ?? err}). ` +
+        "Resolve the error (run `cinatra instance db upgrade-preflight` to diagnose), then retry.",
+      null,
+    );
+  }
+}
+
+function bringUpInfra({ slug = null, deps = {}, targetDir, log = console.log, composeFiles = null, composeProject = null, envFile = null, nangoHealthUrl = null }) {
+  // cinatra-cli#140: the recreate GATE runs FIRST — before a single stateful
+  // container is (re)created — so a major data-format boundary halts here rather
+  // than crash-looping (cinatra-ai/cinatra#1417). Every install/refresh recreate
+  // routes through this one seam, and a blocking verdict aborts the bring-up.
+  preflightRecreate({ slug, targetDir, composeFiles, composeProject, envFile, log, deps });
   log("- Starting infrastructure (Postgres + Redis + Nango)…");
   composeUpOrThrow(targetDir, { composeFiles, composeProject, envFile });
   const composeBase = composeArgsFor({ composeFiles, composeProject, envFile });
@@ -2346,6 +2383,8 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
     if (!opts.dryRun) {
       ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: slot.appPort, ports: slot.ports, log });
       startInfra({
+        slug,
+        deps,
         targetDir,
         log,
         composeFiles: slot.composeFiles,
@@ -2390,6 +2429,8 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
 
     log(`- Bringing up isolated instance "${slug}" (project ${composeProject}, app port ${appPort})…`);
     startInfra({
+      slug,
+      deps,
       targetDir,
       log,
       composeFiles,
@@ -2427,6 +2468,12 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       deps,
     });
   } catch (err) {
+    // cinatra-cli#140: a recreate-preflight REFUSAL fired BEFORE any container
+    // came up, so there is nothing this install brought up to tear down — and the
+    // rollback's `docker compose down -v` would DESTROY the operator's existing
+    // data volume, the very volume the gate refused to cross. Skip the rollback
+    // and surface the refusal; the pending row is reconciled on a later retry.
+    if (err instanceof RecreatePreflightError) throw err;
     log(`  ✗ Isolated bring-up failed — rolling back the pending instance "${slug}".`);
     await rollbackIsolatedInstance({ targetDir, slug, composeProject, composeFiles, envSnapshot, log, deps }).catch((e) =>
       log(`  ⚠ Rollback best-effort error: ${e.message}`),
@@ -3747,6 +3794,8 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
   ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: effectivePorts, log });
   const reconvEnvFile = path.join(targetDir, ".env.local");
   startInfra({
+    slug: row.slug,
+    deps,
     targetDir,
     log,
     composeFiles: row.composeFiles,
@@ -4095,7 +4144,11 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
     }
     try {
       log("- Ensuring this checkout's own infra is up (attach)…");
-      startInfra({ targetDir, log, composeFiles, composeProject, envFile: attachEnvFile, nangoHealthUrl: nangoHealthUrlForPorts(row?.ports) });
+      // cinatra-cli#140: a valid ledger key for the recreate gate — the recorded
+      // row's slug, else the dir-derived slug (an unrecorded checkout still has a
+      // deterministic slug; the gate then reads a missing/empty ledger and falls
+      // to the live probe/marker rather than throwing on a null key).
+      startInfra({ slug: row?.slug ?? deriveInstanceSlug(targetDir), deps, targetDir, log, composeFiles, composeProject, envFile: attachEnvFile, nangoHealthUrl: nangoHealthUrlForPorts(row?.ports) });
       broughtUp = true;
       // cinatra-cli#128: an attach re-up deploys whatever the moved checkout
       // now pins — record it (best-effort).
@@ -4618,7 +4671,10 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
     defaultProject = await withAllocLock(lockPath, async () => {
       const resolved = resolveDefaultProject({ targetDir, opts, log, deps });
-      startInfra({ targetDir, log, composeProject: resolved });
+      // cinatra-cli#140: the slug matches recordDefaultInstance's key so the
+      // recreate preflight (inside bringUpInfra) reads the right ledger; the
+      // compose project is the one this `up` uses.
+      startInfra({ slug: opts.instance ?? deriveInstanceSlug(targetDir), deps, targetDir, log, composeProject: resolved });
       return resolved;
     });
   }

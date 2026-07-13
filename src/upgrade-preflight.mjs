@@ -93,6 +93,36 @@ export function volumeIdentityStatus(recorded, live) {
   return recorded.name === live.name && recorded.createdAt === live.createdAt ? "match" : "mismatch";
 }
 
+/**
+ * Re-check a volume's stability AFTER the probe sequence (cinatra-cli#140),
+ * distinguishing a CONFIRMED-absent volume from an inspect ERROR (which confirms
+ * nothing). Returns:
+ *   "stable"    — unchanged: confirmed absent→absent, or the same identity.
+ *   "changed"   — created / deleted / recreated (identity differs, or present↔absent).
+ *   "uncertain" — the recheck itself failed → cannot confirm; the caller fails closed.
+ * Prefers a three-way `inspectVolumeStatus(name) → { status:"ok"|"absent"|"error", row }`
+ * seam so an errored recheck is NOT mistaken for absence; falls back to the lossy
+ * `inspectVolume` (row|null), which cannot express an error and so treats a null
+ * recheck as "absent" (the pre-#140 behavior, kept for transports without the seam).
+ */
+export function recheckVolumeStability(transport, volumeName, before) {
+  const sameIdentity = (id) => Boolean(before && id && id.name === before.name && id.createdAt === before.createdAt);
+  if (transport.inspectVolumeStatus) {
+    const rs = transport.inspectVolumeStatus(volumeName);
+    if (!rs || rs.status === "error") return "uncertain";
+    if (rs.status === "absent") return before ? "changed" : "stable";
+    const id = volumeIdentityFromInspect(rs.row);
+    if (!id) return "uncertain"; // "ok" but unparseable → cannot confirm
+    return sameIdentity(id) ? "stable" : "changed";
+  }
+  if (transport.inspectVolume) {
+    const id = volumeIdentityFromInspect(transport.inspectVolume(volumeName));
+    if (!id) return before ? "changed" : "stable"; // lossy: null = absent-or-error → treated as absent
+    return sameIdentity(id) ? "stable" : "changed";
+  }
+  return "stable"; // no recheck seam → leave facts as gathered
+}
+
 // --- detection (pure over already-gathered facts) --------------------------
 
 /**
@@ -342,7 +372,18 @@ export function runPreflight({
   ledgerDir,
   authorizations = [],
 }) {
-  const read = readLedger(slug, ledgerDir);
+  let read;
+  try {
+    read = readLedger(slug, ledgerDir);
+  } catch {
+    // An unusable ledger KEY (a null/invalid slug — e.g. an unrecorded attach
+    // checkout the recreate gate could not resolve to an instance) simply means
+    // there is NO recorded ledger. Detection then falls to the live probe / raw
+    // marker (still fail-closed on an unreadable non-empty volume) rather than
+    // throwing — a valid slug never reaches this branch, so recorded-ledger
+    // behavior is unchanged.
+    read = { status: "missing", ledger: { version: 1, slug: slug ?? null, services: {}, pending: null } };
+  }
   // A malformed ledger is a fail-closed condition for EVERY service — never
   // silently treated as "no recorded version" (that would reopen the naive
   // recreate hazard the ledger exists to close).
@@ -400,14 +441,49 @@ export function runPreflight({
       markerVersion,
     });
 
+    // TOCTOU + fact-consistency guard (cinatra-cli#140). The facts above are
+    // gathered across SEVERAL calls, and the version-touching probes MOUNT the
+    // volume (`docker run -v` — which auto-creates a missing named volume; Docker
+    // has no atomic require-existing mount). Two ways the gathered fact-set can be
+    // untrustworthy, both closed here:
+    //
+    //  (a) IDENTITY CHANGED across the sequence. Re-inspect AFTER all probes; if
+    //      the volume's presence/identity differs from the first inspect (a
+    //      concurrent teardown deleting+recreating it, or a concurrent create),
+    //      every fact — including a ledger match against the STALE first-inspect
+    //      identity — may describe a DIFFERENT volume. Fail closed.
+    //  (b) A VERSION WAS READ off a volume reported empty/absent. If detection
+    //      resolved a real version yet volumeState says empty/absent, the facts
+    //      contradict (a version implies non-empty). Never take the empty/absent
+    //      → PASS shortcut over a real detection — force the version comparison so
+    //      an unsafe hop is caught rather than waved through.
+    let detected = detection.version;
+    let detectionFinding = detection.finding;
+    let effectiveVolumeState = volumeState;
+    // Re-inspect AFTER all probes. Prefer a THREE-WAY status seam
+    // (`inspectVolumeStatus` → "ok"|"absent"|"error") so an inspect ERROR is
+    // never collapsed to "absent": a failed final inspect cannot CONFIRM the
+    // volume is still absent (it may have been concurrently created), so it fails
+    // closed. Fall back to the lossy `inspectVolume` (row|null) for transports
+    // that predate the seam.
+    const rechecked = volumeName ? recheckVolumeStability(transport, volumeName, liveVolumeIdentity) : "stable";
+    if (rechecked === "changed" || rechecked === "uncertain") {
+      detected = null;
+      detectionFinding = null;
+      effectiveVolumeState = "present";
+    }
+    if (detected != null && (effectiveVolumeState === "empty" || effectiveVolumeState === "absent")) {
+      effectiveVolumeState = "present";
+    }
+
     results.push(
       decideService({
         service,
-        detected: detection.version,
-        detectionFinding: detection.finding,
+        detected,
+        detectionFinding,
         detectionSource: detection.source,
         target,
-        volumeState,
+        volumeState: effectiveVolumeState,
         profileEnabled: true,
         matrix,
         authorization: authIndex.get(service) ?? null,
@@ -574,6 +650,7 @@ export const __test = {
   USAGE,
   volumeIdentityFromInspect,
   volumeIdentityStatus,
+  recheckVolumeStability,
   detectVersion,
   decideService,
   authorizationMatches,
