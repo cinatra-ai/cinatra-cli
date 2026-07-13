@@ -66,6 +66,19 @@ export const PG_UPGRADE_MAJOR_COMMAND = "cinatra instance db upgrade-major";
 export const UPGRADE_RUNBOOK_URL =
   "https://docs.cinatra.ai/self-hosting/upgrading-stateful-services";
 
+// The authoritative matrix REVISION this shipped-with copy is reconciled against
+// (cinatra-ai/cinatra docs/architecture/upgrade-matrix.json, loaded via
+// scripts/lib/upgrade-matrix.mjs `MATRIX_REVISION`). cli#128 shipped this copy as
+// the client half of the #1420 contract "to reconcile when the authoritative pins
+// land"; #1420 landed at revision 2 (PR #1438), so this copy is reconciled to it
+// (cinatra-cli#129): the Postgres transitions here agree with the authoritative
+// service list — platform-postgres 17->18 (baseline), the nango-postgres 15->17
+// case exception (cinatra-ai/cinatra#1417 Case B), and twenty/plane held at their
+// upstream-dictated majors (no in-place major hop). The reconcile is regression-
+// guarded by tests/upgrade-matrix-reconcile.test.mjs. Both repos pin this number,
+// so a future authoritative revision bump fails closed on skew on both sides.
+export const RECONCILED_MATRIX_REVISION = 2;
+
 // The CLI's shipped-with copy of the supported matrix. Version-axis orders and
 // the supported forward hops reflect the stack pins the 0.1.x product line ships
 // (platform pg 18, nango pg 17, twenty pg 16, plane pg 15.7, mariadb 11.4,
@@ -81,9 +94,15 @@ export const DEFAULT_UPGRADE_MATRIX = Object.freeze({
     // detected major is evaluated independently. The nango 15→17 hop is the
     // cinatra-ai/cinatra#1417 concrete case, carried as a case-scoped exception.
     postgres: pgService("/var/lib/postgresql", [{ from: "17", to: "18" }]),
+    // nango-db holds at the upstream-validated pg17 baseline; the ONLY supported
+    // forward hop is the pre-baseline pg15 field volume, carried as the
+    // cinatra-ai/cinatra#1417 Case B case-scoped exception (skips 16 in one
+    // logical dump/restore hop). Reconciled to authoritative revision 2: there is
+    // NO general 16->17 nango transition (an earlier shipped copy carried one —
+    // removed here so this copy cannot authorize a hop the authoritative matrix
+    // fail-closes).
     "nango-db": pgService("/var/lib/postgresql", [
       { from: "15", to: "17", caseScoped: true },
-      { from: "16", to: "17" },
     ]),
     "twenty-db": pgService("/var/lib/postgresql", []),
     "plane-db": pgService("/var/lib/postgresql", []),
