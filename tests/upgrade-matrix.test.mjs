@@ -45,9 +45,15 @@ describe("supportedTransition — explicit hops only, never inferred from adjace
     expect(t).toBeTruthy();
     expect(t.migration).toBe(PG_UPGRADE_MAJOR_COMMAND);
   });
-  it("nango supports both 15→17 and 16→17", () => {
-    expect(supportedTransition(DEFAULT_UPGRADE_MATRIX, "nango-db", "15", "17")).toBeTruthy();
-    expect(supportedTransition(DEFAULT_UPGRADE_MATRIX, "nango-db", "16", "17")).toBeTruthy();
+  it("nango supports ONLY the 15→17 case-scoped exception (reconciled to authoritative rev 2)", () => {
+    // The pre-baseline pg15 nango volume is a case-scoped exception
+    // (cinatra-ai/cinatra#1417 Case B); the general baseline holds at 17. The
+    // earlier shipped copy also carried a general 16→17 hop the authoritative
+    // matrix does NOT have — removed in the cinatra-cli#129 reconcile.
+    const caseB = supportedTransition(DEFAULT_UPGRADE_MATRIX, "nango-db", "15", "17");
+    expect(caseB).toBeTruthy();
+    expect(caseB.caseScoped).toBe(true);
+    expect(supportedTransition(DEFAULT_UPGRADE_MATRIX, "nango-db", "16", "17")).toBeNull();
   });
   it("an ordered-but-unlisted hop is NOT supported (twenty/plane have no in-place path yet)", () => {
     expect(supportedTransition(DEFAULT_UPGRADE_MATRIX, "twenty-db", "16", "18")).toBeNull();
