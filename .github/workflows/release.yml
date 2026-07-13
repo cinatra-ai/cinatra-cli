@@ -41,7 +41,7 @@ jobs:
     # approval. It is the technical backstop for the no-autonomous-publish rule.
     environment: release-approval
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # No git auth is used after checkout (no push/fetch/submodule); the
           # publish authenticates via OIDC, not the GITHUB_TOKEN. Don't leave
