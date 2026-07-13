@@ -116,7 +116,7 @@ export function makeProbeVersion({ runningContainerFor, dockerExec }) {
     if (!container) return null;
     // -tA: tuples-only, unaligned — bare "17.2". `SHOW server_version` is
     // cheaper + more robust than parsing verbose version().
-    const out = dockerExec(container, ["psql", "-U", "postgres", "-tArc", "SHOW server_version"]);
+    const out = dockerExec(container, ["psql", "-U", "postgres", "-tAc", "SHOW server_version"]);
     return parseServerVersionMajor(out);
   };
 }

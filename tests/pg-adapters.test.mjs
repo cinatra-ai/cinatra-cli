@@ -74,7 +74,7 @@ describe("makeProbeVersion (injected docker exec)", () => {
     });
     expect(probe("postgres")).toBe("17");
     expect(calls[0].container).toBe("cinatra-postgres-1");
-    expect(calls[0].argv).toEqual(["psql", "-U", "postgres", "-tArc", "SHOW server_version"]);
+    expect(calls[0].argv).toEqual(["psql", "-U", "postgres", "-tAc", "SHOW server_version"]);
   });
   it("returns null (falls through to the marker) when the server is not running", () => {
     let execCalled = false;
