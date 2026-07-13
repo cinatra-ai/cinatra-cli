@@ -14,6 +14,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_REPO_URL, parseInstallArgs, runInstall } from "../src/install.mjs";
 import { readInstanceRegistry } from "../src/instance-registry.mjs";
 import { readMarker } from "../src/instance-marker.mjs";
+import { RecreatePreflightError } from "../src/recreate-preflight.mjs";
 
 // ---------------------------------------------------------------------------
 // T5a/T5b — parser enum surface + gated co-use.
@@ -248,7 +249,41 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     expect(readMarker(installDir).status).toBe("ok");
   });
 
-  // ── cinatra-cli#35 — default project name + ownership preflight ─────────────
+  // ── cinatra-cli#140 — recreate paths consult the fail-closed upgrade preflight ──
+  it("#140: the default recreate routes through the upgrade gate (right slug/project) and a block ABORTS before compose up", async () => {
+    // Using the REAL bringUpInfra (not the stub) so the gate actually runs; the
+    // injected preflight BLOCKS, so the abort happens before a single `docker
+    // compose up` — no daemon is touched (a real `up` would surface a docker
+    // error, not our sentinel message).
+    const installDir = path.join(sandbox, "p140-default");
+    let seen = null;
+    await expect(
+      runInstall(
+        ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+        {
+          log: () => {},
+          deps: flowDeps({
+            detectPortConflicts: async () => [],
+            bringUpInfra: undefined, // fall through to the real bringUpInfra → the gate runs
+            assertRecreateSafe: (args) => {
+              seen = args;
+              throw new RecreatePreflightError("STOP: nango-db 15 → 17 pending", { findings: [{ service: "nango-db", verdict: "stop" }] });
+            },
+          }),
+        },
+      ),
+    ).rejects.toThrow(/STOP: nango-db 15 → 17 pending/);
+    // The gate was asked to check the DEPLOYMENT's actual identity: the slug
+    // recordDefaultInstance keys on, the project this `up` uses, and the dir.
+    expect(seen).toBeTruthy();
+    expect(seen.slug).toBe("p140-default");
+    expect(seen.composeProject).toBe("cinatra_p140_default");
+    expect(seen.targetDir).toBe(installDir);
+    // The block aborted BEFORE the registry row flipped to ready.
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances["p140-default"]?.state ?? "absent").not.toBe("ready");
+  });
+
   it("#35: the default `up` is invoked with the computed instance-scoped `-p`", async () => {
     const installDir = path.join(sandbox, "p35-default");
     const upCalls = [];
@@ -1079,6 +1114,43 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     const reg = readInstanceRegistry(regPath);
     expect(reg.registry.instances.isofail).toBeUndefined();
     expect(existsSync(path.join(installDir, "docker-compose.cinatra-isolated.yml"))).toBe(false);
+  });
+
+  it("#140: a recreate-preflight REFUSAL on the isolated path SKIPS the `down -v` rollback (preserves existing data)", async () => {
+    const installDir = path.join(sandbox, "iso-p140");
+    const downCalls = [];
+    await expect(
+      runInstall(
+        [
+          "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+          "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "isop140",
+        ],
+        {
+          log: () => {},
+          deps: flowDeps({
+            detectPortConflicts: async (band) => {
+              const pg = band.find((b) => b.service === "postgres");
+              if (pg && pg.port === 5434) return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+              return [];
+            },
+            // The recreate gate (inside the real bringUpInfra) refuses a boundary
+            // crossing — simulated here by the seam throwing a RecreatePreflightError.
+            bringUpInfra: () => {
+              throw new RecreatePreflightError("STOP: nango-db 15 → 17 pending", { findings: [] });
+            },
+            runComposeDown: (d, opts) => downCalls.push({ d, ...opts }),
+          }),
+        },
+      ),
+    ).rejects.toThrow(/STOP: nango-db 15 → 17 pending/);
+    // CRITICAL (data safety): the volume-deleting `down -v` rollback NEVER ran —
+    // the operator's existing data volume (the one the gate refused to cross) is
+    // preserved. Contrast with T9, where a normal bring-up failure DOES roll back.
+    expect(downCalls).toEqual([]);
+    // The pending row is left for a later retry (not released by a phantom rollback).
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances.isop140).toBeDefined();
+    expect(reg.registry.instances.isop140.state).not.toBe("ready");
   });
 
   it("T11: --on-conflict=stop-existing refuses an UNRELATED holder", async () => {
