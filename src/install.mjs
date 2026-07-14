@@ -1660,7 +1660,13 @@ function ensureMarkerIgnored(targetDir) {
   }
 }
 
-/** Read both registries (read-only) for classification / status. */
+/** Read both registries (read-only) for classification / status. A malformed
+ *  instance registry is swallowed to `null` here (a status/classification read
+ *  must never fail over a bad file) but the error is RETURNED as
+ *  `instanceRegistryError` so a caller that needs parity with a MUTATING command
+ *  — which `requireUsableInstanceRegistry` makes throw on a malformed registry —
+ *  can surface it (cinatra-cli#147: the dry-run advisory reports it rather than
+ *  silently previewing a plan the real install would abort before reaching). */
 function readBothRegistries(deps = {}) {
   const instReader = deps.readInstanceRegistry ?? (() => requireUsableInstanceRegistry(defaultInstanceRegistryPath()));
   let cloneRegistry = null;
@@ -1670,12 +1676,14 @@ function readBothRegistries(deps = {}) {
     cloneRegistry = null;
   }
   let instanceRegistry = null;
+  let instanceRegistryError = null;
   try {
     instanceRegistry = instReader();
-  } catch {
+  } catch (err) {
     instanceRegistry = null;
+    instanceRegistryError = err;
   }
-  return { instanceRegistry, cloneRegistry };
+  return { instanceRegistry, cloneRegistry, instanceRegistryError };
 }
 
 /** Validate an external-infra URL (shape only). Allows postgres(ql)/redis(s)/
@@ -2637,9 +2645,24 @@ function pickFixedOffset(band, offset, cloneRegistry, instanceRegistry, extraRes
  *   notes: string[] }}
  */
 function computeAdvisoryIsolatedPlan({ opts, band, deps = {} }) {
-  const { instanceRegistry, cloneRegistry } = readBothRegistries(deps);
+  const { instanceRegistry, cloneRegistry, instanceRegistryError } = readBothRegistries(deps);
   const reserved = reservedPorts({ cloneRegistry, instanceRegistry });
   const notes = [];
+
+  // cinatra-cli#147 (finalization): the REAL isolated install reads the registry
+  // via `requireUsableInstanceRegistry`, which THROWS on a malformed file and
+  // aborts before allocating/touching infra. `readBothRegistries` deliberately
+  // swallows that to `null` (a read-only advisory must never itself throw), so
+  // WITHOUT this the dry-run would silently preview a confident isolated plan the
+  // real install can never reach. REPORT it (the AC4 report-not-throw pattern):
+  // the advisory below was computed with NO existing-instance reservations.
+  if (instanceRegistryError) {
+    notes.push(
+      "the instance registry is unreadable/malformed — the real install would ABORT before allocating " +
+        "(it refuses to run against a malformed registry, to avoid handing out a port an existing instance owns). " +
+        "This advisory used NO existing-instance reservations; repair the registry, then retry.",
+    );
+  }
 
   // App port: an explicit --app-port is shown AS REQUESTED (a reserved-set
   // collision is REPORTED — the real install would REJECT it — not thrown);

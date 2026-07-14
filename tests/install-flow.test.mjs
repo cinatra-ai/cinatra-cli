@@ -783,6 +783,44 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     expect(out).toMatch(/App port:\s+\(could not allocate — see advisory below\)/);
   });
 
+  it("#147 AC4: a MALFORMED instance registry is REPORTED in the advisory (the real install would abort there) — never a silent confident plan, never a throw", async () => {
+    // Parity gap: the real isolated path reads the registry via the THROWING
+    // `requireUsableInstanceRegistry` (aborts before allocating on a malformed
+    // file); the dry-run advisory reads via the swallowing `readBothRegistries`.
+    // Without surfacing it, the preview would print a confident isolated plan the
+    // real install can never reach. The advisory must REPORT it (report-not-throw)
+    // and still not throw.
+    const installDir = path.join(sandbox, "iso147-malformed-reg");
+    const logs = [];
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--dry-run", "--on-conflict", "isolated", "--app-port", "3401", "--port-offset", "10000",
+      ],
+      {
+        log: (m) => logs.push(String(m)),
+        deps: flowDeps({
+          detectPortConflicts: conflictOnDefaultBand,
+          // Mirror the throwing reader `requireUsableInstanceRegistry` produces on
+          // a malformed file (what the real isolated path calls, unguarded).
+          readInstanceRegistry: () => {
+            throw new Error("Instance registry at <path> is malformed and was NOT modified.");
+          },
+        }),
+      },
+    );
+    expect(res.dryRun).toBe(true);
+    expect(res.advisory).toBe(true);
+    // Reported via the same `advisoryNotes` channel AC4 uses — not thrown.
+    expect(res.advisoryNotes.some((n) => /instance registry is unreadable\/malformed/.test(n))).toBe(true);
+    const out = logs.join("\n");
+    expect(out).toMatch(/instance registry is unreadable\/malformed/);
+    expect(out).toMatch(/the real install would ABORT before allocating/);
+    // No reservation/lock even on the error path.
+    expect(existsSync(regPath)).toBe(false);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
   it("T8/T8b: --on-conflict=isolated brings up a remapped second stack + records it", async () => {
     const installDir = path.join(sandbox, "iso");
     const upCalls = [];
