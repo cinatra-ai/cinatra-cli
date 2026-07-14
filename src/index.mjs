@@ -682,6 +682,10 @@ Usage:
   cinatra instance clone slug-for-worktree --worktree-path <path>
   cinatra instance clone prune [--worktree-path <path>] [--slug <slug>] --yes
   cinatra instance clone list
+  cinatra instance preview create [--ref <git-ref>] [--slug <slug>] [--port <port>]
+  cinatra instance preview refresh [--ref <git-ref>] [--slug <slug>]
+  cinatra instance preview status [--slug <slug>]
+  cinatra instance preview list
   cinatra instance db migrate [--down] [--count=N] [--dir <abs> --namespace <ns>]
   cinatra instance db upgrade-preflight [--instance <slug>] [--service <name>] [--target <service>=<version>] [--json]
   cinatra instance db upgrade-major --service <name> [--instance <slug>] [--target <version>] [--backup-dir <dir>] [--yes] [--json]
@@ -722,6 +726,17 @@ Commands:
   instance clone list List registered clones (slug, ports, database, state).
   instance clone slug-for-worktree
                       Registry lookup for shell hooks (resolve a worktree → slug).
+  instance preview create|refresh
+                      Build + boot a LOCAL, non-production image at a resolved
+                      source SHA (CINATRA_RUNTIME_MODE=production, provenance
+                      local-image:<sha>) for local verification — NEVER a
+                      production deploy (cinatra-ai/cinatra#1580). create builds
+                      + boots + health-gates on /api/health; refresh rebuilds at
+                      a new SHA, reuses the durable volume, and cleans up the
+                      superseded image. Requires CINATRA_ENCRYPTION_KEY at boot.
+  instance preview status|list
+                      Show a preview's (or all previews') resolved SHA, built
+                      image tag, provenance, durable volume, and state.
   instance db migrate Apply the additive bootstrap + versioned core migration
                       chain. WORKS WHEN THE APP IS DOWN — talks to Postgres
                       directly, so it can repair a broken-schema instance.
@@ -12345,6 +12360,28 @@ function buildHandlers() {
     },
     "clone.slug-for-worktree": (rest) => {
       runCloneSlugForWorktree(rest);
+    },
+    // cinatra-cli#149: the `preview` lifecycle. A distinct, non-production,
+    // production-runtime IMAGE lane with its own create/refresh verbs and its
+    // own registry (previews.json) — lazy-imported like the other heavy engine
+    // commands. Anchored on the operator's checkout (getRepoRoot()): it resolves
+    // a git ref there to a SHA and uses a SHA-pinned worktree as the build
+    // context.
+    "preview.create": async (rest) => {
+      const { runPreviewCreate } = await import("./preview.mjs");
+      await runPreviewCreate(rest, { checkoutDir: getRepoRoot() });
+    },
+    "preview.refresh": async (rest) => {
+      const { runPreviewRefresh } = await import("./preview.mjs");
+      await runPreviewRefresh(rest, { checkoutDir: getRepoRoot() });
+    },
+    "preview.status": async (rest) => {
+      const { runPreviewStatus } = await import("./preview.mjs");
+      runPreviewStatus(rest, { checkoutDir: getRepoRoot() });
+    },
+    "preview.list": async (rest) => {
+      const { runPreviewList } = await import("./preview.mjs");
+      runPreviewList(rest, { checkoutDir: getRepoRoot() });
     },
     "db.migrate": async (rest) => {
       await runDbMigrate(rest);

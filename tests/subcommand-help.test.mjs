@@ -101,6 +101,8 @@ describe("cinatra <subcommand> --help across matcher shapes", () => {
     [["instance", "db", "migrate", "--help"], "cinatra instance db migrate"], // command+mode+sub, destructive
     [["instance", "db", "upgrade-preflight", "--help"], "cinatra instance db upgrade-preflight"], // command+mode+sub, read-only — usage only, no docker/ledger read
     [["instance", "clone", "prune", "--help"], "cinatra instance clone prune"], // command+mode+sub, destructive
+    [["instance", "preview", "create", "--help"], "cinatra instance preview create"], // command+mode+sub, builds+boots an image — must NOT run on --help
+    [["instance", "preview", "refresh", "--help"], "cinatra instance preview refresh"], // command+mode+sub, rebuilds+reboots — must NOT run on --help
     [["instance", "refresh", "--help"], "cinatra instance refresh"], // command+mode, destructive
     [["instance", "start", "--help"], "cinatra instance start"], // command+mode, spawns pnpm dev — must NOT run on --help
     [["instance", "stop", "--help"], "cinatra instance stop"], // command+mode, sends signals — must NOT run on --help

@@ -323,6 +323,38 @@ export const COMMAND_DESCRIPTORS = [
     match: "command+mode+sub",
     summary: "Registry lookup for shell hooks (resolve a worktree to its slug).",
   },
+  // cinatra-cli#149: the `preview` lifecycle — a LOCALLY-BUILT image at a
+  // resolved source SHA, run with production runtime semantics, explicitly
+  // local / non-production (the image-based successor to host-prod-of-main the
+  // S4 runtime contract declined, cinatra-ai/cinatra#1580). It is a DISTINCT
+  // lifecycle with its own create/refresh verbs and its own registry
+  // (previews.json), NOT a third `install --mode` value.
+  {
+    id: "preview.create",
+    path: ["instance", "preview", "create"],
+    match: "command+mode+sub",
+    summary:
+      "Build + boot a LOCAL non-production image at a resolved SHA (CINATRA_RUNTIME_MODE=production, provenance local-image:<sha>); health-gates on /api/health.",
+  },
+  {
+    id: "preview.refresh",
+    path: ["instance", "preview", "refresh"],
+    match: "command+mode+sub",
+    summary:
+      "Rebuild the preview at a NEW resolved SHA, reboot, reuse the durable volume, health-gate, and clean up the superseded image.",
+  },
+  {
+    id: "preview.status",
+    path: ["instance", "preview", "status"],
+    match: "command+mode+sub",
+    summary: "Show a preview's resolved SHA, built image tag, provenance, durable volume, and state.",
+  },
+  {
+    id: "preview.list",
+    path: ["instance", "preview", "list"],
+    match: "command+mode+sub",
+    summary: "List registered previews (slug, sha, image tag, provenance, volume, state).",
+  },
   {
     id: "db.migrate",
     path: ["instance", "db", "migrate"],
