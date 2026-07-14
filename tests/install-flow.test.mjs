@@ -5,6 +5,7 @@
 // no live daemon / Postgres needed.
 
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -2181,5 +2182,142 @@ describe("runInstall — co-use executor (cinatra-cli#40)", () => {
       },
     );
     expect(res.infraPlan).toBe("co-use");
+  });
+
+  it("cinatra-cli#143: PROD co-use FAILS the required-env gate on an invalid donor encryption key and ROLLS BACK", async () => {
+    const installDir = path.join(sandbox, "prodgatefail");
+    const drops = [];
+    // DONOR_ENV.CINATRA_ENCRYPTION_KEY = "donor-enc" does not decode to 32 bytes.
+    // A prod co-use inherits it; the post-setup gate must hard-fail (and roll back).
+    await expect(
+      runInstall(
+        [...baseArgs(installDir).filter((a) => a !== "--no-setup" && a !== "--no-install"), "--mode", "prod"],
+        {
+          log: () => {},
+          deps: couseDeps({
+            coUseDbOps: {
+              createCoUseDb: async () => ({ created: true }),
+              dropDbCreatedByThisRun: async (a) => {
+                drops.push(a);
+              },
+            },
+          }),
+        },
+      ),
+    ).rejects.toThrow(/\[required-env-preflight\][\s\S]*CINATRA_ENCRYPTION_KEY/);
+    // The gate fired BEFORE mark-ready → the created DB rolled back + slot released.
+    expect(drops).toHaveLength(1);
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances.prodgatefail).toBeUndefined();
+  });
+
+  it("cinatra-cli#143: PROD co-use SUCCEEDS when the donor supplies a valid encryption key (gate passes)", async () => {
+    const installDir = path.join(sandbox, "prodgateok");
+    const validDonor = { ...DONOR_ENV, CINATRA_ENCRYPTION_KEY: randomBytes(32).toString("hex") };
+    const res = await runInstall(
+      [...baseArgs(installDir).filter((a) => a !== "--no-setup" && a !== "--no-install"), "--mode", "prod"],
+      {
+        log: () => {},
+        deps: couseDeps({
+          readDonorEnv: () => ({ ...validDonor }),
+          coUseDbOps: {
+            createCoUseDb: async () => ({ created: true }),
+            dropDbCreatedByThisRun: async () => {
+              throw new Error("should not roll back on a passing gate");
+            },
+          },
+        }),
+      },
+    );
+    expect(res.infraPlan).toBe("co-use");
+    expect(res.instance).toBe("prodgateok");
+  });
+
+  it("cinatra-cli#143: an idempotent PROD co-use re-run RE-VALIDATES the existing env (fails if now broken)", async () => {
+    const installDir = path.join(sandbox, "prodidem");
+    const validDonor = { ...DONOR_ENV, CINATRA_ENCRYPTION_KEY: randomBytes(32).toString("hex") };
+    const prodArgs = [
+      ...baseArgs(installDir).filter((a) => a !== "--no-setup" && a !== "--no-install"),
+      "--mode",
+      "prod",
+    ];
+    const mkDeps = () =>
+      couseDeps({
+        readDonorEnv: () => ({ ...validDonor }),
+        coUseDbOps: {
+          createCoUseDb: async () => ({ created: true }),
+          dropDbCreatedByThisRun: async () => {},
+        },
+      });
+    // First run provisions + records the instance ready (gate passes).
+    const first = await runInstall(prodArgs, { log: () => {}, deps: mkDeps() });
+    expect(first.infraPlan).toBe("co-use");
+    // Corrupt the recorded instance's encryption key, then re-run: the idempotent
+    // converge path must RE-VALIDATE and refuse rather than report success.
+    const envPath = path.join(installDir, ".env.local");
+    writeFileSync(
+      envPath,
+      readFileSync(envPath, "utf8").replace(/^CINATRA_ENCRYPTION_KEY=.*$/m, "CINATRA_ENCRYPTION_KEY=broken"),
+    );
+    await expect(runInstall(prodArgs, { log: () => {}, deps: mkDeps() })).rejects.toThrow(
+      /\[required-env-preflight\][\s\S]*CINATRA_ENCRYPTION_KEY/,
+    );
+  });
+
+  // cinatra-cli#143 regression: the gate must NOT be conditioned on the setup/
+  // install phases. --no-setup / --no-install short-circuit deps + setup, but the
+  // co-use .env.local (donor secrets) is still written and the instance is still
+  // marked ready + reported successful — so an invalid donor CINATRA_ENCRYPTION_KEY
+  // under those flags must STILL hard-fail + roll back, never a silent success
+  // followed by a first-boot crash (#142 goal). baseArgs KEEPS --no-setup +
+  // --no-install (the sibling tests above strip them); this pins the fixed path.
+  it("cinatra-cli#143: PROD co-use with --no-setup/--no-install STILL gates an invalid donor key + ROLLS BACK", async () => {
+    const installDir = path.join(sandbox, "prodgatefail-nosetup");
+    const drops = [];
+    // DONOR_ENV.CINATRA_ENCRYPTION_KEY = "donor-enc" does not decode to 32 bytes.
+    await expect(
+      runInstall([...baseArgs(installDir), "--mode", "prod"], {
+        log: () => {},
+        deps: couseDeps({
+          runSetup: () => {
+            throw new Error("runSetup must NOT run under --no-setup");
+          },
+          coUseDbOps: {
+            createCoUseDb: async () => ({ created: true }),
+            dropDbCreatedByThisRun: async (a) => {
+              drops.push(a);
+            },
+          },
+        }),
+      }),
+    ).rejects.toThrow(/\[required-env-preflight\][\s\S]*CINATRA_ENCRYPTION_KEY/);
+    // The gate fired BEFORE mark-ready even with setup/install skipped.
+    expect(drops).toHaveLength(1);
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances["prodgatefail-nosetup"]).toBeUndefined();
+  });
+
+  it("cinatra-cli#143: PROD co-use with --no-setup/--no-install SUCCEEDS on a valid donor key (gate runs, no setup)", async () => {
+    const installDir = path.join(sandbox, "prodgateok-nosetup");
+    const validDonor = { ...DONOR_ENV, CINATRA_ENCRYPTION_KEY: randomBytes(32).toString("hex") };
+    const res = await runInstall([...baseArgs(installDir), "--mode", "prod"], {
+      log: () => {},
+      deps: couseDeps({
+        readDonorEnv: () => ({ ...validDonor }),
+        runSetup: () => {
+          throw new Error("runSetup must NOT run under --no-setup");
+        },
+        coUseDbOps: {
+          createCoUseDb: async () => ({ created: true }),
+          dropDbCreatedByThisRun: async () => {
+            throw new Error("should not roll back on a passing gate");
+          },
+        },
+      }),
+    });
+    expect(res.infraPlan).toBe("co-use");
+    expect(res.instance).toBe("prodgateok-nosetup");
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances["prodgateok-nosetup"].state).toBe("ready");
   });
 });
