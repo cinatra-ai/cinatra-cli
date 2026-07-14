@@ -1332,8 +1332,10 @@ function bringUpInfra({ slug = null, deps = {}, targetDir, log = console.log, co
  *  invocation). The recorded set is the authority (cinatra-cli#17 §C.8) so
  *  up/exec/down all target the same files+project. An `envFile` is threaded so
  *  the ISOLATED generated compose can resolve its scrubbed `${VAR}` placeholders
- *  from .env.local at up-time (review hardening #1) — the default path omits it, keeping
- *  compose's normal `.env` discovery (byte-identical to before). */
+ *  from .env.local at up-time (review hardening #1). The DEFAULT install `up`
+ *  threads it too (cinatra-cli#144 — the base compose interpolates no-default
+ *  secrets like `${NANGO_ENCRYPTION_KEY}`, so without it they resolve BLANK); a
+ *  null envFile keeps compose's normal `.env` discovery. */
 function composeArgsFor({ composeFiles = null, composeProject = null, envFile = null } = {}) {
   const files = composeFiles && composeFiles.length
     ? composeFiles
@@ -2430,7 +2432,8 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
   // isolated `up`, and bring up WITH `--env-file .env.local` so the generated
   // compose's scrubbed `${VAR}` placeholders + the remapped URLs resolve from
   // the file (never an empty/default secret). Mirrors the default flow's
-  // env-before-infra ordering. A failure rolls the pending instance back.
+  // env-before-infra ordering AND its `--env-file .env.local` threading
+  // (cinatra-cli#144). A failure rolls the pending instance back.
   try {
     log(`- Configuring isolated environment for "${slug}"…`);
     ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort, ports: persisted.ports, log });
@@ -4843,10 +4846,38 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
     defaultProject = await withAllocLock(lockPath, async () => {
       const resolved = resolveDefaultProject({ targetDir, opts, log, deps });
+      // cinatra-cli#144: the default (non-isolated) `up` MUST resolve every
+      // docker-compose.yml `${VAR}` (e.g. `NANGO_ENCRYPTION_KEY`,
+      // `CINATRA_BRIDGE_TOKEN` — no compose defaults) from the freshly-minted
+      // .env.local, exactly like every isolated/attach bring-up. Without
+      // `--env-file` compose warns "variable is not set" and nango-server boots
+      // with an EMPTY encryption key that silently diverges from the value in
+      // .env.local (the cinatra-cli#57 failure class on the DEFAULT path). This
+      // also threads the env-file into the recreate preflight's `docker compose
+      // config` resolution (via bringUpInfra → preflightRecreate). `ensureEnvLocal`
+      // (step 5) already materialized the file above, so a missing one here is a
+      // broken state — FAIL CLOSED with an actionable message rather than
+      // silently starting empty-secret containers.
+      const defaultEnvFile = path.join(targetDir, ".env.local");
+      if (!existsSync(defaultEnvFile)) {
+        throw new Error(
+          `Refusing to start the default stack — ${defaultEnvFile} is missing, so ` +
+            "the instance secrets (e.g. NANGO_ENCRYPTION_KEY) would reach the " +
+            "containers empty. It is normally written by the environment step above; " +
+            "re-run `cinatra install` (add --reset-env to regenerate it).",
+        );
+      }
       // cinatra-cli#140: the slug matches recordDefaultInstance's key so the
       // recreate preflight (inside bringUpInfra) reads the right ledger; the
       // compose project is the one this `up` uses.
-      startInfra({ slug: opts.instance ?? deriveInstanceSlug(targetDir), deps, targetDir, log, composeProject: resolved });
+      startInfra({
+        slug: opts.instance ?? deriveInstanceSlug(targetDir),
+        deps,
+        targetDir,
+        log,
+        composeProject: resolved,
+        envFile: defaultEnvFile,
+      });
       return resolved;
     });
   }
