@@ -64,6 +64,7 @@ import {
   fstatSync,
 } from "node:fs";
 import os from "node:os";
+import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
@@ -120,6 +121,18 @@ export const PREVIEW_BUILD_TIMEOUT_MS = 1_800_000; // 30m — full multi-stage c
 export const PREVIEW_HEALTH_TIMEOUT_MS = 180_000; // 3m health-gate budget (mirrors prod-boot-e2e default)
 export const PREVIEW_HEALTH_POLL_INTERVAL_MS = 3_000; // 3s (mirrors prod-boot-e2e sleep 3)
 export const DOCKER_CLI_PROBE_TIMEOUT_MS = 15_000; // 15s fast docker-CLI metadata probes
+
+// Preview containers publish their app port (container 3000) to a host port in a
+// DEDICATED pool, disjoint from every port the install/clone systems hand out:
+// the default-stack app ports (3000 AND 3010 — 3010 is WayFlow's default, which
+// instance-alloc reserves and never hands out), the static clone bands
+// (3100-3219), and the instance app-port pool (3300-3399). Each preview gets its
+// OWN host port (recorded in its registry row, reused across refresh); a fresh
+// create allocates the lowest pool port not already claimed by another preview
+// row and probed free on the host — so two previews never collide and a preview
+// never lands on a live default install's (e.g. WayFlow's) port.
+export const PREVIEW_HOST_PORT_MIN = 3400;
+export const PREVIEW_HOST_PORT_MAX = 3499;
 
 // The runtime env keys a preview container inherits from the ambient
 // environment when present (the operator supplies DB / auth / redis via env or
@@ -260,24 +273,34 @@ export function assertEncryptionKey(env = process.env) {
 }
 
 /**
- * AC9: preview refuses to run against a checkout whose `.env.local` resolves to
- * a real `--mode prod` install with NO preview provenance stamp — so a preview
- * command is never accidentally misapplied against a genuine production
- * checkout (and, symmetrically, the dev-only `instance start`/`refresh` guards —
- * which throw on a production `.env.local` — are never bypassed, because a
- * preview boots via `docker run -e`, it never writes a production `.env.local`
- * into the operator's dev checkout).
+ * AC9: preview refuses to run (create OR refresh) against a checkout whose
+ * `.env.local` resolves to a real `--mode prod` install — so a preview command
+ * is never misapplied against a genuine production checkout (and, symmetrically,
+ * the dev-only `instance start`/`refresh` guards — which throw on a production
+ * `.env.local` — are never bypassed, because a preview boots via `docker run
+ * -e`, it never writes a production `.env.local` into the operator's dev
+ * checkout).
  *
- * @param {{ envMode: string|null, hasPreviewProvenance: boolean }} args
+ * The refusal is UNCONDITIONAL on the checkout's env mode and is derived from
+ * the CHECKOUT, never from the registry: a preview never writes a production
+ * `.env.local`, so the only way this directory's `.env.local` reads
+ * CINATRA_RUNTIME_MODE=production is that it IS a genuine `--mode prod` install
+ * — there is no legitimate preview run from such a directory. Whether a preview
+ * ROW happens to exist for the slug says nothing about whether THIS directory is
+ * a production install, so it must never gate this refusal — that is exactly the
+ * conflation that would make the guard a no-op for `refresh` (which requires an
+ * existing row to proceed, forcing any such "row exists" signal permanently
+ * true).
+ *
+ * @param {{ envMode: string|null }} args
  */
-export function assertPreviewCheckoutAllowed({ envMode, hasPreviewProvenance }) {
-  const normalized = normalizeMode(envMode);
-  if (normalized === "production" && !hasPreviewProvenance) {
+export function assertPreviewCheckoutAllowed({ envMode }) {
+  if (normalizeMode(envMode) === "production") {
     throw new Error(
       `Refusing: this checkout's .env.local is a real production install ` +
-        `(CINATRA_RUNTIME_MODE=production) with no preview provenance. A preview is a distinct, ` +
-        `non-production lifecycle — it must not be run against a genuine --mode prod checkout. ` +
-        `Run preview from a dev checkout (it builds an image at a resolved SHA and boots it in a container).`,
+        `(CINATRA_RUNTIME_MODE=production). A preview is a distinct, non-production lifecycle — ` +
+        `it must not be run against a genuine --mode prod checkout. Run preview from a dev checkout ` +
+        `(it builds an image at a resolved SHA and boots it in a container).`,
     );
   }
   return true;
@@ -757,6 +780,21 @@ function defaultPrepareContext({ sha, checkoutDir }) {
   };
 }
 
+/**
+ * Real host-port probe: resolves true iff `port` can be bound on 0.0.0.0 — the
+ * interface `docker run -p <host>:3000` publishes on. A bind error (EADDRINUSE /
+ * EACCES) means the port is busy. Best-effort; used only as defense-in-depth on
+ * top of the registry-recorded per-preview ports.
+ */
+function defaultProbePort(port, host = "0.0.0.0") {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.once("error", () => resolve(false));
+    srv.once("listening", () => srv.close(() => resolve(true)));
+    srv.listen(port, host);
+  });
+}
+
 async function defaultProbeHealth(url) {
   try {
     const controller = new AbortController();
@@ -785,6 +823,7 @@ export function defaultDeps({ registryPath = defaultRegistryPath(), log = consol
     resolveSha: defaultResolveSha,
     prepareContext: defaultPrepareContext,
     probeHealth: defaultProbeHealth,
+    probePort: (port) => defaultProbePort(port),
     runDocker: (args, opts = {}) => runSpawn("docker", args, opts),
     env: process.env,
   };
@@ -960,7 +999,63 @@ export function deriveSlug({ rest, checkoutDir }) {
   return isValidSlug(slug) ? slug : "main";
 }
 
-const DEFAULT_HEALTH_PORT = 3010;
+/** The host ports already claimed by existing preview rows (durable per-slug). */
+export function usedPreviewHostPorts(registry) {
+  const used = new Set();
+  for (const slot of Object.values(registry?.previews ?? {})) {
+    if (Number.isInteger(slot?.hostPort)) used.add(slot.hostPort);
+  }
+  return used;
+}
+
+/**
+ * Allocate the lowest free preview host port: within the dedicated pool, not
+ * already claimed by another preview row (`registry`), not in `exclude`, and —
+ * when a `probe` is provided — live-bindable on the host. `probe(port)` resolves
+ * true iff the port is free. Throws (actionable) when the pool is exhausted.
+ *
+ * Called UNDER the registry lock against the same snapshot the claim is written
+ * to, so two concurrent creates never pick the same host port (the earlier
+ * claim's row is visible to the later one).
+ */
+export async function allocatePreviewHostPort({
+  registry,
+  exclude = null,
+  probe = null,
+  min = PREVIEW_HOST_PORT_MIN,
+  max = PREVIEW_HOST_PORT_MAX,
+} = {}) {
+  const used = usedPreviewHostPorts(registry);
+  const skip = exclude instanceof Set ? exclude : new Set();
+  for (let p = min; p <= max; p += 1) {
+    if (used.has(p) || skip.has(p)) continue;
+    if (typeof probe === "function") {
+      let free = false;
+      try {
+        free = await probe(p);
+      } catch {
+        free = false; // a probe throw is treated as "busy" (fail closed on this port)
+      }
+      if (!free) continue;
+    }
+    return p;
+  }
+  throw new Error(
+    `No free preview host port in ${min}-${max} (every port is claimed by another preview or busy on the host). ` +
+      `Prune a preview, or pass --port <n> with a free port.`,
+  );
+}
+
+/** Validate an explicit operator-supplied `--port` (SHAPE / range only). Rejects
+ *  trailing garbage (`4321junk`) — the whole token must be digits. */
+export function validatePreviewPort(value) {
+  const raw = String(value).trim();
+  const n = Number.parseInt(raw, 10);
+  if (!/^\d+$/.test(raw) || !Number.isInteger(n) || n < 1024 || n > 65535) {
+    throw new Error(`Invalid --port "${value}". Must be an integer between 1024 and 65535.`);
+  }
+  return n;
+}
 
 /**
  * `cinatra instance preview create` (AC1, AC2, AC5, AC6, AC7): resolve the git
@@ -977,29 +1072,31 @@ export async function runPreviewCreate(rest, injected = {}) {
   const encryptionKey = assertEncryptionKey(env);
   // AC7-iii: never route around the materialize safety invariant.
   assertMaterializeNotDisabled(env);
+  // AC9: refuse a genuine `--mode prod` checkout up front — before we even
+  // resolve a SHA against or touch its `.git`. Checkout-derived, unconditional on
+  // the env mode (never gated on a registry row).
+  assertPreviewCheckoutAllowed({ envMode: readCheckoutEnvMode(checkoutDir) });
 
   const slug = deriveSlug({ rest, checkoutDir });
   const ref = readOption(rest, "--ref") ?? "main";
-  const hostPort = Number.parseInt(readOption(rest, "--port") ?? "", 10) || DEFAULT_HEALTH_PORT;
+  const explicitPort = readOption(rest, "--port");
 
   const sha = deps.resolveSha(ref, checkoutDir);
   const tag = previewImageTag(sha);
   const provenance = previewProvenance(sha);
   const volumeName = previewVolumeName(slug);
 
-  // Atomically CLAIM the slug under the registry lock (lifecycle ownership): a
-  // concurrent create/refresh on the same slug sees the claim and refuses,
-  // rather than racing to replace the container / drop a shared image. AC1's
-  // "already exists" refusal is enforced HERE (any prior row — ready, degraded,
-  // or an in-flight provisioning claim — blocks a fresh create). AC9's
-  // prod-checkout guard runs inside the lock against the same snapshot.
-  await withRegistryLock(deps.registryPath, () => {
+  // Atomically CLAIM the slug under the registry lock (lifecycle ownership) AND
+  // allocate this preview's OWN host port against the same snapshot: a concurrent
+  // create/refresh on the same slug sees the claim and refuses, rather than
+  // racing to replace the container / drop a shared image, and two creates never
+  // pick the same host port. AC1's "already exists" refusal is enforced HERE (any
+  // prior row — ready, degraded, or an in-flight provisioning claim — blocks a
+  // fresh create).
+  let hostPort;
+  await withRegistryLock(deps.registryPath, async () => {
     const reg = requireUsableRegistry(deps.registryPath);
     const existing = getPreview(reg, slug);
-    assertPreviewCheckoutAllowed({
-      envMode: readCheckoutEnvMode(checkoutDir),
-      hasPreviewProvenance: Boolean(existing),
-    });
     if (existing) {
       const hint =
         existing.state === "provisioning"
@@ -1010,6 +1107,10 @@ export async function runPreviewCreate(rest, injected = {}) {
           `at a new SHA (it reuses the durable volume), or prune the existing preview first.`,
       );
     }
+    hostPort =
+      explicitPort !== undefined
+        ? validatePreviewPort(explicitPort)
+        : await allocatePreviewHostPort({ registry: reg, probe: deps.probePort });
     const next = cloneRegistry(reg);
     next.previews[slug] = makePreviewSlot({ slug, ref, sha, hostPort, state: "provisioning", now: () => new Date().toISOString() });
     writeRegistry(deps.registryPath, next);
@@ -1107,6 +1208,11 @@ export async function runPreviewRefresh(rest, injected = {}) {
 
   const encryptionKey = assertEncryptionKey(env); // AC6
   assertMaterializeNotDisabled(env); // AC7-iii
+  // AC9: refuse a genuine `--mode prod` checkout up front — checkout-derived and
+  // unconditional. Critically NOT gated on an existing registry row: refresh
+  // requires an existing row to proceed, so gating the refusal on "a row exists"
+  // would force it permanently satisfied and make the guard a no-op here.
+  assertPreviewCheckoutAllowed({ envMode: readCheckoutEnvMode(checkoutDir) });
 
   const slug = deriveSlug({ rest, checkoutDir });
   const ref = readOption(rest, "--ref") ?? "main";
@@ -1115,16 +1221,12 @@ export async function runPreviewRefresh(rest, injected = {}) {
   const provenance = previewProvenance(newSha);
 
   // CLAIM the slug under the lock: require an existing (non-in-flight) row,
-  // enforce AC9, capture the prior sha/tag, and flip the row to `provisioning`
-  // so a concurrent op can't race the container replacement.
+  // capture the prior sha/tag + reuse the durable host port, and flip the row to
+  // `provisioning` so a concurrent op can't race the container replacement.
   let oldSha, oldTag, hostPort, volumeName;
-  await withRegistryLock(deps.registryPath, () => {
+  await withRegistryLock(deps.registryPath, async () => {
     const reg = requireUsableRegistry(deps.registryPath);
     const existing = getPreview(reg, slug);
-    assertPreviewCheckoutAllowed({
-      envMode: readCheckoutEnvMode(checkoutDir),
-      hasPreviewProvenance: Boolean(existing),
-    });
     if (!existing) {
       throw new Error(
         `No preview exists for slug "${slug}" to refresh. Run ` +
@@ -1136,10 +1238,17 @@ export async function runPreviewRefresh(rest, injected = {}) {
     }
     oldSha = existing.sha;
     oldTag = existing.imageTag;
-    hostPort = existing.hostPort ?? DEFAULT_HEALTH_PORT;
+    // Reuse the preview's durable host port; allocate only if an older row never
+    // recorded one (rows created by this CLI always carry a hostPort).
+    hostPort = Number.isInteger(existing.hostPort)
+      ? existing.hostPort
+      : await allocatePreviewHostPort({ registry: reg, probe: deps.probePort });
     volumeName = existing.volumeName;
     const next = cloneRegistry(reg);
-    next.previews[slug] = { ...existing, state: "provisioning" };
+    // Persist the (possibly freshly-allocated, for a legacy row) durable host
+    // port in the SAME locked transaction as the claim — so a concurrent create
+    // sees it claimed via usedPreviewHostPorts and never picks the same port.
+    next.previews[slug] = { ...existing, hostPort, state: "provisioning" };
     writeRegistry(deps.registryPath, next);
   });
 
@@ -1299,6 +1408,8 @@ export const __test = {
   MATERIALIZE_DISABLE_ENV,
   FORBIDDEN_PRODUCTION_IMAGE_NAMES,
   PASSTHROUGH_ENV_KEYS,
+  PREVIEW_HOST_PORT_MIN,
+  PREVIEW_HOST_PORT_MAX,
   // pure helpers
   isValidSlug,
   isImmutableSha,
@@ -1315,6 +1426,9 @@ export const __test = {
   buildPreviewRunEnvArgs,
   classifyHealthResponse,
   pollHealthGate,
+  usedPreviewHostPorts,
+  allocatePreviewHostPort,
+  validatePreviewPort,
   // registry
   defaultRegistryPath,
   readRegistry,

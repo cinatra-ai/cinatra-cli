@@ -30,6 +30,9 @@ const {
   buildPreviewRunEnvArgs,
   classifyHealthResponse,
   pollHealthGate,
+  usedPreviewHostPorts,
+  allocatePreviewHostPort,
+  validatePreviewPort,
   readRegistry,
   writeRegistry,
   getPreview,
@@ -41,6 +44,8 @@ const {
   runPreviewStatus,
   PREVIEW_IMAGE_TAG_PREFIX,
   PREVIEW_RUNTIME_MODE,
+  PREVIEW_HOST_PORT_MIN,
+  PREVIEW_HOST_PORT_MAX,
   MATERIALIZE_DISABLE_ENV,
   ENCRYPTION_KEY_ENV,
   EXTENSION_DATA_ROOT_ENV,
@@ -138,6 +143,9 @@ function makeDeps(state, { env, checkoutDir } = {}) {
     resolveSha: (ref) => state.shaForRef?.[ref] ?? state.sha ?? SHA_A,
     prepareContext: () => ({ contextDir: path.join(tmp, "ctx"), cleanup: () => {} }),
     probeHealth: async () => state.healthResponses?.shift() ?? state.health ?? null,
+    // Hermetic host-port probe: every pool port reads free unless `state.busyPorts`
+    // marks it busy — no real socket bind in the unit suite.
+    probePort: async (p) => !(state.busyPorts instanceof Set && state.busyPorts.has(p)),
     runDocker: fake.runDocker,
   };
   return { deps, fake, logs };
@@ -317,15 +325,16 @@ describe("preview — health classification (AC5)", () => {
 // --------------------------------------------------------------------------
 
 describe("preview — real-prod-checkout guard (AC9)", () => {
-  it("refuses a production .env.local with no preview provenance stamp", () => {
-    expect(() => assertPreviewCheckoutAllowed({ envMode: "production", hasPreviewProvenance: false })).toThrow(/real production install/);
-  });
-  it("allows a production checkout WHEN a preview provenance stamp exists", () => {
-    expect(assertPreviewCheckoutAllowed({ envMode: "production", hasPreviewProvenance: true })).toBe(true);
+  it("refuses a production .env.local UNCONDITIONALLY (no registry escape hatch)", () => {
+    expect(() => assertPreviewCheckoutAllowed({ envMode: "production" })).toThrow(/real production install/);
+    expect(() => assertPreviewCheckoutAllowed({ envMode: "prod" })).toThrow(/real production install/);
+    // The guard takes ONLY the checkout env mode — a caller cannot pass a
+    // registry-derived flag that would suppress the refusal (the old no-op bug).
+    expect(() => assertPreviewCheckoutAllowed({ envMode: "production", hasPreviewProvenance: true })).toThrow(/real production install/);
   });
   it("allows a dev checkout / no .env.local", () => {
-    expect(assertPreviewCheckoutAllowed({ envMode: "development", hasPreviewProvenance: false })).toBe(true);
-    expect(assertPreviewCheckoutAllowed({ envMode: null, hasPreviewProvenance: false })).toBe(true);
+    expect(assertPreviewCheckoutAllowed({ envMode: "development" })).toBe(true);
+    expect(assertPreviewCheckoutAllowed({ envMode: null })).toBe(true);
   });
   it("readCheckoutEnvMode reads CINATRA_RUNTIME_MODE from .env.local", () => {
     writeFileSync(path.join(tmp, ".env.local"), "FOO=bar\nCINATRA_RUNTIME_MODE=production\n");
@@ -532,6 +541,24 @@ describe("preview refresh — rebuild at a new SHA (AC1, AC3, AC4, AC5, AC10)", 
     // Registry still at the old, healthy sha.
     expect(getPreview(readRegistry(registryPath).registry, "main").sha).toBe(SHA_A);
   });
+
+  it("AC9: refresh REFUSES a genuine production checkout even though a registry row exists (the guard is NOT a no-op for refresh)", async () => {
+    // A preview row for `main` already exists globally (registry is
+    // checkout-independent). The operator's shell is cd'd into a REAL --mode prod
+    // checkout (.env.local = production). Refresh must refuse — the prior no-op
+    // let it proceed to `git worktree add` against the production checkout.
+    seedReady();
+    writeFileSync(path.join(tmp, ".env.local"), "CINATRA_RUNTIME_MODE=production\n");
+    const state = { sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' } };
+    const { deps, fake } = makeDeps(state);
+    await expect(runPreviewRefresh(["--ref", "main", "--slug", "main"], deps)).rejects.toThrow(/real production install/);
+    // Never built (never reached prepareContext/worktree-add against the prod checkout).
+    expect(fake.calls.find((c) => c[0] === "build")).toBeUndefined();
+    // The row is untouched: still `ready` at the old sha, never flipped to provisioning/degraded.
+    const row = getPreview(readRegistry(registryPath).registry, "main");
+    expect(row.state).toBe("ready");
+    expect(row.sha).toBe(SHA_A);
+  });
 });
 
 // --------------------------------------------------------------------------
@@ -619,5 +646,104 @@ describe("preview — degraded classification requires HTTP 503 (AC5, tightened)
     expect(classifyHealthResponse({ status: 500, body: '{"status":"error"}' })).toBe("unknown");
     // The exact 503 pairing IS terminal.
     expect(classifyHealthResponse({ status: 503, body: '{"status":"degraded"}' })).toBe("degraded");
+  });
+});
+
+// --------------------------------------------------------------------------
+// Host-port allocation — a preview never collides with the default stack
+// (WayFlow's 3010) or with a sibling preview by default.
+// --------------------------------------------------------------------------
+
+describe("preview — host-port allocation (no default-stack / sibling collision)", () => {
+  it("the preview pool is disjoint from the reserved default WayFlow port (3010)", () => {
+    expect(PREVIEW_HOST_PORT_MIN).toBeGreaterThan(3010);
+    expect(3010).toBeLessThan(PREVIEW_HOST_PORT_MIN);
+  });
+
+  it("allocates the pool base when nothing is claimed", async () => {
+    const port = await allocatePreviewHostPort({ registry: { previews: {} }, probe: async () => true });
+    expect(port).toBe(PREVIEW_HOST_PORT_MIN);
+  });
+
+  it("skips a port already claimed by another preview row (siblings never collide)", async () => {
+    const registry = {
+      previews: {
+        a: makePreviewSlot({ slug: "a", ref: "main", sha: SHA_A, hostPort: PREVIEW_HOST_PORT_MIN, now: () => "T0" }),
+      },
+    };
+    expect([...usedPreviewHostPorts(registry)]).toContain(PREVIEW_HOST_PORT_MIN);
+    const port = await allocatePreviewHostPort({ registry, probe: async () => true });
+    expect(port).toBe(PREVIEW_HOST_PORT_MIN + 1);
+  });
+
+  it("skips a port a live probe reports busy (e.g. WayFlow / another process on it)", async () => {
+    const busy = new Set([PREVIEW_HOST_PORT_MIN]);
+    const port = await allocatePreviewHostPort({ registry: { previews: {} }, probe: async (p) => !busy.has(p) });
+    expect(port).toBe(PREVIEW_HOST_PORT_MIN + 1);
+  });
+
+  it("throws actionably when the pool is exhausted", async () => {
+    await expect(
+      allocatePreviewHostPort({ registry: { previews: {} }, probe: async () => false }),
+    ).rejects.toThrow(/No free preview host port/);
+  });
+
+  it("validatePreviewPort accepts a valid explicit port and rejects out-of-range / trailing garbage", () => {
+    expect(validatePreviewPort("4200")).toBe(4200);
+    expect(() => validatePreviewPort("nope")).toThrow(/between 1024 and 65535/);
+    expect(() => validatePreviewPort("80")).toThrow(/between 1024 and 65535/);
+    // The whole token must be digits — no `parseInt` trailing-garbage acceptance.
+    expect(() => validatePreviewPort("4321junk")).toThrow(/between 1024 and 65535/);
+  });
+
+  it("refresh of a LEGACY row (no recorded hostPort) allocates AND PERSISTS a durable port in the locked claim", async () => {
+    // Legacy row: created before per-preview ports (hostPort null).
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, now: () => "T0" }) },
+    });
+    expect(getPreview(readRegistry(registryPath).registry, "main").hostPort).toBeNull();
+    // Build fails AFTER the claim is written — abort restores from the persisted
+    // provisioning row, so the restored row must already carry the allocated port,
+    // proving it was written into the locked claim (visible to a concurrent create).
+    const { deps } = makeDeps({ sha: SHA_B, buildFails: true });
+    await expect(runPreviewRefresh(["--slug", "main"], deps)).rejects.toThrow(/docker build.*failed/s);
+    const row = getPreview(readRegistry(registryPath).registry, "main");
+    expect(Number.isInteger(row.hostPort)).toBe(true);
+    expect(row.hostPort).toBeGreaterThanOrEqual(PREVIEW_HOST_PORT_MIN);
+    expect(row.hostPort).toBeLessThanOrEqual(PREVIEW_HOST_PORT_MAX);
+  });
+
+  it("two creates (different slugs, no --port) get DISTINCT host ports — never both 3010", async () => {
+    const { deps: d1 } = makeDeps({ sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' } });
+    const one = await runPreviewCreate(["--slug", "one"], d1);
+    const { deps: d2 } = makeDeps({ sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' } });
+    const two = await runPreviewCreate(["--slug", "two"], d2);
+    expect(one.hostPort).not.toBe(two.hostPort);
+    expect([one.hostPort, two.hostPort]).not.toContain(3010);
+    expect(one.hostPort).toBeGreaterThanOrEqual(PREVIEW_HOST_PORT_MIN);
+    expect(two.hostPort).toBeGreaterThanOrEqual(PREVIEW_HOST_PORT_MIN);
+  });
+
+  it("an explicit --port is honored and recorded on the row", async () => {
+    const { deps, fake } = makeDeps({ sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' } });
+    const out = await runPreviewCreate(["--slug", "main", "--port", "4321"], deps);
+    expect(out.hostPort).toBe(4321);
+    // The published host port reaches `docker run -p`.
+    const run = fake.calls.find((c) => c[0] === "run");
+    expect(run.join(" ")).toContain("-p 4321:3000");
+    expect(getPreview(readRegistry(registryPath).registry, "main").hostPort).toBe(4321);
+  });
+
+  it("refresh REUSES the durable recorded host port (does not re-allocate)", async () => {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 4444, now: () => "T0" }) },
+    });
+    const { deps, fake } = makeDeps({ sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' } });
+    const out = await runPreviewRefresh(["--slug", "main"], deps);
+    expect(out.hostPort).toBe(4444);
+    const run = fake.calls.find((c) => c[0] === "run");
+    expect(run.join(" ")).toContain("-p 4444:3000");
   });
 });
