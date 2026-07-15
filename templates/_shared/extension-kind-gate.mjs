@@ -1783,6 +1783,85 @@ export const ARTIFACT_ALLOWED_CINATRA_KEYS = new Set(["kind", "apiVersion", "art
 const SKILL_REF_IS_INVALID = (s) => /\.md$/i.test(s) || /^\.{0,2}\//.test(s) || s.startsWith("/");
 const ARTIFACT_FORMS = new Set(["file", "connectorRef", "dashboard"]);
 
+// cinatra#1621/#1622 — the versioned `cinatra.artifact.ui` renderer block. This
+// self-contained, zero-dependency kind-gate performs a VALUE-INDEPENDENT
+// structural PRE-SCREEN only: the object shape, the per-renderer shape, a
+// package-contained `entry` subpath, and the v1 NO-PORTS rule (a renderer
+// carries only { entry, propsApiVersion, representations? }). It deliberately
+// does NOT re-list the DERIVED values — the closed slot enum (detail/preview),
+// the exact `abiVersion`, or the GENERATED `sdkAbiRange` — which live in
+// packages/sdk-extensions/src/artifact-contract.ts and are AUTHORITATIVELY
+// enforced by the derive-from-live-source conformance gate
+// (scripts/extensions/conformance-gate.mjs, run per repo via the reusable
+// extension-conformance-gate workflow) and, fail-closed, at marketplace
+// publish. Re-listing those derived values in this copy would reintroduce
+// exactly the prose-vs-code drift the #979 conformance-gate design exists to
+// eliminate. Boot is field-tolerant (a malformed ui degrades-with-diagnostic
+// and never drops the extension's type registration or claims), so this
+// pre-screen exists to catch gross authoring mistakes early, not to be the
+// authoritative ui validator.
+
+/** Mirror of the leaf `isContainedEntryPath` (artifact-contract.ts): a
+ * package-relative, path-contained subpath — "./…", no ".."/empty/"." segment,
+ * no absolute path, no protocol/URL, no backslash. This is a path SHAPE rule
+ * (value-independent), so mirroring it here introduces no derived-value drift. */
+function isContainedRendererEntry(entry) {
+  if (typeof entry !== "string" || entry.length === 0) return false;
+  if (!entry.startsWith("./")) return false;
+  if (entry.includes("\\")) return false;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(entry)) return false; // protocol / URL
+  return !entry.slice(2).split("/").some((s) => s === "" || s === "." || s === "..");
+}
+
+const ARTIFACT_UI_ALLOWED_KEYS = ["abiVersion", "sdkAbiRange", "renderers"];
+const ARTIFACT_UI_RENDERER_ALLOWED_KEYS = ["entry", "propsApiVersion", "representations"];
+
+/** VALUE-INDEPENDENT shallow structural pre-screen of a `cinatra.artifact.ui`
+ * block. Returns string[] errors ([] = shape-conformant). The caller invokes
+ * this only when `ui` is present (it is optional — a purely declarative
+ * artifact extension ships none). */
+export function validateArtifactUiShape(ui) {
+  const errors = [];
+  if (!isObj(ui)) return ["ui must be an object ({ abiVersion, sdkAbiRange, renderers })"];
+  for (const k of Object.keys(ui)) {
+    if (!ARTIFACT_UI_ALLOWED_KEYS.includes(k)) errors.push(`ui: unexpected key "${k}"`);
+  }
+  if (typeof ui.abiVersion !== "number" || !Number.isInteger(ui.abiVersion) || ui.abiVersion < 1) {
+    errors.push("ui.abiVersion must be a positive integer");
+  }
+  if (!nonEmptyStr(ui.sdkAbiRange)) errors.push("ui.sdkAbiRange must be a non-empty string");
+  if (!isObj(ui.renderers) || Object.keys(ui.renderers).length === 0) {
+    errors.push("ui.renderers must be a non-empty object mapping a v1 slot to a renderer");
+    return errors;
+  }
+  for (const [slot, r] of Object.entries(ui.renderers)) {
+    const at = `ui.renderers.${slot}`;
+    if (!isObj(r)) {
+      errors.push(`${at} must be an object ({ entry, propsApiVersion[, representations] })`);
+      continue;
+    }
+    // v1 NO-PORTS: a renderer requests no host ports — only these three keys.
+    for (const k of Object.keys(r)) {
+      if (!ARTIFACT_UI_RENDERER_ALLOWED_KEYS.includes(k)) {
+        errors.push(`${at}: unexpected key "${k}" — v1 renderers request NO host ports (only { entry, propsApiVersion, representations? })`);
+      }
+    }
+    if (!isContainedRendererEntry(r.entry)) {
+      errors.push(`${at}.entry must be a package-relative, path-contained subpath ("./…", no "..", no absolute path or URL)`);
+    }
+    if (typeof r.propsApiVersion !== "number" || !Number.isInteger(r.propsApiVersion) || r.propsApiVersion < 1) {
+      errors.push(`${at}.propsApiVersion must be an integer >= 1`);
+    }
+    if (
+      r.representations !== undefined &&
+      (!Array.isArray(r.representations) || r.representations.length === 0 || !r.representations.every(nonEmptyStr))
+    ) {
+      errors.push(`${at}.representations, when present, must be a non-empty array of MIME pattern strings`);
+    }
+  }
+  return errors;
+}
+
 /** Structural mirror of artifactDescriptorSchema (.strict() throughout). */
 export function validateArtifactDescriptor(a) {
   const errors = [];
@@ -1850,8 +1929,11 @@ export function validateArtifactDescriptor(a) {
     const v = a.matcherConfidenceThreshold;
     if (typeof v !== "number" || v < 0 || v > 1) errors.push("matcherConfidenceThreshold must be a number in [0,1]");
   }
+  if (a.ui !== undefined) {
+    for (const e of validateArtifactUiShape(a.ui)) errors.push(e);
+  }
   for (const k of Object.keys(a)) {
-    if (!["accepts", "satisfies", "templates", "skills", "agentDependencies", "matcherConfidenceThreshold"].includes(k)) {
+    if (!["accepts", "satisfies", "templates", "skills", "agentDependencies", "matcherConfidenceThreshold", "ui"].includes(k)) {
       errors.push(`unexpected key "${k}"`);
     }
   }
