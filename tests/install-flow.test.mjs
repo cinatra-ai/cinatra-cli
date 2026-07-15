@@ -302,9 +302,51 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     // dir basename) — the core data-risk fix.
     expect(upCalls.length).toBe(1);
     expect(upCalls[0].composeProject).toBe("cinatra_p35_default");
+    // cinatra-cli#144: the default (non-isolated) `up` is ALSO given
+    // `--env-file .env.local` (mirroring the isolated `up` at T8/T8b) so the
+    // base docker-compose.yml's `${NANGO_ENCRYPTION_KEY}` / `${CINATRA_BRIDGE_TOKEN}`
+    // resolve from the freshly-minted secret instead of BLANK. Regression guard
+    // for the exact silent-empty-secret defect (#108 shipped this; #140 dropped
+    // it during the recreate-preflight refactor).
+    expect(upCalls[0].envFile).toMatch(/\.env\.local$/);
+    expect(upCalls[0].envFile).toBe(path.join(installDir, ".env.local"));
+    // …and the file the env-file points at actually carries a populated secret
+    // (ensureEnvLocal minted it) — proving the value that now flows is non-empty.
+    expect(readFileSync(upCalls[0].envFile, "utf8")).toMatch(/^NANGO_ENCRYPTION_KEY=.+$/m);
     // …and the SAME name is recorded.
     const reg = readInstanceRegistry(regPath);
     expect(reg.registry.instances["p35-default"].composeProject).toBe("cinatra_p35_default");
+  });
+
+  it("#144: the default `up` FAILS CLOSED when .env.local is absent (never starts empty-secret containers)", async () => {
+    const installDir = path.join(sandbox, "p144-missing-env");
+    const upCalls = [];
+    await expect(
+      runInstall(
+        ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+        {
+          log: () => {},
+          deps: flowDeps({
+            detectPortConflicts: async () => [], // no conflict → default plan
+            // Force the "unreachable" broken state: ensureEnvLocal (step 5)
+            // materialized .env.local, but by the time the default bring-up runs
+            // it is gone. inspectProjectOwnership runs INSIDE resolveDefaultProject,
+            // just before the fail-closed guard — delete the file there.
+            inspectProjectOwnership: () => {
+              const envLocal = path.join(installDir, ".env.local");
+              if (existsSync(envLocal)) rmSync(envLocal);
+              return { containerRows: [], volumeRows: [] };
+            },
+            bringUpInfra: (args) => upCalls.push(args),
+          }),
+        },
+      ),
+    ).rejects.toThrow(/Refusing to start the default stack — .*\.env\.local is missing/);
+    // The guard fired BEFORE any container was (re)created — no bring-up ran.
+    expect(upCalls).toEqual([]);
+    // …and the broken install did not flip a registry row to ready.
+    const reg = readInstanceRegistry(regPath);
+    expect(reg.registry.instances["p144-missing-env"]?.state ?? "absent").not.toBe("ready");
   });
 
   it("#35: a mismatched-working_dir inspect row REJECTS before `up` (no bringUpInfra)", async () => {

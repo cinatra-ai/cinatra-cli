@@ -8,6 +8,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The default (non-isolated) `install` brings up Compose with
+  `--env-file .env.local`, so `${NANGO_ENCRYPTION_KEY}` (and the other minted
+  secrets the base `docker-compose.yml` interpolates) reach the containers
+  instead of resolving blank; a missing `.env.local` now fails the install with
+  an actionable message rather than silently starting empty-secret containers.
+  Restores the #108 fix that #112 dropped. (#144)
 - `install --dry-run` previews the isolation/port intent the real run would
   execute: `--on-conflict=isolated` with a detected conflict now shows an
   advisory app port / band offset / remapped band (matching the real isolated
