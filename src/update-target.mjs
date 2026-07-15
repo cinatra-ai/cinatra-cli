@@ -158,7 +158,12 @@ export function resolveUpdatePath(target, isTty) {
  *   - dev  → fast-forward to the latest `origin/main` (kind "ref", ref "main").
  *   - prod → move to the latest `v*` release TAG (kind "tag", resolved by the
  *            caller via resolveLatestReleaseTag). Today's behavior.
- * An explicit `--ref` always overrides the type-derived default (kind "ref").
+ * An explicit `--ref` always overrides the type-derived default (kind "ref") for
+ * a DEV instance. For a PRODUCTION instance `--ref` is REJECTED (cinatra-cli#146):
+ * a git ref is not proof the corresponding published release image exists, and
+ * production updates select a released version by image tag/digest (pull +
+ * redeploy the pinned release image), not by moving the checkout to an arbitrary
+ * ref. The prod default (no `--ref`) still resolves to the latest `v*` release.
  *
  * IMPORTANT (dev): the ref is the bare branch name `"main"`, NOT the local branch
  * as-is and NOT the literal remote-tracking ref `"origin/main"` (which is not a
@@ -177,6 +182,17 @@ export function resolveUpdatePath(target, isTty) {
  *   tag" (the caller fills it in); a concrete string is used verbatim.
  */
 export function resolveInstanceMoveTarget(mode, pinnedRef) {
+  if (mode === "production" && pinnedRef) {
+    // cinatra-cli#146: reject --ref for the production update lifecycle. Checked
+    // BEFORE the generic pinnedRef branch so a prod instance can never move to an
+    // arbitrary git ref.
+    throw new Error(
+      `Refusing --ref "${pinnedRef}" for a production instance: a git ref is not proof the ` +
+        "corresponding published release image exists. Production updates select a released version " +
+        "by image tag/digest (pull + redeploy the pinned release image) — drop --ref to move to the " +
+        "latest release.",
+    );
+  }
   if (pinnedRef) {
     return { kind: "ref", ref: pinnedRef, source: "--ref" };
   }

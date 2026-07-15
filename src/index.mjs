@@ -25,6 +25,7 @@ import { syncDevApps, readDevAppsConfig } from "./dev-apps.mjs";
 import { deriveKindFromName, syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
 import { LOCAL_REGISTRY_URL, seedLocalRegistryExtensions } from "./seed-local-registry.mjs";
 import { parseDevRefreshFlags, describeDockerDecision } from "./dev-refresh.mjs";
+import { prodRuntimeGuidanceLines } from "./prod-runtime-guidance.mjs";
 import { applyCheckoutBootstrapDdl } from "./checkout-bootstrap-ddl.mjs";
 import {
   CLI_INSTALL_SPEC,
@@ -1035,6 +1036,27 @@ function normalizeRuntimeMode(value) {
   return normalized === "production" || normalized === "prod" ? "production" : "development";
 }
 
+// Fail-CLOSED development allowlist for a RAW .env.local mode value, shared by the
+// privileged guards (host dev-start refusal + prod update lifecycle). The CLI only
+// ever WRITES CINATRA_RUNTIME_MODE=development or =production — demo is the
+// orthogonal CINATRA_INSTALL_PROFILE axis layered on a development runtime, never a
+// runtime-mode value (install.mjs RUNTIME_MODE = { dev, prod, demo→development }).
+// So "clearly names development" is the safe test: everything else — production in
+// EVERY spelling and any unrecognized value — fails closed. A production BLOCKLIST
+// (exact match, or even a leading-"prod" check) can never be watertight, because
+// parseEnvFile preserves a raw value verbatim: an inline `# comment` after `=` is
+// not stripped (`production # live`), and only a MATCHED surrounding quote pair is
+// removed (`"production" # live` keeps its opening quote, `` `production` `` keeps
+// a backtick). This is exactly why runDevRefresh already uses a strict dev
+// allowlist rather than a prod blocklist. Match "dev"/"development" as a COMPLETE
+// TOKEN — optionally wrapped in a MATCHED quote pair and/or trailed by an inline
+// `# comment` (both shapes parseEnvFile can leave in the raw value) — NOT an
+// unbounded prefix, so "devil", "device", or "development-production" do not read
+// as development (case-insensitive).
+export function isDevelopmentModeValue(rawMode) {
+  return /^(["']?)\s*(?:development|dev)\s*\1(?:\s*#.*)?$/i.test(String(rawMode ?? "").trim());
+}
+
 function normalizeOptionalUrl(value) {
   const trimmed = String(value ?? "").trim();
   if (!trimmed) {
@@ -1311,6 +1333,55 @@ function readConfiguredRuntimeMode(env) {
   }
 
   return "development";
+}
+
+// cinatra-cli#146: decide whether a host dev-start (`cinatra instance start` →
+// `pnpm dev`) is allowed for a checkout, from its RAW .env.local values. This is
+// the pure, spawn-free decision seam behind the fail-closed prod refusal.
+//
+// Fail-CLOSED development allowlist: production runs the pinned published release
+// image (production-runtime contract), never a host `pnpm dev`. Host dev-start is
+// allowed ONLY for a checkout with NO explicit mode key (the historical dev
+// default, dev-start byte-for-byte unchanged) or one that clearly names a
+// development runtime (isDevelopmentModeValue — which also covers a demo install,
+// whose runtime mode is development). Everything else — production in any spelling,
+// or an unrecognized value — refuses. Callers MUST pass the RAW file values
+// (parseEnvFile), never a process.env overlay, so a shell
+// `CINATRA_RUNTIME_MODE=development` override cannot coax a real production
+// checkout into a host dev boot — mirroring the `runDevRefresh` raw-file guard.
+export function evaluateHostDevStartMode(fileEnv = {}) {
+  const fileMode = APP_RUNTIME_MODE_ENV_KEYS.map((key) =>
+    typeof fileEnv?.[key] === "string" ? fileEnv[key].trim() : "",
+  ).find((value) => value.length > 0);
+  // Fail-CLOSED allowlist: allow host dev-start ONLY for a checkout with no
+  // explicit mode (the historical dev default, dev-start unchanged) or one that
+  // clearly names a development runtime. Everything else — production in any
+  // spelling, or an unrecognized value — refuses, so a real production checkout
+  // can never host-boot `pnpm dev`, regardless of comment/quote punctuation.
+  if (!fileMode || isDevelopmentModeValue(fileMode)) {
+    return { allowed: true, mode: "development", fileMode: fileMode ?? null };
+  }
+  return { allowed: false, mode: "production", fileMode };
+}
+
+// I/O wrapper for the guard above: reads the checkout's RAW .env.local and, for a
+// production-mode checkout, throws the shared image-lifecycle guidance (exiting
+// nonzero). A missing file or a non-production mode is allowed, so dev/demo
+// `instance start`/`restart` is unchanged.
+function assertHostDevStartAllowed(repoRoot) {
+  const envPath = path.join(repoRoot, ".env.local");
+  const fileEnv = existsSync(envPath) ? parseEnvFile(envPath) : {};
+  const decision = evaluateHostDevStartMode(fileEnv);
+  if (!decision.allowed) {
+    throw new Error(
+      [
+        `Refusing to start a host dev server: ${envPath} is a production-mode checkout ` +
+          `(CINATRA_RUNTIME_MODE=${decision.fileMode}). A host \`pnpm dev\` is not a supported ` +
+          "production runtime.",
+        ...prodRuntimeGuidanceLines({ indent: "  " }),
+      ].join("\n"),
+    );
+  }
 }
 
 // Lazy `pg` (the command-routing contract). `pg` is a CJS module; under some loaders its
@@ -6064,7 +6135,14 @@ async function runInstanceUpdate({ ref: pinnedRef, force, refreshArgs, dryRun })
         "run `cinatra install` first.",
     );
   }
-  const instanceMode = normalizeRuntimeMode(fileMode); // "development" | "production"
+  // Fail-CLOSED mode resolution (cinatra-cli#146): treat the instance as
+  // development ONLY when .env.local clearly names a development runtime;
+  // everything else — production in any spelling (incl. a trailing `# comment` or a
+  // quote parseEnvFile preserves) or an unrecognized value — resolves to
+  // production, so resolveInstanceMoveTarget REJECTS `--ref` and the checkout is
+  // never run through the dev deps/DB reconcile. normalizeRuntimeMode's exact-match
+  // blocklist would silently downgrade an annotated production value to development.
+  const instanceMode = isDevelopmentModeValue(fileMode) ? "development" : "production"; // "development" | "production"
   const isDev = instanceMode === "development";
 
   // Preflight the SAME shell-override guard the dev reconcile enforces, but BEFORE
@@ -9419,6 +9497,9 @@ async function runDevStart(argv) {
   rejectTailscaleAuthkeyFlag(argv);
   const cleanDirective = parseNextCleanDirective(argv);
   const { repoRoot, port } = resolveDevMainTarget();
+  // cinatra-cli#146: fail-closed — a production-mode checkout must never host-boot
+  // `pnpm dev`. Refuse BEFORE taking the runtime lock or spawning.
+  assertHostDevStartAllowed(repoRoot);
   const pidPath = clonePidPath(DEV_MAIN_SLUG);
   const logPath = cloneLogPath(DEV_MAIN_SLUG);
   const healthUrl = `http://localhost:${port}/api/health`;
@@ -9685,6 +9766,10 @@ async function runDevRestart(argv) {
   // `restart --clean` = stop → clean `.next` → start; `restart` (no flag) =
   // stop → auto-clean iff HEAD moved → start (cinatra-cli#105).
   parseNextCleanDirective(argv);
+  // cinatra-cli#146: refuse a production-mode checkout BEFORE stopping the server —
+  // restart calls stop→start, so guard here too so a prod checkout is not torn down
+  // only to then refuse to start. (runDevStart re-checks; the guard is idempotent.)
+  assertHostDevStartAllowed(resolveDevMainTarget().repoRoot);
   // Branch on the structured stop RESULT, not the global `process.exitCode`
   // side-channel: a restart must NOT start a second instance on top of a
   // possibly-live one (the start would refuse on the not-ours guard anyway,
