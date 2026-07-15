@@ -12,7 +12,8 @@
 //      checkout, recorded the SHA, created .env.local, and (idempotently)
 //      re-ran as an update. No docker / network / pnpm needed.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -32,6 +33,7 @@ import {
   DEFAULT_DEV_HOST_PORTS,
   DEFAULT_REPO_URL,
   assertAmbientModeMatches,
+  assertProdEnvComplete,
   assertSafeRepoUrl,
   detectPortConflicts,
   emitDegradedBandWarning,
@@ -42,6 +44,7 @@ import {
   normalizeRemote,
   ownedPortsFromInspect,
   parseComposePublishedPorts,
+  parseEnvBody,
   parseInstallArgs,
   pickLatestReleaseTag,
   resolveLatestReleaseTag,
@@ -338,11 +341,267 @@ describe("ensureEnvLocal", () => {
     expect(r.created).toBe(true);
     const after = readFileSync(path.join(dir, ".env.local"), "utf8");
     expect(after).toMatch(/^BETTER_AUTH_SECRET=[0-9a-f]{64}$/m);
-    // A fresh secret almost-certainly differs.
+    // A fresh secret almost-certainly differs. (dev mode mints no
+    // encryption/attest keys, so this whole-body assertion is unaffected by the
+    // prod-mode preserve-on-reset behaviour — see the prod-secrets block below.)
     expect(after).not.toBe(before);
   });
 });
 
+// ---------------------------------------------------------------------------
+// 4b. ensureEnvLocal — prod secrets (cinatra-cli#143).
+// ---------------------------------------------------------------------------
+describe("ensureEnvLocal — prod secrets (cinatra-cli#143)", () => {
+  // A fresh prod target. SUPABASE_DB_URL ships a working default in the real
+  // .env.example; here any non-empty placeholder suffices (ensureEnvLocal only
+  // mints the two prod-only secrets — the gate validates the full matrix).
+  function mkProdTarget() {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "cinatra-prodsecrets-"));
+    writeFileSync(
+      path.join(dir, ".env.example"),
+      "SUPABASE_DB_URL=set-by-example\nBETTER_AUTH_SECRET=\nCINATRA_RUNTIME_MODE=production\n",
+    );
+    return dir;
+  }
+  const readLocal = (dir) => readFileSync(path.join(dir, ".env.local"), "utf8");
+  const enc = (body) => /^CINATRA_ENCRYPTION_KEY=(\S+)$/m.exec(body)?.[1];
+  const attest = (body) => /^CINATRA_CONTEXT_ATTEST_KEY=(\S+)$/m.exec(body)?.[1];
+
+  it("fresh prod install mints a 64-hex CINATRA_ENCRYPTION_KEY and CINATRA_CONTEXT_ATTEST_KEY", () => {
+    const dir = mkProdTarget();
+    const r = ensureEnvLocal({ targetDir: dir, mode: "prod", log: () => {} });
+    expect(r.created).toBe(true);
+    const body = readLocal(dir);
+    expect(body).toMatch(/^CINATRA_ENCRYPTION_KEY=[0-9a-f]{64}$/m);
+    expect(body).toMatch(/^CINATRA_CONTEXT_ATTEST_KEY=[0-9a-f]{64}$/m);
+    // The two keys are DISTINCT values (attest is not conflated with encryption).
+    expect(enc(body)).not.toBe(attest(body));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("dev install does NOT mint the prod-only keys (they stay prod-gated)", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "cinatra-devsecrets-"));
+    writeFileSync(path.join(dir, ".env.example"), "BETTER_AUTH_SECRET=\nCINATRA_RUNTIME_MODE=development\n");
+    ensureEnvLocal({ targetDir: dir, mode: "dev", log: () => {} });
+    const body = readLocal(dir);
+    expect(body).not.toMatch(/^CINATRA_ENCRYPTION_KEY=/m);
+    expect(body).not.toMatch(/^CINATRA_CONTEXT_ATTEST_KEY=/m);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("preserve path: a valid existing key is carried forward untouched (never rotated)", () => {
+    const dir = mkProdTarget();
+    ensureEnvLocal({ targetDir: dir, mode: "prod", log: () => {} });
+    const first = readLocal(dir);
+    const r = ensureEnvLocal({ targetDir: dir, mode: "prod", log: () => {} });
+    expect(r.created).toBe(false);
+    const second = readLocal(dir);
+    expect(enc(second)).toBe(enc(first));
+    expect(attest(second)).toBe(attest(first));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("preserve path: mints a MISSING encryption/attest key into an existing prod file (self-heal)", () => {
+    const dir = mkProdTarget();
+    // A pre-#143 prod .env.local: has the other secrets but neither new key.
+    writeFileSync(
+      path.join(dir, ".env.local"),
+      `SUPABASE_DB_URL=set\nBETTER_AUTH_SECRET=${randomBytes(32).toString("hex")}\nCINATRA_RUNTIME_MODE=production\n`,
+    );
+    const r = ensureEnvLocal({ targetDir: dir, mode: "prod", log: () => {} });
+    expect(r.created).toBe(false);
+    const body = readLocal(dir);
+    expect(body).toMatch(/^CINATRA_ENCRYPTION_KEY=[0-9a-f]{64}$/m);
+    expect(body).toMatch(/^CINATRA_CONTEXT_ATTEST_KEY=[0-9a-f]{64}$/m);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("--reset-env preserves a valid encryption/attest key while regenerating BETTER_AUTH_SECRET", () => {
+    const dir = mkProdTarget();
+    ensureEnvLocal({ targetDir: dir, mode: "prod", log: () => {} });
+    const first = readLocal(dir);
+    const auth1 = /^BETTER_AUTH_SECRET=(\S+)$/m.exec(first)[1];
+    const r = ensureEnvLocal({ targetDir: dir, mode: "prod", resetEnv: true, log: () => {} });
+    expect(r.created).toBe(true);
+    const after = readLocal(dir);
+    // Encryption + attestation keys SURVIVE the reset (rotating enc orphans data).
+    expect(enc(after)).toBe(enc(first));
+    expect(attest(after)).toBe(attest(first));
+    // BETTER_AUTH_SECRET is still regenerated on reset (not preserve-listed).
+    expect(/^BETTER_AUTH_SECRET=(\S+)$/m.exec(after)[1]).not.toBe(auth1);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("accepts a base64 32-byte existing encryption key as valid (hex-or-base64, matching the app)", () => {
+    const dir = mkProdTarget();
+    const b64 = randomBytes(32).toString("base64");
+    writeFileSync(
+      path.join(dir, ".env.local"),
+      `SUPABASE_DB_URL=set\nBETTER_AUTH_SECRET=x\nCINATRA_ENCRYPTION_KEY=${b64}\nCINATRA_RUNTIME_MODE=production\n`,
+    );
+    expect(() => ensureEnvLocal({ targetDir: dir, mode: "prod", resetEnv: true, log: () => {} })).not.toThrow();
+    expect(enc(readLocal(dir))).toBe(b64);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("malformed existing encryption key HARD-FAILS (throws, no silent rotate) — preserve path", () => {
+    const dir = mkProdTarget();
+    writeFileSync(
+      path.join(dir, ".env.local"),
+      "SUPABASE_DB_URL=set\nBETTER_AUTH_SECRET=x\nCINATRA_ENCRYPTION_KEY=too-short\nCINATRA_RUNTIME_MODE=production\n",
+    );
+    expect(() => ensureEnvLocal({ targetDir: dir, mode: "prod", log: () => {} })).toThrow(
+      /malformed CINATRA_ENCRYPTION_KEY/,
+    );
+    // The malformed value is NOT rotated — the file is untouched.
+    expect(readLocal(dir)).toMatch(/^CINATRA_ENCRYPTION_KEY=too-short$/m);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("malformed existing encryption key HARD-FAILS even under --reset-env WITHOUT destroying the file", () => {
+    const dir = mkProdTarget();
+    const original =
+      "SUPABASE_DB_URL=set\nBETTER_AUTH_SECRET=x\nCINATRA_ENCRYPTION_KEY=zzzz\nCINATRA_RUNTIME_MODE=production\n";
+    writeFileSync(path.join(dir, ".env.local"), original);
+    expect(() => ensureEnvLocal({ targetDir: dir, mode: "prod", resetEnv: true, log: () => {} })).toThrow(
+      /malformed CINATRA_ENCRYPTION_KEY/,
+    );
+    // The malformed key must abort BEFORE the file is overwritten — otherwise a
+    // retry would see no key and mint a replacement, silently rotating it.
+    expect(readLocal(dir)).toBe(original);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("preserves a VALID encryption key that carries a trailing inline comment (dotenv parity)", () => {
+    const dir = mkProdTarget();
+    const validHex = randomBytes(32).toString("hex");
+    writeFileSync(
+      path.join(dir, ".env.local"),
+      `SUPABASE_DB_URL=set\nBETTER_AUTH_SECRET=x\nCINATRA_ENCRYPTION_KEY=${validHex} # do not rotate\nCINATRA_RUNTIME_MODE=production\n`,
+    );
+    // The inline comment must NOT make the valid key read as malformed.
+    expect(() => ensureEnvLocal({ targetDir: dir, mode: "prod", resetEnv: true, log: () => {} })).not.toThrow();
+    expect(enc(readLocal(dir))).toBe(validHex);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4b-bis. parseEnvBody — dotenv inline-comment parity (cinatra-cli#143).
+// ---------------------------------------------------------------------------
+describe("parseEnvBody — inline comments (cinatra-cli#143)", () => {
+  it("parses unquoted + quoted values with dotenv comment semantics", () => {
+    const parsed = parseEnvBody(
+      [
+        "CINATRA_ENCRYPTION_KEY=deadbeef # do not rotate", // unquoted + comment → stripped
+        'QUOTED="abc # keep"', // '#' inside quotes → literal
+        'QUOTED_TRAILING="abc" # note', // quote close then comment → quotes gone, comment gone
+        'QUOTED_INNER_HASH="abc # keep" # note', // inner '#' kept, trailing comment gone
+        "HASHY=ab#cd", // no leading space → not a comment
+        "PLAIN=value",
+        "'SINGLE'=ignored", // (key can't be quoted; line ignored)
+        "SINGLEV='sv' # c",
+      ].join("\n"),
+    );
+    expect(parsed.CINATRA_ENCRYPTION_KEY).toBe("deadbeef");
+    expect(parsed.QUOTED).toBe("abc # keep");
+    expect(parsed.QUOTED_TRAILING).toBe("abc"); // no surrounding quotes, no comment
+    expect(parsed.QUOTED_INNER_HASH).toBe("abc # keep");
+    expect(parsed.HASHY).toBe("ab#cd");
+    expect(parsed.PLAIN).toBe("value");
+    expect(parsed.SINGLEV).toBe("sv");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4c. assertProdEnvComplete — post-install prod-env gate (cinatra-cli#143).
+// ---------------------------------------------------------------------------
+describe("assertProdEnvComplete — post-install prod-env gate (cinatra-cli#143)", () => {
+  function mkEnvLocal(lines) {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "cinatra-prodgate-"));
+    writeFileSync(path.join(dir, ".env.local"), lines.join("\n") + "\n");
+    return dir;
+  }
+  const key = () => randomBytes(32).toString("hex");
+
+  it("passes when every hard var is present + valid (soft/attest present)", () => {
+    const dir = mkEnvLocal([
+      "SUPABASE_DB_URL=set",
+      "BETTER_AUTH_SECRET=" + key(),
+      "CINATRA_ENCRYPTION_KEY=" + key(),
+      "CINATRA_BRIDGE_TOKEN=" + key(),
+      "CINATRA_CONTEXT_ATTEST_KEY=" + key(),
+    ]);
+    const r = assertProdEnvComplete({ targetDir: dir, log: () => {} });
+    expect(r.hardFailures).toEqual([]);
+    expect(r.softMissing).toEqual([]);
+    expect(r.attestMissing).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("throws naming EVERY missing/malformed hard var (aggregated, [required-env-preflight] style)", () => {
+    // SUPABASE_DB_URL present; BETTER_AUTH_SECRET missing; encryption key malformed.
+    const dir = mkEnvLocal(["SUPABASE_DB_URL=set", "CINATRA_ENCRYPTION_KEY=not-32-bytes"]);
+    let msg = "";
+    try {
+      assertProdEnvComplete({ targetDir: dir, log: () => {} });
+    } catch (e) {
+      msg = e.message;
+    }
+    expect(msg).toMatch(/\[required-env-preflight\]/);
+    expect(msg).toMatch(/BETTER_AUTH_SECRET/);
+    expect(msg).toMatch(/CINATRA_ENCRYPTION_KEY/);
+    expect(msg).not.toMatch(/SUPABASE_DB_URL/); // present → not named
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("a missing SOFT var (CINATRA_BRIDGE_TOKEN) and missing attest key WARN but do not throw", () => {
+    const dir = mkEnvLocal([
+      "SUPABASE_DB_URL=set",
+      "BETTER_AUTH_SECRET=" + key(),
+      "CINATRA_ENCRYPTION_KEY=" + key(),
+      // no CINATRA_BRIDGE_TOKEN, no CINATRA_CONTEXT_ATTEST_KEY
+    ]);
+    const warnings = [];
+    const r = assertProdEnvComplete({ targetDir: dir, log: (m) => warnings.push(m) });
+    expect(r.softMissing.map((s) => s.name)).toContain("CINATRA_BRIDGE_TOKEN");
+    expect(r.attestMissing).toBe(true);
+    const joined = warnings.join("\n");
+    expect(joined).toMatch(/CINATRA_BRIDGE_TOKEN/);
+    expect(joined).toMatch(/CINATRA_CONTEXT_ATTEST_KEY/);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("accepts a base64 32-byte encryption key (hex-or-base64 — matches the app, NOT preview's hex-only)", () => {
+    const dir = mkEnvLocal([
+      "SUPABASE_DB_URL=set",
+      "BETTER_AUTH_SECRET=x",
+      "CINATRA_ENCRYPTION_KEY=" + randomBytes(32).toString("base64"),
+    ]);
+    expect(() => assertProdEnvComplete({ targetDir: dir, log: () => {} })).not.toThrow();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("throws when .env.local is absent (nothing to validate)", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "cinatra-prodgate-none-"));
+    expect(() => assertProdEnvComplete({ targetDir: dir, log: () => {} })).toThrow(/\.env\.local is missing/);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("prod-mode E2E: the gate exits NON-ZERO naming the missing hard var (real subprocess)", () => {
+    // A deliberately incomplete prod .env.local (no BETTER_AUTH_SECRET / encryption key).
+    const dir = mkEnvLocal(["SUPABASE_DB_URL=set", "CINATRA_RUNTIME_MODE=production"]);
+    const installUrl = new URL("../src/install.mjs", import.meta.url).href;
+    const script =
+      `import { assertProdEnvComplete } from ${JSON.stringify(installUrl)};` +
+      `assertProdEnvComplete({ targetDir: ${JSON.stringify(dir)}, log: () => {} });`;
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8" });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/BETTER_AUTH_SECRET/);
+    expect(r.stderr).toMatch(/CINATRA_ENCRYPTION_KEY/);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
 
 // ---------------------------------------------------------------------------
 // 5. End-to-end from zero against a local file:// "cinatra" repo.

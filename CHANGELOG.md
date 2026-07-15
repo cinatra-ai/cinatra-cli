@@ -8,6 +8,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `install --mode prod` now provisions AND validates the full hard-required
+  secret set before reporting success. It mints a valid 32-byte
+  `CINATRA_ENCRYPTION_KEY` (and the distinct WayFlow `CINATRA_CONTEXT_ATTEST_KEY`)
+  when missing, preserves a valid existing key untouched — including across
+  `--reset-env` — and aborts on a malformed encryption key rather than rotating
+  it (which would orphan already-encrypted data). A new post-install gate
+  validates `.env.local` against the app's required-env contract and fails the
+  install naming every missing or malformed required var, instead of a silent
+  success that crashes on first prod boot. (#143)
 - The default (non-isolated) `install` brings up Compose with
   `--env-file .env.local`, so `${NANGO_ENCRYPTION_KEY}` (and the other minted
   secrets the base `docker-compose.yml` interpolates) reach the containers
