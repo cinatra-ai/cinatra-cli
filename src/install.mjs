@@ -55,6 +55,7 @@ import {
   formatHardFailureMessage,
   validateEncryptionKey,
 } from "./prod-env-validate.mjs";
+import { prodRuntimeGuidanceLines } from "./prod-runtime-guidance.mjs";
 import { defaultAssertRecreateSafe, RecreatePreflightError } from "./recreate-preflight.mjs";
 import { captureDeployedVersions } from "./version-ledger-capture.mjs";
 import {
@@ -4909,8 +4910,13 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
       log(`  Instance:      ${couse.instance?.slug} (co-use — shares the donor's infra; separate DB ${couse.instance?.dbName ?? coUseDbName(deriveCoUseSlug(targetDir, opts))})`);
       log("");
       log("  Next:");
-      log(`    cd ${targetDir}`);
-      log(`    pnpm dev        # start this co-use instance at http://localhost:${couse.instance?.appPort}`);
+      if (RUNTIME_MODE[opts.mode] === "production") {
+        // cinatra-cli#146: never steer a production checkout at `pnpm dev`.
+        for (const line of prodRuntimeGuidanceLines()) log(line);
+      } else {
+        log(`    cd ${targetDir}`);
+        log(`    pnpm dev        # start this co-use instance at http://localhost:${couse.instance?.appPort}`);
+      }
     }
     return {
       targetDir,
@@ -4998,7 +5004,12 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     log("✓ Cinatra co-use install complete.");
     log(`  Directory:     ${targetDir}`);
     log(`  Instance:      ${resolution?.instance?.slug} (co-use — shares the donor's infra)`);
-    log(`    cd ${targetDir} && pnpm dev   # http://localhost:${resolution?.instance?.appPort}`);
+    if (RUNTIME_MODE[opts.mode] === "production") {
+      // cinatra-cli#146: never steer a production checkout at `pnpm dev`.
+      for (const line of prodRuntimeGuidanceLines()) log(line);
+    } else {
+      log(`    cd ${targetDir} && pnpm dev   # http://localhost:${resolution?.instance?.appPort}`);
+    }
     return {
       targetDir,
       ref: opts.ref,
@@ -5202,9 +5213,16 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   if (infraPlan === "external") log("  Infra:         external (operator-owned; not install-managed)");
   log("");
   log("  Next:");
-  log(`    cd ${targetDir}`);
-  log(`    pnpm dev        # start the app at http://localhost:${appPortForSummary}`);
-  log("    The first user to register becomes the admin.");
+  if (RUNTIME_MODE[opts.mode] === "production") {
+    // cinatra-cli#146: production runs the pinned published RELEASE IMAGE, never a
+    // host `pnpm dev` (production-runtime contract). Steer to the supported image
+    // lifecycle — the dev hint below is emitted only for dev/demo.
+    for (const line of prodRuntimeGuidanceLines()) log(line);
+  } else {
+    log(`    cd ${targetDir}`);
+    log(`    pnpm dev        # start the app at http://localhost:${appPortForSummary}`);
+    log("    The first user to register becomes the admin.");
+  }
   return {
     targetDir,
     ref: opts.ref,

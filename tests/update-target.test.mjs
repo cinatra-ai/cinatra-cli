@@ -126,9 +126,15 @@ describe("resolveInstanceMoveTarget — instance type → git-move target", () =
     expect(resolveInstanceMoveTarget("production", null)).toMatchObject({ kind: "tag", ref: null });
   });
 
-  it("an explicit --ref overrides the type default on either mode", () => {
+  it("an explicit --ref overrides the type default for a DEV instance", () => {
     expect(resolveInstanceMoveTarget("development", "release-tag-9")).toMatchObject({ kind: "ref", ref: "release-tag-9" });
-    expect(resolveInstanceMoveTarget("production", "mybranch")).toMatchObject({ kind: "ref", ref: "mybranch" });
+  });
+
+  it("rejects --ref for a PRODUCTION instance — image tag/digest, not a git ref (cinatra-cli#146)", () => {
+    expect(() => resolveInstanceMoveTarget("production", "mybranch")).toThrow(/Refusing --ref "mybranch"/);
+    expect(() => resolveInstanceMoveTarget("production", "v-anything")).toThrow(/published release image/);
+    // The prod default (no --ref) is untouched: still the latest v* release.
+    expect(resolveInstanceMoveTarget("production", null)).toMatchObject({ kind: "tag", ref: null });
   });
 });
 

@@ -1700,3 +1700,107 @@ describe("moveExistingCheckoutToRef — against a real local checkout", () => {
     expect(readVersion()).toBe("dev-tip");
   });
 });
+
+// ---------------------------------------------------------------------------
+// cinatra-cli#146 — mode-aware install completion hint.
+//
+// A prod install's "Next:" output steers to the pinned image lifecycle (pull +
+// ops Compose deploy + preview lane), NEVER `pnpm dev`; dev output is unchanged.
+// Drives the REAL runInstall completion tail against a local file:// origin with
+// --no-infra --no-install (no docker/network/pnpm).
+// ---------------------------------------------------------------------------
+describe("runInstall — mode-aware completion hint (cinatra-cli#146)", () => {
+  let sandbox;
+  let originRepo;
+  const savedMode = {};
+
+  beforeAll(() => {
+    // Neutralize any ambient runtime-mode export so `--mode prod` does not trip
+    // assertAmbientModeMatches (which refuses a shell/flag mode conflict).
+    for (const key of ["CINATRA_RUNTIME_MODE", "APP_RUNTIME_MODE"]) {
+      savedMode[key] = process.env[key];
+      delete process.env[key];
+    }
+    sandbox = mkdtempSync(path.join(os.tmpdir(), "cinatra-install-mode-hint-"));
+    process.env.CINATRA_INSTANCE_REGISTRY = path.join(sandbox, "instances.json");
+    process.env.CINATRA_ALLOC_LOCK = path.join(sandbox, "alloc.lock");
+
+    const src = path.join(sandbox, "src");
+    mkdirSync(path.join(src, "packages", "cli"), { recursive: true });
+    mkdirSync(path.join(src, "packages", "migrations"), { recursive: true });
+    writeFileSync(path.join(src, "pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n");
+    writeFileSync(
+      path.join(src, "packages", "cli", "package.json"),
+      JSON.stringify({ name: "@cinatra-ai/cli", version: "0.0.0" }),
+    );
+    writeFileSync(
+      path.join(src, "packages", "migrations", "package.json"),
+      JSON.stringify({ name: "@cinatra-ai/migrations", version: "0.0.0" }),
+    );
+    writeFileSync(
+      path.join(src, "package.json"),
+      JSON.stringify({ name: "cinatra-host", cinatra: { devExtensions: {} } }),
+    );
+    writeFileSync(
+      path.join(src, ".env.example"),
+      "BETTER_AUTH_SECRET=\nCINATRA_RUNTIME_MODE=development\n",
+    );
+    writeFileSync(path.join(src, ".gitignore"), ".env.local\nextensions/\n");
+
+    const G = (args, cwd) =>
+      execFileSync("git", args, {
+        cwd,
+        env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" },
+        stdio: "ignore",
+      });
+    G(["init", "-b", "main"], src);
+    G(["add", "-A"], src);
+    G(["commit", "-m", "init"], src);
+
+    originRepo = path.join(sandbox, "origin.git");
+    G(["clone", "--bare", src, originRepo], sandbox);
+  });
+
+  afterAll(() => {
+    delete process.env.CINATRA_INSTANCE_REGISTRY;
+    delete process.env.CINATRA_ALLOC_LOCK;
+    for (const key of ["CINATRA_RUNTIME_MODE", "APP_RUNTIME_MODE"]) {
+      if (savedMode[key] === undefined) delete process.env[key];
+      else process.env[key] = savedMode[key];
+    }
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  const runMode = async (mode) => {
+    const logs = [];
+    const result = await runInstall(
+      [
+        "--dir", path.join(sandbox, `out-${mode}`),
+        "--repo-url", `file://${originRepo}`,
+        "--ref", "main",
+        "--mode", mode,
+        "--yes", "--no-infra", "--no-install",
+      ],
+      { log: (m) => logs.push(String(m)) },
+    );
+    return { out: logs.join("\n"), result };
+  };
+
+  it("prod completion names the image lifecycle and NEVER `pnpm dev`", async () => {
+    const { out, result } = await runMode("prod");
+    expect(result.mode).toBe("prod");
+    expect(out).toMatch(/install complete/);
+    expect(out).toContain("docker pull cinatra/cinatra:VERSION");
+    expect(out).toContain("deploy-instance.sh");
+    expect(out).toContain("cinatra instance preview create");
+    expect(out).not.toMatch(/pnpm dev/);
+  });
+
+  it("dev completion is unchanged — prints `pnpm dev`, no image guidance", async () => {
+    const { out, result } = await runMode("dev");
+    expect(result.mode).toBe("dev");
+    expect(out).toMatch(/pnpm dev\s+# start the app/);
+    expect(out).not.toMatch(/docker pull cinatra\/cinatra/);
+    expect(out).not.toMatch(/deploy-instance\.sh/);
+  });
+});

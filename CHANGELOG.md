@@ -23,6 +23,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
   instead of resolving blank; a missing `.env.local` now fails the install with
   an actionable message rather than silently starting empty-secret containers.
   Restores the #108 fix that #112 dropped. (#144)
+- Post-install run guidance is now mode-aware: a `--mode prod` install points at
+  the supported image lifecycle (pull the pinned published release image + deploy
+  via the ops Compose flow, plus `cinatra instance preview create` for local
+  prod-mode verification) instead of `pnpm dev`. Dev/demo guidance is unchanged.
+  (#146)
+- `cinatra instance start` / `restart` refuse a production-mode checkout
+  (fail-closed on the raw `.env.local` runtime mode) rather than host-booting
+  `pnpm dev`, and print the same image-lifecycle guidance. (#146)
+- `cinatra update --instance --ref <ref>` is rejected for a production instance —
+  a git ref is not proof the corresponding published image exists; select a
+  released version by image tag/digest. (#146)
 - `install --dry-run` previews the isolation/port intent the real run would
   execute: `--on-conflict=isolated` with a detected conflict now shows an
   advisory app port / band offset / remapped band (matching the real isolated
