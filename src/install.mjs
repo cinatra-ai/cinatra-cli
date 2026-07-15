@@ -1660,7 +1660,13 @@ function ensureMarkerIgnored(targetDir) {
   }
 }
 
-/** Read both registries (read-only) for classification / status. */
+/** Read both registries (read-only) for classification / status. A malformed
+ *  instance registry is swallowed to `null` here (a status/classification read
+ *  must never fail over a bad file) but the error is RETURNED as
+ *  `instanceRegistryError` so a caller that needs parity with a MUTATING command
+ *  — which `requireUsableInstanceRegistry` makes throw on a malformed registry —
+ *  can surface it (cinatra-cli#147: the dry-run advisory reports it rather than
+ *  silently previewing a plan the real install would abort before reaching). */
 function readBothRegistries(deps = {}) {
   const instReader = deps.readInstanceRegistry ?? (() => requireUsableInstanceRegistry(defaultInstanceRegistryPath()));
   let cloneRegistry = null;
@@ -1670,12 +1676,14 @@ function readBothRegistries(deps = {}) {
     cloneRegistry = null;
   }
   let instanceRegistry = null;
+  let instanceRegistryError = null;
   try {
     instanceRegistry = instReader();
-  } catch {
+  } catch (err) {
     instanceRegistry = null;
+    instanceRegistryError = err;
   }
-  return { instanceRegistry, cloneRegistry };
+  return { instanceRegistry, cloneRegistry, instanceRegistryError };
 }
 
 /** Validate an external-infra URL (shape only). Allows postgres(ql)/redis(s)/
@@ -2614,6 +2622,90 @@ function pickFixedOffset(band, offset, cloneRegistry, instanceRegistry, extraRes
         `or pushes a port past 65535. Choose a different offset.`,
     );
   }
+}
+
+/**
+ * cinatra-cli#147 — compute the ADVISORY isolated plan a `--dry-run
+ * --on-conflict=isolated` preview shows. This mirrors the READ-ONLY, PURE half
+ * of `executeIsolatedInstall`'s allocation (app port + band offset + remapped
+ * band) WITHOUT any of its side effects: it reads both registries read-only
+ * (`readBothRegistries`) and computes with the pure allocator primitives
+ * (`reservedPorts` / `allocateAppPort` / `allocateBandOffset` / `pickFixedOffset`).
+ * It NEVER acquires the alloc lock, writes the registry, generates a compose
+ * file, or probes a socket — so a dry-run makes no reservation (cinatra-cli#147
+ * AC3). Pre-clone there is no authoritative compose-derived band, so the advisory
+ * band is built from the SAME static `DEFAULT_DEV_HOST_PORTS` the dry-run conflict
+ * probe already uses (AC5 — inherently advisory, not the real post-clone band).
+ * Any allocator collision (an explicit `--app-port` in the reserved set, or a
+ * band offset that cannot be placed) is REPORTED via `notes`, never thrown
+ * (AC4 — the dry-run PREVIEWS a conflict, the real install is what rejects it).
+ *
+ * @returns {{ appPort: number|null, appPortSource: "explicit"|"auto",
+ *   offset: number|null, remapped: Array<{service:string,host:string,port:number}>,
+ *   notes: string[] }}
+ */
+function computeAdvisoryIsolatedPlan({ opts, band, deps = {} }) {
+  const { instanceRegistry, cloneRegistry, instanceRegistryError } = readBothRegistries(deps);
+  const reserved = reservedPorts({ cloneRegistry, instanceRegistry });
+  const notes = [];
+
+  // cinatra-cli#147 (finalization): the REAL isolated install reads the registry
+  // via `requireUsableInstanceRegistry`, which THROWS on a malformed file and
+  // aborts before allocating/touching infra. `readBothRegistries` deliberately
+  // swallows that to `null` (a read-only advisory must never itself throw), so
+  // WITHOUT this the dry-run would silently preview a confident isolated plan the
+  // real install can never reach. REPORT it (the AC4 report-not-throw pattern):
+  // the advisory below was computed with NO existing-instance reservations.
+  if (instanceRegistryError) {
+    notes.push(
+      "the instance registry is unreadable/malformed — the real install would ABORT before allocating " +
+        "(it refuses to run against a malformed registry, to avoid handing out a port an existing instance owns). " +
+        "This advisory used NO existing-instance reservations; repair the registry, then retry.",
+    );
+  }
+
+  // App port: an explicit --app-port is shown AS REQUESTED (a reserved-set
+  // collision is REPORTED — the real install would REJECT it — not thrown);
+  // otherwise auto-allocate the lowest free instance app port. No live socket
+  // probe: the advisory is register-derived + labelled non-authoritative, and
+  // the real run's live-probe/auto-bump is inherently host-specific.
+  let appPort = null;
+  const appPortSource = opts.appPort != null ? "explicit" : "auto";
+  if (opts.appPort != null) {
+    appPort = opts.appPort;
+    if (reserved.has(appPort)) {
+      notes.push(
+        `--app-port ${appPort} collides with the reserved set (default stack / clone band / a live instance) — ` +
+          `the real install would REJECT it; pick a free port.`,
+      );
+    }
+  } else {
+    try {
+      appPort = allocateAppPort({ cloneRegistry, instanceRegistry });
+    } catch (err) {
+      notes.push(`could not auto-allocate an instance app port (${err instanceof Error ? err.message : err}).`);
+    }
+  }
+
+  // Band offset + remapped band: an explicit numeric --port-offset is pinned via
+  // pickFixedOffset; "auto"/omitted allocates the lowest free offset. The chosen
+  // app port is reserved against the band (mirrors the real path's extraReserved)
+  // so no remapped infra port lands on this instance's own app port. A collision
+  // is REPORTED, never thrown (AC4).
+  let offset = null;
+  let remapped = [];
+  const extraReserved = Number.isInteger(appPort) ? appPort : null;
+  try {
+    if (typeof opts.portOffset === "number") {
+      ({ offset, remapped } = pickFixedOffset(band, opts.portOffset, cloneRegistry, instanceRegistry, extraReserved));
+    } else {
+      ({ offset, remapped } = allocateBandOffset({ band, cloneRegistry, instanceRegistry, extraReserved }));
+    }
+  } catch (err) {
+    notes.push(`could not compute a remapped infra band (${err instanceof Error ? err.message : err}).`);
+  }
+
+  return { appPort, appPortSource, offset, remapped, notes };
 }
 
 /** Best-effort isolated Nango health URL from the remapped ports map (the
@@ -4385,11 +4477,30 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     if (pre.infraWillStart && !opts.noInfra) {
       conflicts = await probePorts(DEFAULT_DEV_HOST_PORTS);
     }
+
+    // cinatra-cli#147: the dry-run plan must reflect the SAME isolation/port
+    // intent the real run would EXECUTE for the same flags. Grounded parity
+    // fact: the real run only reaches the isolated path when a conflict is
+    // DETECTED (the post-clone authoritative band probe) — `--on-conflict
+    // isolated` with NO conflict is silently ignored (it falls through to the
+    // default-band install, `--app-port`/`--port-offset` unconsumed). Mirror
+    // that here: an ADVISORY isolated plan is previewed ONLY when a conflict is
+    // detected AND isolation was explicitly requested; otherwise the plan stays
+    // "default" (parity-true — never a fabricated isolated preview). The
+    // computation is read-only + lock-free (no reservation).
+    const isolationRequested = opts.onConflict === "isolated";
+    const advisory =
+      conflicts.length > 0 && isolationRequested && !opts.noInfra
+        ? computeAdvisoryIsolatedPlan({ opts, band: DEFAULT_DEV_HOST_PORTS, deps })
+        : null;
+
     const infraPlanIntent = opts.noInfra
       ? "external"
-      : conflicts.length > 0
-        ? `default (port conflict detected on ${conflicts.map((c) => c.port).join(", ")} — would prompt/resolve)`
-        : "default";
+      : advisory
+        ? "isolated (advisory — not authoritative, no reservation made)"
+        : conflicts.length > 0
+          ? `default (port conflict detected on ${conflicts.map((c) => c.port).join(", ")} — would prompt/resolve)`
+          : "default";
 
     log("");
     log("✓ Dry run — no changes made (no clone, env, infra, or setup).");
@@ -4401,14 +4512,61 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     log(`    Infra plan:    ${infraPlanIntent}`);
     log(`    Project name:  ${isValidSlug(defaultSlug) ? defaultSlug : "(unnamed — would not record)"}`);
     log(`    Compose -p:    ${defaultComposeProject} (explicit; ownership preflight runs at install)`);
-    log(`    App port:      ${DEFAULT_APP_PORT_FOR_RECORD}`);
-    if (conflicts.length > 0) {
-      for (const c of conflicts) {
-        log(`    conflict:      port ${c.port} held — install would prompt for resolution (suggest --on-conflict=isolated).`);
+    if (advisory) {
+      // cinatra-cli#147 AC1: an explicit --on-conflict=isolated + a detected
+      // conflict → PREVIEW the isolation remap the real install would allocate.
+      // ADVISORY: computed from the static default band (no post-clone
+      // authoritative band exists yet) with NO reservation/lock made.
+      log(
+        `    App port:      ${advisory.appPort ?? "(could not allocate — see advisory below)"} ` +
+          `(${advisory.appPortSource === "explicit" ? "requested --app-port" : "auto-allocated"}; advisory — no reservation made)`,
+      );
+      if (advisory.offset != null) {
+        log(
+          `    Band offset:   +${advisory.offset} ` +
+            `(${typeof opts.portOffset === "number" ? "requested --port-offset" : "auto"}; advisory)`,
+        );
+        log("    Remapped band: (advisory — from the static default band; the real band is derived post-clone)");
+        for (const e of advisory.remapped) {
+          const where = e.host === "0.0.0.0" ? `port ${e.port}` : `${e.host}:${e.port}`;
+          log(`      ${e.service}: ${e.port - advisory.offset} → ${where}`);
+        }
       }
-      log(`    Conflicts:     ${conflicts.length} default-band port(s) in use — install would classify the holder and offer a resolution.`);
+      for (const c of conflicts) {
+        log(
+          advisory.offset != null
+            ? `    conflict:      port ${c.port} held — the real install would isolate onto the remapped band above.`
+            : `    conflict:      port ${c.port} held — the real install would isolate (advisory band could not be computed — see advisory below).`,
+        );
+      }
+      for (const n of advisory.notes) {
+        log(`    advisory:      ${n}`);
+      }
+      log(
+        "    (Advisory only: --dry-run makes NO registry reservation and acquires NO alloc lock; " +
+          "the real install re-derives the authoritative band from the checkout's own compose config.)",
+      );
     } else {
-      log("    Conflicts:     none detected on the default band (read-only probe).");
+      log(`    App port:      ${DEFAULT_APP_PORT_FOR_RECORD}`);
+      if (conflicts.length > 0) {
+        for (const c of conflicts) {
+          log(`    conflict:      port ${c.port} held — install would classify the holder and offer a resolution.`);
+        }
+        log(`    Conflicts:     ${conflicts.length} default-band port(s) in use.`);
+        // cinatra-cli#147 AC2: a detected conflict with NO explicit
+        // --on-conflict=isolated → enumerate the SAME resolution choices
+        // runExecuteMenu offers; do NOT compute or assume an isolated allocation.
+        log("    Resolution choices the install would offer:");
+        log("      [i] Isolated      — a second full stack on its own remapped infra + app ports (safe, recommended)");
+        log("      [a] Attach        — converge on the existing checkout instead of a second stack");
+        log("      [s] Stop-existing — stop the holder first (offered when it is a single known Cinatra instance), then install on the default ports");
+        log("      [e] External      — point this install at external Postgres/Redis/Nango (--db-url/--redis-url/…; no local infra)");
+        log("      [c] Co-use        — share the holder's infra (separate DB + queue; offered when the donor build isolates auth cookies per instance)");
+        log("      [x] Abort         — stop and free the ports yourself");
+        log("      (Re-run --dry-run with --on-conflict=isolated [--app-port/--port-offset] to preview the isolation remap.)");
+      } else {
+        log("    Conflicts:     none detected on the default band (read-only probe).");
+      }
     }
     log("  Writability:   validated read-only (no temp probe written).");
     log("  Would write:   the checkout, .env.local (fresh secret), then run infra/install/setup per the plan above.");
@@ -4421,9 +4579,23 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
       sha: resolvedSha,
       mode: opts.mode,
       instance: isValidSlug(defaultSlug) ? defaultSlug : null,
-      infraPlan: opts.noInfra ? "external" : "default",
-      appPort: DEFAULT_APP_PORT_FOR_RECORD,
+      infraPlan: opts.noInfra ? "external" : advisory ? "isolated" : "default",
+      // An advisory plan reports the isolated app port it computed — which may be
+      // `null` when the instance pool is exhausted (the note explains it, and the
+      // real run would THROW there). Never substitute the reserved default 3000
+      // into an isolated advisory (cinatra-cli#147 — parity/field consistency);
+      // 3000 is only the default/non-advisory plan's app port.
+      appPort: advisory ? advisory.appPort : DEFAULT_APP_PORT_FOR_RECORD,
       conflicts: conflicts.map((c) => c.port),
+      ...(advisory
+        ? {
+            advisory: true,
+            appPortSource: advisory.appPortSource,
+            offset: advisory.offset,
+            remappedBand: advisory.remapped,
+            advisoryNotes: advisory.notes,
+          }
+        : {}),
     };
   }
 

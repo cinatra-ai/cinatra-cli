@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `install --dry-run` previews the isolation/port intent the real run would
+  execute: `--on-conflict=isolated` with a detected conflict now shows an
+  advisory app port / band offset / remapped band (matching the real isolated
+  allocation flag-for-flag), a bare conflict lists the resolution choices
+  instead of assuming isolation, and the preview makes no registry reservation
+  and acquires no allocation lock. (#147)
+
 ## [0.1.8] - 2026-07-07
 
 ### Fixed

@@ -579,6 +579,248 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     expect(existsSync(path.join(installDir, "pnpm-workspace.yaml"))).toBe(false);
   });
 
+  // ── cinatra-cli#147 — `--dry-run` must PREVIEW the isolation/port intent the
+  //    real run would execute, flag-for-flag, without any reservation. A conflict
+  //    on the default band is the shared precondition (the real run only reaches
+  //    the isolated path under a detected conflict). ─────────────────────────────
+  const conflictOnDefaultBand = async (band) => {
+    // The ORIGINAL default band conflicts (someone holds postgres 5434); every
+    // remapped band (offset applied) and the app-port probe are FREE. Distinguish
+    // by the postgres host port, exactly like the T8/T8b real-run fixture.
+    const pg = band.find((b) => b.service === "postgres");
+    if (pg && pg.port === 5434) return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+    return [];
+  };
+
+  it("#147 AC1/AC6: --dry-run --on-conflict=isolated (--port-offset auto) previews the SAME app port/offset/remapped band the real isolated run allocates — advisory, writing nothing, no lock", async () => {
+    const installDir = path.join(sandbox, "iso147-parity-auto");
+    const upCalls = [];
+    const logs = [];
+    // (1) DRY-RUN advisory isolated plan (empty registry — reserves nothing).
+    const dry = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--dry-run", "--on-conflict", "isolated", "--instance", "iso147pa", "--port-offset", "auto",
+      ],
+      { log: (m) => logs.push(String(m)), deps: flowDeps({ detectPortConflicts: conflictOnDefaultBand, bringUpInfra: (a) => upCalls.push(a) }) },
+    );
+    expect(dry.dryRun).toBe(true);
+    expect(dry.advisory).toBe(true);
+    expect(dry.infraPlan).toBe("isolated");
+    // AC7: zero infra bring-up, zero writes under the target, zero registry write,
+    // zero alloc.lock — the advisory is purely read-only (the sandboxed paths,
+    // redirected via CINATRA_INSTANCE_REGISTRY / CINATRA_ALLOC_LOCK, never appear).
+    expect(upCalls).toEqual([]);
+    expect(existsSync(regPath)).toBe(false);
+    expect(existsSync(lockPath)).toBe(false);
+    expect(existsSync(path.join(installDir, ".env.local"))).toBe(false);
+    expect(existsSync(path.join(installDir, "pnpm-workspace.yaml"))).toBe(false);
+    // AC1: the plan is labelled advisory and shows an isolation remap, not 3000/default.
+    const out = logs.join("\n");
+    expect(out).toMatch(/Infra plan:\s+isolated \(advisory — not authoritative, no reservation made\)/);
+    expect(out).toMatch(/Remapped band:/);
+    expect(out).not.toMatch(/App port:\s+3000\b/);
+
+    // (2) REAL isolated install, SAME flags + SAME conflict precondition. The
+    //     dry-run reserved nothing, so the registry is STILL empty → the real run
+    //     allocates from the identical starting state (this run is what proves the
+    //     dry-run's non-mutation, and what the advisory is pinned against).
+    const real = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso147pa", "--port-offset", "auto",
+      ],
+      { log: () => {}, deps: flowDeps({ detectPortConflicts: conflictOnDefaultBand }) },
+    );
+    expect(real.infraPlan).toBe("isolated");
+    const row = readInstanceRegistry(regPath).registry.instances.iso147pa;
+    // Flag-for-flag PLAN PARITY: app port + band offset match EXACTLY.
+    expect(dry.appPort).toBe(row.appPort);
+    expect(dry.offset).toBe(row.offset);
+    // Every remapped host port the real run records is present in the advisory
+    // band (the static advisory band is a superset of the fixture's compose band;
+    // the services both bands share agree — the parity contract for AC6).
+    const advByService = {};
+    for (const e of dry.remappedBand) (advByService[e.service] ??= []).push(e.port);
+    for (const svc of Object.keys(row.ports)) {
+      for (const p of row.ports[svc]) expect(advByService[svc] ?? []).toContain(p);
+    }
+  });
+
+  it("#147 AC1/AC6: --dry-run --on-conflict=isolated with EXPLICIT --app-port + fixed --port-offset matches the real isolated allocation", async () => {
+    const installDir = path.join(sandbox, "iso147-parity-fixed");
+    const flags = [
+      "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+      "--on-conflict", "isolated", "--instance", "iso147pf", "--app-port", "3350", "--port-offset", "20000",
+    ];
+    const dry = await runInstall(
+      [...flags, "--yes", "--dry-run"],
+      { log: () => {}, deps: flowDeps({ detectPortConflicts: conflictOnDefaultBand }) },
+    );
+    expect(dry.advisory).toBe(true);
+    expect(dry.appPort).toBe(3350);
+    expect(dry.offset).toBe(20000);
+    expect(existsSync(regPath)).toBe(false);
+    expect(existsSync(lockPath)).toBe(false);
+
+    const real = await runInstall(
+      [...flags, "--yes", "--no-install"],
+      { log: () => {}, deps: flowDeps({ detectPortConflicts: conflictOnDefaultBand }) },
+    );
+    expect(real.infraPlan).toBe("isolated");
+    const row = readInstanceRegistry(regPath).registry.instances.iso147pf;
+    expect(dry.appPort).toBe(row.appPort);
+    expect(dry.offset).toBe(row.offset);
+    const advByService = {};
+    for (const e of dry.remappedBand) (advByService[e.service] ??= []).push(e.port);
+    for (const svc of Object.keys(row.ports)) {
+      for (const p of row.ports[svc]) expect(advByService[svc] ?? []).toContain(p);
+    }
+  });
+
+  it("#147 AC2: a bare --dry-run conflict with NO --on-conflict lists the resolution choices and does NOT assume/compute isolation", async () => {
+    const installDir = path.join(sandbox, "iso147-bare");
+    const logs = [];
+    const res = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--dry-run"],
+      { log: (m) => logs.push(String(m)), deps: flowDeps({ detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }] }) },
+    );
+    expect(res.dryRun).toBe(true);
+    expect(res.advisory).toBeUndefined(); // NOT an isolated advisory
+    expect(res.infraPlan).toBe("default");
+    const out = logs.join("\n");
+    // Mirrors runExecuteMenu's option set (isolated/attach/stop/external/co-use/abort).
+    expect(out).toMatch(/Resolution choices the install would offer/);
+    expect(out).toMatch(/\[i\] Isolated/);
+    expect(out).toMatch(/\[a\] Attach/);
+    expect(out).toMatch(/\[s\] Stop-existing/);
+    expect(out).toMatch(/\[e\] External/);
+    expect(out).toMatch(/\[c\] Co-use/);
+    expect(out).toMatch(/\[x\] Abort/);
+    // No fabricated isolated remap.
+    expect(out).not.toMatch(/Remapped band:/);
+    expect(out).not.toMatch(/isolated \(advisory/);
+  });
+
+  it("#147 AC2: --dry-run with a value OTHER THAN isolated (--on-conflict attach) also lists choices, never an isolated allocation", async () => {
+    const installDir = path.join(sandbox, "iso147-attach");
+    const logs = [];
+    const res = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--dry-run", "--on-conflict", "attach"],
+      { log: (m) => logs.push(String(m)), deps: flowDeps({ detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }] }) },
+    );
+    expect(res.advisory).toBeUndefined();
+    expect(res.infraPlan).toBe("default");
+    const out = logs.join("\n");
+    expect(out).toMatch(/Resolution choices the install would offer/);
+    expect(out).not.toMatch(/Remapped band:/);
+  });
+
+  it("#147 AC6: --dry-run --on-conflict=isolated with NO conflict stays plan 'default' (parity-true — the real run ignores isolation without a conflict)", async () => {
+    const installDir = path.join(sandbox, "iso147-noconf");
+    const logs = [];
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--dry-run", "--on-conflict", "isolated", "--app-port", "3400", "--port-offset", "auto",
+      ],
+      { log: (m) => logs.push(String(m)), deps: flowDeps({ detectPortConflicts: async () => [] }) },
+    );
+    expect(res.dryRun).toBe(true);
+    expect(res.advisory).toBeUndefined();
+    expect(res.infraPlan).toBe("default");
+    expect(res.appPort).toBe(3000);
+    const out = logs.join("\n");
+    expect(out).toMatch(/Infra plan:\s+default\b/);
+    expect(out).not.toMatch(/isolated \(advisory/);
+    expect(existsSync(regPath)).toBe(false);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("#147 AC4: an advisory --app-port that collides with the RESERVED set is REPORTED, not thrown", async () => {
+    const installDir = path.join(sandbox, "iso147-reserved");
+    const logs = [];
+    // --app-port 3000 is the DEFAULT stack app port → reserved. Under --dry-run it
+    // must be REPORTED (the real install would reject it), and the band remap is
+    // still previewed (report-not-throw).
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--dry-run", "--on-conflict", "isolated", "--app-port", "3000", "--port-offset", "auto",
+      ],
+      { log: (m) => logs.push(String(m)), deps: flowDeps({ detectPortConflicts: conflictOnDefaultBand }) },
+    );
+    expect(res.dryRun).toBe(true);
+    expect(res.advisory).toBe(true);
+    expect(res.offset).toBe(10000); // the band was still computed (not thrown)
+    const out = logs.join("\n");
+    expect(out).toMatch(/--app-port 3000 collides with the reserved set/);
+    expect(existsSync(regPath)).toBe(false);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("#147 AC4: when the instance app-port pool is EXHAUSTED, the advisory reports appPort null (never the reserved default 3000) and does not throw", async () => {
+    // Codex-review edge case: the auto app-port allocator throws when 3300-3399 is
+    // fully reserved. The advisory must REPORT that (appPort null + a note), not
+    // substitute the reserved default 3000 into an isolated plan (parity/field
+    // consistency) and not throw.
+    const installDir = path.join(sandbox, "iso147-exhausted");
+    const fullPool = { version: 1, instances: {} };
+    for (let p = 3300; p <= 3399; p += 1) fullPool.instances[`pool${p}`] = { appPort: p, ports: {} };
+    const logs = [];
+    const res = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--dry-run", "--on-conflict", "isolated"],
+      { log: (m) => logs.push(String(m)), deps: flowDeps({ detectPortConflicts: conflictOnDefaultBand, readInstanceRegistry: () => fullPool }) },
+    );
+    expect(res.dryRun).toBe(true);
+    expect(res.advisory).toBe(true);
+    expect(res.infraPlan).toBe("isolated");
+    expect(res.appPort).toBeNull(); // NOT 3000
+    expect(res.advisoryNotes.some((n) => /could not auto-allocate an instance app port/.test(n))).toBe(true);
+    // The band was still computed (app-port failure does not block it).
+    expect(res.offset).toBe(10000);
+    const out = logs.join("\n");
+    expect(out).toMatch(/App port:\s+\(could not allocate — see advisory below\)/);
+  });
+
+  it("#147 AC4: a MALFORMED instance registry is REPORTED in the advisory (the real install would abort there) — never a silent confident plan, never a throw", async () => {
+    // Parity gap: the real isolated path reads the registry via the THROWING
+    // `requireUsableInstanceRegistry` (aborts before allocating on a malformed
+    // file); the dry-run advisory reads via the swallowing `readBothRegistries`.
+    // Without surfacing it, the preview would print a confident isolated plan the
+    // real install can never reach. The advisory must REPORT it (report-not-throw)
+    // and still not throw.
+    const installDir = path.join(sandbox, "iso147-malformed-reg");
+    const logs = [];
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--dry-run", "--on-conflict", "isolated", "--app-port", "3401", "--port-offset", "10000",
+      ],
+      {
+        log: (m) => logs.push(String(m)),
+        deps: flowDeps({
+          detectPortConflicts: conflictOnDefaultBand,
+          // Mirror the throwing reader `requireUsableInstanceRegistry` produces on
+          // a malformed file (what the real isolated path calls, unguarded).
+          readInstanceRegistry: () => {
+            throw new Error("Instance registry at <path> is malformed and was NOT modified.");
+          },
+        }),
+      },
+    );
+    expect(res.dryRun).toBe(true);
+    expect(res.advisory).toBe(true);
+    // Reported via the same `advisoryNotes` channel AC4 uses — not thrown.
+    expect(res.advisoryNotes.some((n) => /instance registry is unreadable\/malformed/.test(n))).toBe(true);
+    const out = logs.join("\n");
+    expect(out).toMatch(/instance registry is unreadable\/malformed/);
+    expect(out).toMatch(/the real install would ABORT before allocating/);
+    // No reservation/lock even on the error path.
+    expect(existsSync(regPath)).toBe(false);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
   it("T8/T8b: --on-conflict=isolated brings up a remapped second stack + records it", async () => {
     const installDir = path.join(sandbox, "iso");
     const upCalls = [];
