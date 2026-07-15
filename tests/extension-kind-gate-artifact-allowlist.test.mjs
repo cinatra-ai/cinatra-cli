@@ -79,3 +79,39 @@ describe("scaffolded artifact — copied gate honors the seven-key cinatra allow
     expect(errors).toContain(unexpectedKeyError("bogus"));
   });
 });
+
+// cinatra#1621/#1622 (artifact-ui S3): the COPIED gate ADMITS a versioned
+// `cinatra.artifact.ui` renderer block (nested in the descriptor) and shallow
+// pre-screens it, so an M1 renderer PR no longer red-fails on its own repo's
+// standalone kind-gate. The authoritative derived validation (closed slot enum /
+// exact abiVersion / generated sdkAbiRange) is the reusable conformance gate's
+// job — proven ADMITTED here, exercised through the real scaffold copy path.
+describe("scaffolded artifact — copied gate admits + shape-screens cinatra.artifact.ui", () => {
+  const uiOK = {
+    abiVersion: 1,
+    sdkAbiRange: "^2.4.0",
+    renderers: { detail: { entry: "./src/renderers/detail.tsx", propsApiVersion: 1 } },
+  };
+
+  it("an otherwise-valid manifest carrying a well-formed cinatra.artifact.ui passes", () => {
+    const { kind, errors } = runWithCinatra((c) => {
+      c.artifact.ui = JSON.parse(JSON.stringify(uiOK));
+    });
+    expect(kind).toBe("artifact");
+    expect(errors).toEqual([]);
+  });
+
+  it("a ui renderer with an uncontained entry fails the copied gate's shape screen", () => {
+    const { errors } = runWithCinatra((c) => {
+      c.artifact.ui = { abiVersion: 1, sdkAbiRange: "^2.4.0", renderers: { detail: { entry: "../evil.tsx", propsApiVersion: 1 } } };
+    });
+    expect(errors.join("|")).toContain("path-contained subpath");
+  });
+
+  it("a ui renderer requesting a host port (extra key) fails the v1 NO-PORTS rule", () => {
+    const { errors } = runWithCinatra((c) => {
+      c.artifact.ui = { abiVersion: 1, sdkAbiRange: "^2.4.0", renderers: { detail: { entry: "./src/d.tsx", propsApiVersion: 1, ports: ["settings"] } } };
+    });
+    expect(errors.join("|")).toContain("NO host ports");
+  });
+});
