@@ -6,6 +6,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Removed
+
+- `create-extension` no longer offers the `workflow` kind — the workflow
+  extension kind is retired. The scaffolder now supports exactly four kinds
+  (`agent`, `connector`, `artifact`, `skill`); requesting `workflow` is a usage
+  error, and the `templates/workflow/` scaffold tree has been deleted.
+
 ### Fixed
 
 - `install --mode prod` now provisions AND validates the full hard-required

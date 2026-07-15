@@ -518,11 +518,11 @@ Commands:
                     --json            Emit the installed set as JSON.
 
   create-extension  Scaffold a new Cinatra extension package on disk, ready to
-                    author + publish. One of five kinds: agent, connector,
-                    artifact, skill, workflow. Zero-dependency, offline; the
+                    author + publish. One of four kinds: agent, connector,
+                    artifact, skill. Zero-dependency, offline; the
                     generated repo pins @cinatra-ai/sdk-extensions as an
                     OPTIONAL peer (never installed by this command).
-                    <kind>            agent | connector | artifact | skill | workflow.
+                    <kind>            agent | connector | artifact | skill.
                     [name]            Extension name; the \`-<kind>\` (or \`-skills\`)
                                       suffix is appended if absent. Prompted on a TTY.
                     --scope <scope>   npm scope (default: cinatra-ai; connectors may
@@ -863,7 +863,6 @@ non-fatal and only reported).`,
   connector   A capability/MCP provider with a register(ctx) server entry (any scope).
   artifact    A semantic-artifact descriptor (first-party scope).
   skill       A pure-content SKILL.md package (first-party or vendored scope).
-  workflow    A Cinatra BPMN Profile sidecar + optional dashboard (first-party scope).
 
 Options:
   --scope <scope>          npm scope (default: cinatra-ai)

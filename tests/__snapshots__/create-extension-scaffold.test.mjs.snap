@@ -84,25 +84,3 @@ exports[`create-extension scaffolds a valid skill > matches the golden generated
   "tsconfig.json",
 ]
 `;
-
-exports[`create-extension scaffolds a valid workflow > matches the golden generated file list 1`] = `
-[
-  ".gitattributes",
-  ".github/workflows/actions-pinned-gate.yml",
-  ".github/workflows/ci.yml",
-  ".github/workflows/gitignore-gate.yml",
-  ".github/workflows/release.yml",
-  ".github/workflows/source-leak-gate.yml",
-  ".gitignore",
-  ".npmrc",
-  "LICENSE",
-  "README.md",
-  "cinatra/dashboard.json",
-  "cinatra/workflow.bpmn",
-  "extension-kind-gate.mjs",
-  "package.json",
-  "renovate.json",
-  "src/index.ts",
-  "tsconfig.json",
-]
-`;

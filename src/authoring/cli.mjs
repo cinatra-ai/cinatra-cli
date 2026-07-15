@@ -9,7 +9,7 @@
 //
 //   cinatra create-extension <kind> [name] [options]
 //
-// <kind>  one of: agent | connector | artifact | skill | workflow
+// <kind>  one of: agent | connector | artifact | skill
 // [name]  the extension name; the `-<kind>` (or `-skills`) suffix is appended
 //         automatically if absent. Prompted for when omitted on a TTY.
 //
