@@ -21,7 +21,7 @@ function packlist() {
   return JSON.parse(out)[0].files.map((f) => f.path);
 }
 
-const KINDS = ["agent", "connector", "artifact", "skill", "workflow"];
+const KINDS = ["agent", "connector", "artifact", "skill"];
 
 describe("@cinatra-ai/cinatra tarball ships the create-extension authoring assets", () => {
   const files = packlist();

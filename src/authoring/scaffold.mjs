@@ -27,12 +27,11 @@ export const TEMPLATES_ROOT = join(REPO_ROOT, "templates");
 
 /** Kinds that ship the self-contained extension-kind-gate.mjs.
  *
- * ALL FIVE kinds ship it (cinatra-cli#72 / hot-install): the shared gate now
+ * ALL FOUR kinds ship it (cinatra-cli#72 / hot-install): the shared gate now
  * runs the COMMON cross-kind rules (manifest shape, host ports, sdkAbiRange,
  * @/ + SDK-only import bans, host-peer value-import ban, README/license,
  * serverEntry preflight, schema-config) PLUS the kind-specific gate — so every
- * scaffolded repo catches what the install pipeline rejects BEFORE publishing,
- * not just agent + workflow. (Previously agent/workflow only.) */
+ * scaffolded repo catches what the install pipeline rejects BEFORE publishing. */
 const KINDS_WITH_GATE = new Set(EXTENSION_KINDS);
 
 /** Titleize a slug base, e.g. "web-research" → "Web Research". */
@@ -158,8 +157,8 @@ export function scaffold(opts) {
 
   const written = renderTree(srcDir, targetDir, vars);
 
-  // agent + workflow kinds ship the shared self-contained kind gate (verbatim,
-  // not a template — it carries no placeholders).
+  // All kinds ship the shared self-contained kind gate (verbatim, not a
+  // template — it carries no placeholders).
   if (KINDS_WITH_GATE.has(kind)) {
     const gateSrc = join(TEMPLATES_ROOT, "_shared", "extension-kind-gate.mjs");
     const gateDest = join(targetDir, "extension-kind-gate.mjs");

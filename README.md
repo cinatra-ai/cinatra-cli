@@ -110,8 +110,8 @@ it, because setup can write to that database).
 
 ## Author an extension
 
-Scaffold a ready-to-author, ready-to-publish extension package — one of five
-kinds (`agent`, `connector`, `artifact`, `skill`, `workflow`):
+Scaffold a ready-to-author, ready-to-publish extension package — one of four
+kinds (`agent`, `connector`, `artifact`, `skill`):
 
     cinatra create-extension agent invoice-extractor
 
@@ -131,7 +131,6 @@ templates/        Scaffold templates for each extension kind
   artifact/
   connector/
   skill/
-  workflow/
   _shared/        Shared files copied into every generated extension
 tests/            Vitest test suite
 ```

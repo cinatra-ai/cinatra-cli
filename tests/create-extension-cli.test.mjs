@@ -44,7 +44,7 @@ function run(args, opts = {}) {
 }
 
 describe("cinatra create-extension <kind> [name] --yes scaffolds on disk", () => {
-  it.each(["agent", "connector", "artifact", "skill", "workflow"])(
+  it.each(["agent", "connector", "artifact", "skill"])(
     "scaffolds a %s into the cwd and exits 0",
     (kind) => {
       const name = `cli-${kind === "skill" ? "tools" : "thing"}`;
@@ -89,6 +89,19 @@ describe("cinatra create-extension typed exit codes", () => {
     expect(readdirSync(workdir)).toEqual([]);
   });
 
+  it("rejects the retired `workflow` kind with a clear usage error and scaffolds nothing", () => {
+    // The workflow extension kind is retired: it is no longer a create-extension
+    // target, so `workflow` is now an unknown kind and must be rejected exactly
+    // like any other bad kind — exit 2, a clear message, and no scaffold on disk.
+    const res = run(["create-extension", "workflow", "x", "--yes"]);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/kind must be one of/i);
+    // The allowed-kinds list surfaced in the error must NOT re-admit workflow.
+    expect(res.stderr).toMatch(/agent, connector, artifact, skill/);
+    expect(res.stderr).not.toMatch(/one of:[^(]*workflow/);
+    expect(readdirSync(workdir)).toEqual([]);
+  });
+
   it("exits 2 on a missing name in non-interactive mode", () => {
     const res = run(["create-extension", "agent", "--yes"]);
     expect(res.status).toBe(2);
@@ -118,9 +131,11 @@ describe("cinatra create-extension --help (footgun guard)", () => {
     const res = run(["create-extension", "--help"]);
     expect(res.status).toBe(0);
     expect(res.stdout).toContain("Kinds:");
-    for (const kind of ["agent", "connector", "artifact", "skill", "workflow"]) {
+    for (const kind of ["agent", "connector", "artifact", "skill"]) {
       expect(res.stdout, `--help should list the "${kind}" kind`).toContain(kind);
     }
+    // The retired `workflow` kind must NOT appear in the kinds surface.
+    expect(res.stdout, "--help must not list the retired workflow kind").not.toContain("workflow");
     expect(res.stdout).toContain("--scope");
   });
 

@@ -1,15 +1,15 @@
 // Kind catalog + naming/scope policy.
 //
 // Mirrors the public Cinatra extension contracts:
-//   - EXTENSION_KINDS           — the five extension kinds.
+//   - EXTENSION_KINDS           — the four extension kinds.
 //   - KIND_SCOPE_POLICY         — which npm scopes each kind may use.
 //   - FORBIDDEN_TOPOLOGY_TOKENS — agent slugs may not name orchestrator topology.
 //
 // Kept as a single source of truth so the CLI validates a name exactly the way
 // the marketplace naming gate will. No network, no @cinatra-ai dependency.
 
-/** The five extension kinds. `cinatra.kind` is always one of these. */
-export const EXTENSION_KINDS = ["agent", "connector", "artifact", "skill", "workflow"];
+/** The four extension kinds. `cinatra.kind` is always one of these. */
+export const EXTENSION_KINDS = ["agent", "connector", "artifact", "skill"];
 
 /** The first-party npm scope. Most kinds are first-party-only. */
 export const FIRST_PARTY_SCOPE = "@cinatra-ai";
@@ -28,7 +28,6 @@ export const KIND_SCOPE_POLICY = {
   connector: "any-scope",
   artifact: "first-party-only",
   skill: "first-party-plus-vendored",
-  workflow: "first-party-only",
 };
 
 /** Vendored scopes a `kind:"skill"` package may use. */

@@ -1,13 +1,13 @@
 // `cinatra create-extension <kind>` scaffold parity + correctness (cinatra#402).
 //
 // `cinatra create-extension` scaffold parity + correctness: scaffold each of
-// the five kinds via the SHARED authoring core (the same code path the
+// the four kinds via the SHARED authoring core (the same code path the
 // `cinatra create-extension` command drives) and assert the SDK-P1-equivalent
 // local invariants per kind —
 //   - manifest shape (cinatra.apiVersion/kind, license, semver),
 //   - first-party dep shape (no leaked @cinatra-ai deps; SDK is an optional peer),
 //   - README gate shape (one H1; allowed/ordered H2; no H3+),
-//   - the self-contained kind gate (agent/workflow) returns clean,
+//   - the self-contained kind gate returns clean,
 //   - the npm pack packlist of the GENERATED repo leaks no non-distributable path.
 //
 // Plus two fold-specific guards Codex asked for:
@@ -29,7 +29,7 @@ import { scaffold, REPO_ROOT } from "../src/authoring/scaffold.mjs";
 import { runGate } from "../templates/_shared/extension-kind-gate.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const KINDS = ["agent", "connector", "artifact", "skill", "workflow"];
+const KINDS = ["agent", "connector", "artifact", "skill"];
 
 // README gate: exactly one H1; optional "## Works with" must precede the
 // required "## Capabilities"; no other H2; no H3+.
@@ -156,9 +156,9 @@ describe.each(KINDS)("create-extension scaffolds a valid %s", (kind) => {
     errors.push(...validateDepShape(pkg));
     errors.push(...validateReadme(readFileSync(join(dir, "README.md"), "utf8")));
 
-    // ALL FIVE kinds now ship the self-contained gate (cinatra-cli#72): the
+    // ALL FOUR kinds now ship the self-contained gate (cinatra-cli#72): the
     // common cross-kind rules + the per-kind gate catch what the install
-    // pipeline rejects, before publish — not just agent + workflow.
+    // pipeline rejects, before publish.
     expect(existsSync(join(dir, "extension-kind-gate.mjs")), `${kind} must ship extension-kind-gate.mjs`).toBe(true);
     const gate = runGate(dir);
     for (const e of gate.errors) errors.push(`kind-gate: ${e}`);

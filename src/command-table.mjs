@@ -156,7 +156,7 @@ export const COMMAND_DESCRIPTORS = [
     id: "create-extension",
     path: ["create-extension"],
     match: "command",
-    summary: "Scaffold a new Cinatra extension package on disk (agent|connector|artifact|skill|workflow).",
+    summary: "Scaffold a new Cinatra extension package on disk (agent|connector|artifact|skill).",
   },
   {
     id: "mcp.tunnel",
