@@ -5102,15 +5102,15 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
       // deliberate "second stack alongside" ask: skip the guard AND withhold
       // the self-exemption below, so the self-held ports surface as conflicts
       // and the normal conflict->isolated resolution allocates the remapped
-      // second instance the flag promises (codex r2: the guard must never
-      // dead-end its own remediation advice).
+      // second instance the flag promises — the guard must never dead-end its
+      // own remediation advice.
       const isolatedSecondRequested =
         opts.onConflict === "isolated" && ownership.ports.size > 0 && foreignSelfProjects.length > 0;
 
       // Probe FIRST (self-exempted): a STRANGER holding a not-yet-published
       // service's port must keep surfacing through the existing conflict
-      // resolution even when this checkout is also a live self-instance
-      // (codex r3: the legacy guard must never skip the authoritative gate).
+      // resolution even when this checkout is also a live self-instance —
+      // the legacy guard never skips the authoritative gate.
       const conflicts = await probePorts(band, { ownedPorts: isolatedSecondRequested ? new Set() : ownedPorts });
 
       if (conflicts.length === 0 && ownership.ports.size > 0 && foreignSelfProjects.length > 0 && !isolatedSecondRequested) {
