@@ -4,9 +4,19 @@
 
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
-import { existsSync, copyFileSync, chmodSync } from "node:fs";
+import { existsSync, copyFileSync, chmodSync, readFileSync, writeFileSync } from "node:fs";
 
-import { EXTENSION_KINDS, DEFAULT_SCOPE, SDK_EXTENSIONS_PIN, SDK_ABI_RANGE } from "./kinds.mjs";
+import {
+  EXTENSION_KINDS,
+  DEFAULT_SCOPE,
+  SDK_EXTENSIONS_PIN,
+  SDK_ABI_RANGE,
+  ARTIFACT_UI_ABI_VERSION,
+  ARTIFACT_UI_SDK_ABI_RANGE,
+  ARTIFACT_RENDERER_PROPS_API_VERSION,
+  REACT_PEER_RANGE,
+  REACT_TYPES_RANGE,
+} from "./kinds.mjs";
 import {
   normalizeScope,
   deriveSlug,
@@ -64,12 +74,31 @@ export function pascalCase(base) {
  * Resolve and validate all inputs. Returns { ok, errors, vars, kind, slug,
  * scope, packageName, targetDir } — `vars` is the substitution map.
  */
-export function resolveInputs({ kind, name, scope, displayName, description, targetParent }) {
+export function resolveInputs({
+  kind,
+  name,
+  scope,
+  displayName,
+  description,
+  targetParent,
+  withUi = false,
+  withRegistryItems = false,
+}) {
   const errors = [];
   if (!EXTENSION_KINDS.includes(kind)) {
     errors.push(`unknown kind "${kind}" — expected one of: ${EXTENSION_KINDS.join(", ")}`);
     return { ok: false, errors };
   }
+  // The opt-in renderer/registry template is an artifact-kind-only surface.
+  if ((withUi || withRegistryItems) && kind !== "artifact") {
+    errors.push(
+      `--with-ui / --with-registry-items apply only to kind "artifact" (a renderer/registry-item block lives in cinatra.artifact.ui); got kind "${kind}"`,
+    );
+  }
+  if (withRegistryItems && !withUi) {
+    errors.push("--with-registry-items requires --with-ui (registryItems is declared inside cinatra.artifact.ui)");
+  }
+  if (errors.length) return { ok: false, errors, kind };
   const slug = deriveSlug(name, kind);
   if (!slug) errors.push("name is required");
   const bareScope = normalizeScope(scope) || DEFAULT_SCOPE;
@@ -134,7 +163,19 @@ export function resolveInputs({ kind, name, scope, displayName, description, tar
   };
 
   const targetDir = join(targetParent || process.cwd(), slug);
-  return { ok: true, errors: [], vars, kind, slug, scope: bareScope, packageName: pkgName, targetDir, base };
+  return {
+    ok: true,
+    errors: [],
+    vars,
+    kind,
+    slug,
+    scope: bareScope,
+    packageName: pkgName,
+    targetDir,
+    base,
+    withUi: Boolean(withUi),
+    withRegistryItems: Boolean(withRegistryItems),
+  };
 }
 
 /**
@@ -157,6 +198,15 @@ export function scaffold(opts) {
 
   const written = renderTree(srcDir, targetDir, vars);
 
+  // Opt-in artifact `ui` template (cinatra#1627 AC3): overlay the RSC renderer
+  // stub + vendored-primitives seed (+ registry-item seed) and patch the
+  // rendered package.json / README with the `cinatra.artifact.ui` manifest,
+  // exports subpath(s), and the React toolchain delta. Applied BEFORE the gate
+  // copy so the gate lands last (it is not part of the ui overlay).
+  if (r.withUi) {
+    written.push(...applyArtifactUiOverlay(targetDir, vars, { withRegistryItems: r.withRegistryItems }));
+  }
+
   // All kinds ship the shared self-contained kind gate (verbatim, not a
   // template — it carries no placeholders).
   if (KINDS_WITH_GATE.has(kind)) {
@@ -166,8 +216,99 @@ export function scaffold(opts) {
     written.push("extension-kind-gate.mjs");
   }
 
-  written.sort();
-  return { targetDir, written, packageName: r.packageName, kind, slug: r.slug, vars };
+  // Deduplicate (the ui overlay may re-render a path already present) + sort.
+  const uniqueWritten = [...new Set(written)].sort();
+  return {
+    targetDir,
+    written: uniqueWritten,
+    packageName: r.packageName,
+    kind,
+    slug: r.slug,
+    vars,
+    withUi: r.withUi,
+    withRegistryItems: r.withRegistryItems,
+  };
+}
+
+/**
+ * Apply the opt-in artifact `ui` overlay onto an already-rendered artifact repo:
+ * render the renderer stub + vendored-primitives seed (+ optional registry-item
+ * seed), then patch the rendered package.json (the `cinatra.artifact.ui`
+ * manifest, the `exports` subpath map, and the React toolchain delta) and the
+ * README (a discoverability bullet). Returns the list of paths written/patched
+ * (relative to targetDir). Kept pure of CLI concerns so tests call it directly.
+ */
+export function applyArtifactUiOverlay(targetDir, vars, { withRegistryItems = false } = {}) {
+  const touched = [];
+
+  // 1. Overlay the ui delta FILES (renderer stub + vendored-primitives seed).
+  const uiOverlay = join(TEMPLATES_ROOT, "_artifact-ui");
+  touched.push(...renderTree(uiOverlay, targetDir, vars));
+  if (withRegistryItems) {
+    const regOverlay = join(TEMPLATES_ROOT, "_artifact-registry");
+    touched.push(...renderTree(regOverlay, targetDir, vars));
+  }
+
+  // 2. Patch the rendered package.json — the ui manifest, exports, toolchain.
+  const pkgPath = join(targetDir, "package.json");
+  const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+
+  // exports subpath(s) — a stable import for the renderer (and registry item).
+  const exportsMap = { ".": "./src/index.ts", "./renderers/detail": "./src/renderers/detail.tsx" };
+  if (withRegistryItems) exportsMap["./registry/sample-tile"] = "./src/registry/sample-tile.tsx";
+  pkg.exports = exportsMap;
+
+  // React toolchain delta — optional host peers (external at bundle time) + dev
+  // deps for local authoring/typecheck. Never @cinatra-ai, so no first-party rule.
+  pkg.peerDependencies = { ...(pkg.peerDependencies || {}), react: REACT_PEER_RANGE, "react-dom": REACT_PEER_RANGE };
+  pkg.peerDependenciesMeta = {
+    ...(pkg.peerDependenciesMeta || {}),
+    react: { optional: true },
+    "react-dom": { optional: true },
+  };
+  pkg.devDependencies = {
+    ...(pkg.devDependencies || {}),
+    react: REACT_PEER_RANGE,
+    "react-dom": REACT_PEER_RANGE,
+    "@types/react": REACT_TYPES_RANGE,
+    "@types/react-dom": REACT_TYPES_RANGE,
+  };
+
+  // The versioned cinatra.artifact.ui block: a `detail`-slot renderer (+ optional
+  // registryItems). The `entry` files are shipped by `files: ["src", …]`.
+  const ui = {
+    abiVersion: ARTIFACT_UI_ABI_VERSION,
+    sdkAbiRange: ARTIFACT_UI_SDK_ABI_RANGE,
+    renderers: {
+      detail: { entry: "./src/renderers/detail.tsx", propsApiVersion: ARTIFACT_RENDERER_PROPS_API_VERSION },
+    },
+  };
+  if (withRegistryItems) {
+    ui.registryItems = [
+      {
+        name: "sample-tile",
+        entry: "./src/registry/sample-tile.tsx",
+        type: "registry:ui",
+        description: "A presentational sample tile — replace with your own primitive.",
+      },
+    ];
+  }
+  pkg.cinatra.artifact.ui = ui;
+
+  writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`);
+  touched.push("package.json");
+
+  // 3. README discoverability bullet (stays under the gate-allowed "## Capabilities"
+  // H2 — the last section — so the one-H1 / allowed-H2 README contract holds).
+  const readmePath = join(targetDir, "README.md");
+  let readme = readFileSync(readmePath, "utf8");
+  if (!readme.endsWith("\n")) readme += "\n";
+  readme +=
+    "- Renders its own detail view (an RSC renderer under `src/renderers/`, wired via `cinatra.artifact.ui`)\n";
+  writeFileSync(readmePath, readme);
+  touched.push("README.md");
+
+  return touched;
 }
 
 export { EXTENSION_KINDS };
