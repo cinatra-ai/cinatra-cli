@@ -861,13 +861,43 @@ export function ownedPortsFromInspect(inspectRows, expectDir) {
   return owned;
 }
 
-/** The host ports THIS target's OWN running compose containers publish, proven
- *  by the compose `working_dir` label (not a basename-collision project). Lists
- *  the project's container ids (cwd-scoped `compose ps -q`), inspects them, and
- *  keeps only ports whose container is rooted at `targetDir`. Empty set on any
+/** Ownership snapshot from raw `docker inspect` rows: the host-port KEYS and
+ *  the compose PROJECT names of containers PROVEN rooted at `expectDir` (the
+ *  compose `working_dir` label — never a basename-collision project). The
+ *  project set is what lets callers tell "this checkout's stack under the
+ *  project we would target (idempotent re-run)" apart from "this checkout's
+ *  stack under a LEGACY project name" (#159 — a pre-explicit `-p` install). */
+export function ownershipFromInspect(inspectRows, expectDir) {
+  const ports = new Set();
+  const projects = new Set();
+  if (!Array.isArray(inspectRows) || !expectDir) return { ports, projects };
+  const want = String(expectDir);
+  for (const row of inspectRows) {
+    const labels = row?.Config?.Labels ?? {};
+    if (labels["com.docker.compose.project.working_dir"] !== want) continue;
+    const project = labels["com.docker.compose.project"];
+    if (typeof project === "string" && project) projects.add(project);
+    const portMap = row?.NetworkSettings?.Ports ?? {};
+    for (const [spec, bindings] of Object.entries(portMap)) {
+      if (!/\/tcp$/i.test(spec)) continue;
+      for (const b of Array.isArray(bindings) ? bindings : []) {
+        const hp = Number.parseInt(String(b?.HostPort ?? ""), 10);
+        if (!Number.isFinite(hp) || hp <= 0) continue;
+        ports.add(hostPortKey(b?.HostIp, hp));
+      }
+    }
+  }
+  return { ports, projects };
+}
+
+/** The full ownership snapshot ({ports, projects}) for THIS target's OWN
+ *  running compose containers, proven by the compose `working_dir` label.
+ *  Lists the project's container ids (cwd-scoped `compose ps -q`), inspects
+ *  them, and keeps only containers rooted at `targetDir`. Empty sets on any
  *  error (fail-safe: a missed exemption only re-surfaces the real bind error,
  *  it never wrongly suppresses a stranger's conflict). */
-function targetComposeOwnedPorts(targetDir, deps = {}) {
+function targetComposeOwnership(targetDir, deps = {}) {
+  const empty = { ports: new Set(), projects: new Set() };
   const cap = deps.capture ?? capture;
   const ids = cap(
     "docker",
@@ -875,16 +905,23 @@ function targetComposeOwnedPorts(targetDir, deps = {}) {
     { cwd: targetDir },
   );
   const idList = (ids ?? "").split("\n").map((s) => s.trim()).filter(Boolean);
-  if (idList.length === 0) return new Set();
+  if (idList.length === 0) return empty;
   const raw = cap("docker", ["inspect", ...idList]);
-  if (!raw) return new Set();
+  if (!raw) return empty;
   let rows;
   try {
     rows = JSON.parse(raw);
   } catch {
-    return new Set();
+    return empty;
   }
-  return ownedPortsFromInspect(rows, path.resolve(targetDir));
+  return ownershipFromInspect(rows, path.resolve(targetDir));
+}
+
+/** The host ports THIS target's OWN running compose containers publish (see
+ *  targetComposeOwnership — this is its ports slice, kept for existing
+ *  callers/seams; behavior unchanged). */
+function targetComposeOwnedPorts(targetDir, deps = {}) {
+  return targetComposeOwnership(targetDir, deps).ports;
 }
 
 /** Detect host-port conflicts for the dev band. `band` is `[{service,host,port}]`
@@ -4612,7 +4649,14 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   const dockerPresent = deps.commandExists ?? ((c, a) => commandExists(c, a));
   const composeOk = deps.composeAvailable ?? composeAvailable;
   const deriveBand = deps.composePublishedPortsForTarget ?? composePublishedPortsForTarget;
-  const deriveOwnedPorts = deps.targetComposeOwnedPorts ?? targetComposeOwnedPorts;
+  const resolveOwnership = (dir) =>
+    deps.targetComposeOwnership
+      ? deps.targetComposeOwnership(dir, deps)
+      : deps.targetComposeOwnedPorts
+        // Back-compat: a legacy ports-only seam still exempts its ports; an
+        // empty projects set means the legacy-mismatch guard never fires from it.
+        ? { ports: deps.targetComposeOwnedPorts(dir), projects: new Set() }
+        : targetComposeOwnership(dir, deps);
   const startInfra = deps.bringUpInfra ?? bringUpInfra;
   const preflight = deps.runPreflight ?? runPreflight;
 
@@ -4691,9 +4735,29 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     // (The AUTHORITATIVE post-clone band comes from the checkout's own compose
     // config, which dry-run never has; the static default band is the best
     // read-only signal.) Under --dry-run a conflict is REPORTED, never thrown.
+    //
+    // #159 parity: the REAL run EXEMPTS ports the target's OWN running stack
+    // publishes (proven via the compose working_dir label — a read-only docker
+    // inspect, dry-run-safe). Without the same exemption here, an idempotent
+    // re-run previewed its own instance as nine foreign conflicts and suggested
+    // isolating from itself — the exact false plan the issue reports.
     let conflicts = [];
+    let selfOwnership = { ports: new Set(), projects: new Set() };
+    if (alreadyCheckout && pre.infraWillStart && !opts.noInfra) {
+      selfOwnership = resolveOwnership(targetDir);
+    }
+    // Mutually exclusive self-instance readings (#159): same planned project =
+    // idempotent re-run; a DIFFERENT (legacy) project = the real run refuses a
+    // parallel bring-up (see the legacy self-instance guard on the real path).
+    const selfLegacyMismatch =
+      selfOwnership.ports.size > 0 &&
+      [...selfOwnership.projects].some((p) => p !== computeDefaultProject(opts, targetDir));
     if (pre.infraWillStart && !opts.noInfra) {
-      conflicts = await probePorts(DEFAULT_DEV_HOST_PORTS);
+      // Parity with the real-run guard: an explicit --on-conflict=isolated on a
+      // legacy self-instance withholds the self-exemption so the isolated
+      // advisory plan renders from the self-held ports.
+      const exempt = selfLegacyMismatch && opts.onConflict === "isolated" ? new Set() : selfOwnership.ports;
+      conflicts = await probePorts(DEFAULT_DEV_HOST_PORTS, { ownedPorts: exempt });
     }
 
     // cinatra-cli#147: the dry-run plan must reflect the SAME isolation/port
@@ -4730,6 +4794,31 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     log(`    Infra plan:    ${infraPlanIntent}`);
     log(`    Project name:  ${isValidSlug(defaultSlug) ? defaultSlug : "(unnamed — would not record)"}`);
     log(`    Compose -p:    ${defaultComposeProject} (explicit; ownership preflight runs at install)`);
+    if (selfOwnership.ports.size > 0) {
+      if (selfLegacyMismatch) {
+        const selfProjectNames = [...selfOwnership.projects].filter((p) => p !== defaultComposeProject).join('", "');
+        log(
+          opts.onConflict === "attach"
+            ? `    Self instance: this directory ALREADY runs its own live stack under compose project ` +
+                `"${selfProjectNames}" (legacy naming). With --on-conflict=attach the real install CONVERGES on ` +
+                `that running stack in place (no parallel bring-up).`
+            : opts.onConflict === "isolated"
+              ? `    Self instance: this directory ALREADY runs its own live stack under compose project ` +
+                  `"${selfProjectNames}" (legacy naming). With --on-conflict=isolated the real install keeps ` +
+                  `these self-held ports visible as conflicts and allocates a SECOND isolated stack alongside ` +
+                  `the running one.`
+              : `    Self instance: this directory ALREADY runs its own live stack under compose project ` +
+                  `"${selfProjectNames}" (legacy naming). A real install targeting ` +
+                  `"${defaultComposeProject}" would REFUSE rather than bring up a parallel container set on the same ` +
+                  `ports — re-run with --on-conflict=attach to converge on the running stack in place.`,
+        );
+      } else {
+        log(
+          `    Self instance: ${selfOwnership.ports.size} default-band port(s) are held by this checkout's OWN ` +
+            `running stack — treated as self (idempotent re-run), not as conflicts.`,
+        );
+      }
+    }
     if (advisory) {
       // cinatra-cli#147 AC1: an explicit --on-conflict=isolated + a detected
       // conflict → PREVIEW the isolation remap the real install would allocate.
@@ -4787,7 +4876,19 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
       }
     }
     log("  Writability:   validated read-only (no temp probe written).");
-    log("  Would write:   the checkout, .env.local (fresh secret), then run infra/install/setup per the plan above.");
+    // #159 honesty: the real run PRESERVES an existing .env.local (--reset-env
+    // regenerates) and re-uses an existing checkout — the plan must say so
+    // instead of promising a fresh secret it would never mint.
+    {
+      const checkoutPart = alreadyCheckout ? "re-use the existing checkout (fetch/update)" : "the checkout";
+      const envPart =
+        alreadyCheckout && existsSync(path.join(targetDir, ".env.local"))
+          ? opts.resetEnv
+            ? ".env.local REGENERATED (--reset-env: fresh secret replaces the existing file)"
+            : ".env.local PRESERVED (pass --reset-env to regenerate)"
+          : ".env.local (fresh secret)";
+      log(`  Would write:   ${checkoutPart}, ${envPart}, then run infra/install/setup per the plan above.`);
+    }
     log("  Re-run without --dry-run to perform the install.");
 
     return {
@@ -4805,6 +4906,10 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
       // 3000 is only the default/non-advisory plan's app port.
       appPort: advisory ? advisory.appPort : DEFAULT_APP_PORT_FOR_RECORD,
       conflicts: conflicts.map((c) => c.port),
+      // #159 self-instance plan facts (structured mirrors of the plan lines).
+      selfOwnedPortCount: selfOwnership.ports.size,
+      selfComposeProjects: [...selfOwnership.projects],
+      selfLegacyMismatch,
       ...(advisory
         ? {
             advisory: true,
@@ -4978,9 +5083,57 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
       // Exempt only the ports THIS target's own running compose services already
       // publish (idempotent re-run) — a stranger holding a not-yet-up service's
       // port is still a real conflict (hardening requirement: no blanket project-up skip).
-      const ownedPorts = deriveOwnedPorts(targetDir);
-      const conflicts = await probePorts(band, { ownedPorts });
-      if (conflicts.length > 0) {
+      const ownership = resolveOwnership(targetDir);
+      const ownedPorts = ownership.ports;
+
+      // #159 — LEGACY self-instance guard. Live containers PROVEN rooted at this
+      // checkout but running under a compose project the default plan would NOT
+      // target (a pre-explicit-`-p` install: project = dir basename, e.g.
+      // "cinatra" vs the planned "cinatra_cinatra"). The owned-port exemption
+      // just above would otherwise let the default path sail through with zero
+      // conflicts and `up -d -p <new project>` a PARALLEL container set onto the
+      // SAME host ports — late docker bind errors at best, a duplicate stack at
+      // worst. Fail CLOSED before any env/infra side effect; `--on-conflict=attach`
+      // is the sanctioned converge (attach with no registry row omits `-p`, so
+      // compose's basename fallback adopts the running legacy stack in place).
+      const plannedProject = computeDefaultProject(opts, targetDir);
+      const foreignSelfProjects = [...ownership.projects].filter((p) => p !== plannedProject);
+      // An EXPLICIT --on-conflict=isolated on a legacy self-instance is a
+      // deliberate "second stack alongside" ask: skip the guard AND withhold
+      // the self-exemption below, so the self-held ports surface as conflicts
+      // and the normal conflict->isolated resolution allocates the remapped
+      // second instance the flag promises (codex r2: the guard must never
+      // dead-end its own remediation advice).
+      const isolatedSecondRequested =
+        opts.onConflict === "isolated" && ownership.ports.size > 0 && foreignSelfProjects.length > 0;
+
+      // Probe FIRST (self-exempted): a STRANGER holding a not-yet-published
+      // service's port must keep surfacing through the existing conflict
+      // resolution even when this checkout is also a live self-instance
+      // (codex r3: the legacy guard must never skip the authoritative gate).
+      const conflicts = await probePorts(band, { ownedPorts: isolatedSecondRequested ? new Set() : ownedPorts });
+
+      if (conflicts.length === 0 && ownership.ports.size > 0 && foreignSelfProjects.length > 0 && !isolatedSecondRequested) {
+        const legacyNames = foreignSelfProjects.join('", "');
+        if (opts.onConflict === "attach") {
+          log(
+            `- This checkout already runs its own live stack under compose project "${legacyNames}" — ` +
+              "converging on it (--on-conflict=attach).",
+          );
+          resolution = await executeAttach({ targetDir, opts, resolvedSha, classified: null, log, deps });
+          infraPlan = resolution.infraPlan;
+        } else {
+          throw new Error(
+            `This directory already runs its OWN live Cinatra stack under compose project "${legacyNames}" ` +
+              `(legacy naming), but this install would bring up compose project "${plannedProject}" — a PARALLEL ` +
+              `container set competing for the same host ports. Nothing was changed. To repair/reconcile the ` +
+              `running instance, re-run with --on-conflict=attach (converges on the existing stack in place, ` +
+              `.env.local preserved). To really create a second instance, use --dir <elsewhere> or --on-conflict=isolated.`,
+          );
+        }
+      }
+
+      if (conflicts.length > 0 && infraPlan === "default") {
         // cinatra-cli#17: classify the holder, then offer + execute an option.
         resolution = await resolveConflict({
           targetDir,
