@@ -21,6 +21,12 @@
 //   --dir <path>             parent directory to scaffold into (default cwd)
 //   --force                  scaffold into a non-empty directory
 //   --yes, -y                accept defaults, never prompt
+//   --with-ui                (artifact only) also scaffold the opt-in
+//                            `cinatra.artifact.ui` renderer: an RSC detail-slot
+//                            renderer stub, the exports subpath, the React
+//                            toolchain delta, and a vendored-primitives seed.
+//   --with-registry-items    (artifact only; implies --with-ui) also seed a
+//                            contributed shadcn registry item (registryItems).
 //
 // `runCreateExtension(argv)` RETURNS 0 on success and THROWS on error. A usage /
 // validation error throws an Error carrying `.exitCode = 2` so the bin exits
@@ -42,12 +48,17 @@ function usageError(message) {
 }
 
 export function parseCreateExtensionArgv(argv) {
-  const opts = { _: [], yes: false, force: false };
+  const opts = { _: [], yes: false, force: false, withUi: false, withRegistryItems: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--yes" || a === "-y") opts.yes = true;
     else if (a === "--force") opts.force = true;
-    else if (a === "--scope") opts.scope = argv[++i];
+    else if (a === "--with-ui") opts.withUi = true;
+    else if (a === "--with-registry-items") {
+      // registryItems lives inside cinatra.artifact.ui, so it implies --with-ui.
+      opts.withRegistryItems = true;
+      opts.withUi = true;
+    } else if (a === "--scope") opts.scope = argv[++i];
     else if (a.startsWith("--scope=")) opts.scope = a.slice("--scope=".length);
     else if (a === "--display-name") opts.displayName = argv[++i];
     else if (a.startsWith("--display-name=")) opts.displayName = a.slice("--display-name=".length);
@@ -126,6 +137,15 @@ export async function runCreateExtension(argv) {
     const description =
       opts.description || (await maybePrompt(rl, opts.yes, `Description [${defaultDesc}]: `, defaultDesc));
 
+    // ── opt-in artifact ui template (cinatra#1627 AC3) ──────────────────────
+    // Guard here too (in addition to resolveInputs) so the usage error is typed
+    // (exit 2) and reported before any prompting side effects.
+    if ((opts.withUi || opts.withRegistryItems) && kind !== "artifact") {
+      throw usageError(
+        `--with-ui / --with-registry-items apply only to kind "artifact" (got "${kind}")`,
+      );
+    }
+
     // ── scaffold ────────────────────────────────────────────────────────────
     const result = scaffold({
       kind,
@@ -135,10 +155,20 @@ export async function runCreateExtension(argv) {
       description,
       targetParent: opts.dir,
       force: opts.force,
+      withUi: opts.withUi,
+      withRegistryItems: opts.withRegistryItems,
     });
 
     stdout.write(`\nScaffolded ${result.packageName} (kind: ${kind})\n`);
     stdout.write(`  ${result.targetDir}\n\n`);
+    if (result.withUi) {
+      stdout.write(
+        `  Includes the opt-in cinatra.artifact.ui renderer (src/renderers/detail.tsx). It renders\n` +
+          `  from the SDK-supplied ArtifactRendererProps snapshot (no host ports); vendor UI primitives\n` +
+          `  into src/ui/ with the PINNED shadcn CLI. Until your extension is in the base image build,\n` +
+          `  it renders generically with a "requires rebuild" indicator.\n\n`,
+      );
+    }
     stdout.write(`  ${result.written.length} files:\n`);
     for (const f of result.written) stdout.write(`    ${f}\n`);
     stdout.write(`\nNext steps:\n`);

@@ -79,3 +79,44 @@ export const SDK_EXTENSIONS_PIN = "^0.1.1";
  * forward-compatible declaration is "^2".
  */
 export const SDK_ABI_RANGE = "^2";
+
+// ---------------------------------------------------------------------------
+// Opt-in artifact `ui` template (cinatra#1627 AC3) — the values the `--with-ui`
+// renderer template bakes into `cinatra.artifact.ui`. Centralized here (the one
+// naming/version source) rather than scattered across template JSON.
+// ---------------------------------------------------------------------------
+
+/**
+ * `cinatra.artifact.ui.abiVersion` — the versioned renderer-block ABI. Mirrors
+ * `ARTIFACT_UI_ABI_VERSION` in packages/sdk-extensions/src/artifact-contract.ts.
+ */
+export const ARTIFACT_UI_ABI_VERSION = 1;
+
+/**
+ * `cinatra.artifact.ui.sdkAbiRange` — the GENERATED value
+ * `^<SDK_EXTENSIONS_ABI_VERSION>` (see `generateArtifactUiSdkAbiRange()` in
+ * packages/sdk-extensions/src/artifact-contract.ts). The publish conformance
+ * gate asserts a manifest's range EQUALS this generated value, so it must move
+ * in lock-step with the SDK ABI (currently 2.4.0 → "^2.4.0"). Bump here whenever
+ * the SDK ABI bumps.
+ */
+export const ARTIFACT_UI_SDK_ABI_RANGE = "^2.4.0";
+
+/**
+ * `propsApiVersion` — the renderer-props contract version a v1 renderer stub
+ * declares + imports. Mirrors `ARTIFACT_RENDERER_PROPS_API_VERSION` in the SDK
+ * leaf packages/sdk-extensions/src/artifact-renderer-props.ts (the type the stub
+ * imports from `@cinatra-ai/sdk-extensions/artifact-renderer-props`).
+ */
+export const ARTIFACT_RENDERER_PROPS_API_VERSION = 1;
+
+/**
+ * React toolchain delta for a renderer-shipping (`--with-ui`) artifact. React /
+ * react-dom are host peers the renderer bundle leaves EXTERNAL (they resolve to
+ * the host's single shared instances in the main realm), so they are declared as
+ * OPTIONAL peers (never installed by the scaffolder) plus devDependencies for
+ * local authoring/typecheck. Not @cinatra-ai, so the SDK-only first-party rule
+ * does not apply.
+ */
+export const REACT_PEER_RANGE = "^19.0.0";
+export const REACT_TYPES_RANGE = "^19";

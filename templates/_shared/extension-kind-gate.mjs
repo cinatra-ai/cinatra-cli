@@ -2067,16 +2067,26 @@ function isContainedRendererEntry(entry) {
   return !entry.slice(2).split("/").some((s) => s === "" || s === "." || s === "..");
 }
 
-const ARTIFACT_UI_ALLOWED_KEYS = ["abiVersion", "sdkAbiRange", "renderers"];
+// `renderers` and `registryItems` are BOTH optional since cinatra#1623 (S5): a
+// `ui` block may carry a renderer slot map, a contributed-registry-item list, or
+// both — but at least one must be non-empty. Mirrors artifactUiSchema in
+// packages/sdk-extensions/src/artifact-contract.ts.
+const ARTIFACT_UI_ALLOWED_KEYS = ["abiVersion", "sdkAbiRange", "renderers", "registryItems"];
 const ARTIFACT_UI_RENDERER_ALLOWED_KEYS = ["entry", "propsApiVersion", "representations"];
+const ARTIFACT_UI_REGISTRY_ITEM_ALLOWED_KEYS = ["name", "entry", "type", "description"];
+// Mirrors ARTIFACT_UI_REGISTRY_ITEM_TYPES + REGISTRY_COMPONENT_NAME_RE in the leaf.
+const ARTIFACT_UI_REGISTRY_ITEM_TYPES = new Set(["registry:ui", "registry:lib"]);
+const REGISTRY_COMPONENT_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 /** VALUE-INDEPENDENT shallow structural pre-screen of a `cinatra.artifact.ui`
  * block. Returns string[] errors ([] = shape-conformant). The caller invokes
  * this only when `ui` is present (it is optional — a purely declarative
- * artifact extension ships none). */
+ * artifact extension ships none). The authoritative derived validation (closed
+ * slot enum / exact abiVersion / GENERATED sdkAbiRange / entry file resolution /
+ * registry-item DAG) is the reusable conformance gate's job. */
 export function validateArtifactUiShape(ui) {
   const errors = [];
-  if (!isObj(ui)) return ["ui must be an object ({ abiVersion, sdkAbiRange, renderers })"];
+  if (!isObj(ui)) return ["ui must be an object ({ abiVersion, sdkAbiRange, renderers?/registryItems? })"];
   for (const k of Object.keys(ui)) {
     if (!ARTIFACT_UI_ALLOWED_KEYS.includes(k)) errors.push(`ui: unexpected key "${k}"`);
   }
@@ -2084,34 +2094,80 @@ export function validateArtifactUiShape(ui) {
     errors.push("ui.abiVersion must be a positive integer");
   }
   if (!nonEmptyStr(ui.sdkAbiRange)) errors.push("ui.sdkAbiRange must be a non-empty string");
-  if (!isObj(ui.renderers) || Object.keys(ui.renderers).length === 0) {
-    errors.push("ui.renderers must be a non-empty object mapping a v1 slot to a renderer");
-    return errors;
-  }
-  for (const [slot, r] of Object.entries(ui.renderers)) {
-    const at = `ui.renderers.${slot}`;
-    if (!isObj(r)) {
-      errors.push(`${at} must be an object ({ entry, propsApiVersion[, representations] })`);
-      continue;
-    }
-    // v1 NO-PORTS: a renderer requests no host ports — only these three keys.
-    for (const k of Object.keys(r)) {
-      if (!ARTIFACT_UI_RENDERER_ALLOWED_KEYS.includes(k)) {
-        errors.push(`${at}: unexpected key "${k}" — v1 renderers request NO host ports (only { entry, propsApiVersion, representations? })`);
+
+  const hasRenderers = ui.renderers !== undefined;
+  const hasRegistryItems = ui.registryItems !== undefined;
+
+  if (hasRenderers) {
+    if (!isObj(ui.renderers) || Object.keys(ui.renderers).length === 0) {
+      errors.push("ui.renderers, when present, must be a non-empty object mapping a v1 slot to a renderer");
+    } else {
+      for (const [slot, r] of Object.entries(ui.renderers)) {
+        const at = `ui.renderers.${slot}`;
+        if (!isObj(r)) {
+          errors.push(`${at} must be an object ({ entry, propsApiVersion[, representations] })`);
+          continue;
+        }
+        // v1 NO-PORTS: a renderer requests no host ports — only these three keys.
+        for (const k of Object.keys(r)) {
+          if (!ARTIFACT_UI_RENDERER_ALLOWED_KEYS.includes(k)) {
+            errors.push(`${at}: unexpected key "${k}" — v1 renderers request NO host ports (only { entry, propsApiVersion, representations? })`);
+          }
+        }
+        if (!isContainedRendererEntry(r.entry)) {
+          errors.push(`${at}.entry must be a package-relative, path-contained subpath ("./…", no "..", no absolute path or URL)`);
+        }
+        if (typeof r.propsApiVersion !== "number" || !Number.isInteger(r.propsApiVersion) || r.propsApiVersion < 1) {
+          errors.push(`${at}.propsApiVersion must be an integer >= 1`);
+        }
+        if (
+          r.representations !== undefined &&
+          (!Array.isArray(r.representations) || r.representations.length === 0 || !r.representations.every(nonEmptyStr))
+        ) {
+          errors.push(`${at}.representations, when present, must be a non-empty array of MIME pattern strings`);
+        }
       }
     }
-    if (!isContainedRendererEntry(r.entry)) {
-      errors.push(`${at}.entry must be a package-relative, path-contained subpath ("./…", no "..", no absolute path or URL)`);
+  }
+
+  if (hasRegistryItems) {
+    if (!Array.isArray(ui.registryItems) || ui.registryItems.length === 0) {
+      errors.push("ui.registryItems, when present, must be a non-empty array of { name, entry, type, description }");
+    } else {
+      const seenNames = new Set();
+      ui.registryItems.forEach((item, i) => {
+        const at = `ui.registryItems[${i}]`;
+        if (!isObj(item)) {
+          errors.push(`${at} must be an object ({ name, entry, type, description })`);
+          return;
+        }
+        for (const k of Object.keys(item)) {
+          if (!ARTIFACT_UI_REGISTRY_ITEM_ALLOWED_KEYS.includes(k)) {
+            errors.push(`${at}: unexpected key "${k}" — a registry item is a presentational-only declaration ({ name, entry, type, description })`);
+          }
+        }
+        if (!nonEmptyStr(item.name) || !REGISTRY_COMPONENT_NAME_RE.test(item.name)) {
+          errors.push(`${at}.name must be a strict lowercase-kebab component token (e.g. "stat-tile")`);
+        } else if (seenNames.has(item.name)) {
+          errors.push(`${at}.name "${item.name}" is a duplicate registry item name within the manifest`);
+        } else {
+          seenNames.add(item.name);
+        }
+        if (!isContainedRendererEntry(item.entry)) {
+          errors.push(`${at}.entry must be a package-relative, path-contained subpath ("./…", no "..", no absolute path or URL)`);
+        }
+        if (!ARTIFACT_UI_REGISTRY_ITEM_TYPES.has(item.type)) {
+          errors.push(`${at}.type must be one of registry:ui | registry:lib`);
+        }
+        if (!nonEmptyStr(item.description)) {
+          errors.push(`${at}.description must be a non-empty string`);
+        }
+      });
     }
-    if (typeof r.propsApiVersion !== "number" || !Number.isInteger(r.propsApiVersion) || r.propsApiVersion < 1) {
-      errors.push(`${at}.propsApiVersion must be an integer >= 1`);
-    }
-    if (
-      r.representations !== undefined &&
-      (!Array.isArray(r.representations) || r.representations.length === 0 || !r.representations.every(nonEmptyStr))
-    ) {
-      errors.push(`${at}.representations, when present, must be a non-empty array of MIME pattern strings`);
-    }
+  }
+
+  if (!hasRenderers && !hasRegistryItems) {
+    errors.push("ui must declare at least one of `renderers` (a non-empty v1 slot map) or `registryItems` (a non-empty list)");
   }
   return errors;
 }
