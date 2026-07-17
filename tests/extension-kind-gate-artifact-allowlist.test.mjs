@@ -1,14 +1,15 @@
 // AC2 of cinatra-ai/extension-release-tooling#54 (cinatra-cli#154): the gate as
 // COPIED INTO a scaffolded artifact repo — not merely the source template —
 // admits the two cross-kind presentation/byline keys the org allowlist now
-// carries (cinatra.displayName + cinatra.vendor) and still rejects any key
-// outside the seven-key artifact allowlist with the EXACT allowlist error.
+// carries (cinatra.displayName + cinatra.vendor) plus the S9-a chat-view
+// declaration surface (cinatra.views, cinatra#1626), and still rejects any key
+// outside the eight-key artifact allowlist with the EXACT allowlist error.
 //
 // The point is to exercise the whole copy path `cinatra create-extension
 // artifact` runs: scaffold() copies templates/_shared/extension-kind-gate.mjs
 // verbatim into the generated repo, and the generated repo's standalone CI runs
 // THAT copy. Importing the copied file (not the source template) proves the byte
-// the external author's CI actually executes carries the seven-key allowlist —
+// the external author's CI actually executes carries the eight-key allowlist —
 // the exact drift class the daily release-template-drift-audit flags.
 
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
@@ -20,10 +21,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { scaffold } from "../src/authoring/scaffold.mjs";
 
-// The exact seven-key allowlist error the copied gate must emit, kept as a
+// The exact eight-key allowlist error the copied gate must emit, kept as a
 // literal so any drift in the gate's wording (key set, key order) reddens this.
 const unexpectedKeyError = (k) =>
-  `artifact extensions may only declare cinatra.{kind,apiVersion,artifact,dependencies,roles,displayName,vendor}; unexpected key "${k}"`;
+  `artifact extensions may only declare cinatra.{kind,apiVersion,artifact,dependencies,roles,displayName,vendor,views}; unexpected key "${k}"`;
 
 let parent;
 let targetDir;
@@ -60,7 +61,7 @@ function runWithCinatra(mutate) {
   return runGate(targetDir);
 }
 
-describe("scaffolded artifact — copied gate honors the seven-key cinatra allowlist", () => {
+describe("scaffolded artifact — copied gate honors the eight-key cinatra allowlist", () => {
   it("an otherwise-valid manifest with string-valued cinatra.displayName + cinatra.vendor passes", () => {
     const { kind, errors } = runWithCinatra((c) => {
       c.displayName = "Blog Post";
@@ -70,7 +71,23 @@ describe("scaffolded artifact — copied gate honors the seven-key cinatra allow
     expect(errors).toEqual([]);
   });
 
-  it("an added unknown cinatra key fails with the exact seven-key allowlist error", () => {
+  // S9-a chat-view declaration surface (cinatra#1626, epic #1620): the copied
+  // gate ADMITS a top-level cinatra.views key (the host allowlist gained it at
+  // 8e615bac; it is carried through UNVALIDATED here — the S9 host slice owns
+  // the shape/rendering). Proven ADMITTED through the real scaffold copy path so
+  // a freshly scaffolded artifact declaring cinatra.views does not red-fail its
+  // own repo's standalone kind-gate.
+  it("an otherwise-valid manifest declaring cinatra.views passes (S9-a chat-view surface)", () => {
+    const { kind, errors } = runWithCinatra((c) => {
+      c.displayName = "Blog Post";
+      c.vendor = "Cinatra";
+      c.views = { detail: { entry: "./src/views/detail.tsx" } };
+    });
+    expect(kind).toBe("artifact");
+    expect(errors).toEqual([]);
+  });
+
+  it("an added unknown cinatra key fails with the exact eight-key allowlist error", () => {
     const { errors } = runWithCinatra((c) => {
       c.displayName = "Blog Post";
       c.vendor = "Cinatra";
