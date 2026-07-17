@@ -5113,9 +5113,24 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
       // the legacy guard never skips the authoritative gate.
       const conflicts = await probePorts(band, { ownedPorts: isolatedSecondRequested ? new Set() : ownedPorts });
 
-      if (conflicts.length === 0 && ownership.ports.size > 0 && foreignSelfProjects.length > 0 && !isolatedSecondRequested) {
+      if (ownership.ports.size > 0 && foreignSelfProjects.length > 0 && !isolatedSecondRequested) {
+        // The guard fires REGARDLESS of stranger conflicts: routing a mixed
+        // legacy+stranger case into the normal resolver would let e.g.
+        // --on-conflict=stop-existing stop the stranger and then bring up the
+        // parallel project anyway — the exact hazard this guard exists for.
         const legacyNames = foreignSelfProjects.join('", "');
+        const strangerNote =
+          conflicts.length > 0
+            ? ` Additionally, ${conflicts.length} port(s) are held by OTHER processes ` +
+              `(${conflicts.map((c) => c.port).join(", ")}) — resolve those separately.`
+            : "";
         if (opts.onConflict === "attach") {
+          if (conflicts.length > 0) {
+            throw new Error(
+              `Cannot attach: this checkout's own live stack (compose project "${legacyNames}") would be ` +
+                `converged, but other processes still hold required ports.${strangerNote} Nothing was changed.`,
+            );
+          }
           log(
             `- This checkout already runs its own live stack under compose project "${legacyNames}" — ` +
               "converging on it (--on-conflict=attach).",
@@ -5128,7 +5143,8 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
               `(legacy naming), but this install would bring up compose project "${plannedProject}" — a PARALLEL ` +
               `container set competing for the same host ports. Nothing was changed. To repair/reconcile the ` +
               `running instance, re-run with --on-conflict=attach (converges on the existing stack in place, ` +
-              `.env.local preserved). To really create a second instance, use --dir <elsewhere> or --on-conflict=isolated.`,
+              `.env.local preserved). To really create a second instance, use --dir <elsewhere> or ` +
+              `--on-conflict=isolated.${strangerNote}`,
           );
         }
       }

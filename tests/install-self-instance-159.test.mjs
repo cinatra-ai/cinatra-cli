@@ -240,6 +240,41 @@ describe("cinatra-cli#159 — install vs a live self-instance", () => {
     expect(upCalls).toEqual([]);
   });
 
+  it("(h) MIXED legacy self-instance + STRANGER conflict still refuses — never falls into the normal resolver", async () => {
+    const dir = cloneCheckout("mixedstranger");
+    const upCalls = [];
+    // Probe reports one STRANGER conflict beyond the self-owned band.
+    const strangerProbe = async () => [{ service: "extra", host: "127.0.0.1", port: 9999, holder: "someone-else" }];
+    await expect(
+      runInstall(
+        ["--dir", dir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+        {
+          log: () => {},
+          deps: deps({
+            targetComposeOwnership: ownSelf(dir, { legacy: true }),
+            detectPortConflicts: strangerProbe,
+            bringUpInfra: (args) => upCalls.push(args),
+          }),
+        },
+      ),
+    ).rejects.toThrow(/OWN live Cinatra stack under compose project "cinatra".*held by OTHER processes.*9999/s);
+    expect(upCalls).toEqual([]);
+  });
+
+  it("(h2) attach on a legacy self-instance REFUSES while a stranger still holds ports", async () => {
+    const dir = cloneCheckout("attachstranger");
+    const strangerProbe = async () => [{ service: "extra", host: "127.0.0.1", port: 9999, holder: "someone-else" }];
+    await expect(
+      runInstall(
+        ["--dir", dir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install", "--on-conflict", "attach"],
+        {
+          log: () => {},
+          deps: deps({ targetComposeOwnership: ownSelf(dir, { legacy: true }), detectPortConflicts: strangerProbe }),
+        },
+      ),
+    ).rejects.toThrow(/Cannot attach.*other processes still hold required ports/s);
+  });
+
   it("(g) --on-conflict=isolated on a legacy self-instance reaches the isolated path (guard must not dead-end its own advice)", async () => {
     const dir = cloneCheckout("legacyiso");
     const probeArgs = [];
