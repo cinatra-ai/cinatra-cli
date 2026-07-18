@@ -300,6 +300,30 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode+sub",
         },
         {
+          "command": "instance sandbox build",
+          "hidden": false,
+          "id": "sandbox.build",
+          "match": "command+mode+sub",
+        },
+        {
+          "command": "instance sandbox doctor",
+          "hidden": false,
+          "id": "sandbox.doctor",
+          "match": "command+mode+sub",
+        },
+        {
+          "command": "instance sandbox status",
+          "hidden": false,
+          "id": "sandbox.status",
+          "match": "command+mode+sub",
+        },
+        {
+          "command": "instance sandbox gc",
+          "hidden": false,
+          "id": "sandbox.gc",
+          "match": "command+mode+sub",
+        },
+        {
           "command": "instance db migrate",
           "hidden": false,
           "id": "db.migrate",

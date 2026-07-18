@@ -56,6 +56,26 @@ import {
   validateEncryptionKey,
 } from "./prod-env-validate.mjs";
 import { prodRuntimeGuidanceLines } from "./prod-runtime-guidance.mjs";
+import {
+  L0_DOCKERFILE_REL,
+  L0_BUILD_CONTEXT_REL,
+  EXECUTION_MODE_ENV_KEY,
+  ROLLOUT_ENV_KEY,
+  ROLLOUT_ON,
+  EGRESS_MODE_ENV_KEY,
+  DEFAULT_EGRESS_MODE,
+  parseExecutionModeFlags,
+  normalizeExecutionMode,
+  defaultExecutionModeForInstall,
+  resolveExecutionModeForInstall,
+  applyEnvUpsertsToBody,
+  validateRemoteConfig,
+  executionEnvUpserts,
+  planImageAcquisition,
+  l0BuildArgs,
+  l0DigestInspectArgs,
+  parseInspectedDigest,
+} from "./execution-mode.mjs";
 import { defaultAssertRecreateSafe, RecreatePreflightError } from "./recreate-preflight.mjs";
 import { captureDeployedVersions } from "./version-ledger-capture.mjs";
 import {
@@ -446,6 +466,9 @@ export function parseInstallArgs(argv = []) {
       redisDb != null ||
       bullmqQueue != null,
     couseSidecar: { reuseFrom, dbName, redisDb, bullmqQueue },
+    // cinatra-cli#160 (exec-plane S4): the execution-mode choice + remote/egress
+    // config (parse-time validated; null-filled when absent).
+    execution: parseExecutionModeFlags(argv),
   };
 }
 
@@ -4610,6 +4633,110 @@ async function executeStopExisting({ targetDir, opts, conflicts, classified, log
 // The command.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Execution plane provisioning (cinatra-cli#160, exec-plane S4)
+// ---------------------------------------------------------------------------
+//
+// The install-time execution-mode choice + first-class L0 image acquisition.
+// Runs on the FULL provision path only (the caller gates it off --dry-run /
+// --no-install / --no-setup). Best-effort by contract: an execution-plane hiccup
+// (missing L0 Dockerfile on an older checkout, Docker down, a docker build
+// failure) WARNS and records what it can — it never fails an otherwise-complete
+// install. The pure decisions live in execution-mode.mjs (unit-tested).
+
+// Upsert / remove a set of execution env keys in .env.local (create-less: only
+// when the file exists — ensureEnvLocal owns creation). value:null ⇒ remove.
+function persistExecutionEnv(targetDir, upserts) {
+  const envPath = path.join(targetDir, ".env.local");
+  if (!existsSync(envPath)) return;
+  writeFileSync(envPath, applyEnvUpsertsToBody(readFileSync(envPath, "utf8"), upserts), { mode: 0o600 });
+}
+
+async function provisionExecutionPlane({ targetDir, opts, log = console.log }) {
+  try {
+    const flags = opts.execution ?? { mode: null, brokerUrl: null, imageRef: null, egressMode: null };
+    // Install-preflight execution-mode CHOICE. An explicit --execution-mode wins;
+    // otherwise, on an interactive TTY without --yes, PROMPT (defaulting to the
+    // install-mode default); a non-interactive / --yes install takes the default
+    // silently so scripted installs never hang.
+    const interactive = flags.mode == null && !opts.yes && Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
+    let mode;
+    if (interactive) {
+      const def = defaultExecutionModeForInstall(opts.mode);
+      const answer = await promptLine(
+        "Execution plane — where should model-run sandboxes execute?\n" +
+          "  local-dev (build + run on this machine) | remote (broker + digest-pinned image) | disabled (no sandbox)\n" +
+          `Choose [${def}]: `,
+        def,
+      );
+      mode = normalizeExecutionMode((answer && answer.trim()) || def);
+    } else {
+      mode = resolveExecutionModeForInstall({ installMode: opts.mode, flagMode: flags.mode, isTty: false }).mode;
+    }
+    const egressMode = flags.egressMode ?? null;
+
+    if (mode === "remote") {
+      // Fully validate + record when the operator supplied broker/image; else
+      // record the mode and defer broker/image to the deployment layer (prod
+      // hands the execution stack to the deployment layer — epic + cinatra-cli#146).
+      if (flags.brokerUrl || flags.imageRef) {
+        const { brokerUrl, imageRef } = validateRemoteConfig({ brokerUrl: flags.brokerUrl, imageRef: flags.imageRef });
+        persistExecutionEnv(targetDir, executionEnvUpserts({ executionMode: "remote", imageRef, brokerUrl, egressMode }));
+        log("- Execution plane: remote mode recorded (broker URL + digest-pinned L0 image).");
+      } else {
+        persistExecutionEnv(targetDir, [
+          { key: EXECUTION_MODE_ENV_KEY, value: "remote" },
+          { key: ROLLOUT_ENV_KEY, value: ROLLOUT_ON },
+          { key: EGRESS_MODE_ENV_KEY, value: egressMode ?? DEFAULT_EGRESS_MODE },
+        ]);
+        log(
+          "- Execution plane: remote mode recorded. Configure the broker URL + a DIGEST-PINNED L0 image in the " +
+            "deployment layer (CINATRA_EXECUTION_BROKER_URL / CINATRA_SANDBOX_L0_IMAGE=name@sha256:… — never :latest).",
+        );
+      }
+      return;
+    }
+
+    if (mode === "disabled") {
+      persistExecutionEnv(targetDir, executionEnvUpserts({ executionMode: "disabled" }));
+      log("- Execution plane: disabled (models stay usable; no sandbox provisioned on this host).");
+      return;
+    }
+
+    // local-dev: acquire the L0 image as a first-class step + record its digest pin.
+    const dockerfileAbs = path.join(targetDir, L0_DOCKERFILE_REL);
+    if (!existsSync(dockerfileAbs)) {
+      persistExecutionEnv(targetDir, executionEnvUpserts({ executionMode: "local-dev", imageDigest: null, egressMode }));
+      log(
+        `- Execution plane: local-dev mode recorded; the L0 Dockerfile (${L0_DOCKERFILE_REL}) is not in this checkout — ` +
+          "skipping the image build (run `cinatra instance sandbox build` once it is present).",
+      );
+      return;
+    }
+    if (!commandExists("docker", ["--version"])) {
+      persistExecutionEnv(targetDir, executionEnvUpserts({ executionMode: "local-dev", imageDigest: null, egressMode }));
+      log("- Execution plane: local-dev mode recorded; Docker is not available — skipping the image build (run `cinatra instance sandbox build` when Docker is up).");
+      return;
+    }
+    const plan = planImageAcquisition({ executionMode: "local-dev", dockerfileExists: true });
+    log(`- Execution plane: building the L0 sandbox image ${plan.imageRef} (digest-pinned, never :latest)…`);
+    runOrThrow(
+      "docker",
+      l0BuildArgs({ imageRef: plan.imageRef, dockerfile: dockerfileAbs, buildContext: path.join(targetDir, L0_BUILD_CONTEXT_REL) }),
+      "Failed to build the sandbox L0 image",
+      { cwd: targetDir },
+    );
+    const inspected = capture("docker", l0DigestInspectArgs(plan.imageRef), { cwd: targetDir });
+    const digest = parseInspectedDigest(inspected);
+    persistExecutionEnv(targetDir, executionEnvUpserts({ executionMode: "local-dev", imageDigest: digest, egressMode }));
+    log(`- Execution plane: L0 image built${digest ? ` (digest ${digest.slice(0, 19)}… recorded)` : ""}.`);
+  } catch (err) {
+    log(
+      `  ⚠ Execution-plane provisioning had an issue (continuing; run \`cinatra instance sandbox doctor\` to reconcile): ${err && err.message ? err.message : err}`,
+    );
+  }
+}
+
 export async function runInstall(argv = [], { log = console.log, deps = {} } = {}) {
   const opts = parseInstallArgs(argv);
 
@@ -5340,6 +5467,14 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
       // this full-setup path — the --no-setup / --no-install branches above skip it.
       assertProdEnvComplete({ targetDir, log });
     }
+  }
+
+  // 7a2. Execution plane (cinatra-cli#160): the install-time execution-mode choice
+  //      + first-class L0 image acquisition. Gated to the full provision path —
+  //      --dry-run returns long before here; --no-install / --no-setup skip it
+  //      (checkout + env only). Best-effort inside (never fails a done install).
+  if (!opts.noInstall && !opts.noSetup) {
+    await provisionExecutionPlane({ targetDir, opts, log });
   }
 
   // 7b. T8c — record a registry row + marker for the DEFAULT / EXTERNAL install

@@ -26,6 +26,44 @@ import { deriveKindFromName, syncCinatraDevExtensions } from "./cinatra-dev-exte
 import { LOCAL_REGISTRY_URL, seedLocalRegistryExtensions } from "./seed-local-registry.mjs";
 import { parseDevRefreshFlags, describeDockerDecision } from "./dev-refresh.mjs";
 import { prodRuntimeGuidanceLines } from "./prod-runtime-guidance.mjs";
+import {
+  EXECUTION_MODES,
+  DEFAULT_L0_IMAGE_LOCAL_DEV,
+  L0_DOCKERFILE_REL,
+  L0_BUILD_CONTEXT_REL,
+  EXECUTION_MODE_ENV_KEY,
+  L0_IMAGE_DIGEST_ENV_KEY,
+  GATEWAY_CONTAINER_NAME,
+  GATEWAY_ADMIN_PORT,
+  GATEWAY_HEALTH_PATH,
+  applyEnvUpsertsToBody,
+  planImageAcquisition,
+  l0BuildArgs,
+  l0PullArgs,
+  l0DigestInspectArgs,
+  parseInspectedDigest,
+  hardenedProbeRunArgs,
+  networkInternalInspectArgs,
+  containerRunningArgs,
+  workspaceVolumeLsArgs,
+  readExecutionConfig,
+  effectiveImageRef,
+  parseExecutionModeFlags,
+  resolveExecutionModeForInstall,
+  defaultExecutionModeForInstall,
+  validateRemoteConfig,
+  brokerHealthUrl,
+  executionEnvUpserts,
+  classifyWorkerHealth,
+  classifyImageDigestMatch,
+  classifyEgressEnforcement,
+  classifyIsolationMode,
+  classifyAuditSink,
+  summarizeSandboxDoctor,
+  planUpdateCoordination,
+  checkProtocolCompatibility,
+  prodExecutionUpdateGuidanceLines,
+} from "./execution-mode.mjs";
 import { applyCheckoutBootstrapDdl } from "./checkout-bootstrap-ddl.mjs";
 import {
   CLI_INSTALL_SPEC,
@@ -687,6 +725,11 @@ Usage:
   cinatra instance preview refresh [--ref <git-ref>] [--slug <slug>]
   cinatra instance preview status [--slug <slug>]
   cinatra instance preview list
+  cinatra instance sandbox build [--execution-mode <remote|local-dev|disabled>] [--sandbox-broker-url <url>]
+                                 [--sandbox-image <name@sha256:...>] [--sandbox-egress <default_internet|allowlist|none>]
+  cinatra instance sandbox doctor [--strict]
+  cinatra instance sandbox status
+  cinatra instance sandbox gc [--yes]
   cinatra instance db migrate [--down] [--count=N] [--dir <abs> --namespace <ns>]
   cinatra instance db upgrade-preflight [--instance <slug>] [--service <name>] [--target <service>=<version>] [--json]
   cinatra instance db upgrade-major --service <name> [--instance <slug>] [--target <version>] [--backup-dir <dir>] [--yes] [--json]
@@ -1645,42 +1688,326 @@ function reinstallDependencies(repoRoot) {
   }
 }
 
-// Discover a shell-runtime build context from the extensions tree WITHOUT
-// hardcoding a specific extension instance (IoC: core resolves capabilities from
-// what is installed, not by name). Any extension that ships a runtime/Dockerfile
-// provides the sandbox image. Returns the first match's context dir, or null.
-function findExtensionShellRuntimeContext(repoRoot) {
-  const extRoot = path.join(repoRoot, "extensions");
-  if (!existsSync(extRoot)) return null;
-  for (const scope of readdirSync(extRoot, { withFileTypes: true })) {
-    if (!scope.isDirectory()) continue;
-    const scopeDir = path.join(extRoot, scope.name);
-    for (const pkg of readdirSync(scopeDir, { withFileTypes: true })) {
-      if (!pkg.isDirectory()) continue;
-      const ctx = path.join(scopeDir, pkg.name, "runtime");
-      if (existsSync(path.join(ctx, "Dockerfile"))) return ctx;
-    }
-  }
-  return null;
+// ===========================================================================
+// Execution plane — sandbox lifecycle (cinatra-cli#160, exec-plane S4)
+// ===========================================================================
+//
+// The CLI lifecycle layer over the S1 execution-plane surface (broker + local-dev
+// worker + digest-pinned L0 image + egress gateway, all in the cinatra checkout's
+// `@cinatra-ai/execution-plane`). The pure decision/argv logic lives in
+// `execution-mode.mjs` (unit-tested without docker); the docker/HTTP orchestration
+// lives here. This REPLACES the retired openai-connector shell image build
+// (`cinatra/skill-shell:latest`) — the CLI-managed sandbox image path is now the
+// digest-pinned L0 image, never `:latest` (cinatra-cli#160 AC4).
+
+const SANDBOX_PROBE_TIMEOUT_MS = 20000;
+const SANDBOX_HTTP_TIMEOUT_MS = 5000;
+
+// Read-only docker capture (never inherits stdio into the terminal).
+function sandboxDockerCapture(args, { cwd } = {}) {
+  const r = spawnSync("docker", args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: SANDBOX_PROBE_TIMEOUT_MS,
+    ...(cwd ? { cwd } : {}),
+  });
+  return { status: r.status, stdout: (r.stdout ?? "").trim(), stderr: (r.stderr ?? "").trim(), error: r.error };
 }
 
-function buildOpenAiShellImage(repoRoot) {
-  // Build the shell sandbox image from whichever extension ships a
-  // runtime/Dockerfile (today the OpenAI connector). Skip (don't throw) when none
-  // is present so a full reset never hard-fails on a missing build context.
-  const runtimeContext = findExtensionShellRuntimeContext(repoRoot);
-  if (!runtimeContext) {
-    console.warn(
-      "  Skipping OpenAI shell Docker image: no extension ships a runtime/Dockerfile yet (OpenAI shell tool unavailable until the runtime Dockerfile is restored to the OpenAI connector).",
-    );
-    return;
+// The resolved digest (immutable image Id) of a present L0 image, or null.
+function resolveL0Digest(imageRef) {
+  let args;
+  try {
+    args = l0DigestInspectArgs(imageRef); // throws on an unsafe/invalid ref
+  } catch {
+    return null; // a hand-edited invalid ref ⇒ unresolvable → reported degraded, never a crash
   }
+  const r = sandboxDockerCapture(args);
+  if (r.status !== 0) return null;
+  return parseInspectedDigest(r.stdout);
+}
+
+// Run one hardened probe command over the L0 image (mirrors the S1 profile).
+function probeHardened(imageRef, command, { name } = {}) {
+  const r = sandboxDockerCapture(hardenedProbeRunArgs({ imageRef, command, name }));
+  return { ok: r.status === 0, stdout: r.stdout, stderr: r.stderr };
+}
+
+// A bounded HTTP GET that resolves true only on a network-level answer (any HTTP
+// status counts as "reachable"; a transport error / timeout is false).
+async function sandboxHttpReachable(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SANDBOX_HTTP_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    return res.ok; // 2xx only — a 404/500 is reachable-but-not-healthy, not "healthy".
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Acquire the L0 image for a given execution mode. local-dev builds from the
+// checkout Dockerfile + resolves the digest; remote pulls the digest-pinned
+// image; disabled skips. Returns { action, imageRef, digest }.
+function acquireL0Image({ repoRoot, executionMode, imageRef = null, log = console.log }) {
+  const dockerfileAbs = path.join(repoRoot, L0_DOCKERFILE_REL);
+  const plan = planImageAcquisition({ executionMode, imageRef, dockerfileExists: existsSync(dockerfileAbs) });
+  if (plan.action === "skip") {
+    log(`  Sandbox image: skipped (${plan.reason})`);
+    return { action: "skip", imageRef: null, digest: null };
+  }
+  if (plan.action === "pull") {
+    log(`  Sandbox image: pulling digest-pinned ${plan.imageRef}…`);
+    runCommandOrThrow("docker", l0PullArgs(plan.imageRef), `Failed to pull the sandbox L0 image ${plan.imageRef}.`, { cwd: repoRoot });
+    const digest = resolveL0Digest(plan.imageRef);
+    log(`  Sandbox image: pulled${digest ? ` (${digest.slice(0, 19)}…)` : ""}.`);
+    return { action: "pull", imageRef: plan.imageRef, digest };
+  }
+  // build
+  const buildContextAbs = path.join(repoRoot, L0_BUILD_CONTEXT_REL);
+  log(`  Sandbox image: building ${plan.imageRef} from ${L0_DOCKERFILE_REL}…`);
   runCommandOrThrow(
     "docker",
-    ["build", "-t", "cinatra/skill-shell:latest", runtimeContext],
-    "Failed to build the OpenAI shell Docker image.",
+    l0BuildArgs({ imageRef: plan.imageRef, dockerfile: dockerfileAbs, buildContext: buildContextAbs }),
+    "Failed to build the sandbox L0 image.",
     { cwd: repoRoot },
   );
+  const digest = resolveL0Digest(plan.imageRef);
+  if (!digest) throw new Error("Built the sandbox L0 image but could not resolve its digest for the pin record.");
+  log(`  Sandbox image: built ${plan.imageRef} (digest ${digest.slice(0, 19)}… recorded).`);
+  return { action: "build", imageRef: plan.imageRef, digest };
+}
+
+// `cinatra instance sandbox build` — acquire the L0 image for the configured (or
+// flag-overridden) execution mode + record its digest pin. Dev-oriented: an
+// unconfigured checkout defaults to local-dev.
+async function runSandboxBuild(rest) {
+  const repoRoot = getRepoRoot();
+  const envPath = path.join(repoRoot, ".env.local");
+  const fileEnv = existsSync(envPath) ? parseEnvFile(envPath) : {};
+  const configured = readExecutionConfig(fileEnv);
+  const flags = parseExecutionModeFlags(rest);
+
+  // Effective mode: an explicit flag wins; else the configured mode; else (unset)
+  // local-dev (the natural intent of "build the sandbox image").
+  let mode = flags.mode ?? (configured.mode === "disabled" && !fileEnv[EXECUTION_MODE_ENV_KEY] ? "local-dev" : configured.mode);
+  if (mode === "disabled" && flags.mode == null) {
+    console.log("Execution mode is `disabled` for this instance — nothing to build. Pass --execution-mode=local-dev|remote to change it.");
+    return;
+  }
+
+  let imageRef = flags.imageRef ?? configured.imageRef;
+  let brokerUrl = flags.brokerUrl ?? configured.brokerUrl;
+  if (mode === "remote") {
+    ({ brokerUrl, imageRef } = validateRemoteConfig({ brokerUrl, imageRef }));
+  }
+
+  console.log(`Acquiring the execution-plane sandbox image (mode: ${mode})…`);
+  const acquired = acquireL0Image({ repoRoot, executionMode: mode, imageRef, log: console.log });
+
+  // Persist config the build resolved so `.env.local` stays the source of truth.
+  const egressMode = flags.egressMode ?? configured.egressMode;
+  const upserts = executionEnvUpserts({
+    executionMode: mode,
+    imageRef: mode === "remote" ? imageRef : null,
+    imageDigest: mode === "local-dev" ? acquired.digest : null,
+    brokerUrl: mode === "remote" ? brokerUrl : null,
+    egressMode,
+  });
+  applyExecutionEnvUpserts(repoRoot, upserts);
+  console.log(`✓ Sandbox image acquired; execution config persisted to .env.local (mode=${mode}).`);
+}
+
+// Apply a set of executionEnvUpserts to .env.local (create-less: only when the
+// file exists; install owns creation). null value ⇒ remove the key.
+function applyExecutionEnvUpserts(repoRoot, upserts) {
+  const envPath = path.join(repoRoot, ".env.local");
+  if (!existsSync(envPath)) return false;
+  writeFileSync(envPath, applyEnvUpsertsToBody(readFileSync(envPath, "utf8"), upserts));
+  return true;
+}
+
+// Gather the execution-plane doctor checks by probing the LIVE local surface
+// (docker + HTTP), then classifying each via the pure classifiers. Returns the
+// ordered check array (each { id, label, verdict, detail, remediation }).
+async function gatherSandboxDoctor({ repoRoot, env, fetchImpl = sandboxHttpReachable } = {}) {
+  const cfg = readExecutionConfig(env);
+  const mode = cfg.mode;
+  const imageRef = effectiveImageRef(cfg);
+
+  // Worker health + isolation share ONE hardened probe run (uid + read-only +
+  // no-new-privileges are all observable from a single command).
+  let imagePresent = false;
+  let probeOk = false;
+  let probeDetail = "";
+  let uid = null;
+  let readOnlyRootfs = null;
+  let noNewPrivileges = null;
+  let resolvedDigest = null;
+
+  if (mode === "local-dev") {
+    resolvedDigest = resolveL0Digest(imageRef);
+    imagePresent = resolvedDigest !== null;
+    if (imagePresent) {
+      // One probe reports uid, whether `/` is read-only (a write to / must fail),
+      // and whether no-new-privileges is in effect (no_new_privs:1 in /proc/self/status).
+      const probe = probeHardened(
+        imageRef,
+        'printf "UID=%s\\n" "$(id -u)"; if : > /rotest 2>/dev/null; then echo "ROOTFS=rw"; rm -f /rotest; else echo "ROOTFS=ro"; fi; grep -q "NoNewPrivs:.*1" /proc/self/status && echo "NNP=1" || echo "NNP=0"',
+      );
+      probeOk = probe.ok;
+      probeDetail = probe.ok ? "" : probe.stderr.slice(0, 160);
+      const out = probe.stdout;
+      const uidM = out.match(/UID=(\d+)/);
+      uid = uidM ? Number(uidM[1]) : null;
+      readOnlyRootfs = /ROOTFS=ro/.test(out) ? true : /ROOTFS=rw/.test(out) ? false : null;
+      noNewPrivileges = /NNP=1/.test(out) ? true : /NNP=0/.test(out) ? false : null;
+    }
+  } else if (mode === "remote") {
+    resolvedDigest = imageRef ? resolveL0Digest(imageRef) : null;
+  }
+
+  // Egress topology (local-dev): is the internal no-NAT network present + is the
+  // gateway container running?
+  let networkExists = false;
+  let networkInternal = false;
+  let gatewayRunning = null;
+  let gatewayHealthy = null;
+  if (mode === "local-dev" && cfg.egressMode !== "none") {
+    const net = sandboxDockerCapture(networkInternalInspectArgs());
+    networkExists = net.status === 0;
+    networkInternal = net.stdout.trim() === "true";
+    const gw = sandboxDockerCapture(containerRunningArgs(GATEWAY_CONTAINER_NAME));
+    gatewayRunning = gw.status === 0 && gw.stdout.length > 0;
+    if (gatewayRunning) {
+      // Resolve the gateway admin port's host mapping + probe /__health (2xx).
+      // A running-but-unhealthy (or unprobeable) gateway must NOT read as healthy.
+      const portMap = sandboxDockerCapture(["port", GATEWAY_CONTAINER_NAME, String(GATEWAY_ADMIN_PORT)]);
+      const firstMap = portMap.status === 0 ? (portMap.stdout.split("\n")[0] || "").trim() : "";
+      const hostPort = firstMap.match(/:(\d+)$/);
+      gatewayHealthy = hostPort ? await fetchImpl(`http://127.0.0.1:${hostPort[1]}${GATEWAY_HEALTH_PATH}`) : false;
+    }
+  }
+
+  // Reachability probes (audit sink + remote worker/broker health).
+  const origin = resolveLocalOrigin(env);
+  let appReachable = null;
+  let brokerReachable = null;
+  if (mode === "local-dev") {
+    appReachable = await fetchImpl(`${origin}/api/health`);
+  } else if (mode === "remote" && cfg.brokerUrl) {
+    brokerReachable = await fetchImpl(brokerHealthUrl(cfg.brokerUrl));
+  }
+
+  return [
+    classifyWorkerHealth({ executionMode: mode, imagePresent, probeOk, probeDetail, brokerReachable }),
+    classifyImageDigestMatch({ executionMode: mode, imageRef: cfg.imageRef, recordedDigest: cfg.imageDigest, resolvedDigest }),
+    classifyEgressEnforcement({ executionMode: mode, egressMode: cfg.egressMode, networkExists, networkInternal, gatewayRunning, gatewayHealthy }),
+    classifyIsolationMode({ executionMode: mode, uid, readOnlyRootfs, noNewPrivileges }),
+    classifyAuditSink({ executionMode: mode, appReachable, brokerReachable }),
+  ];
+}
+
+// Render one sandbox-doctor check line. healthy ✓ / degraded ⚠ / disabled ○.
+function printSandboxCheck(c) {
+  const glyph = c.verdict === "healthy" ? "✓" : c.verdict === "disabled" ? "○" : "⚠";
+  console.log(`  ${glyph} [${c.verdict.toUpperCase()}] ${c.label}: ${c.detail}`);
+  if (c.verdict === "degraded" && c.remediation) console.log(`        ↳ ${c.remediation}`);
+}
+
+// `cinatra instance sandbox doctor` — the execution-plane self-check. Each check
+// reports healthy / degraded / disabled distinctly. `--strict` exits non-zero on
+// any degraded check.
+async function runSandboxDoctor(rest) {
+  const repoRoot = getRepoRoot();
+  const envPath = path.join(repoRoot, ".env.local");
+  const env = existsSync(envPath) ? parseEnvFile(envPath) : {};
+  const strict = rest.includes("--strict");
+
+  const checks = await gatherSandboxDoctor({ repoRoot, env });
+  const { counts, overall } = summarizeSandboxDoctor(checks);
+  const cfg = readExecutionConfig(env);
+
+  console.log(`Cinatra execution-plane self-check (mode: ${cfg.mode}):`);
+  for (const c of checks) printSandboxCheck(c);
+  console.log(`  Summary: ${counts.healthy} healthy, ${counts.degraded} degraded, ${counts.disabled} disabled — overall ${overall.toUpperCase()}.`);
+  if (counts.degraded > 0) {
+    console.log("  Some checks are DEGRADED (a dependency is down or unverifiable). They are NOT failures of the design — address the remediations above.");
+  }
+  if (strict && counts.degraded > 0) process.exitCode = 1;
+}
+
+// `cinatra instance sandbox status` — read-only view of the configured mode,
+// image + recorded digest, and local topology.
+async function runSandboxStatus(rest) {
+  void rest;
+  const repoRoot = getRepoRoot();
+  const envPath = path.join(repoRoot, ".env.local");
+  const env = existsSync(envPath) ? parseEnvFile(envPath) : {};
+  const cfg = readExecutionConfig(env);
+  const imageRef = effectiveImageRef(cfg);
+
+  console.log("Cinatra execution-plane status:");
+  console.log(`  Execution mode:   ${cfg.mode}${cfg.rolloutOn ? " (capability rollout ON)" : " (capability dark)"}`);
+  console.log(`  Egress mode:      ${cfg.egressMode}`);
+  if (cfg.mode === "remote") {
+    console.log(`  Broker URL:       ${cfg.brokerUrl ?? "(unset)"}`);
+    console.log(`  L0 image (pin):   ${cfg.imageRef ?? "(unset)"}`);
+  } else if (cfg.mode === "local-dev") {
+    const resolved = resolveL0Digest(imageRef);
+    console.log(`  L0 image:         ${imageRef}${resolved ? " (present)" : " (not built)"}`);
+    console.log(`  Recorded digest:  ${cfg.imageDigest ?? "(none recorded)"}`);
+    if (resolved) console.log(`  Present digest:   ${resolved}`);
+    const net = sandboxDockerCapture(networkInternalInspectArgs());
+    console.log(`  Sandbox network:  ${net.status === 0 ? (net.stdout.trim() === "true" ? "present, internal (no NAT)" : "present, NOT internal") : "absent (created on first job)"}`);
+  } else {
+    console.log("  The execution plane is disabled — models stay usable; no sandbox is provisioned on this host.");
+  }
+}
+
+// `cinatra instance sandbox gc` — reap orphaned L2 workspace volumes. Dev-only;
+// read-only plan unless `--yes`.
+async function runSandboxGc(rest) {
+  const repoRoot = getRepoRoot();
+  const envPath = path.join(repoRoot, ".env.local");
+  const fileEnv = existsSync(envPath) ? parseEnvFile(envPath) : {};
+  const fileMode = APP_RUNTIME_MODE_ENV_KEYS.map((k) => (typeof fileEnv[k] === "string" ? fileEnv[k].trim() : "")).find((v) => v.length > 0);
+  // Fail CLOSED: this is destructive + dev-only. Require an .env.local that
+  // EXPLICITLY names a development runtime — an absent / unset / non-dev mode is
+  // refused, so gc never reaps volumes against an unknown or production instance.
+  if (!fileMode || !isDevelopmentModeValue(fileMode)) {
+    throw new Error(
+      "`cinatra instance sandbox gc` is development-only and refuses to run without an explicit development " +
+        ".env.local (CINATRA_RUNTIME_MODE=development). Workspace-volume reaping in production is a deployment-layer concern.",
+    );
+  }
+  const list = sandboxDockerCapture(workspaceVolumeLsArgs());
+  const volumes = list.status === 0 ? list.stdout.split("\n").map((l) => l.trim()).filter(Boolean) : [];
+  if (volumes.length === 0) {
+    console.log("No detached L2 sandbox workspace volumes to reap.");
+    return;
+  }
+  if (!rest.includes("--yes")) {
+    console.log(`Would reap ${volumes.length} L2 sandbox workspace volume(s) not attached to a running container (re-run with --yes):`);
+    for (const v of volumes) console.log(`  - ${v}`);
+    console.log("  (Docker refuses to remove a volume attached to a running sandbox, so an in-flight job's workspace is protected.)");
+    return;
+  }
+  let removed = 0;
+  let failed = 0;
+  for (const v of volumes) {
+    const r = sandboxDockerCapture(["volume", "rm", v]);
+    if (r.status === 0) {
+      removed += 1;
+    } else {
+      failed += 1;
+      console.warn(`  ⚠ Could not remove ${v} (in use or already gone): ${r.stderr.slice(0, 120)}`);
+    }
+  }
+  console.log(`Reaped ${removed}/${volumes.length} detached L2 sandbox workspace volume(s)${failed ? `; ${failed} skipped (in use / error)` : ""}.`);
+  if (failed > 0) process.exitCode = 1;
 }
 
 function rebuildEnvLocal(repoRoot) {
@@ -6107,6 +6434,18 @@ async function runCliUpdate({ dryRun }) {
  * prod → latest `v*` release tag (today's behavior). An explicit `--ref` always
  * overrides the type-derived default.
  */
+// cinatra-cli#160: the deployed execution-plane package version is the CLI's
+// protocol-version proxy (there is no runtime protocol endpoint yet — a later S1
+// slice). Read from the checkout; null when the package/file is absent.
+function readExecutionPlaneVersion(repoRoot) {
+  try {
+    const pj = JSON.parse(readFileSync(path.join(repoRoot, "packages", "execution-plane", "package.json"), "utf8"));
+    return typeof pj.version === "string" ? pj.version : null;
+  } catch {
+    return null;
+  }
+}
+
 async function runInstanceUpdate({ ref: pinnedRef, force, refreshArgs, dryRun }) {
   // Anchor on the operator's checkout (same resolution every other in-checkout
   // command uses). update operates on an EXISTING checkout — getRepoRoot throws
@@ -6207,6 +6546,7 @@ async function runInstanceUpdate({ ref: pinnedRef, force, refreshArgs, dryRun })
   // Move the checkout to the target. The helper fetches the EXACT ref, resolves
   // it to a concrete commit (NOT ambient FETCH_HEAD), and fast-forwards (or, with
   // --force, hard-resets) onto it. Returns the new HEAD sha.
+  const oldExecVersion = readExecutionPlaneVersion(repoRoot);
   const newSha = moveExistingCheckoutToRef({ targetDir: repoRoot, ref: targetRef, kind: move.kind, force });
   console.log(`✓ Checkout moved to ${targetRef} (${newSha}).`);
 
@@ -6225,6 +6565,29 @@ async function runInstanceUpdate({ ref: pinnedRef, force, refreshArgs, dryRun })
         "Apply it the production way: rebuild/redeploy the release-tagged images.",
     );
   }
+
+  // cinatra-cli#160 (exec-plane S4): surface execution-plane update coordination.
+  // The deployed execution-plane package MAJOR is the protocol proxy (old→new);
+  // a major hop needs the drain + roll-workers-before-app order (+ rollback path).
+  const execMode = readExecutionConfig(fileEnv).mode;
+  if (execMode !== "disabled") {
+    const newExecVersion = readExecutionPlaneVersion(repoRoot);
+    const compat = checkProtocolCompatibility({
+      appVersion: newExecVersion,
+      brokerVersion: oldExecVersion,
+      workerVersion: newExecVersion,
+    });
+    console.log(`\nExecution plane (${execMode}) — ${compat.detail}`);
+    if (!compat.compatible) {
+      console.log("  ⚠ Execution-plane protocol MAJOR changed across this update — follow the coordination order:");
+    }
+    const plan = planUpdateCoordination({ executionMode: execMode });
+    for (const step of plan.steps) console.log(`    - ${step}`);
+    if (!isDev) {
+      console.log("");
+      for (const line of prodExecutionUpdateGuidanceLines()) console.log(line);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -6235,7 +6598,8 @@ async function runInstanceUpdate({ ref: pinnedRef, force, refreshArgs, dryRun })
 // schema) to the code they have checked out. The human owns git (pull /
 // checkout); this command never touches it. It is the idempotent,
 // non-destructive subset of `scripts/setup.sh` minus .env.local creation —
-// dev-mode only, never updates extensions, never rebuilds images, never deploys.
+// dev-mode only, never updates extensions, never deploys (it DOES rebuild the local
+// execution-plane L0 image when the instance runs the sandbox locally — cinatra-cli#160).
 
 async function runDevRefresh(rest) {
   const repoRoot = getRepoRoot();
@@ -6372,6 +6736,27 @@ async function runDevRefresh(rest) {
   //    --with-dev-apps to opt into dev-app reconciliation.
   console.log("- Database + settings: running idempotent dev setup…");
   await runSetup("dev", { skipDevApps: !withDevApps });
+
+  // 3b. Execution plane (cinatra-cli#160): when this instance runs the sandbox
+  //     locally (execution mode local-dev), rebuild the L0 image so the worker
+  //     moves with the app on every refresh — refresh previously skipped image
+  //     rebuilds. Best-effort: a docker hiccup warns, never fails the reconcile.
+  //     An unset / disabled / remote instance skips (no local worker to rebuild).
+  {
+    const execCfg = readExecutionConfig(fileEnv);
+    if (execCfg.mode === "local-dev") {
+      try {
+        console.log("- Execution plane: rebuilding the L0 sandbox image…");
+        const acquired = acquireL0Image({ repoRoot, executionMode: "local-dev", log: console.log });
+        applyExecutionEnvUpserts(
+          repoRoot,
+          executionEnvUpserts({ executionMode: "local-dev", imageDigest: acquired.digest }),
+        );
+      } catch (err) {
+        console.warn(`  ⚠ Could not rebuild the sandbox image (continuing): ${err && err.message ? err.message : err}`);
+      }
+    }
+  }
 
   // 4. Advisory: additive schema is reconciled automatically and the versioned
   //    migration chain has been applied (or ledger-faked on a fresh schema) by
@@ -11316,8 +11701,22 @@ async function runResetDev(argv) {
     console.log("Running setup...");
     await runSetup("dev");
 
-    console.log("Building OpenAI shell Docker image...");
-    buildOpenAiShellImage(repoRoot);
+    // cinatra-cli#160 (exec-plane S4): a full reset re-acquires the digest-pinned
+    // execution-plane L0 sandbox image (successor of the retired
+    // `cinatra/skill-shell:latest`) and re-records its digest pin. Non-fatal: a
+    // docker build hiccup must not abort an otherwise-complete reset.
+    console.log("Acquiring the execution-plane sandbox image (local-dev)...");
+    try {
+      const acquired = acquireL0Image({ repoRoot, executionMode: "local-dev", log: console.log });
+      applyExecutionEnvUpserts(
+        repoRoot,
+        executionEnvUpserts({ executionMode: "local-dev", imageDigest: acquired.digest }),
+      );
+    } catch (err) {
+      console.warn(
+        `  ⚠ Could not acquire the sandbox image (continuing; run \`cinatra instance sandbox build\` later): ${err && err.message ? err.message : err}`,
+      );
+    }
 
     console.log("\nFull development reset complete. Everything has been rebuilt from scratch.");
     console.log("Start the app with: pnpm dev");
@@ -12466,6 +12865,18 @@ function buildHandlers() {
     "preview.list": async (rest) => {
       const { runPreviewList } = await import("./preview.mjs");
       runPreviewList(rest, { checkoutDir: getRepoRoot() });
+    },
+    "sandbox.build": async (rest) => {
+      await runSandboxBuild(rest);
+    },
+    "sandbox.doctor": async (rest) => {
+      await runSandboxDoctor(rest);
+    },
+    "sandbox.status": async (rest) => {
+      await runSandboxStatus(rest);
+    },
+    "sandbox.gc": async (rest) => {
+      await runSandboxGc(rest);
     },
     "db.migrate": async (rest) => {
       await runDbMigrate(rest);

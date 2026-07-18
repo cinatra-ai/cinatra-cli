@@ -6,6 +6,32 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Execution-plane lifecycle (`cinatra instance sandbox …`, exec-plane S4).**
+  `install` now offers an execution-mode choice — `local-dev` (build + run the
+  sandbox on this machine), `remote` (a broker URL + a digest-pinned image), or
+  `disabled` (no sandbox; models stay usable) — interactive on a TTY, otherwise
+  the mode default (dev/demo → local-dev, prod → remote) or an explicit
+  `--execution-mode` flag. Image acquisition is now a first-class install step.
+  New `cinatra instance sandbox build | doctor | status | gc` verbs manage the
+  digest-pinned L0 sandbox image and self-check the worker, image-digest pin,
+  egress enforcement, isolation, and audit-sink surfaces (each reported
+  distinctly as healthy / degraded / disabled; unverifiable-because-not-yet-wired
+  app surfaces degrade honestly rather than reporting a false pass).
+  `cinatra update` surfaces the execution-plane update coordination (protocol
+  compatibility, drain → roll workers before the app, rollback path, prod
+  guidance), and `cinatra instance refresh` now rebuilds the local L0 image so
+  the worker moves with the app.
+
+### Changed
+
+- The CLI-managed sandbox image path is now the digest-pinned execution-plane L0
+  image (built from `docker/sandbox/Dockerfile`, its resolved digest recorded).
+  The retired `:latest` skill-shell image is no longer built by
+  `instance reset --full` (or any other CLI path) — digest pins only.
+
+
 ### Removed
 
 - `create-extension` no longer offers the `workflow` kind — the workflow

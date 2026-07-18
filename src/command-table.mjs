@@ -355,6 +355,37 @@ export const COMMAND_DESCRIPTORS = [
     match: "command+mode+sub",
     summary: "List registered previews (slug, sha, image tag, provenance, volume, state).",
   },
+  // cinatra-cli#160 (exec-plane S4): execution-plane sandbox lifecycle verbs.
+  // The execution plane is the core-owned sandboxed executor every LLM run can
+  // reach (S1 #1706). These manage its LOCAL surface — acquire the digest-pinned
+  // L0 image, self-check the worker/egress/isolation/audit surfaces, and show the
+  // configured mode. Namespaced under `instance` (they operate on this instance).
+  {
+    id: "sandbox.build",
+    path: ["instance", "sandbox", "build"],
+    match: "command+mode+sub",
+    summary:
+      "Acquire the execution-plane L0 sandbox image (local-dev: build from docker/sandbox/Dockerfile + record its digest; remote: pull the digest-pinned image). Digest-pinned, never :latest.",
+  },
+  {
+    id: "sandbox.doctor",
+    path: ["instance", "sandbox", "doctor"],
+    match: "command+mode+sub",
+    summary:
+      "Execution-plane self-check: worker health, L0 image-digest match, egress enforcement, isolation mode, audit-sink reachability (healthy / degraded / disabled).",
+  },
+  {
+    id: "sandbox.status",
+    path: ["instance", "sandbox", "status"],
+    match: "command+mode+sub",
+    summary: "Show the configured execution mode, L0 image + recorded digest, and local sandbox topology (read-only).",
+  },
+  {
+    id: "sandbox.gc",
+    path: ["instance", "sandbox", "gc"],
+    match: "command+mode+sub",
+    summary: "Reap orphaned L2 sandbox workspace volumes (dev only; --yes required; read-only plan otherwise).",
+  },
   {
     id: "db.migrate",
     path: ["instance", "db", "migrate"],
