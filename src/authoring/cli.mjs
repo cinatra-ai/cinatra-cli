@@ -27,6 +27,11 @@
 //                            toolchain delta, and a vendored-primitives seed.
 //   --with-registry-items    (artifact only; implies --with-ui) also seed a
 //                            contributed shadcn registry item (registryItems).
+//   --assistant              (agent only) also ship a cinatra/config.json
+//                            `assistant` declaration (abiVersion, displayName,
+//                            preferredTag, persona, skillBundle, launch,
+//                            delivery, …) — an agent-kind assistant the host
+//                            adopts as a first-class chat assistant.
 //
 // `runCreateExtension(argv)` RETURNS 0 on success and THROWS on error. A usage /
 // validation error throws an Error carrying `.exitCode = 2` so the bin exits
@@ -48,11 +53,12 @@ function usageError(message) {
 }
 
 export function parseCreateExtensionArgv(argv) {
-  const opts = { _: [], yes: false, force: false, withUi: false, withRegistryItems: false };
+  const opts = { _: [], yes: false, force: false, withUi: false, withRegistryItems: false, assistant: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--yes" || a === "-y") opts.yes = true;
     else if (a === "--force") opts.force = true;
+    else if (a === "--assistant") opts.assistant = true;
     else if (a === "--with-ui") opts.withUi = true;
     else if (a === "--with-registry-items") {
       // registryItems lives inside cinatra.artifact.ui, so it implies --with-ui.
@@ -146,6 +152,13 @@ export async function runCreateExtension(argv) {
       );
     }
 
+    // ── assistant flavor (cinatra#1874 W1) ──────────────────────────────────
+    // Guard here too (in addition to resolveInputs) so the usage error is typed
+    // (exit 2) and reported before any prompting side effects.
+    if (opts.assistant && kind !== "agent") {
+      throw usageError(`--assistant is only valid for kind "agent" (got "${kind}")`);
+    }
+
     // ── scaffold ────────────────────────────────────────────────────────────
     const result = scaffold({
       kind,
@@ -157,10 +170,18 @@ export async function runCreateExtension(argv) {
       force: opts.force,
       withUi: opts.withUi,
       withRegistryItems: opts.withRegistryItems,
+      assistant: opts.assistant,
     });
 
-    stdout.write(`\nScaffolded ${result.packageName} (kind: ${kind})\n`);
+    stdout.write(`\nScaffolded ${result.packageName} (kind: ${kind}${result.assistant ? ", assistant flavor" : ""})\n`);
     stdout.write(`  ${result.targetDir}\n\n`);
+    if (result.assistant) {
+      stdout.write(
+        `  Includes the assistant declaration (cinatra/config.json). Edit its \`assistant\` block —\n` +
+          `  the persona, preferredTag, skillBundle, launch, and delivery. The host validates it\n` +
+          `  through its single shared assistant-declaration parser at install (fail-closed).\n\n`,
+      );
+    }
     if (result.withUi) {
       stdout.write(
         `  Includes the opt-in cinatra.artifact.ui renderer (src/renderers/detail.tsx). It renders\n` +

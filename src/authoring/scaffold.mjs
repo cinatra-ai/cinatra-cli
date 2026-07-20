@@ -44,6 +44,18 @@ export const TEMPLATES_ROOT = join(REPO_ROOT, "templates");
  * scaffolded repo catches what the install pipeline rejects BEFORE publishing. */
 const KINDS_WITH_GATE = new Set(EXTENSION_KINDS);
 
+/** The ASSISTANT FLAVOR (cinatra#1874 W1) is a VARIANT of the `agent` kind: an
+ *  assistant is an agent-kind extension whose package-root cinatra/config.json
+ *  carries an `assistant` block (the host adopts it as a first-class chat
+ *  assistant — its own handle/persona/skill bundle, launch + delivery topology,
+ *  run surface on the host runtime). Only `agent` may take `--assistant`; the
+ *  overlay tree (templates/_assistant, rendered ON TOP of the agent template)
+ *  merges the well-formed cinatra/config.json into the agent's existing
+ *  cinatra/ directory. The agent template already packages `cinatra`
+ *  (package.json#files), so the declaration ships in the tarball. */
+const ASSISTANT_FLAVOR_KIND = "agent";
+const ASSISTANT_OVERLAY_DIR = "_assistant";
+
 /** Titleize a slug base, e.g. "web-research" → "Web Research". */
 export function titleize(base) {
   return base
@@ -83,6 +95,7 @@ export function resolveInputs({
   targetParent,
   withUi = false,
   withRegistryItems = false,
+  assistant = false,
 }) {
   const errors = [];
   if (!EXTENSION_KINDS.includes(kind)) {
@@ -97,6 +110,12 @@ export function resolveInputs({
   }
   if (withRegistryItems && !withUi) {
     errors.push("--with-registry-items requires --with-ui (registryItems is declared inside cinatra.artifact.ui)");
+  }
+  // The assistant flavor is a variant of the agent kind only (cinatra#1874 W1).
+  if (assistant && kind !== ASSISTANT_FLAVOR_KIND) {
+    errors.push(
+      `--assistant is only valid for kind "${ASSISTANT_FLAVOR_KIND}" (an assistant is an agent-kind extension whose cinatra/config.json declares an \`assistant\` block); got kind "${kind}"`,
+    );
   }
   if (errors.length) return { ok: false, errors, kind };
   const slug = deriveSlug(name, kind);
@@ -175,6 +194,7 @@ export function resolveInputs({
     base,
     withUi: Boolean(withUi),
     withRegistryItems: Boolean(withRegistryItems),
+    assistant: Boolean(assistant),
   };
 }
 
@@ -207,6 +227,22 @@ export function scaffold(opts) {
     written.push(...applyArtifactUiOverlay(targetDir, vars, { withRegistryItems: r.withRegistryItems }));
   }
 
+  // ASSISTANT FLAVOR (cinatra#1874 W1): overlay the assistant declaration onto
+  // the agent scaffold — a package-root cinatra/config.json with a well-formed
+  // `assistant` block the host's SINGLE shared assistant-declaration parser
+  // accepts (fail-closed: unknown key / bad preferredTag / wrong abiVersion is
+  // rejected at install). The agent template already packages "cinatra"
+  // (package.json#files), so the config.json ships. Rendered AFTER the base tree
+  // so it merges into the existing cinatra/ directory; BEFORE the gate copy so
+  // the gate lands last. The install-time assistant⊕executor XOR is on the
+  // `access` block (never scaffolded here), so shipping the agent oas.json
+  // alongside the declaration is gate-clean at W1.
+  if (r.assistant) {
+    const overlaySrc = join(TEMPLATES_ROOT, ASSISTANT_OVERLAY_DIR);
+    if (!existsSync(overlaySrc)) throw new Error(`no assistant overlay template at ${overlaySrc}`);
+    written.push(...renderTree(overlaySrc, targetDir, vars));
+  }
+
   // All kinds ship the shared self-contained kind gate (verbatim, not a
   // template — it carries no placeholders).
   if (KINDS_WITH_GATE.has(kind)) {
@@ -227,6 +263,7 @@ export function scaffold(opts) {
     vars,
     withUi: r.withUi,
     withRegistryItems: r.withRegistryItems,
+    assistant: r.assistant,
   };
 }
 

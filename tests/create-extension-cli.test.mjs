@@ -72,6 +72,25 @@ describe("cinatra create-extension argument routing (the kind token in `mode`)",
     expect(existsSync(path.join(workdir, "routed-thing-agent"))).toBe(true);
   });
 
+  it("`create-extension agent foo --assistant` ships the cinatra/config.json assistant declaration", () => {
+    const res = run(["create-extension", "agent", "support-bot", "--assistant", "--yes"]);
+    expect(res.status, `stderr: ${res.stderr}`).toBe(0);
+    const dir = path.join(workdir, "support-bot-agent");
+    expect(existsSync(path.join(dir, "cinatra", "config.json")), "assistant flavor must ship cinatra/config.json").toBe(true);
+    const cfg = JSON.parse(readFileSync(path.join(dir, "cinatra", "config.json"), "utf8"));
+    expect(cfg.formatVersion).toBe(1);
+    expect(cfg.assistant.abiVersion).toBe(1);
+    expect(cfg.assistant.preferredTag).toBe("support-bot");
+    expect(res.stdout).toContain("assistant flavor");
+  });
+
+  it("rejects --assistant for a non-agent kind with a typed usage error (exit 2), scaffolds nothing", () => {
+    const res = run(["create-extension", "connector", "stripe", "--assistant", "--yes"]);
+    expect(res.status).toBe(2);
+    expect(res.stderr).toMatch(/--assistant is only valid for kind "agent"/);
+    expect(existsSync(path.join(workdir, "stripe-connector"))).toBe(false);
+  });
+
   it("honors --scope for a connector (any-scope kind)", () => {
     const res = run(["create-extension", "connector", "stripe", "--scope", "acme", "--yes"]);
     expect(res.status, `stderr: ${res.stderr}`).toBe(0);

@@ -909,6 +909,9 @@ non-fatal and only reported).`,
 
 Options:
   --scope <scope>          npm scope (default: cinatra-ai)
+  --assistant              (agent only) also ship a cinatra/config.json assistant
+                           declaration — an agent-kind assistant the host adopts
+                           as a first-class chat assistant
   --display-name <name>    human display name (README H1)
   --description <text>     one-line description
   --dir <path>             parent directory to scaffold into (default: cwd)
@@ -917,6 +920,7 @@ Options:
 
 Examples:
   cinatra create-extension agent invoice-extractor
+  cinatra create-extension agent support-bot --assistant
   cinatra create-extension connector stripe --scope acme
   cinatra create-extension skill pdf-tools --scope anthropics`,
   "db.upgrade-preflight": `Read-only preflight for a stateful-service major upgrade (cinatra-cli#128).

@@ -1,0 +1,16 @@
+{
+  "formatVersion": 1,
+  "assistant": {
+    "abiVersion": 1,
+    "displayName": "{{displayName}}",
+    "preferredTag": "{{base}}",
+    "persona": "You are {{displayName}}, a Cinatra assistant. Replace this persona with your assistant's real system guidance: who it is, what it helps with, and how it should respond.",
+    "skillBundle": ["{{base}}"],
+    "allowedTools": [],
+    "allowedAgents": [],
+    "modelPrefs": {},
+    "mcp": { "enabled": true, "restriction": "org-members" },
+    "launch": { "kind": "local" },
+    "delivery": { "kind": "host-runtime" }
+  }
+}
