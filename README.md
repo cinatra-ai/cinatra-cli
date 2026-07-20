@@ -120,6 +120,12 @@ kind-specific payload). The generated package pins `@cinatra-ai/sdk-extensions`
 as an optional peer; nothing is installed for you. Run `cinatra create-extension
 --help` for the kinds and options.
 
+Add `--assistant` to the `agent` kind to also ship a `cinatra/config.json`
+assistant declaration — an agent-kind assistant the host adopts as a first-class
+chat assistant (its own handle, persona, skill bundle, launch, and delivery):
+
+    cinatra create-extension agent support-bot --assistant
+
 ## Repo structure
 
 ```
