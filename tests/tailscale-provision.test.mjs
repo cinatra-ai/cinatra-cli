@@ -9,7 +9,10 @@
 // `https://` scheme + trailing `/`) AND have >=1 hostname label before
 // a non-empty tailnet portion; otherwise → "" → fail-loud (no write).
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import path from "node:path";
+import { tmpdir } from "node:os";
 
 import {
   TailscaleProvisionError,
@@ -219,6 +222,77 @@ describe.skip("verifyRegisteredHostnameMatchesPrediction (needs extensions clone
         expect(typeof res.error.code).toBe("string");
         expect(res.error.code.startsWith("tailscale.")).toBe(true);
       }
+    }
+  });
+});
+
+// --- cinatra#1919: repoRoot threading (production path, real loader) --------
+//
+// The `.skip`ped block above needs the REAL connector clone. These cases use a
+// FIXTURE extensions tree with a synthetic `tailscale-hostname` declarer, passed
+// via the new `repoRoot` argument, to prove — WITHOUT injecting a fake verifier
+// — that `verifyRegisteredHostnameMatchesPrediction` threads `repoRoot` to the
+// dev-CLI module loader. This is the exact defect cinatra#1919 fixes: the
+// published/extracted CLI's default (monorepo-relative) root points outside the
+// operator's checkout, so the declarer was never found even when present.
+describe("verifyRegisteredHostnameMatchesPrediction — cinatra#1919 repoRoot threading (fixture tree)", () => {
+  let fixtureRoot = "";
+
+  beforeEach(() => {
+    fixtureRoot = mkdtempSync(path.join(tmpdir(), "ts-hostname-fixture-"));
+    // A synthetic declarer: predicts a fixed hostname so we can drive a match.
+    const extDir = path.join(
+      fixtureRoot,
+      "extensions",
+      "cinatra-ai",
+      "tailscale-connector",
+    );
+    mkdirSync(extDir, { recursive: true });
+    writeFileSync(
+      path.join(extDir, "package.json"),
+      JSON.stringify({
+        name: "@cinatra-ai/tailscale-connector",
+        cinatra: { devCliModules: { "tailscale-hostname": "./hostname.mjs" } },
+      }),
+    );
+    writeFileSync(
+      path.join(extDir, "hostname.mjs"),
+      "export function deriveDevTailscaleHostname() { return 'cinatra-fixture'; }\n",
+    );
+  });
+
+  afterEach(() => {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  });
+
+  it("resolves the declarer from the passed repoRoot (not the monorepo-relative default)", async () => {
+    const res = await verifyRegisteredHostnameMatchesPrediction({
+      registered: "cinatra-fixture.tailnet000.ts.net.",
+      dbUrl: "postgres://127.0.0.1:5432/cinatra",
+      schema: "cinatra",
+      repoRoot: fixtureRoot,
+    });
+    expect(res.ok).toBe(true);
+    expect(res.predicted).toBe("cinatra-fixture");
+    expect(res.registered).toBe("cinatra-fixture");
+  });
+
+  it("throws the loader's MARKED declarer-missing error when repoRoot has no declarer", async () => {
+    const emptyRoot = mkdtempSync(path.join(tmpdir(), "ts-hostname-empty-"));
+    try {
+      await expect(
+        verifyRegisteredHostnameMatchesPrediction({
+          registered: "cinatra-fixture.tailnet000.ts.net.",
+          dbUrl: "postgres://127.0.0.1:5432/cinatra",
+          schema: "cinatra",
+          repoRoot: emptyRoot,
+        }),
+      ).rejects.toMatchObject({
+        code: "ERR_MODULE_NOT_FOUND",
+        cinatraDevCliDeclarerMissing: true,
+      });
+    } finally {
+      rmSync(emptyRoot, { recursive: true, force: true });
     }
   });
 });

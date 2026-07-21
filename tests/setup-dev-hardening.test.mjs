@@ -1201,4 +1201,137 @@ describe("ensureDevPublicMcpUrl — Step 3 self-establish + self-heal", () => {
     expect(r.status).toBe("skipped-no-db");
     expect(deps.runDevTunnel).not.toHaveBeenCalled();
   });
+
+  // --- cinatra#1919: unresolvable `tailscale-hostname` declarer degrades -----
+  //
+  // The hostname prediction resolves the `tailscale-hostname` dev-CLI module
+  // lazily from the extensions tree; on a fresh/empty tree (or a deliberately
+  // removed connector) the loader throws ERR_MODULE_NOT_FOUND. That throw must
+  // NEVER escape ensureDevPublicMcpUrl — it must degrade to ONE attributable
+  // status so `runSetup`'s summary + `doctor` name the true cause instead of the
+  // misleading "self-establish failed unexpectedly" warning cascading into four
+  // hosted-LLM assertion failures.
+  // Mirrors the loader's genuinely-absent-declarer error (dev-cli-modules.mjs):
+  // ERR_MODULE_NOT_FOUND PLUS the distinct `cinatraDevCliDeclarerMissing` marker
+  // that the degradation guard keys on (so a declared-but-broken import — which
+  // also throws ERR_MODULE_NOT_FOUND but WITHOUT the marker — is NOT masked).
+  function declarerMissing() {
+    const err = new Error(
+      'Cannot find module for dev-CLI key "tailscale-hostname" — no extension present ' +
+        'under extensions/ declares cinatra.devCliModules["tailscale-hostname"].',
+    );
+    err.code = "ERR_MODULE_NOT_FOUND";
+    err.cinatraDevCliDeclarerMissing = true;
+    return err;
+  }
+
+  it("DEGRADES (never throws) to an attributable status when the tailscale-hostname declarer is absent — sidecar down", async () => {
+    const deps = makeDeps({
+      composeProjectUp: () => false, // sidecar down (fresh CI/dev bring-up)
+      verifyRegisteredHostnameMatchesPrediction: async () => {
+        throw declarerMissing();
+      },
+    });
+    const r = await ensureDevPublicMcpUrl({
+      dbUrl: "postgres://x",
+      schemaName: "cinatra",
+      env: {},
+      operatorUrl: { url: null },
+      deps,
+    });
+    // ONE attributable status — NOT a thrown module error, NOT a misleading
+    // "errored" cascade.
+    expect(r.status).toBe("hostname-declarer-unresolvable");
+    expect(r.owned).toBe(false);
+    expect(r.publicBaseUrl).toBeNull();
+    // The remediation names the setup step that materializes the declarer.
+    expect(r.fixHint).toBe("cinatra instance setup dev");
+    expect(r.reason).toMatch(/tailscale-hostname/);
+    // Degradation happens at the ownership read — it must NOT limp on to a
+    // Funnel bring-up on an unresolvable declarer.
+    expect(deps.runDevTunnel).not.toHaveBeenCalled();
+  });
+
+  it("DEGRADES on the post-bring-up hostname re-derivation too (sidecar came up, declarer still absent)", async () => {
+    let upCalls = 0;
+    let verifyCalls = 0;
+    const deps = makeDeps({
+      // Sidecar reads DOWN on the first ownership probe (forcing bring-up), then
+      // UP after runDevTunnel — so the post-bring-up verifyHostname runs.
+      composeProjectUp: () => upCalls++ > 0,
+      runDevTunnel: vi.fn(async () => undefined),
+      waitForTailscaleFunnelUrl: async () => ({
+        url: "https://cinatra-main.tailnet.ts.net",
+        registeredDnsName: "cinatra-main.tailnet.ts.net",
+      }),
+      // First (pre-bring-up) ownership read resolves cleanly to "not owned";
+      // the post-bring-up re-derivation hits the absent declarer.
+      verifyRegisteredHostnameMatchesPrediction: async () => {
+        if (++verifyCalls >= 2) throw declarerMissing();
+        return { ok: false, predicted: "cinatra-main", registered: "" };
+      },
+    });
+    const r = await ensureDevPublicMcpUrl({
+      dbUrl: "postgres://x",
+      schemaName: "cinatra",
+      env: {},
+      operatorUrl: { url: null },
+      deps,
+    });
+    expect(r.status).toBe("hostname-declarer-unresolvable");
+    expect(r.publicBaseUrl).toBeNull();
+    expect(deps.writeClonePublicBaseUrl).not.toHaveBeenCalled();
+  });
+
+  it("a NON-module-not-found error still propagates (degradation is scoped to the declarer-absent case)", async () => {
+    const deps = makeDeps({
+      verifyRegisteredHostnameMatchesPrediction: async () => {
+        throw new Error("some unexpected DB failure");
+      },
+    });
+    await expect(
+      ensureDevPublicMcpUrl({
+        dbUrl: "postgres://x",
+        schemaName: "cinatra",
+        env: {},
+        operatorUrl: { url: null },
+        deps,
+      }),
+    ).rejects.toThrow(/unexpected DB failure/);
+  });
+});
+
+// --- cinatra#1919: materialization-order structural pin ---------------------
+//
+// The public-MCP self-establish (`ensureDevPublicMcpUrl`) predicts the dev-main
+// Tailscale hostname via the `tailscale-hostname` dev-CLI module, which only
+// exists once the extensions tree is synced. `runSetup("dev")` MUST therefore
+// sync the dev extensions BEFORE it calls the self-establish step — otherwise a
+// fresh checkout has no declarer and self-establish can never resolve one. This
+// pins the source order so a future refactor can't silently re-introduce the
+// bug (the empty-tree/materialization-order regression).
+describe("cinatra#1919 — runSetup materializes the extensions tree before self-establish", () => {
+  it("syncCinatraDevExtensions precedes ensureDevPublicMcpUrl inside runSetup('dev')", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const path = (await import("node:path")).default;
+    const srcPath = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "..",
+      "src",
+      "index.mjs",
+    );
+    const src = readFileSync(srcPath, "utf8");
+    const start = src.indexOf("async function runSetup(");
+    expect(start).toBeGreaterThan(-1);
+    // Scope to the runSetup body (up to the next top-level `async function`).
+    const rest = src.slice(start + "async function runSetup(".length);
+    const nextFn = rest.indexOf("\nasync function ");
+    const body = nextFn === -1 ? rest : rest.slice(0, nextFn);
+    const syncIdx = body.indexOf("syncCinatraDevExtensions({");
+    const establishIdx = body.indexOf("ensureDevPublicMcpUrl({");
+    expect(syncIdx).toBeGreaterThan(-1);
+    expect(establishIdx).toBeGreaterThan(-1);
+    expect(syncIdx).toBeLessThan(establishIdx);
+  });
 });

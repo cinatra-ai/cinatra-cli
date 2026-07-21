@@ -85,6 +85,13 @@ export async function loadDevCliModule(key, repoRoot = REPO_ROOT) {
         `declares cinatra.devCliModules["${key}"] (the extensions tree is populated by \`cinatra instance setup dev\`).`,
     );
     err.code = "ERR_MODULE_NOT_FOUND";
+    // cinatra#1919 — a DISTINCT marker for "no extension DECLARES this key",
+    // separate from the identical ERR_MODULE_NOT_FOUND a dynamic import() throws
+    // for a declared-but-broken module (missing file / missing transitive dep).
+    // Graceful-degradation guards that want to tolerate ONLY a genuinely-absent
+    // declarer (see ensureDevPublicMcpUrl) key on this flag so they never mask a
+    // real installation/code defect.
+    err.cinatraDevCliDeclarerMissing = true;
     throw err;
   }
   return import(pathToFileURL(modulePath).href);

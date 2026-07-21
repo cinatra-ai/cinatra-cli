@@ -150,13 +150,27 @@ export async function verifyRegisteredHostnameMatchesPrediction({
   registered,
   dbUrl,
   schema,
+  repoRoot,
 }) {
   // Single source of truth — NEVER re-derive here. Discovered + loaded lazily
   // through the connector's `cinatra.devCliModules` manifest declaration
   // (cinatra#151 Stage 5c) so this module imports cleanly when the gitignored
   // connector source is absent and names no extension.
+  //
+  // cinatra#1919 — the caller MUST pass the resolved checkout `repoRoot`. The
+  // loader's default REPO_ROOT is derived three directories up from THIS module
+  // file, which is correct only for the in-monorepo layout; for the
+  // published/extracted CLI (this module lives under
+  // node_modules/@cinatra-ai/cinatra/src) that default points OUTSIDE the
+  // operator's checkout, so the `tailscale-hostname` declarer in the checkout's
+  // `extensions/` tree is never found and discovery returns null → the module
+  // load throws even though the connector IS present. Threading the resolved
+  // root (getRepoRoot() at the call sites) fixes the published-CLI discovery.
   const { loadDevCliModule } = await import("./dev-cli-modules.mjs");
-  const { deriveDevTailscaleHostname } = await loadDevCliModule("tailscale-hostname");
+  const { deriveDevTailscaleHostname } = await loadDevCliModule(
+    "tailscale-hostname",
+    repoRoot,
+  );
   const predicted = deriveDevTailscaleHostname({ dbUrl, schema });
   const segment = extractTailscaleHostnameSegment(registered);
 

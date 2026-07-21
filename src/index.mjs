@@ -5408,6 +5408,56 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
     // live DNSName when owned, and AUTO-BRINGS-UP the dev-main Funnel when it
     // is missing/down (owner decision). Strictly conditional + soft-fail: a
     // bring-up failure becomes a LOUD warning below, NEVER an aborted setup.
+    // cinatra#1919 — materialize the dev extensions tree BEFORE the public-MCP
+    // self-establish step below. `ensureDevPublicMcpUrl` predicts the dev-main
+    // Tailscale hostname via the `tailscale-hostname` dev-CLI module, which is
+    // DISCOVERED from an extension's `cinatra.devCliModules` manifest — a
+    // declarer that only exists once the extensions tree is cloned. Running the
+    // sync first means a fresh CI/dev `setup dev` has the declarer on disk when
+    // self-establish runs, so the public URL is established with zero manual
+    // steps (instead of throwing ERR_MODULE_NOT_FOUND → no URL → doctor's
+    // LLM-MCP-access hard-fail → the misleading downstream UAT failures). The
+    // sync is idempotent + loud-but-non-fatal (a warm checkout is a no-op).
+    // `extensionSync`/`extensionSyncFailed` are declared at function scope so the
+    // later local-registry seed (in the dev tail below) still reads the result.
+    let extensionSync;
+    let extensionSyncFailed = false;
+    if (mode === "dev") {
+      // Clone the companion extension repos (cinatra-ai/<slug>) into
+      // extensions/<scope>/<name>. Source of truth is the companion repos
+      // (post-cutover); a no-op when `cinatra.devExtensions` is empty.
+      // Loud-but-non-fatal, like the dev-app sync in the tail.
+      try {
+        extensionSync = await syncCinatraDevExtensions({
+          repoRoot,
+          targetRoot: repoRoot,
+          argv: skipDevApps ? ["--skip-dev-apps"] : process.argv.slice(2),
+        });
+      } catch (err) {
+        extensionSyncFailed = true;
+        console.error(`\n⚠ Dev extension sync FAILED:\n  ${err && err.message ? err.message : err}\n`);
+        process.exitCode = 1;
+      }
+      // Re-link the freshly-cloned extensions into the workspace so their host
+      // value-imports resolve at `pnpm dev` (guarded no-op on warm checkouts).
+      const devInstallResult = installAfterExtensionSync(repoRoot, extensionSync);
+      // cinatra-cli#41: guarantee every emitted on-disk extension is linked into
+      // node_modules (verify + non-destructive symlink repair) before regen, and
+      // gate the regen on it — see ensureClonedExtensionsLinked.
+      const devLinkState = ensureClonedExtensionsLinked(repoRoot);
+      const devLinkSafe = (devInstallResult ? devInstallResult.ok !== false : true) && devLinkState.ok;
+      // Presence-aware regeneration of the generated extension maps
+      // (cinatra#109/#110): keeps the committed src/lib/generated/* maps matching
+      // the extension set actually on disk. Gated on a successful, non-skipped,
+      // non-empty sync AND the #41 link invariant — see
+      // regenerateExtensionManifestAfterSync.
+      regenerateExtensionManifestAfterSync(repoRoot, extensionSync, {
+        failed: extensionSyncFailed || !devLinkSafe,
+      });
+    }
+    // cinatra#260 Step 3 — self-establishing + self-healing public MCP URL
+    // (dev only). Runs AFTER the extension-tree materialization above so the
+    // tailscale-hostname declarer is present (cinatra#1919).
     let publicMcpUrl = null;
     if (mode === "dev") {
       try {
@@ -5416,6 +5466,10 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
           schemaName,
           env,
           operatorUrl: { url: hasExplicitOperatorPublicUrl ? explicitOperatorPublicUrl : null },
+          // cinatra#1919 — the resolved checkout root, so the hostname
+          // prediction discovers the `tailscale-hostname` declarer from THIS
+          // tree (correct for the published/extracted CLI too).
+          repoRoot,
         });
       } catch (err) {
         // Defensive — the helper never throws past its boundary, but any
@@ -5557,44 +5611,11 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
         console.error(`\n⚠ Dev app sync FAILED:\n  ${err && err.message ? err.message : err}\n`);
         process.exitCode = 1;
       }
-      // Clone the companion extension repos (cinatra-ai/<slug>) into
-      // extensions/<scope>/<name>. Source of truth is the companion repos
-      // (post-cutover); a no-op when `cinatra.devExtensions` is empty.
-      // Loud-but-non-fatal, like the dev-app sync above.
-      let extensionSync;
-      let extensionSyncFailed = false;
-      try {
-        extensionSync = await syncCinatraDevExtensions({
-          repoRoot,
-          targetRoot: repoRoot,
-          argv: skipDevApps ? ["--skip-dev-apps"] : process.argv.slice(2),
-        });
-      } catch (err) {
-        extensionSyncFailed = true;
-        console.error(`\n⚠ Dev extension sync FAILED:\n  ${err && err.message ? err.message : err}\n`);
-        process.exitCode = 1;
-      }
-      // Re-link the freshly-cloned extensions into the workspace so their host
-      // value-imports resolve at `pnpm dev` (guarded no-op on warm checkouts).
-      const devInstallResult = installAfterExtensionSync(repoRoot, extensionSync);
-      // cinatra-cli#41: guarantee every emitted on-disk extension is linked into
-      // node_modules (verify + non-destructive symlink repair) before regen, and
-      // gate the regen on it — see ensureClonedExtensionsLinked.
-      const devLinkState = ensureClonedExtensionsLinked(repoRoot);
-      const devLinkSafe = (devInstallResult ? devInstallResult.ok !== false : true) && devLinkState.ok;
-      // Presence-aware regeneration of the generated extension maps
-      // (cinatra#109/#110): the committed src/lib/generated/* maps are
-      // byte-checked in CI against the synced extension set, but the companion
-      // repos move independently of this tree — a fresh clone can sync
-      // extension mains that drifted past the committed maps, leaving literal
-      // `import("...")` specifiers that no longer resolve (Turbopack
-      // module-not-found on /connectors). Regenerating right after the sync
-      // keeps the maps matching the extension set actually on disk.
-      // Gated on a successful, non-skipped, non-empty sync AND the #41 link
-      // invariant — see regenerateExtensionManifestAfterSync.
-      regenerateExtensionManifestAfterSync(repoRoot, extensionSync, {
-        failed: extensionSyncFailed || !devLinkSafe,
-      });
+      // cinatra#1919 — the companion extension repos (cinatra-ai/<slug>) are now
+      // synced + linked + manifest-regenerated EARLIER, before the public-MCP
+      // self-establish step, so the tailscale-hostname dev-CLI declarer is on
+      // disk when self-establish runs. `extensionSync`/`extensionSyncFailed` from
+      // that earlier step are in scope here for the local-registry seed below.
       // cinatra#386 — seed the on-disk first-party extensions into the LOCAL
       // bundled Verdaccio so they resolve + install out of the box (the fresh
       // local registry starts empty; the installer is registry-only). Runs
@@ -9073,8 +9094,13 @@ function loadTailscaleHostnameModule() {
 //   them to drive every branch hermetically (no Docker, no live DB).
 // @returns {Promise<{ status: string, owned: boolean, broughtUp: boolean,
 //   publicBaseUrl: string | null, fixHint: string | null }>}
-async function ensureDevPublicMcpUrl({ dbUrl, schemaName, env, operatorUrl, deps = {} }) {
+async function ensureDevPublicMcpUrl({ dbUrl, schemaName, env, operatorUrl, repoRoot, deps = {} }) {
   const resolvedSchema = schemaName?.trim() || "cinatra";
+  // cinatra#1919 — resolve the checkout root ONCE so the hostname prediction's
+  // `tailscale-hostname` dev-CLI module is discovered from the operator's
+  // extensions tree (not the loader's monorepo-relative default, which is wrong
+  // for the published/extracted CLI). Callers pass it; default defensively.
+  const resolvedRepoRoot = repoRoot ?? getRepoRoot();
 
   // Non-pure boundaries, injectable for hermetic tests. Each defaults to the
   // real implementation — production callers pass no `deps`.
@@ -9100,6 +9126,42 @@ async function ensureDevPublicMcpUrl({ dbUrl, schemaName, env, operatorUrl, deps
         await client.end().catch(() => null);
       }
     });
+
+  // cinatra#1919 — the hostname prediction (`verifyHostname`) resolves the
+  // `tailscale-hostname` dev-CLI module lazily from the extensions tree; when no
+  // present extension DECLARES it, the loader throws its own marked error. That
+  // is a legitimate "declarer genuinely unresolvable" state (a fresh/empty tree,
+  // or a deliberately-removed connector), NOT an unexpected crash — it must
+  // NEVER escape this boundary and cascade into the caller's misleading
+  // "self-establish failed unexpectedly" warning + four downstream hosted-LLM
+  // assertion failures. Wrap every hostname read so an unresolvable declarer
+  // degrades to ONE attributable status the summary + doctor can name truthfully.
+  //
+  // The check keys on the loader's DISTINCT `cinatraDevCliDeclarerMissing`
+  // marker, NOT on the bare ERR_MODULE_NOT_FOUND code — a declared-but-broken
+  // module (missing file, missing transitive dep) also surfaces
+  // ERR_MODULE_NOT_FOUND from the dynamic import(), and that is a REAL defect
+  // that must propagate, not be masked as "declarer absent".
+  async function verifyHostnameSafe(args) {
+    try {
+      return { ok: true, result: await verifyHostname({ ...args, repoRoot: resolvedRepoRoot }) };
+    } catch (err) {
+      if (err && err.cinatraDevCliDeclarerMissing === true) {
+        return { ok: false, declarerUnresolvable: err };
+      }
+      throw err;
+    }
+  }
+  const declarerUnresolvableStatus = (err, { broughtUp = false } = {}) => ({
+    status: "hostname-declarer-unresolvable",
+    owned: false,
+    broughtUp,
+    publicBaseUrl: null,
+    // The declarer lives in the extensions tree, populated by `setup dev`; the
+    // attributable remediation is to (re)run setup so the tree materializes.
+    fixHint: "cinatra instance setup dev",
+    reason: err && err.message ? err.message : String(err),
+  });
 
   // GATE 1 — operator-supplied env URL wins.
   // Only an EXPLICIT public URL counts as operator-supplied. BETTER_AUTH_URL /
@@ -9207,11 +9269,17 @@ async function ensureDevPublicMcpUrl({ dbUrl, schemaName, env, operatorUrl, deps
   // SOURCE/OWNERSHIP validation — NOT reachability. Matches → owned; a fresh
   // un-propagated URL still validates here because we compare node identity,
   // never DNS resolution.
-  const hostnameCheck = await verifyHostname({
+  const hostnameProbe = await verifyHostnameSafe({
     registered: registeredDnsName,
     dbUrl,
     schema: resolvedSchema,
   });
+  if (!hostnameProbe.ok) {
+    // Declarer genuinely unresolvable (empty/fresh extensions tree). Degrade to
+    // ONE attributable status instead of throwing (cinatra#1919).
+    return declarerUnresolvableStatus(hostnameProbe.declarerUnresolvable);
+  }
+  const hostnameCheck = hostnameProbe.result;
 
   if (sidecarUp && shouldWritePublicBaseUrl({ funnelUrl, hostnameCheck })) {
     // OWNED. (Re)write `publicBaseUrl` from the live DNSName into THIS schema —
@@ -9309,11 +9377,17 @@ async function ensureDevPublicMcpUrl({ dbUrl, schemaName, env, operatorUrl, deps
       postFunnelUrl = null;
     }
   }
-  const postCheck = await verifyHostname({
+  const postProbe = await verifyHostnameSafe({
     registered: postRegistered,
     dbUrl,
     schema: resolvedSchema,
   });
+  if (!postProbe.ok) {
+    // The Funnel bring-up DID succeed here — report it truthfully even though
+    // the declarer went unresolvable on the post-bring-up re-derivation.
+    return declarerUnresolvableStatus(postProbe.declarerUnresolvable, { broughtUp });
+  }
+  const postCheck = postProbe.result;
   if (shouldWritePublicBaseUrl({ funnelUrl: postFunnelUrl, hostnameCheck: postCheck })) {
     try {
       await writeUrl(dbUrl, postFunnelUrl, {
@@ -9761,6 +9835,11 @@ async function runCloneStart(argv) {
           registered: registeredDnsName,
           dbUrl: cloneUrl,
           schema,
+          // cinatra#1919 — discover the tailscale-hostname declarer from the
+          // CLONE's own worktree (where `setup clone` materialized the
+          // extensions tree), NOT `repoRoot` (the shared main-repo root) nor the
+          // loader's monorepo-relative default.
+          repoRoot: worktreePath,
         });
         // Tag the source so the dev tab can distinguish auto-provisioned
         // (Nango OAuth client) from operator-pasted URLs.
@@ -10606,6 +10685,9 @@ async function runDevTunnel(argv) {
       registered: registeredDnsName,
       dbUrl: mainDbUrl,
       schema: mainSchema,
+      // cinatra#1919 — discover the tailscale-hostname declarer from THIS
+      // checkout (getRepoRoot()), not the loader's monorepo-relative default.
+      repoRoot,
     });
     let publicBaseUrl = null;
     if (mainDbUrl) {
@@ -10878,6 +10960,9 @@ async function runDevTunnel(argv) {
       registered: registeredDnsName,
       dbUrl: mainDbUrl,
       schema: mainSchema,
+      // cinatra#1919 — discover the tailscale-hostname declarer from THIS
+      // checkout (getRepoRoot()), not the loader's monorepo-relative default.
+      repoRoot,
     });
     // Tag the source so the dev tab can distinguish auto-provisioned
     // (Nango OAuth client) from operator-pasted URLs.
