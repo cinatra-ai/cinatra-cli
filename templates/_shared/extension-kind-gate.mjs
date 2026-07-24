@@ -74,11 +74,14 @@
 //     - artifact  → name @cinatra-ai/<slug>-artifact; kind:"artifact"; NO
 //                    cinatra.oas; mandatory valid cinatra.artifact descriptor;
 //                    cinatra block carries only {kind,apiVersion,artifact,
-//                    dependencies,roles,displayName,vendor,views} (mirrors
-//                    artifact-handler.validate + the shared
-//                    ARTIFACT_ALLOWED_CINATRA_KEYS; displayName + vendor are
-//                    cross-kind presentation/byline metadata; views is the
-//                    S9-a chat-view declaration surface, cinatra#1626).
+//                    dependencies,roles,displayName,vendor,views,fieldRenderers,
+//                    dashboardContribution} (mirrors artifact-handler.validate +
+//                    the shared ARTIFACT_ALLOWED_CINATRA_KEYS; displayName +
+//                    vendor are cross-kind presentation/byline metadata; views is
+//                    the S9-a chat-view declaration surface, cinatra#1626;
+//                    fieldRenderers is the artifact field-renderer surface;
+//                    dashboardContribution is the dashboard-pack carrier
+//                    re-homed to the artifact kind, cinatra#1896/#2005).
 //     - skill     → name ends `-skills`; kind:"skill" (mirrors the kind-at-end
 //                    naming-conformance rule for skills).
 //   (The `workflow` kind is RETIRED: a package declaring cinatra.kind:"workflow"
@@ -2032,7 +2035,7 @@ export function validateConnector(packageRoot) {
 // artifact gate — mirror of packages/extensions/src/artifact-handler.validate.
 // ===========================================================================
 export const ARTIFACT_NAME_RE = /^@cinatra-ai\/[a-z0-9][a-z0-9-]*-artifact$/;
-export const ARTIFACT_ALLOWED_CINATRA_KEYS = new Set(["kind", "apiVersion", "artifact", "dependencies", "roles", "displayName", "vendor", "views"]);
+export const ARTIFACT_ALLOWED_CINATRA_KEYS = new Set(["kind", "apiVersion", "artifact", "dependencies", "roles", "displayName", "vendor", "views", "fieldRenderers", "dashboardContribution"]);
 
 const SKILL_REF_IS_INVALID = (s) => /\.md$/i.test(s) || /^\.{0,2}\//.test(s) || s.startsWith("/");
 const ARTIFACT_FORMS = new Set(["file", "connectorRef", "dashboard"]);
@@ -2386,7 +2389,7 @@ export function validateArtifactPackageShape(pkg) {
   }
   for (const k of Object.keys(cinatra)) {
     if (!ARTIFACT_ALLOWED_CINATRA_KEYS.has(k)) {
-      errors.push(`artifact extensions may only declare cinatra.{kind,apiVersion,artifact,dependencies,roles,displayName,vendor,views}; unexpected key "${k}"`);
+      errors.push(`artifact extensions may only declare cinatra.{kind,apiVersion,artifact,dependencies,roles,displayName,vendor,views,fieldRenderers,dashboardContribution}; unexpected key "${k}"`);
     }
   }
   return errors;

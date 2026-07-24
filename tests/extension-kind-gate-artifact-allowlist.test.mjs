@@ -1,15 +1,17 @@
 // AC2 of cinatra-ai/extension-release-tooling#54 (cinatra-cli#154): the gate as
 // COPIED INTO a scaffolded artifact repo — not merely the source template —
 // admits the two cross-kind presentation/byline keys the org allowlist now
-// carries (cinatra.displayName + cinatra.vendor) plus the S9-a chat-view
-// declaration surface (cinatra.views, cinatra#1626), and still rejects any key
-// outside the eight-key artifact allowlist with the EXACT allowlist error.
+// carries (cinatra.displayName + cinatra.vendor), the S9-a chat-view declaration
+// surface (cinatra.views, cinatra#1626), the artifact field-renderer surface
+// (cinatra.fieldRenderers), and the dashboard-pack carrier re-homed to the
+// artifact kind (cinatra.dashboardContribution, cinatra#1896/#2005), and still
+// rejects any key outside the ten-key artifact allowlist with the EXACT error.
 //
 // The point is to exercise the whole copy path `cinatra create-extension
 // artifact` runs: scaffold() copies templates/_shared/extension-kind-gate.mjs
 // verbatim into the generated repo, and the generated repo's standalone CI runs
 // THAT copy. Importing the copied file (not the source template) proves the byte
-// the external author's CI actually executes carries the eight-key allowlist —
+// the external author's CI actually executes carries the ten-key allowlist —
 // the exact drift class the daily release-template-drift-audit flags.
 
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
@@ -21,10 +23,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { scaffold } from "../src/authoring/scaffold.mjs";
 
-// The exact eight-key allowlist error the copied gate must emit, kept as a
+// The exact ten-key allowlist error the copied gate must emit, kept as a
 // literal so any drift in the gate's wording (key set, key order) reddens this.
 const unexpectedKeyError = (k) =>
-  `artifact extensions may only declare cinatra.{kind,apiVersion,artifact,dependencies,roles,displayName,vendor,views}; unexpected key "${k}"`;
+  `artifact extensions may only declare cinatra.{kind,apiVersion,artifact,dependencies,roles,displayName,vendor,views,fieldRenderers,dashboardContribution}; unexpected key "${k}"`;
 
 let parent;
 let targetDir;
@@ -61,7 +63,7 @@ function runWithCinatra(mutate) {
   return runGate(targetDir);
 }
 
-describe("scaffolded artifact — copied gate honors the eight-key cinatra allowlist", () => {
+describe("scaffolded artifact — copied gate honors the ten-key cinatra allowlist", () => {
   it("an otherwise-valid manifest with string-valued cinatra.displayName + cinatra.vendor passes", () => {
     const { kind, errors } = runWithCinatra((c) => {
       c.displayName = "Blog Post";
@@ -87,7 +89,35 @@ describe("scaffolded artifact — copied gate honors the eight-key cinatra allow
     expect(errors).toEqual([]);
   });
 
-  it("an added unknown cinatra key fails with the exact eight-key allowlist error", () => {
+  // Artifact field-renderer surface: the host allowlist carries cinatra.fieldRenderers
+  // (mirrored in artifact-handler.validate); the copied gate admits it (carried
+  // through UNVALIDATED — the host owns the shape), so a scaffolded artifact
+  // declaring it does not red-fail its own repo's standalone kind-gate.
+  it("an otherwise-valid manifest declaring cinatra.fieldRenderers passes", () => {
+    const { kind, errors } = runWithCinatra((c) => {
+      c.displayName = "Blog Post";
+      c.vendor = "Cinatra";
+      c.fieldRenderers = { entries: [{ field: "status", entry: "./src/renderers/status.tsx" }] };
+    });
+    expect(kind).toBe("artifact");
+    expect(errors).toEqual([]);
+  });
+
+  // Dashboard-pack carrier (cinatra#1896/#2005): dashboardContribution re-homed
+  // from the agent kind to the artifact kind; the host artifact allowlist carries
+  // it, so the copied gate must admit it on a first meaning-pack artifact
+  // (e.g. @cinatra-ai/web-analytics-dashboard-artifact).
+  it("an otherwise-valid manifest declaring cinatra.dashboardContribution passes (dashboard meaning pack)", () => {
+    const { kind, errors } = runWithCinatra((c) => {
+      c.displayName = "Web Analytics Dashboard";
+      c.vendor = "Cinatra";
+      c.dashboardContribution = { abiVersion: 1, contributionVersion: 1, contributionKey: "web-analytics" };
+    });
+    expect(kind).toBe("artifact");
+    expect(errors).toEqual([]);
+  });
+
+  it("an added unknown cinatra key fails with the exact ten-key allowlist error", () => {
     const { errors } = runWithCinatra((c) => {
       c.displayName = "Blog Post";
       c.vendor = "Cinatra";
