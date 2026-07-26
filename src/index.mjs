@@ -395,8 +395,8 @@ function printHelp() {
   console.log(`Cinatra setup CLI
 
 Usage:
-  cinatra install [--dir <path>] [--ref <main|tag|sha>] [--mode dev|prod|demo]
-                  [--repo-url <url>] [--yes] [--force] [--reset-env]
+  cinatra install [dev|prod|demo] [--dir <path>] [--ref <main|tag|sha>]
+                  [--mode dev|prod|demo] [--repo-url <url>] [--yes] [--force] [--reset-env]
                   [--skip-dev-apps] [--no-infra] [--no-install] [--no-setup]
                   [--on-conflict fail|prompt|isolated|stop-existing|attach|external|co-use]
                   [--infra new|external|share] [--instance <slug>] [--app-port <n>]
@@ -452,6 +452,11 @@ Commands:
                     phase; a dirty checkout is refused unless --force (stashes).
                     --dir <path>      Install location (default: ./cinatra; prompts on a TTY).
                     --ref <ref>       Branch, tag, or commit to install (default: main).
+                    [dev|prod|demo]   Install mode as a POSITIONAL — \`cinatra
+                                      install demo\` is equivalent to \`--mode demo\`
+                                      (pass it ONE way; conflicting forms like
+                                      \`install demo --mode prod\` are refused, as is
+                                      any unknown trailing argument).
                     --mode dev|prod|demo
                                       Install mode (default: dev). "demo" is a
                                       strict superset of dev: the same dev base
