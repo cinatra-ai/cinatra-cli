@@ -279,6 +279,36 @@ function readOption(argv, flag) {
 // `--mode` enum (rather than a `--demo` flag) matches the documented
 // `--mode dev|prod` surface and lets the marker/reconcile round-trip it.
 const VALID_MODES = new Set(["dev", "prod", "demo"]);
+// Every `install` flag that consumes a FOLLOWING argv token as its value in the
+// space form (`--flag value`). Used ONLY by `extractInstallPositionals` so the
+// positional-mode scan (cinatra-cli#122 / cinatra#1238 item 1) can skip a flag's
+// value and never mistake it for a positional. The inline form (`--flag=value`)
+// carries its value in the same token, so it needs no lookahead. MUST list every
+// value-taking flag this parser (or `parseExecutionModeFlags`) reads — a missing
+// entry would let a flag's value be misread as an "unknown trailing arg".
+const VALUE_TAKING_INSTALL_FLAGS = new Set([
+  "--dir",
+  "--ref",
+  "--repo-url",
+  "--mode",
+  "--port-offset",
+  "--app-port",
+  "--db-url",
+  "--redis-url",
+  "--nango-url",
+  "--graphiti-url",
+  "--reuse-from",
+  "--db-name",
+  "--redis-db",
+  "--bullmq-queue",
+  "--infra",
+  "--on-conflict",
+  "--instance",
+  "--execution-mode",
+  "--sandbox-broker-url",
+  "--sandbox-image",
+  "--sandbox-egress",
+]);
 // The install profiles a `--mode` value maps to. `dev`/`prod` carry no profile
 // (the default, fixtures-off dev behaviour post-cinatra#1237); `demo` carries
 // the `demo` profile. Used to (1) drive the child `CINATRA_INSTALL_PROFILE`
@@ -336,6 +366,88 @@ function readEnumOption(argv, flag, validSet, label) {
   return v;
 }
 
+/** Extract the POSITIONAL (non-flag) tokens from an `install` argv, correctly
+ *  skipping the value token of every space-form value-taking flag so a value is
+ *  never mistaken for a positional (cinatra-cli#122 / cinatra#1238 item 1).
+ *
+ *  `install` historically took no positional; the ONLY positional it now accepts
+ *  is the mode (`install dev|prod|demo`). So the caller treats the first
+ *  positional as the mode and rejects (a) a first positional that is not a valid
+ *  mode and (b) any positional beyond the first — i.e. "reject unknown trailing
+ *  args, don't silently ignore". A literal `--` ends flag parsing (POSIX): every
+ *  token after it is positional. */
+export function extractInstallPositionals(argv = []) {
+  const positionals = [];
+  let endOfFlags = false;
+  for (let i = 0; i < argv.length; i++) {
+    const tok = argv[i];
+    if (typeof tok !== "string") continue;
+    if (endOfFlags) {
+      positionals.push(tok);
+      continue;
+    }
+    if (tok === "--") {
+      endOfFlags = true;
+      continue;
+    }
+    if (tok.startsWith("-") && tok !== "-") {
+      // A flag. In the space form (no "="), a value-taking flag consumes the
+      // NEXT token as its value — skip it so it is not read as a positional.
+      const eqIdx = tok.indexOf("=");
+      const flagName = eqIdx === -1 ? tok : tok.slice(0, eqIdx);
+      if (eqIdx === -1 && VALUE_TAKING_INSTALL_FLAGS.has(flagName)) i++;
+      continue;
+    }
+    positionals.push(tok);
+  }
+  return positionals;
+}
+
+/** Resolve the install mode from BOTH the positional (`install demo`) and the
+ *  `--mode demo` flag forms, rejecting a conflict between them and any unknown
+ *  trailing positional (cinatra-cli#122 / cinatra#1238 item 1). `modeOpt` is the
+ *  raw `--mode` value (or null). Returns the resolved mode.
+ *
+ *  Self-validating: `modeOpt` is checked against VALID_MODES here (not assumed
+ *  pre-validated) so this exported helper is correct in isolation — a caller
+ *  cannot bypass mode validation by reaching it directly (codex round). The
+ *  positional form is validated on its own path below. */
+export function resolveInstallMode(argv, modeOpt) {
+  if (modeOpt != null && !VALID_MODES.has(modeOpt)) {
+    throw new Error(
+      `Invalid --mode "${modeOpt}". Use one of: ${[...VALID_MODES].join(", ")}.`,
+    );
+  }
+  const positionals = extractInstallPositionals(argv);
+  let positionalMode = null;
+  if (positionals.length > 0) {
+    const first = positionals[0];
+    if (!VALID_MODES.has(first)) {
+      throw new Error(
+        `Unknown argument "${first}". \`cinatra install\` takes an optional mode ` +
+          `(${[...VALID_MODES].join("|")}) plus flags — e.g. \`cinatra install demo\` or ` +
+          `\`cinatra install --mode demo\`. Run \`cinatra install --help\`.`,
+      );
+    }
+    if (positionals.length > 1) {
+      throw new Error(
+        `Unexpected extra argument(s) after \`install ${first}\`: ` +
+          `${positionals.slice(1).map((s) => `"${s}"`).join(", ")}. ` +
+          `\`cinatra install\` takes at most one mode positional (${[...VALID_MODES].join("|")}).`,
+      );
+    }
+    positionalMode = first;
+  }
+
+  if (modeOpt != null && positionalMode != null && modeOpt !== positionalMode) {
+    throw new Error(
+      `Conflicting mode: positional \`install ${positionalMode}\` vs \`--mode ${modeOpt}\`. ` +
+        `Pass the mode ONE way — either \`install ${positionalMode}\` or \`--mode ${positionalMode}\`.`,
+    );
+  }
+  return modeOpt ?? positionalMode ?? "dev";
+}
+
 export function parseInstallArgs(argv = []) {
   const dirOpt = readOption(argv, "--dir");
   const refOpt = readOption(argv, "--ref");
@@ -350,15 +462,13 @@ export function parseInstallArgs(argv = []) {
     );
   }
 
-  let mode = "dev";
-  if (modeOpt != null) {
-    if (!VALID_MODES.has(modeOpt)) {
-      throw new Error(
-        `Invalid --mode "${modeOpt}". Use one of: ${[...VALID_MODES].join(", ")}.`,
-      );
-    }
-    mode = modeOpt;
-  }
+  // cinatra-cli#122 / cinatra#1238 item 1: accept BOTH the positional form
+  // (`install demo`) and the `--mode demo` flag, reject a conflict between them
+  // (`install demo --mode prod`), and reject an unknown trailing positional
+  // (don't silently ignore it). The positional was previously dropped on the
+  // floor — `install demo` silently ran a plain dev install. `resolveInstallMode`
+  // also validates the `--mode` value (single source of truth).
+  const mode = resolveInstallMode(argv, modeOpt);
 
   // cinatra-cli#122: `--skip-dev-apps` skips cloning/bringing up the bundled dev
   // apps — which are exactly what `demo` exists to populate. Silently honouring
@@ -366,8 +476,8 @@ export function parseInstallArgs(argv = []) {
   // combination loudly rather than quietly degrade the superset guarantee.
   if (mode === "demo" && argv.includes("--skip-dev-apps")) {
     throw new Error(
-      "--skip-dev-apps cannot be combined with --mode demo (demo exists to bring up + seed the bundled apps). " +
-        "Use --mode dev if you want the dev base without the demo apps.",
+      "--skip-dev-apps cannot be combined with demo mode (demo exists to bring up + seed the bundled apps). " +
+        "Use `install dev` if you want the dev base without the demo apps.",
     );
   }
 

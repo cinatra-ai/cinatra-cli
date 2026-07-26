@@ -4,6 +4,10 @@
 //   1. parseInstallArgs — accepts `demo`, lists all three modes on an invalid
 //      value, and rejects `--mode demo --skip-dev-apps` (which would neuter the
 //      demo apps). dev/prod + --skip-dev-apps stay allowed (AC8 unchanged).
+//   1b. Positional mode (cinatra#1238 item 1) — accepts BOTH `install demo` and
+//      `--mode demo`, rejects a conflict (`install demo --mode prod`), rejects an
+//      unknown positional / extra trailing arg (never silently ignored), and
+//      never reads a value-taking flag's value as a positional.
 //   2. mode helpers — isDevLikeMode / installProfileForMode.
 //   3. reconcileInstallProfile — pure add / clear / idempotent logic.
 //   4. buildSetupChildEnv — CINATRA_INSTALL_PROFILE is set for demo and CLEARED
@@ -31,10 +35,12 @@ import {
   assertTargetSupportsDemo,
   buildSetupChildEnv,
   ensureEnvLocal,
+  extractInstallPositionals,
   installProfileForMode,
   isDevLikeMode,
   parseInstallArgs,
   reconcileInstallProfile,
+  resolveInstallMode,
   runInstall,
 } from "../src/install.mjs";
 
@@ -89,13 +95,103 @@ describe("parseInstallArgs — demo mode", () => {
 
   it("rejects --mode demo --skip-dev-apps (would neuter the demo apps)", () => {
     expect(() => parseInstallArgs(["--mode", "demo", "--skip-dev-apps"])).toThrow(
-      /--skip-dev-apps cannot be combined with --mode demo/,
+      /--skip-dev-apps cannot be combined with demo mode/,
+    );
+  });
+
+  it("rejects the POSITIONAL install demo --skip-dev-apps too", () => {
+    expect(() => parseInstallArgs(["demo", "--skip-dev-apps"])).toThrow(
+      /--skip-dev-apps cannot be combined with demo mode/,
     );
   });
 
   it("still allows --skip-dev-apps with dev and prod (AC8 unchanged)", () => {
     expect(parseInstallArgs(["--mode", "dev", "--skip-dev-apps"]).skipDevApps).toBe(true);
     expect(parseInstallArgs(["--mode", "prod", "--skip-dev-apps"]).skipDevApps).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1b. Positional mode + conflict + trailing-arg rejection (cinatra#1238 item 1).
+// ---------------------------------------------------------------------------
+describe("parseInstallArgs — positional mode", () => {
+  it("accepts `install demo` / `install dev` / `install prod` positionally", () => {
+    expect(parseInstallArgs(["demo"]).mode).toBe("demo");
+    expect(parseInstallArgs(["dev"]).mode).toBe("dev");
+    expect(parseInstallArgs(["prod"]).mode).toBe("prod");
+  });
+
+  it("defaults to dev with no mode token at all", () => {
+    expect(parseInstallArgs([]).mode).toBe("dev");
+  });
+
+  it("accepts the positional alongside agreeing flags/values in any order", () => {
+    expect(parseInstallArgs(["--yes", "demo"]).mode).toBe("demo");
+    expect(parseInstallArgs(["demo", "--yes"]).mode).toBe("demo");
+    expect(parseInstallArgs(["--dir", "/x", "demo"]).mode).toBe("demo");
+    expect(parseInstallArgs(["demo", "--ref", "main"]).mode).toBe("demo");
+    expect(parseInstallArgs(["--", "demo"]).mode).toBe("demo");
+  });
+
+  it("accepts BOTH forms when they AGREE (install demo --mode demo)", () => {
+    expect(parseInstallArgs(["demo", "--mode", "demo"]).mode).toBe("demo");
+    expect(parseInstallArgs(["demo", "--mode=demo"]).mode).toBe("demo");
+  });
+
+  it("REJECTS a conflict between the positional and --mode", () => {
+    expect(() => parseInstallArgs(["demo", "--mode", "prod"])).toThrow(/Conflicting mode/);
+    expect(() => parseInstallArgs(["dev", "--mode", "demo"])).toThrow(/Conflicting mode/);
+  });
+
+  it("REJECTS an unknown positional (lists the valid modes; does not silently ignore)", () => {
+    let msg = "";
+    try {
+      parseInstallArgs(["bogus"]);
+    } catch (e) {
+      msg = e.message;
+    }
+    expect(msg).toMatch(/Unknown argument "bogus"/);
+    for (const m of ["dev", "prod", "demo"]) expect(msg).toContain(m);
+  });
+
+  it("REJECTS an extra trailing positional after a valid mode", () => {
+    expect(() => parseInstallArgs(["demo", "extra"])).toThrow(/Unexpected extra argument/);
+    expect(() => parseInstallArgs(["dev", "foo", "bar"])).toThrow(/Unexpected extra argument/);
+  });
+
+  it("does NOT read a value-taking flag's value as a positional", () => {
+    // --ref/--dir/--repo-url values look like bare words but must be skipped.
+    expect(() => parseInstallArgs(["--ref", "demo"])).not.toThrow();
+    expect(parseInstallArgs(["--ref", "demo"]).mode).toBe("dev"); // "demo" is the ref, not the mode
+    expect(() => parseInstallArgs(["--instance", "prod"])).not.toThrow();
+    expect(parseInstallArgs(["--sandbox-image", "x"]).mode).toBe("dev");
+  });
+});
+
+describe("extractInstallPositionals / resolveInstallMode (unit)", () => {
+  it("extractInstallPositionals skips value-taking flags (space + inline)", () => {
+    expect(extractInstallPositionals(["--dir", "/x", "demo"])).toEqual(["demo"]);
+    expect(extractInstallPositionals(["--dir=/x", "demo"])).toEqual(["demo"]);
+    expect(extractInstallPositionals(["--yes", "demo", "--force"])).toEqual(["demo"]);
+    expect(extractInstallPositionals(["--ref", "demo"])).toEqual([]); // value, not positional
+    expect(extractInstallPositionals(["--", "--not-a-flag", "x"])).toEqual(["--not-a-flag", "x"]);
+  });
+
+  it("resolveInstallMode reconciles positional + flag and defaults to dev", () => {
+    expect(resolveInstallMode([], null)).toBe("dev");
+    expect(resolveInstallMode(["demo"], null)).toBe("demo");
+    expect(resolveInstallMode([], "prod")).toBe("prod");
+    expect(resolveInstallMode(["demo"], "demo")).toBe("demo");
+    expect(() => resolveInstallMode(["demo"], "prod")).toThrow(/Conflicting mode/);
+    expect(() => resolveInstallMode(["nope"], null)).toThrow(/Unknown argument/);
+    expect(() => resolveInstallMode(["demo", "x"], null)).toThrow(/Unexpected extra/);
+  });
+
+  it("resolveInstallMode is self-validating on --mode (does not assume a pre-validated modeOpt)", () => {
+    // Defense-in-depth (codex round): a direct caller cannot slip an invalid
+    // --mode past the exported helper.
+    expect(() => resolveInstallMode([], "staging")).toThrow(/Invalid --mode "staging"/);
+    expect(() => resolveInstallMode(["demo"], "bogus")).toThrow(/Invalid --mode "bogus"/);
   });
 });
 
@@ -305,7 +401,31 @@ describe("cinatra bin — demo surface", () => {
   it("`install --mode demo --skip-dev-apps` is refused before any work", () => {
     const r = runBin(["install", "--mode", "demo", "--skip-dev-apps"]);
     expect(r.status).not.toBe(0);
-    expect(r.stderr).toMatch(/--skip-dev-apps cannot be combined with --mode demo/);
+    expect(r.stderr).toMatch(/--skip-dev-apps cannot be combined with demo mode/);
+  });
+
+  it("`install demo` (positional) is accepted (reaches the target-support gate, not a usage error)", () => {
+    // No checkout ⇒ it must fail LATER (preflight/gate), never with an
+    // arg-parse "Unknown argument"/"Invalid --mode" error — proving the
+    // positional mode is recognised, not dropped or rejected.
+    const r = runBin(["install", "demo", "--dir", "/nonexistent-cin-demo-xyz", "--no-infra", "--yes"]);
+    expect(r.status).not.toBe(0);
+    const out = `${r.stdout}${r.stderr}`;
+    expect(out).not.toMatch(/Unknown argument/);
+    expect(out).not.toMatch(/Invalid --mode/);
+  });
+
+  it("`install demo --mode prod` (conflict) is refused with a clear message", () => {
+    const r = runBin(["install", "demo", "--mode", "prod"]);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/Conflicting mode/);
+  });
+
+  it("`install bogus` (unknown positional) is refused, listing the valid modes", () => {
+    const r = runBin(["install", "bogus"]);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/Unknown argument "bogus"/);
+    for (const m of ["dev", "prod", "demo"]) expect(r.stderr).toContain(m);
   });
 
   it("demo is discoverable in `--help`", () => {
@@ -382,5 +502,40 @@ describe.skipIf(NODE_MAJOR < 24)("runInstall — --mode demo sequencing", () => 
         { log: () => {} },
       ),
     ).rejects.toThrow(/does not support `--mode demo`/);
+  });
+
+  it("the POSITIONAL `install demo` drives the same demo install (profile stamped)", async () => {
+    const origin = makeOrigin("pos", { installProfiles: ["dev", "prod", "demo"] });
+    const out = path.join(sandbox, "out-pos");
+    const result = await runInstall(
+      ["demo", "--dir", out, "--repo-url", `file://${origin}`, "--ref", "main", "--yes", "--no-infra", "--no-install"],
+      { log: () => {} },
+    );
+    expect(result.mode).toBe("demo");
+    expect(readFileSync(path.join(out, ".env.local"), "utf8")).toMatch(/^CINATRA_INSTALL_PROFILE=demo$/m);
+  });
+
+  it("superset guarantee (CLI-side): a plain `install dev` after a demo install clears the demo profile — no demo leak", async () => {
+    const origin = makeOrigin("superset", { installProfiles: ["dev", "prod", "demo"] });
+    const out = path.join(sandbox, "out-superset");
+    const envLocal = path.join(out, ".env.local");
+
+    // 1) demo install → .env.local pins the demo profile.
+    await runInstall(
+      ["demo", "--dir", out, "--repo-url", `file://${origin}`, "--ref", "main", "--yes", "--no-infra", "--no-install"],
+      { log: () => {} },
+    );
+    expect(readFileSync(envLocal, "utf8")).toMatch(/^CINATRA_INSTALL_PROFILE=demo$/m);
+
+    // 2) re-run as plain dev on the SAME checkout → the demo profile is cleared
+    //    (reconcile, not recreate), so the next `pnpm dev` boots a plain dev
+    //    instance with NO demo overlay leaking through. The target-side setup.sh
+    //    then re-stamps CINATRA_INSTALL_PROFILE=dev; the reader treats dev≡absent.
+    const result = await runInstall(
+      ["dev", "--dir", out, "--repo-url", `file://${origin}`, "--ref", "main", "--yes", "--no-infra", "--no-install"],
+      { log: () => {} },
+    );
+    expect(result.mode).toBe("dev");
+    expect(readFileSync(envLocal, "utf8")).not.toContain("CINATRA_INSTALL_PROFILE=demo");
   });
 });
