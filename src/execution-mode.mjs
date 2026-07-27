@@ -1,99 +1,181 @@
 // Pure, side-effect-free decision helpers for the CLI execution-plane lifecycle
-// (cinatra-cli#160 — exec-plane S4; epic cinatra-ai/cinatra#1705, S1 #1706).
+// (cinatra-cli#174 — exec-plane S4; epic cinatra-ai/cinatra#1705).
 //
-// The execution plane is the core-owned sandboxed executor every LLM invocation
-// can reach (`sandbox_execute`). S1 shipped its runtime surface in the cinatra
-// monorepo — the broker + local-dev worker, the hardened L0 run profile, the
-// digest-pinned L0 base image (`docker/sandbox/Dockerfile`), and the attributing
-// egress gateway (all in `@cinatra-ai/execution-plane`). S4 is the CLI LIFECYCLE
-// layer over that surface: an install execution-mode picker, image acquisition
-// as a first-class install step (digest-pinned — no `:latest`), update
-// coordination, and the `sandbox` doctor/verbs.
+// WHAT CHANGED vs cinatra-cli#164 (and why this module was re-authored)
+// --------------------------------------------------------------------
+// #164 shipped this lifecycle BEFORE the core activation existed, so its env
+// contract was necessarily invented: it wrote `CINATRA_EXECUTION_MODE`,
+// `CINATRA_EXECUTION_BROKER_URL`, `CINATRA_SANDBOX_L0_IMAGE_DIGEST` and
+// `CINATRA_SANDBOX_EGRESS_MODE` — NOT ONE of which the merged activation reads.
+// A `local-dev` install therefore produced an instance whose boot phase wired
+// nothing, forever, with no diagnostic saying so.
 //
-// As with `update-target.mjs` / `dev-refresh.mjs` / `prod-runtime-guidance.mjs`,
-// this module is PURE (no imports, no I/O): the flow orchestration (docker build,
-// probes, `.env.local` writes) lives in `index.mjs` / `install.mjs` where the
-// process/fs helpers are; the decision + argv-shape logic that is worth testing
-// in isolation lives HERE so it unit-tests without a docker daemon.
+// The activation has since MERGED (cinatra-ai/cinatra#2144 "S1b activation",
+// plus #2143 slice B), so every constant below is now GROUNDED in a real reader
+// on cinatra `origin/main` and cites it by path. Nothing here is guessed.
 //
-// GROUNDING NOTE (S1 live surface vs app wiring). The execution-plane PACKAGE is
-// live (broker/worker/L0-image/egress). The APP wiring S1 lists as later slices
-// — the HTTP/mTLS broker service boundary, the durable jobs/audit DB tables, the
-// platform-admin settings surface, the health-view boot phase, and a runtime
-// protocol-version endpoint — is NOT yet live (see
-// `packages/execution-plane/src/index.ts`). So every check that would depend on
-// a not-yet-live app surface (a remote broker's health/version endpoint, a
-// durable audit sink) is classified honestly as `degraded` with a manual-verify
-// remediation rather than fabricated as `healthy`. The checks that ARE live —
-// building the real L0 image, running the real hardened profile, inspecting the
-// real internal egress network — are exercised for real.
+// THE ACTUAL CONTRACT THE MERGED ACTIVATION READS
+// -----------------------------------------------
+//   env  CINATRA_EXECUTION_PLANE_ROLLOUT       packages/llm/src/execution-plane/policy.ts
+//        └─ `isExecutionPlaneRolloutEnabled()`; ONLY the exact string "on".
+//           Off ⇒ `executionBrokerPhases()` returns an EMPTY phase list — no
+//           phase at all, nothing can ever wire (boot/phases/execution-broker.ts).
+//   env  EXECUTION_BROKER_URL                  src/lib/boot/phases/execution-plane-health.ts
+//   env  EXECUTION_BROKER_SECRET               packages/llm/src/execution-plane/session.ts
+//        └─ BOTH: `evaluateExecutionPlaneReadiness()` treats *both empty* as
+//           "not-configured" (⇒ the instance has NOT opted in ⇒
+//           `resolveExecutionEnvironmentReadiness()` answers `disabled`), and
+//           *one empty* as "misconfigured" (a degraded boot phase). The secret
+//           is what `sealExecutionSession()` signs the job carrier with — absent
+//           ⇒ `ExecutionBrokerSecretMissingError`, fail-closed.
+//   env  EXECUTION_ENVIRONMENT_PROVENANCE_KEY  src/lib/execution/environment-execution-service.ts
+//        └─ `PROVENANCE_KEY_ENV`; empty ⇒ readiness `unavailable`, declared-
+//           environment runs refuse (slice B, cinatra#2143).
+//   env  EXECUTION_BROKER_SERVICE_TOKEN        packages/execution-plane/src/broker.ts
+//        └─ `verifyServiceToken()` — the broker's own service boundary,
+//           independently scoped from the carrier secret by design.
+//   env  CINATRA_SANDBOX_L0_IMAGE              packages/execution-plane/src/l0-profile.ts
+//        └─ `resolveL0ImageRef()`; unset falls back to DEFAULT_L0_IMAGE_LOCAL_DEV.
+//   env  EXECUTION_SANDBOX_NETWORK             src/lib/execution/execution-broker-construct.ts
+//   env  EXECUTION_GATEWAY_SCRIPT_PATH         src/lib/execution/execution-broker-construct.ts
+//   env  EXECUTION_PLANE_REQUIRED              src/lib/boot/phases/execution-plane-health.ts
+//
+//   ★ THE MODE IS NOT AN ENV VAR. `readExecutionPlaneSettings()`
+//     (src/lib/execution/execution-plane-settings.ts) reads it from the platform
+//     key/value metadata store under `connector_config:execution_plane`, shaped
+//     `{ mode, egressMode, egressAllowlist }`. An instance whose env is perfect
+//     but whose settings row is absent boots with the DEFAULT mode `disabled`
+//     and wires NOTHING. That is why `install --execution-mode local-dev` must
+//     seed the settings row as well as the env — "no manual edits" is otherwise
+//     unreachable.
+//
+// This module stays PURE (no imports, no I/O) exactly as `update-target.mjs` /
+// `prod-runtime-guidance.mjs` do: docker/HTTP/pg orchestration lives in
+// `index.mjs` + `install.mjs`; the decision logic that is worth testing without
+// a docker daemon lives here.
+//
+// SECRET DISCIPLINE: nothing in this module ever RETURNS or FORMATS a secret
+// value. Readers answer `…Present: boolean`; the only place a minted secret
+// exists is inside the upsert list handed straight to the `.env.local` writer.
 
 // ---------------------------------------------------------------------------
-// Contract constants — mirrored (not imported: this is a plain .mjs CLI with no
-// TS path aliases into packages/**) from the S1 surface. Each cites its source.
+// Grounded contract constants
 // ---------------------------------------------------------------------------
 
-/** The three install-time execution modes (cinatra-cli#160 scope). */
+/** The persisted placement vocabulary. Mirrors `EXECUTION_PLANE_MODES`
+ *  (cinatra src/lib/execution/execution-plane-settings.ts), in render order. */
 export const EXECUTION_MODES = Object.freeze(["remote", "local-dev", "disabled"]);
 
-/** CLI-managed `.env.local` key recording the chosen execution mode. */
-export const EXECUTION_MODE_ENV_KEY = "CINATRA_EXECUTION_MODE";
+/** `DEFAULT_EXECUTION_PLANE_MODE` — the fail-closed default, both there and here. */
+export const DEFAULT_EXECUTION_MODE = "disabled";
 
-/** S1 rollout merge gate (packages/llm/src/execution-plane/policy.ts): only the
- *  exact string "on" enables capability injection; anything else stays dark. */
+/** The rollout merge gate. ONLY the exact string "on" (policy.ts). */
 export const ROLLOUT_ENV_KEY = "CINATRA_EXECUTION_PLANE_ROLLOUT";
 export const ROLLOUT_ON = "on";
 
-/** S1 image override (packages/execution-plane/src/l0-profile.ts): production
- *  sets this to a DIGEST-PINNED reference; unset falls back to the local-dev tag. */
+/** Execution-plane CLIENT config the health boot phase validates. */
+export const BROKER_URL_ENV_KEY = "EXECUTION_BROKER_URL";
+/** Carrier signing secret (`sealExecutionSession`). Fail-closed when absent. */
+export const BROKER_SECRET_ENV_KEY = "EXECUTION_BROKER_SECRET";
+/** The broker's own service-boundary token (`verifyServiceToken`). */
+export const BROKER_SERVICE_TOKEN_ENV_KEY = "EXECUTION_BROKER_SERVICE_TOKEN";
+/** L1 environment provenance HMAC key (`PROVENANCE_KEY_ENV`, slice B). */
+export const PROVENANCE_KEY_ENV_KEY = "EXECUTION_ENVIRONMENT_PROVENANCE_KEY";
+/** L0 image override (`resolveL0ImageRef`). */
 export const L0_IMAGE_ENV_KEY = "CINATRA_SANDBOX_L0_IMAGE";
+/** Internal sandbox network override (`constructLocalDevExecutionBroker`). */
+export const SANDBOX_NETWORK_ENV_KEY = "EXECUTION_SANDBOX_NETWORK";
+/** Gateway script path override (packaged deployments). */
+export const GATEWAY_SCRIPT_PATH_ENV_KEY = "EXECUTION_GATEWAY_SCRIPT_PATH";
+/** Instance CLASS declaring the plane deploy-blocking (`executionPlaneRequired`). */
+export const EXECUTION_PLANE_REQUIRED_ENV_KEY = "EXECUTION_PLANE_REQUIRED";
 
-/** CLI-recorded resolved digest of the acquired L0 image ("digest pins
- *  recorded", AC4) — the local-dev build has no registry RepoDigest, so the
- *  recorded pin is the immutable image ID, exactly what the S1 worker attributes. */
-export const L0_IMAGE_DIGEST_ENV_KEY = "CINATRA_SANDBOX_L0_IMAGE_DIGEST";
+/**
+ * The keys the CLI OWNS in `.env.local`. Selecting `disabled` removes exactly
+ * this set and nothing else — `EXECUTION_PLANE_REQUIRED` and
+ * `EXECUTION_GATEWAY_SCRIPT_PATH` are deployment-class decisions the CLI never
+ * writes and therefore must never silently delete.
+ */
+export const CLI_MANAGED_EXECUTION_ENV_KEYS = Object.freeze([
+  ROLLOUT_ENV_KEY,
+  BROKER_URL_ENV_KEY,
+  BROKER_SECRET_ENV_KEY,
+  BROKER_SERVICE_TOKEN_ENV_KEY,
+  PROVENANCE_KEY_ENV_KEY,
+  L0_IMAGE_ENV_KEY,
+  SANDBOX_NETWORK_ENV_KEY,
+]);
 
-/** Remote broker base URL (S4 CLI-managed; the S1 HTTP boundary is a later slice). */
-export const BROKER_URL_ENV_KEY = "CINATRA_EXECUTION_BROKER_URL";
+/** The env keys whose VALUE is a secret — never rendered, never logged. */
+export const SECRET_EXECUTION_ENV_KEYS = Object.freeze([
+  BROKER_SECRET_ENV_KEY,
+  BROKER_SERVICE_TOKEN_ENV_KEY,
+  PROVENANCE_KEY_ENV_KEY,
+]);
 
-/** Configured egress tier (S1 EgressMode: default_internet | allowlist | none). */
-export const EGRESS_MODE_ENV_KEY = "CINATRA_SANDBOX_EGRESS_MODE";
+/** Platform key/value metadata key holding the settings row
+ *  (`EXECUTION_PLANE_SETTINGS_KEY` prefixed with the connector-config namespace,
+ *  cinatra src/lib/database.ts `readConnectorConfigFromDatabase`). */
+export const EXECUTION_SETTINGS_METADATA_KEY = "connector_config:execution_plane";
+
+/** Egress tier vocabulary — `EXECUTION_EGRESS_MODES`. */
 export const EGRESS_MODES = Object.freeze(["default_internet", "allowlist", "none"]);
+/** `DEFAULT_EXECUTION_PLANE_SETTINGS.egressMode`. */
 export const DEFAULT_EGRESS_MODE = "default_internet";
 
-/** S1 local-dev image tag (l0-profile.ts DEFAULT_L0_IMAGE_LOCAL_DEV). A dev tag,
- *  NOT `:latest` — the acquisition step records its resolved digest as the pin. */
+/** `DEFAULT_L0_IMAGE_LOCAL_DEV` (l0-profile.ts). A dev tag, never `:latest`. */
 export const DEFAULT_L0_IMAGE_LOCAL_DEV = "cinatra-sandbox-l0:dev";
+/** The image NAME (no tag) the prune verb scopes itself to. */
+export const L0_IMAGE_REPO = "cinatra-sandbox-l0";
 
-/** S1 build recipe location (docker/sandbox/Dockerfile), relative to the checkout. */
+/** L0 build recipe location in the checkout. */
 export const L0_DOCKERFILE_REL = "docker/sandbox/Dockerfile";
 export const L0_BUILD_CONTEXT_REL = "docker/sandbox";
 
-/** The RETIRED openai-connector shell image (built as `:latest` by the old
- *  setup.sh / reset paths). The CLI-managed sandbox image path must never
- *  reference it again (AC4: "no `:latest` reference remains"). */
-export const DEPRECATED_SHELL_IMAGE = "cinatra/skill-shell:latest";
-
-/** S1 hardened runtime identity (l0-profile.ts SANDBOX_RUNTIME_UID/GID). */
-export const SANDBOX_RUNTIME_UID = 10001;
-export const SANDBOX_RUNTIME_GID = 10001;
-
-/** S1 egress topology (egress.ts DEFAULT_SANDBOX_NETWORK; local-gateway.ts). */
+/** `DEFAULT_SANDBOX_NETWORK` (packages/execution-plane/src/egress.ts). */
 export const SANDBOX_NETWORK_NAME = "cinatra-exec-internal";
+
+/** Gateway topology (packages/execution-plane/src/local-gateway.ts). */
 export const GATEWAY_CONTAINER_NAME = "cinatra-exec-gateway";
 export const GATEWAY_PROXY_PORT = 3128;
 export const GATEWAY_ADMIN_PORT = 3129;
 export const GATEWAY_HEALTH_PATH = "/__health";
 
-/** S1 workspace volume prefix/label (workspace.ts) — for the `sandbox gc` verb. */
-export const WORKSPACE_VOLUME_PREFIX = "cinatra-exec-l2-";
+/**
+ * The BOOT HANDSHAKE probe, verbatim from
+ * `src/lib/execution/execution-broker-construct.ts`:
+ *
+ *   const HANDSHAKE_COMMAND         = "printf cinatra-exec-handshake";
+ *   const HANDSHAKE_EXPECTED_STDOUT = "cinatra-exec-handshake";
+ *
+ * and its acceptance predicate — `termination === "exited" && exitCode === 0 &&
+ * stdout.trim() === HANDSHAKE_EXPECTED_STDOUT`. The CLI mirrors ALL THREE so a
+ * green `doctor` handshake check means the same thing the boot phase means when
+ * it registers the executor factory.
+ */
+export const HANDSHAKE_COMMAND = "printf cinatra-exec-handshake";
+export const HANDSHAKE_EXPECTED_STDOUT = "cinatra-exec-handshake";
+
+/** Hardened runtime identity (`SANDBOX_RUNTIME_UID` / `_GID`, l0-profile.ts). */
+export const SANDBOX_RUNTIME_UID = 10001;
+export const SANDBOX_RUNTIME_GID = 10001;
+
+/** L2 workspace volume label (workspace.ts) — the `sandbox gc` filter. */
 export const WORKSPACE_LABEL = "ai.cinatra.execution-plane";
 
-/** The three CLI sandbox-doctor verdicts (AC3: "healthy / degraded / disabled"). */
-export const SANDBOX_VERDICTS = Object.freeze(["healthy", "degraded", "disabled"]);
+/** CLI-owned sidecar recording the acquired image pin. NOT read by the app —
+ *  the env contract stays exactly what the activation reads; this file only
+ *  lets `doctor` detect image drift since acquisition. */
+export const PIN_RECORD_REL = ".cinatra/execution-plane.json";
+
+/** The three doctor verdicts. */
+export const EXECUTION_VERDICTS = Object.freeze(["healthy", "degraded", "disabled"]);
+
+/** The RETIRED `:latest` shell image the CLI-managed path must never name again. */
+export const DEPRECATED_SHELL_IMAGE = "cinatra/skill-shell:latest";
 
 // ---------------------------------------------------------------------------
-// Execution-mode parsing + resolution (mirrors update-target.mjs)
+// Mode parsing + install-time resolution
 // ---------------------------------------------------------------------------
 
 const MODE_ALIASES = new Map([
@@ -109,8 +191,7 @@ const MODE_ALIASES = new Map([
 ]);
 
 /**
- * Normalize a raw execution-mode token to one of {@link EXECUTION_MODES}.
- * Accepts a small set of intuitive aliases; throws loudly on anything else so a
+ * Normalize a raw execution-mode token. Throws loudly on anything unknown so a
  * typo never silently degrades to a default.
  *
  * @param {unknown} raw
@@ -122,47 +203,108 @@ export function normalizeExecutionMode(raw) {
   if (!canonical) {
     throw new Error(
       `Invalid execution mode "${raw}". Use one of: ${EXECUTION_MODES.join(", ")} ` +
-        `(remote = a broker URL + digest-pinned image; local-dev = build + run the ` +
-        `sandbox on this dev machine; disabled = no sandbox, models stay usable).`,
+        `(remote = an out-of-process broker URL + shared secret; local-dev = run the ` +
+        `sandbox on this machine; disabled = nothing is provisioned and models stay usable).`,
     );
   }
   return canonical;
 }
 
 /**
- * The default execution mode implied by an INSTALL mode when the operator does
- * not pass `--execution-mode`:
- *   - dev / demo → `local-dev` (the sandbox runs on the dev machine).
- *   - prod       → `remote` (prod hands the execution stack to the deployment
- *                  layer + a broker; a prod host never runs the dev worker).
+ * The default execution mode when the operator passes no `--execution-mode`.
  *
- * @param {"dev"|"prod"|"demo"|string} installMode
- * @returns {"remote"|"local-dev"}
+ * ALWAYS `disabled`, for every install mode — the issue's stated default and
+ * the core's own `DEFAULT_EXECUTION_PLANE_MODE`. A sandbox that can run model-
+ * authored commands is never provisioned by omission; it is always an explicit
+ * choice. (#164 defaulted dev installs to `local-dev`; that silently provisioned
+ * a container runtime on every dev machine.)
+ *
+ * @returns {"disabled"}
  */
-export function defaultExecutionModeForInstall(installMode) {
-  const m = typeof installMode === "string" ? installMode.trim().toLowerCase() : "";
-  if (m === "prod" || m === "production") return "remote";
-  return "local-dev";
+export function defaultExecutionModeForInstall() {
+  return DEFAULT_EXECUTION_MODE;
 }
 
-// A broker/image value must not look like a flag (leading dash) or carry
-// whitespace — both would smuggle option injection into a later docker/curl call.
-function looksLikeFlagOrBlank(value) {
+/**
+ * Resolve the EFFECTIVE mode from the flag + TTY:
+ *   - explicit `--execution-mode` always wins (interactive: false);
+ *   - no flag + TTY → offer the picker, highlighting `disabled`;
+ *   - no flag + no TTY → `disabled` silently, so scripted installs never hang.
+ *
+ * @returns {{ mode: string, interactive: boolean, default: string, reason: string }}
+ */
+export function resolveExecutionModeForInstall({ flagMode = null, isTty = false } = {}) {
+  const fallback = defaultExecutionModeForInstall();
+  if (flagMode != null) {
+    return {
+      mode: normalizeExecutionMode(flagMode),
+      interactive: false,
+      default: fallback,
+      reason: "--execution-mode flag",
+    };
+  }
+  if (isTty) {
+    return { mode: fallback, interactive: true, default: fallback, reason: `interactive picker (default: ${fallback})` };
+  }
+  return { mode: fallback, interactive: false, default: fallback, reason: "non-interactive default (disabled)" };
+}
+
+/**
+ * Blank-or-flag-like. Used for values that end up as an argv token to docker /
+ * curl (a URL, an image ref), where a leading dash really could be read as an
+ * option.
+ */
+function blankOrFlagLike(value) {
   return typeof value !== "string" || value.trim().length === 0 || value.trim().startsWith("-");
 }
 
 /**
- * Parse the execution-plane install flags out of an argv (order-independent;
- * only the execution flags are consumed, everything else is ignored so this can
- * run alongside the main install parser):
- *   --execution-mode=<remote|local-dev|disabled>   (also `--execution-mode v`)
- *   --sandbox-broker-url=<url>   (remote)
- *   --sandbox-image=<ref>        (remote: a digest-pinned L0 reference)
- *   --sandbox-egress=<default_internet|allowlist|none>
- * Returns nulls for anything absent; validates the egress enum eagerly.
+ * Blank ONLY. Used for opaque SECRET material (round-2 finding): a broker
+ * secret or service token is never an argv token, and a perfectly valid
+ * base64/base64url value can begin with `-`. Treating it as "not supplied"
+ * would silently clear it — or, worse, mint a replacement.
+ */
+function blankOnly(value) {
+  return typeof value !== "string" || value.trim().length === 0;
+}
+
+/**
+ * Refuse an env VALUE that could not survive a `.env.local` round-trip intact
+ * (Codex convergence finding 4). A newline in an operator-supplied secret would
+ * append a SECOND, attacker-chosen key to the file — and the provisioning step
+ * would report success. A NUL or other control character truncates or corrupts
+ * the value silently. Neither can ever be a legitimate secret/URL/image-ref.
+ */
+export function assertEnvValueSafe(key, value) {
+  const raw = String(value);
+  if (/[\r\n]/.test(raw)) {
+    throw new Error(
+      `Refusing to write ${key}: the value contains a line break, which would inject an additional ` +
+        "key into .env.local. Supply a single-line value.",
+    );
+  }
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/.test(raw)) {
+    throw new Error(`Refusing to write ${key}: the value contains a control character.`);
+  }
+  return raw;
+}
+
+/**
+ * Parse the execution-plane flags out of an argv (order-independent; unrelated
+ * args are ignored so this runs alongside the main install parser).
+ *
+ *   --execution-mode=<remote|local-dev|disabled>
+ *   --sandbox-broker-url=<url>            → EXECUTION_BROKER_URL
+ *   --sandbox-broker-secret=<secret>      → EXECUTION_BROKER_SECRET
+ *   --sandbox-broker-token=<token>        → EXECUTION_BROKER_SERVICE_TOKEN
+ *   --sandbox-provenance-key=<key>        → EXECUTION_ENVIRONMENT_PROVENANCE_KEY
+ *   --sandbox-image=<ref>                 → CINATRA_SANDBOX_L0_IMAGE
+ *   --sandbox-network=<name>              → EXECUTION_SANDBOX_NETWORK
+ *   --sandbox-egress=<default_internet|allowlist|none>   (settings row)
+ *   --sandbox-egress-allow=<host,host>                   (settings row)
  *
  * @param {string[]} argv
- * @returns {{ mode: string|null, brokerUrl: string|null, imageRef: string|null, egressMode: string|null }}
  */
 export function parseExecutionModeFlags(argv = []) {
   const read = (name) => {
@@ -185,9 +327,6 @@ export function parseExecutionModeFlags(argv = []) {
   const rawMode = read("--execution-mode");
   const mode = rawMode == null ? null : normalizeExecutionMode(rawMode);
 
-  const brokerUrl = read("--sandbox-broker-url");
-  const imageRef = read("--sandbox-image");
-
   const rawEgress = read("--sandbox-egress");
   let egressMode = null;
   if (rawEgress != null) {
@@ -198,45 +337,32 @@ export function parseExecutionModeFlags(argv = []) {
     egressMode = e;
   }
 
-  return { mode, brokerUrl, imageRef, egressMode };
-}
+  const rawAllow = read("--sandbox-egress-allow");
 
-/**
- * Resolve the EFFECTIVE execution mode from an explicit flag + the install mode
- * + the TTY signal (mirrors resolveUpdatePath in update-target.mjs):
- *   - an explicit `--execution-mode` always wins (interactive: false);
- *   - no flag + a TTY → present the picker (interactive: true), defaulting the
- *     highlighted choice to the install-mode default;
- *   - no flag + NO TTY → take the install-mode default silently (interactive: false)
- *     so scripted / CI installs never hang on a prompt.
- *
- * @returns {{ mode: string, interactive: boolean, default: string, reason: string }}
- */
-export function resolveExecutionModeForInstall({ installMode = "dev", flagMode = null, isTty = false } = {}) {
-  const fallback = defaultExecutionModeForInstall(installMode);
-  if (flagMode != null) {
-    return { mode: normalizeExecutionMode(flagMode), interactive: false, default: fallback, reason: "--execution-mode flag" };
-  }
-  if (isTty) {
-    return { mode: fallback, interactive: true, default: fallback, reason: `interactive picker (default: ${fallback})` };
-  }
-  return { mode: fallback, interactive: false, default: fallback, reason: `non-interactive default for --mode ${installMode}` };
+  return {
+    mode,
+    brokerUrl: read("--sandbox-broker-url"),
+    brokerSecret: read("--sandbox-broker-secret"),
+    serviceToken: read("--sandbox-broker-token"),
+    provenanceKey: read("--sandbox-provenance-key"),
+    imageRef: read("--sandbox-image"),
+    sandboxNetwork: read("--sandbox-network"),
+    egressMode,
+    egressAllowlist: rawAllow == null ? null : normalizeEgressAllowlist(rawAllow),
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Image reference safety — kill `:latest`, require digest pins (AC4)
+// Image reference safety — digest pins, never `:latest`
 // ---------------------------------------------------------------------------
 
 const SHA256_DIGEST_RE = /@sha256:[0-9a-f]{64}$/;
+const BARE_DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
 
 /**
- * S1's l0-profile.ts assertSafeImageRef, mirrored: reject an image reference
- * docker could parse as an OPTION (leading non-alphanumeric) or that carries
- * characters outside the image-ref charset. Deployment/dev-controlled, never
- * model-controlled — cheap defense-in-depth against option injection.
- *
- * @param {string} ref
- * @returns {string} the same ref (for chaining)
+ * `assertSafeImageRef` from l0-profile.ts, mirrored: refuse a reference docker
+ * could parse as an OPTION, or one carrying characters outside the image-ref
+ * charset.
  */
 export function assertSafeImageRef(ref) {
   if (typeof ref !== "string" || !/^[A-Za-z0-9]/.test(ref)) {
@@ -253,24 +379,13 @@ export function isDigestPinned(ref) {
   return typeof ref === "string" && SHA256_DIGEST_RE.test(ref);
 }
 
-/** True when `ref` carries the mutable `:latest` tag (case-insensitive). */
+/** True when `ref` carries the mutable `:latest` tag. */
 export function hasLatestTag(ref) {
   if (typeof ref !== "string") return false;
-  // Ignore any digest suffix; inspect the tag part after the final `:` that is
-  // not inside the digest.
-  const withoutDigest = ref.replace(SHA256_DIGEST_RE, "");
-  return /:latest$/i.test(withoutDigest);
+  return /:latest$/i.test(ref.replace(SHA256_DIGEST_RE, ""));
 }
 
-/**
- * Enforce the AC4 image contract for a reference the CLI-managed sandbox path
- * will USE at runtime (remote/prod): it must be `@sha256:`-pinned and must not
- * carry `:latest`. Throws an actionable error otherwise.
- *
- * @param {string} ref
- * @param {{ context?: string }} [opts]
- * @returns {string}
- */
+/** Enforce the digest-pin contract for a reference the runtime will USE. */
 export function assertDigestPinnedImage(ref, { context = "the sandbox L0 image" } = {}) {
   assertSafeImageRef(ref);
   if (hasLatestTag(ref)) {
@@ -281,131 +396,438 @@ export function assertDigestPinnedImage(ref, { context = "the sandbox L0 image" 
   }
   if (!isDigestPinned(ref)) {
     throw new Error(
-      `Refusing ${context} reference "${ref}": it is not digest-pinned. ` +
-        `A remote/prod L0 image must be pinned by digest (name@sha256:<64-hex>) so the running image is immutable + attributable.`,
+      `Refusing ${context} reference "${ref}": it is not digest-pinned. A remote worker must run an ` +
+        `immutable, attributable image (name@sha256:<64-hex>) — the worker records the resolved digest on every audit row.`,
     );
   }
   return ref;
 }
 
 // ---------------------------------------------------------------------------
-// Remote broker config validation
+// The settings row (`connector_config:execution_plane`)
+// ---------------------------------------------------------------------------
+
+/** `normalizeEgressAllowlist` from execution-plane-settings.ts, mirrored. */
+export function normalizeEgressAllowlist(raw) {
+  const source = Array.isArray(raw) ? raw : typeof raw === "string" ? raw.split(/[\s,]+/) : [];
+  const out = [];
+  const seen = new Set();
+  for (const entry of source) {
+    if (typeof entry !== "string") continue;
+    const host = entry.trim().toLowerCase().replace(/\.$/, "");
+    if (host.length === 0 || seen.has(host)) continue;
+    seen.add(host);
+    out.push(host);
+  }
+  return out;
+}
+
+/**
+ * Normalize a raw settings row exactly as `readExecutionPlaneSettings()` does
+ * (unknown mode / egress coerce to the fail-closed defaults), so the CLI's view
+ * of an instance is byte-for-byte the boot phase's view.
+ */
+export function normalizeExecutionSettings(raw) {
+  const fallback = { mode: DEFAULT_EXECUTION_MODE, egressMode: DEFAULT_EGRESS_MODE, egressAllowlist: [] };
+  if (!raw || typeof raw !== "object") return fallback;
+  return {
+    mode: EXECUTION_MODES.includes(raw.mode) ? raw.mode : DEFAULT_EXECUTION_MODE,
+    egressMode: EGRESS_MODES.includes(raw.egressMode) ? raw.egressMode : DEFAULT_EGRESS_MODE,
+    egressAllowlist: normalizeEgressAllowlist(raw.egressAllowlist),
+  };
+}
+
+/** Build the settings row for a chosen mode. */
+export function executionSettingsRow({ mode, egressMode = null, egressAllowlist = null } = {}) {
+  return normalizeExecutionSettings({
+    mode: normalizeExecutionMode(mode),
+    egressMode: egressMode ?? DEFAULT_EGRESS_MODE,
+    egressAllowlist: egressAllowlist ?? [],
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The env plan — EXACTLY the contract the merged activation reads
 // ---------------------------------------------------------------------------
 
 /**
- * Validate the config a `remote` execution mode needs: a broker base URL and a
- * digest-pinned L0 image reference. Returns the normalized values or throws with
- * an actionable message. Pure — no network (the health CHECK is a separate
- * orchestration step; this only validates SHAPE before any I/O).
+ * Compute the `.env.local` upserts + the settings row for a chosen execution
+ * mode. `value: null` means "remove this key if present".
  *
- * @param {{ brokerUrl?: string|null, imageRef?: string|null }} cfg
- * @returns {{ brokerUrl: string, imageRef: string }}
+ * `local-dev`
+ *   ROLLOUT=on, a loopback BROKER_URL, a minted BROKER_SECRET / SERVICE_TOKEN /
+ *   PROVENANCE_KEY, and the L0 image ref. The URL is required even though the
+ *   local-dev broker is IN-PROCESS: `evaluateExecutionPlaneReadiness()` treats
+ *   url+secret both-empty as "the instance never opted into the plane", which
+ *   makes `resolveExecutionEnvironmentReadiness()` answer `disabled` and every
+ *   declared-environment run refuse. So the loopback origin is written as the
+ *   placement endpoint the health phase validates — no separate service is
+ *   contacted in this mode.
+ *
+ * `remote`
+ *   The same keys, but the URL + secret + token are the OPERATOR's (they must
+ *   match the broker's), and the image must be digest-pinned.
+ *
+ * `disabled`
+ *   Removes every CLI-managed key and sets the settings row to `disabled`. On a
+ *   FRESH install nothing was ever written, `seedSettings` is false, and the
+ *   result is literally zero writes — the core's own default is already
+ *   `disabled` + rollout-unset, which makes `executionBrokerPhases()` return an
+ *   empty phase list (byte-equivalent inert).
+ *
+ * @param {{
+ *   mode: string, appOrigin?: string|null, brokerUrl?: string|null,
+ *   brokerSecret?: string|null, serviceToken?: string|null, provenanceKey?: string|null,
+ *   imageRef?: string|null, sandboxNetwork?: string|null, egressMode?: string|null,
+ *   egressAllowlist?: string[]|null, alreadyProvisioned?: boolean,
+ *   mintSecret?: () => string,
+ * }} input
+ * @returns {{ mode: string, upserts: Array<{key:string,value:string|null}>,
+ *            settings: object|null, minted: string[], notes: string[] }}
  */
-export function validateRemoteConfig({ brokerUrl, imageRef } = {}) {
-  if (looksLikeFlagOrBlank(brokerUrl)) {
-    throw new Error(
-      "remote execution mode requires a broker URL (--sandbox-broker-url=https://…): the URL of the execution " +
-        "broker this instance dispatches sandbox jobs to.",
+export function planExecutionEnv({
+  mode,
+  appOrigin = null,
+  brokerUrl = null,
+  brokerSecret = null,
+  serviceToken = null,
+  provenanceKey = null,
+  imageRef = null,
+  sandboxNetwork = null,
+  egressMode = null,
+  egressAllowlist = null,
+  alreadyProvisioned = false,
+  mintSecret = null,
+} = {}) {
+  const resolved = normalizeExecutionMode(mode);
+  const notes = [];
+  const minted = [];
+
+  if (resolved === "disabled") {
+    // AC: `disabled` writes NOTHING on a fresh install. On an instance that WAS
+    // provisioned, removing the keys is the whole point of switching to
+    // disabled — a stale ROLLOUT=on would keep the boot phase alive.
+    if (!alreadyProvisioned) {
+      return {
+        mode: resolved,
+        upserts: [],
+        settings: null,
+        minted,
+        notes: [
+          "Execution plane disabled: nothing written. The core default is already `disabled` with the rollout " +
+            "flag unset, so `executionBrokerPhases()` contributes no boot phase at all — the instance stays inert.",
+        ],
+      };
+    }
+    return {
+      mode: resolved,
+      upserts: CLI_MANAGED_EXECUTION_ENV_KEYS.map((key) => ({ key, value: null })),
+      settings: executionSettingsRow({ mode: "disabled" }),
+      minted,
+      notes: [
+        "Execution plane disabled: the CLI-managed keys were removed and the settings row set to `disabled`, " +
+          "so the boot phase clears any registered executor factory and reports `inert`.",
+      ],
+    };
+  }
+
+  const mint = typeof mintSecret === "function" ? mintSecret : null;
+  const need = (supplied, keyName) => {
+    if (typeof supplied === "string" && supplied.trim().length > 0) return supplied.trim();
+    if (!mint) {
+      throw new Error(
+        `Execution mode "${resolved}" needs ${keyName} and no value was supplied (and no minter is available).`,
+      );
+    }
+    minted.push(keyName);
+    return mint();
+  };
+
+  const upserts = [{ key: ROLLOUT_ENV_KEY, value: ROLLOUT_ON }];
+
+  let url;
+  if (resolved === "remote") {
+    url = validateBrokerUrl(brokerUrl, { required: true });
+    if (blankOnly(brokerSecret)) {
+      throw new Error(
+        `remote execution mode requires the broker's shared carrier secret (--sandbox-broker-secret=…): the app ` +
+          `SIGNS every job carrier with ${BROKER_SECRET_ENV_KEY} and the remote broker verifies that signature. ` +
+          `A minted-but-mismatched secret would fail closed on every command with no diagnostic.`,
+      );
+    }
+    upserts.push({ key: BROKER_URL_ENV_KEY, value: url });
+    upserts.push({ key: BROKER_SECRET_ENV_KEY, value: String(brokerSecret).trim() });
+    const image = assertDigestPinnedImage(String(imageRef ?? "").trim() || "", {
+      context: "the remote sandbox L0 image",
+    });
+    upserts.push({ key: L0_IMAGE_ENV_KEY, value: image });
+    notes.push(
+      "Recorded `remote`. NOTE, from the merged boot phase itself: the remote placement is persisted vocabulary " +
+        "but is NOT operable on the instance yet — `executionBrokerPhases()` wires nothing for `remote` and reports " +
+        "`unavailable` with that reason. The configuration is correct and inert; it activates when the core's remote " +
+        "broker service boundary lands.",
+    );
+  } else {
+    // local-dev
+    const origin = typeof appOrigin === "string" && appOrigin.trim() ? appOrigin.trim() : "http://localhost:3000";
+    url = validateBrokerUrl(brokerUrl ?? origin, { required: true });
+    upserts.push({ key: BROKER_URL_ENV_KEY, value: url });
+    upserts.push({ key: BROKER_SECRET_ENV_KEY, value: need(brokerSecret, BROKER_SECRET_ENV_KEY) });
+    const image = String(imageRef ?? "").trim() || DEFAULT_L0_IMAGE_LOCAL_DEV;
+    assertSafeImageRef(image);
+    if (hasLatestTag(image)) {
+      throw new Error(
+        `Refusing the local-dev sandbox image "${image}": the :latest tag is banned for the execution plane.`,
+      );
+    }
+    upserts.push({ key: L0_IMAGE_ENV_KEY, value: image });
+    notes.push(
+      "local-dev runs model-authored commands in containers ON THIS MACHINE, under the hardened L0 profile " +
+        "(non-root uid 10001, read-only rootfs, cap-drop ALL, no-new-privileges) with egress through the " +
+        "attributing gateway.",
     );
   }
+
+  // The SERVICE TOKEN guards the broker's own inbound boundary, so in `remote`
+  // it must MATCH the broker's configured value. Minting one locally would
+  // produce a token that can never verify — worse than leaving it unset, which
+  // at least fails loudly and visibly (Codex convergence finding 3). In
+  // `local-dev` the boundary collapses in-process, so a minted token is correct.
+  if (resolved === "remote") {
+    if (blankOnly(serviceToken)) {
+      upserts.push({ key: BROKER_SERVICE_TOKEN_ENV_KEY, value: null });
+      notes.push(
+        `No ${BROKER_SERVICE_TOKEN_ENV_KEY} was supplied, so none was written: it guards the REMOTE broker's own ` +
+          "service boundary and must match that broker's configured value — a locally minted one could never " +
+          "verify. Pass --sandbox-broker-token=<the broker's token> when you have it.",
+      );
+    } else {
+      upserts.push({ key: BROKER_SERVICE_TOKEN_ENV_KEY, value: String(serviceToken).trim() });
+    }
+  } else {
+    upserts.push({ key: BROKER_SERVICE_TOKEN_ENV_KEY, value: need(serviceToken, BROKER_SERVICE_TOKEN_ENV_KEY) });
+  }
+  // The provenance key is a HOST-HELD HMAC key that never leaves this machine
+  // (it signs L1 environment-layer provenance), so minting it locally is correct
+  // in BOTH placements.
+  upserts.push({ key: PROVENANCE_KEY_ENV_KEY, value: need(provenanceKey, PROVENANCE_KEY_ENV_KEY) });
+  upserts.push({
+    key: SANDBOX_NETWORK_ENV_KEY,
+    value: typeof sandboxNetwork === "string" && sandboxNetwork.trim() ? sandboxNetwork.trim() : null,
+  });
+
+  for (const u of upserts) if (u.value !== null) assertEnvValueSafe(u.key, u.value);
+
+  return {
+    mode: resolved,
+    upserts,
+    settings: executionSettingsRow({ mode: resolved, egressMode, egressAllowlist }),
+    minted,
+    notes,
+  };
+}
+
+/**
+ * Redact the userinfo segment from a URL-ish string so a validation
+ * error can quote the input without ever printing a credential. Applied to the
+ * RAW string (not the parsed URL) because the malformed-input path never gets a
+ * parsed URL to read `.password` from.
+ */
+export function redactUrlCredentials(raw) {
+  return String(raw).replace(/(\/\/)[^/@\s]*@/g, "$1***@");
+}
+
+/**
+ * Validate a broker base URL exactly as `evaluateExecutionPlaneReadiness()`
+ * does (parseable + http(s)), plus the CLI's own "a BASE url carries no query
+ * or fragment" refinement.
+ */
+export function validateBrokerUrl(raw, { required = false } = {}) {
+  if (blankOrFlagLike(raw)) {
+    if (!required) return null;
+    throw new Error(
+      `A broker URL is required (--sandbox-broker-url=https://…): ${BROKER_URL_ENV_KEY} + ${BROKER_SECRET_ENV_KEY} ` +
+        `are what the instance's execution-plane health phase validates, and both-empty means "never opted in".`,
+    );
+  }
+  // A MALFORMED url never reaches the parser's userinfo accessors, so redact
+  // any userinfo segment BEFORE echoing it (round-3 finding): an input whose
+  // authority ends at the `@` (no host) fails to parse and would otherwise
+  // print the password verbatim in the "not a URL" message.
+  const shown = redactUrlCredentials(raw);
   let parsed;
   try {
-    parsed = new URL(brokerUrl.trim());
+    parsed = new URL(String(raw).trim());
   } catch {
-    throw new Error(`Invalid --sandbox-broker-url "${brokerUrl}": not a URL.`);
+    throw new Error(`Invalid broker URL "${shown}": not a URL.`);
   }
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    throw new Error(`Invalid --sandbox-broker-url "${brokerUrl}": use an http(s) URL.`);
-  }
-  if (parsed.search || parsed.hash) {
-    throw new Error(`Invalid --sandbox-broker-url "${brokerUrl}": a broker BASE URL must not carry a query string or fragment.`);
-  }
-  if (looksLikeFlagOrBlank(imageRef)) {
+  // Codex convergence finding 6: userinfo in the URL is a credential that would
+  // then be echoed verbatim by every reachability diagnostic. The broker's
+  // credential is EXECUTION_BROKER_SECRET, never the URL.
+  //
+  // Checked FIRST, and the URL is NEVER echoed once credentials are present:
+  // a later "bad scheme" / "has a query string" error on the same input would
+  // otherwise print the password itself (round-2 finding).
+  if (parsed.username || parsed.password) {
     throw new Error(
-      "remote execution mode requires a digest-pinned L0 image (--sandbox-image=name@sha256:…): a remote worker " +
-        "runs commands over an immutable, attributable image, never a floating tag.",
+      "Invalid broker URL: a broker BASE url must not embed credentials (user:password@host) — they would be " +
+        `printed by the reachability diagnostics. Supply the credential via ${BROKER_SECRET_ENV_KEY} instead.`,
     );
   }
-  const image = assertDigestPinnedImage(imageRef.trim(), { context: "the remote sandbox L0 image" });
-  return { brokerUrl: parsed.toString(), imageRef: image };
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(`Invalid broker URL "${shown}": ${BROKER_URL_ENV_KEY} must be http(s) (got ${parsed.protocol}).`);
+  }
+  if (parsed.search || parsed.hash) {
+    throw new Error(`Invalid broker URL "${shown}": a broker BASE url must not carry a query string or fragment.`);
+  }
+  return parsed.toString();
 }
 
-/** The broker health probe URL for a given base (mirrors the gateway `/__health`
- *  convention; the broker HTTP boundary itself is a later S1 slice, so a probe
- *  failure is reported honestly, not as a hard install error). */
-export function brokerHealthUrl(brokerUrl) {
-  const u = new URL(String(brokerUrl));
-  u.search = "";
-  u.hash = "";
-  u.pathname = `${u.pathname.replace(/\/+$/, "")}/health`;
-  return u.toString();
+/**
+ * Read the execution-plane ENV posture back out of a parsed `.env.local`.
+ * Secrets are reported as booleans ONLY — a value never leaves this function.
+ *
+ * @param {Record<string,string>} env
+ */
+export function readExecutionEnv(env = {}) {
+  const str = (key) => (typeof env[key] === "string" ? env[key].trim() : "");
+  const brokerUrlRaw = str(BROKER_URL_ENV_KEY);
+  const secretPresent = str(BROKER_SECRET_ENV_KEY).length > 0;
+  return {
+    rolloutOn: str(ROLLOUT_ENV_KEY) === ROLLOUT_ON,
+    rolloutRaw: str(ROLLOUT_ENV_KEY),
+    brokerUrl: brokerUrlRaw || null,
+    brokerSecretPresent: secretPresent,
+    serviceTokenPresent: str(BROKER_SERVICE_TOKEN_ENV_KEY).length > 0,
+    provenanceKeyPresent: str(PROVENANCE_KEY_ENV_KEY).length > 0,
+    imageRef: str(L0_IMAGE_ENV_KEY) || null,
+    sandboxNetwork: str(SANDBOX_NETWORK_ENV_KEY) || SANDBOX_NETWORK_NAME,
+    required: str(EXECUTION_PLANE_REQUIRED_ENV_KEY) === "1",
+    // The health phase's own tri-state, mirrored so `doctor` can name the exact
+    // state the boot phase will land in.
+    clientReadiness: evaluateClientReadiness(brokerUrlRaw, secretPresent ? "set" : ""),
+  };
+}
+
+/** `evaluateExecutionPlaneReadiness()` mirrored (url + secret-presence only). */
+export function evaluateClientReadiness(url, secret) {
+  const u = typeof url === "string" ? url.trim() : "";
+  const s = typeof secret === "string" ? secret.trim() : "";
+  if (u === "" && s === "") return { state: "not-configured" };
+  const missing = [];
+  if (u === "") missing.push(BROKER_URL_ENV_KEY);
+  if (s === "") missing.push(BROKER_SECRET_ENV_KEY);
+  if (missing.length > 0) return { state: "misconfigured", reason: `missing ${missing.join(", ")}` };
+  let parsed;
+  try {
+    parsed = new URL(u);
+  } catch {
+    return { state: "misconfigured", reason: `${BROKER_URL_ENV_KEY} is not a valid URL` };
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { state: "misconfigured", reason: `${BROKER_URL_ENV_KEY} must be http(s) (got ${parsed.protocol})` };
+  }
+  return { state: "ready" };
+}
+
+/** The effective L0 image ref (`resolveL0ImageRef` mirrored). */
+export function effectiveImageRef(imageRef) {
+  return typeof imageRef === "string" && imageRef.trim().length > 0 ? imageRef.trim() : DEFAULT_L0_IMAGE_LOCAL_DEV;
+}
+
+/**
+ * Apply `{key,value}` upserts to a raw `.env.local` body. For each key it
+ * removes EVERY existing occurrence (a hand-edited duplicate would otherwise
+ * survive the disabled purge) and appends one canonical entry when non-null.
+ */
+export function applyEnvUpsertsToBody(body, upserts) {
+  const esc = (k) => String(k).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  let out = typeof body === "string" ? body : "";
+  for (const { key, value } of upserts) {
+    // Remove EVERY assignment of this key in any dotenv-valid shape a
+    // hand-edited file may carry — leading whitespace and the `export ` prefix
+    // included (Codex convergence finding 5). Missing one on the `disabled`
+    // purge would leave a live secret, or a live ROLLOUT=on, behind.
+    out = out.replace(new RegExp(`^[ \t]*(?:export[ \t]+)?${esc(key)}[ \t]*=.*\r?\n?`, "mg"), "");
+    if (value !== null && value !== undefined) {
+      assertEnvValueSafe(key, value);
+      if (out.length > 0 && !out.endsWith("\n")) out += "\n";
+      out += `${key}=${value}\n`;
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
-// Image acquisition plan + pure docker argv builders
+// L0 image lifecycle — acquire / verify / prune
 // ---------------------------------------------------------------------------
 
 /**
- * Decide how to acquire the L0 image for a given execution mode:
- *   - local-dev → BUILD from docker/sandbox/Dockerfile, tag `cinatra-sandbox-l0:dev`,
- *     then RECORD the resolved digest (the built image Id).
- *   - remote    → VERIFY the digest-pinned reference (pull it so the pin is
- *     present + resolvable locally for the doctor digest-match check).
- *   - disabled  → SKIP (no sandbox image on this host).
- *
- * @param {{ executionMode: string, imageRef?: string|null, dockerfileExists?: boolean }} args
- * @returns {{ action: "build"|"pull"|"skip", imageRef: string|null, reason: string }}
+ * How to acquire the L0 image for a mode:
+ *   local-dev → BUILD from the checkout Dockerfile (no registry publishes it).
+ *   remote    → PULL the digest-pinned reference so the pin is locally
+ *               verifiable (and so `doctor` can compare digests).
+ *   disabled  → SKIP.
  */
 export function planImageAcquisition({ executionMode, imageRef = null, dockerfileExists = true } = {}) {
   const mode = normalizeExecutionMode(executionMode);
   if (mode === "disabled") {
-    return { action: "skip", imageRef: null, reason: "execution mode is disabled — no sandbox image is acquired (models stay usable)." };
+    return { action: "skip", imageRef: null, reason: "execution mode is disabled — no sandbox image is acquired." };
   }
   if (mode === "remote") {
     const ref = assertDigestPinnedImage(String(imageRef ?? ""), { context: "the remote sandbox L0 image" });
     return { action: "pull", imageRef: ref, reason: "remote mode: pull + verify the digest-pinned L0 image." };
   }
-  // local-dev
   if (!dockerfileExists) {
     throw new Error(
       `Cannot acquire the local-dev sandbox image: ${L0_DOCKERFILE_REL} is missing from the checkout. ` +
         "Update the instance to a revision that ships the execution-plane L0 Dockerfile, then retry.",
     );
   }
-  const ref = imageRef && imageRef.trim().length > 0 ? assertSafeImageRef(imageRef.trim()) : DEFAULT_L0_IMAGE_LOCAL_DEV;
+  const ref = imageRef && String(imageRef).trim() ? assertSafeImageRef(String(imageRef).trim()) : DEFAULT_L0_IMAGE_LOCAL_DEV;
   if (hasLatestTag(ref)) {
-    throw new Error(`Refusing to build the local-dev sandbox image as "${ref}": the :latest tag is banned; use a dev tag + recorded digest.`);
+    throw new Error(`Refusing to build the local-dev sandbox image as "${ref}": the :latest tag is banned.`);
   }
-  return { action: "build", imageRef: ref, reason: "local-dev mode: build the L0 image from the checkout Dockerfile + record its digest." };
+  return { action: "build", imageRef: ref, reason: "local-dev mode: build the L0 image + record its digest pin." };
 }
 
-/** `docker build` argv (without the leading `docker`) for the local-dev L0 image.
- *  `-f <dockerfile>` + explicit context so it is unambiguous. */
+/** `docker build` argv for the local-dev L0 image. */
 export function l0BuildArgs({ imageRef, dockerfile, buildContext }) {
   assertSafeImageRef(imageRef);
   return ["build", "-t", imageRef, "-f", String(dockerfile), String(buildContext)];
 }
 
-/** `docker pull` argv for a digest-pinned remote L0 image. */
+/** `docker pull` argv for a digest-pinned L0 image. */
 export function l0PullArgs(imageRef) {
-  assertDigestPinnedImage(imageRef, { context: "the remote sandbox L0 image" });
+  assertDigestPinnedImage(imageRef, { context: "the sandbox L0 image" });
   return ["pull", imageRef];
 }
 
-/** `docker image inspect` argv that prints the immutable image Id (the recorded
- *  digest for a local-dev build). */
+/** `docker image inspect` argv printing the immutable image Id. */
 export function l0DigestInspectArgs(imageRef) {
   assertSafeImageRef(imageRef);
   return ["image", "inspect", imageRef, "--format", "{{.Id}}"];
 }
 
-/**
- * Parse the `{{.Id}}` inspect output into a normalized `sha256:<hex>` digest, or
- * null when the image is absent / the output is unrecognizable.
- *
- * @param {string|null|undefined} stdout
- * @returns {string|null}
- */
+/** `docker image inspect` argv printing the registry RepoDigests (one per line). */
+export function l0RepoDigestsInspectArgs(imageRef) {
+  assertSafeImageRef(imageRef);
+  return ["image", "inspect", imageRef, "--format", "{{range .RepoDigests}}{{println .}}{{end}}"];
+}
+
+/** `docker images` argv listing every L0 image (`<id>\t<ref>\t<created-unix>`). */
+export function l0ImageListArgs(repo = L0_IMAGE_REPO) {
+  assertSafeImageRef(String(repo));
+  return ["images", String(repo), "--format", "{{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.CreatedAt}}", "--no-trunc"];
+}
+
+/** `docker image rm` argv. Never `-f`: an image backing a live sandbox must win. */
+export function l0RemoveArgs(id) {
+  assertSafeImageRef(String(id));
+  return ["image", "rm", String(id)];
+}
+
+/** Parse a `{{.Id}}` inspect output into `sha256:<hex>`, or null. */
 export function parseInspectedDigest(stdout) {
   if (typeof stdout !== "string") return null;
   const first = stdout.split("\n").map((l) => l.trim()).find((l) => l.length > 0);
@@ -414,20 +836,88 @@ export function parseInspectedDigest(stdout) {
   return m ? m[0] : null;
 }
 
+/** Parse a RepoDigests inspect output into an array of `name@sha256:…` refs. */
+export function parseRepoDigests(stdout) {
+  if (typeof stdout !== "string") return [];
+  return stdout
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => SHA256_DIGEST_RE.test(l));
+}
+
+/** Parse `docker images --format "{{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.CreatedAt}}"`. */
+export function parseImageList(stdout) {
+  if (typeof stdout !== "string") return [];
+  const out = [];
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const [id, ref, createdAt] = trimmed.split("\t");
+    if (!id) continue;
+    out.push({ id: id.trim(), ref: (ref ?? "").trim(), createdAt: (createdAt ?? "").trim() });
+  }
+  return out;
+}
+
 /**
- * The minimal hardened `docker run` argv the CLI doctor uses to EXERCISE the S1
- * hardened profile for one probe command. Mirrors the load-bearing flags of
- * l0-profile.ts buildHardenedRunArgs (non-root fixed UID, read-only rootfs,
- * cap-drop ALL, no-new-privileges, `--network none`, tmpfs /tmp, `--` argv
- * terminator). This is NOT a substitute for the worker's full profile — it is a
- * self-check that the image can run under the hardened contract at all.
+ * Decide which L0 images are SUPERSEDED and may be pruned.
  *
- * @param {{ imageRef: string, command: string, name?: string }} args
- * @returns {string[]}
+ * KEEP, always: the image the current configuration resolves to (by id AND by
+ * ref), anything dangling that a running container still uses (docker refuses
+ * those anyway, but we never even ask), and — fail-closed — everything when the
+ * keep target is unknown, since pruning "all but nothing" would delete the very
+ * image an in-flight sandbox is running.
+ *
+ * @param {{ images: Array<{id:string,ref:string}>, keepDigest?: string|null,
+ *           keepRef?: string|null, inUseIds?: string[] }} input
+ * @returns {{ remove: Array<{id:string,ref:string}>, keep: Array<{id:string,ref:string}>, reason: string }}
  */
-export function hardenedProbeRunArgs({ imageRef, command, name }) {
+export function planImagePrune({ images = [], keepDigest = null, keepRef = null, inUseIds = [] } = {}) {
+  const list = Array.isArray(images) ? images.filter((i) => i && typeof i.id === "string") : [];
+  if (!keepDigest && !keepRef) {
+    return {
+      remove: [],
+      keep: list,
+      reason:
+        "no current L0 image could be resolved, so nothing is pruned (fail-closed: pruning without a keep target " +
+        "could remove the image an in-flight sandbox is running).",
+    };
+  }
+  const inUse = new Set((inUseIds ?? []).map((i) => String(i)));
+  const keep = [];
+  const remove = [];
+  for (const img of list) {
+    const isKeep =
+      (keepDigest && img.id === keepDigest) ||
+      (keepRef && img.ref === keepRef) ||
+      inUse.has(img.id);
+    (isKeep ? keep : remove).push(img);
+  }
+  return {
+    remove,
+    keep,
+    reason:
+      remove.length === 0
+        ? "no superseded L0 images — the only image present is the one this instance is configured to run."
+        : `${remove.length} superseded L0 image(s) can be reaped; the configured image (and any image backing a running container) is kept.`,
+  };
+}
+
+/**
+ * The `docker run` argv that mirrors the BOOT HANDSHAKE.
+ *
+ * The boot phase's handshake opens a real broker job and dispatches
+ * `HANDSHAKE_COMMAND` through `LocalDevSandboxWorker`, which builds its argv
+ * with `buildHardenedRunArgs` (l0-profile.ts). The CLI cannot open a broker job
+ * (that needs the app's process + DB), so it reproduces the load-bearing half:
+ * the same image, the same hardened flags, the same command, the same expected
+ * stdout. `--network none` is used deliberately — the handshake command performs
+ * no network I/O, so a gateway-less probe still answers the question the boot
+ * handshake asks ("can this worker run a command on this image at all").
+ */
+export function handshakeProbeRunArgs({ imageRef, name = null } = {}) {
   assertSafeImageRef(imageRef);
-  const args = [
+  return [
     "run",
     "--rm",
     "--init",
@@ -447,9 +937,37 @@ export function hardenedProbeRunArgs({ imageRef, command, name }) {
     imageRef,
     "bash",
     "-c",
-    String(command),
+    HANDSHAKE_COMMAND,
   ];
-  return args;
+}
+
+/**
+ * The boot handshake's ACCEPTANCE predicate, mirrored verbatim:
+ * `termination === "exited" && exitCode === 0 && stdout.trim() === expected`.
+ *
+ * @param {{ ran?: boolean, exitCode?: number|null, stdout?: string, timedOut?: boolean }} probe
+ * @returns {{ ok: boolean, reason: string }}
+ */
+export function evaluateHandshakeProbe({ ran = false, exitCode = null, stdout = "", timedOut = false } = {}) {
+  if (timedOut) {
+    return { ok: false, reason: "the handshake command did not complete on a live worker (termination=timeout)" };
+  }
+  if (!ran) {
+    return { ok: false, reason: "the handshake command could not be dispatched (docker unavailable or image missing)" };
+  }
+  if (exitCode !== 0) {
+    return {
+      ok: false,
+      reason: `the handshake command did not complete on a live worker (termination=exited, exit=${String(exitCode)})`,
+    };
+  }
+  if (String(stdout ?? "").trim() !== HANDSHAKE_EXPECTED_STDOUT) {
+    return {
+      ok: false,
+      reason: "the handshake command produced unexpected output — the worker is not running the expected sandbox",
+    };
+  }
+  return { ok: true, reason: "handshake completed: the probe container ran on the L0 image and returned the expected output" };
 }
 
 /** `docker network inspect` argv printing whether the sandbox network is internal. */
@@ -457,119 +975,18 @@ export function networkInternalInspectArgs(name = SANDBOX_NETWORK_NAME) {
   return ["network", "inspect", String(name), "--format", "{{.Internal}}"];
 }
 
-/** `docker ps` argv testing whether a named container is running (prints its name). */
+/** `docker ps` argv testing whether a named container is running. */
 export function containerRunningArgs(name) {
   return ["ps", "--filter", `name=^/${String(name)}$`, "--format", "{{.Names}}"];
 }
 
-/** `docker volume ls` argv listing the L2 workspace volumes (for `sandbox gc`). */
+/** `docker volume ls` argv listing the L2 workspace volumes. */
 export function workspaceVolumeLsArgs() {
   return ["volume", "ls", "--filter", `label=${WORKSPACE_LABEL}=l2`, "--format", "{{.Name}}"];
 }
 
 // ---------------------------------------------------------------------------
-// `.env.local` execution-plane configuration
-// ---------------------------------------------------------------------------
-
-/**
- * The ordered set of `.env.local` key/value upserts that persist a resolved
- * execution-plane configuration. The caller upserts each with its own
- * `upsertEnvKey`. Mode-specific:
- *   - local-dev → rollout ON; egress mode; recorded image digest (no
- *     CINATRA_SANDBOX_L0_IMAGE, so the worker falls back to the :dev tag).
- *   - remote    → rollout ON; egress mode; the digest-pinned CINATRA_SANDBOX_L0_IMAGE
- *     + the broker URL.
- *   - disabled  → mode only; rollout stays absent (dark → the capability is not
- *     injected → models stay usable). Any stale image/broker keys are CLEARED.
- *
- * A key with `value: null` means "remove this key if present".
- *
- * @param {{ executionMode: string, imageRef?: string|null, imageDigest?: string|null, brokerUrl?: string|null, egressMode?: string|null }} cfg
- * @returns {Array<{ key: string, value: string|null }>}
- */
-export function executionEnvUpserts({ executionMode, imageRef = null, imageDigest = null, brokerUrl = null, egressMode = null } = {}) {
-  const mode = normalizeExecutionMode(executionMode);
-  const egress = egressMode ?? DEFAULT_EGRESS_MODE;
-  const upserts = [{ key: EXECUTION_MODE_ENV_KEY, value: mode }];
-
-  if (mode === "disabled") {
-    // Fail-safe: leave the capability dark and clear any stale provisioning.
-    upserts.push({ key: ROLLOUT_ENV_KEY, value: null });
-    upserts.push({ key: L0_IMAGE_ENV_KEY, value: null });
-    upserts.push({ key: L0_IMAGE_DIGEST_ENV_KEY, value: null });
-    upserts.push({ key: BROKER_URL_ENV_KEY, value: null });
-    upserts.push({ key: EGRESS_MODE_ENV_KEY, value: null });
-    return upserts;
-  }
-
-  upserts.push({ key: ROLLOUT_ENV_KEY, value: ROLLOUT_ON });
-  upserts.push({ key: EGRESS_MODE_ENV_KEY, value: egress });
-
-  if (mode === "remote") {
-    const image = assertDigestPinnedImage(String(imageRef ?? ""), { context: "the remote sandbox L0 image" });
-    upserts.push({ key: L0_IMAGE_ENV_KEY, value: image });
-    upserts.push({ key: BROKER_URL_ENV_KEY, value: String(brokerUrl ?? "") });
-    // A remote instance does not run a local worker, so no locally-recorded digest.
-    upserts.push({ key: L0_IMAGE_DIGEST_ENV_KEY, value: null });
-    return upserts;
-  }
-
-  // local-dev
-  if (imageDigest) {
-    if (!/^sha256:[0-9a-f]{64}$/.test(imageDigest)) {
-      throw new Error(`Refusing to record a malformed L0 image digest "${imageDigest}" (expected sha256:<64-hex>).`);
-    }
-    upserts.push({ key: L0_IMAGE_DIGEST_ENV_KEY, value: imageDigest });
-  }
-  // local-dev uses the :dev tag via the worker's fallback — leave CINATRA_SANDBOX_L0_IMAGE
-  // + the broker URL unset.
-  upserts.push({ key: L0_IMAGE_ENV_KEY, value: null });
-  upserts.push({ key: BROKER_URL_ENV_KEY, value: null });
-  return upserts;
-}
-
-/**
- * Read the resolved execution configuration back out of a parsed `.env.local`
- * (or process env) map. `mode` falls back to `disabled` when unset (fail-safe:
- * an instance with no execution config exposes no sandbox). Pure.
- *
- * @param {Record<string,string>} env
- * @returns {{ mode: string, rolloutOn: boolean, imageRef: string|null, imageDigest: string|null, brokerUrl: string|null, egressMode: string }}
- */
-export function readExecutionConfig(env = {}) {
-  const rawMode = typeof env[EXECUTION_MODE_ENV_KEY] === "string" ? env[EXECUTION_MODE_ENV_KEY].trim() : "";
-  let mode = "disabled";
-  if (rawMode) {
-    try {
-      mode = normalizeExecutionMode(rawMode);
-    } catch {
-      mode = "disabled";
-    }
-  }
-  const imageRef = typeof env[L0_IMAGE_ENV_KEY] === "string" && env[L0_IMAGE_ENV_KEY].trim() ? env[L0_IMAGE_ENV_KEY].trim() : null;
-  const imageDigest =
-    typeof env[L0_IMAGE_DIGEST_ENV_KEY] === "string" && env[L0_IMAGE_DIGEST_ENV_KEY].trim() ? env[L0_IMAGE_DIGEST_ENV_KEY].trim() : null;
-  const brokerUrl = typeof env[BROKER_URL_ENV_KEY] === "string" && env[BROKER_URL_ENV_KEY].trim() ? env[BROKER_URL_ENV_KEY].trim() : null;
-  const rawEgress = typeof env[EGRESS_MODE_ENV_KEY] === "string" ? env[EGRESS_MODE_ENV_KEY].trim().toLowerCase() : "";
-  const egressMode = EGRESS_MODES.includes(rawEgress) ? rawEgress : DEFAULT_EGRESS_MODE;
-  const rolloutOn = (typeof env[ROLLOUT_ENV_KEY] === "string" ? env[ROLLOUT_ENV_KEY].trim() : "") === ROLLOUT_ON;
-  return { mode, rolloutOn, imageRef, imageDigest, brokerUrl, egressMode };
-}
-
-/**
- * The effective L0 image reference to inspect/run for a config (mirrors S1
- * resolveL0ImageRef): an explicit CINATRA_SANDBOX_L0_IMAGE wins, else the
- * local-dev :dev tag.
- *
- * @param {{ imageRef: string|null }} cfg
- * @returns {string}
- */
-export function effectiveImageRef(cfg = {}) {
-  return cfg.imageRef && String(cfg.imageRef).trim().length > 0 ? String(cfg.imageRef).trim() : DEFAULT_L0_IMAGE_LOCAL_DEV;
-}
-
-// ---------------------------------------------------------------------------
-// Sandbox doctor classifiers (pure — take probe results, return a verdict)
+// Doctor classifiers — the five execution checks, each with an ACTIONABLE message
 // ---------------------------------------------------------------------------
 
 function check(id, label, verdict, detail, remediation = null) {
@@ -577,173 +994,474 @@ function check(id, label, verdict, detail, remediation = null) {
 }
 
 /**
- * Worker health. local-dev: the L0 image is present AND a hardened probe run
- * succeeds. remote: the broker health probe answered ok. disabled: reported as
- * `disabled`, never a failure.
+ * CHECK 1 — MODE DETECTION.
+ *
+ * The mode lives in the settings row, the rollout flag lives in env, and the
+ * boot phase needs BOTH. Every way that pair can be wrong gets its own message,
+ * because "nothing happens" is the failure signature of all of them.
  */
-export function classifyWorkerHealth({ executionMode, imagePresent = false, probeOk = false, probeDetail = "", brokerReachable = null } = {}) {
-  const mode = normalizeExecutionMode(executionMode);
-  const id = "worker-health";
-  const label = "Sandbox worker health";
-  if (mode === "disabled") {
-    return check(id, label, "disabled", "execution mode is disabled — no worker to check (models stay usable).");
-  }
-  if (mode === "remote") {
-    if (brokerReachable === true) return check(id, label, "healthy", "remote broker answered its health probe.");
+export function classifyExecutionModeCheck({
+  mode = DEFAULT_EXECUTION_MODE,
+  rolloutOn = false,
+  rolloutRaw = "",
+  settingsReadable = true,
+  clientReadiness = { state: "not-configured" },
+  provenanceKeyPresent = false,
+  required = false,
+} = {}) {
+  const id = "execution-mode";
+  const label = "Execution mode";
+
+  if (!settingsReadable) {
     return check(
       id,
       label,
       "degraded",
-      brokerReachable === false
-        ? "remote broker did not answer its health probe."
-        : "remote broker health could not be probed (the broker HTTP surface is a later S1 slice).",
-      "Verify the broker URL + that the broker service is reachable; the app's execution health surface is the authority once wired.",
+      "the instance's execution-plane settings row could not be read, so the mode the boot phase will see is unknown.",
+      "Start the database (`cinatra instance start`) and re-run; the row lives in the platform metadata store under " +
+        `\`${EXECUTION_SETTINGS_METADATA_KEY}\`.`,
     );
   }
-  // local-dev
+
+  if (mode === "disabled") {
+    if (rolloutOn) {
+      return check(
+        id,
+        label,
+        "degraded",
+        "the rollout flag is ON but the persisted mode is `disabled` — the boot phase runs, wires nothing, and " +
+          "reports `inert`. Nothing will ever execute.",
+        `Run \`cinatra instance execution set-mode local-dev\` (or \`remote\`), or clear ${ROLLOUT_ENV_KEY} from ` +
+          ".env.local to make the instance fully inert.",
+      );
+    }
+    return check(
+      id,
+      label,
+      "disabled",
+      "the execution plane is disabled: the mode is `disabled` and the rollout flag is unset, so the boot " +
+        "orchestrator contributes no execution phase at all. Models stay fully usable.",
+    );
+  }
+
+  if (!rolloutOn) {
+    return check(
+      id,
+      label,
+      "degraded",
+      `mode \`${mode}\` is persisted but ${ROLLOUT_ENV_KEY} is ${rolloutRaw ? `"${rolloutRaw}"` : "unset"} — only the ` +
+        'exact string "on" enables the plane, so the boot orchestrator contributes NO execution phase and the mode ' +
+        "is never read.",
+      `Set ${ROLLOUT_ENV_KEY}=on in .env.local (\`cinatra instance execution set-mode ${mode}\` writes it for you), then restart.`,
+    );
+  }
+
+  // `not-configured` (BOTH url and secret empty) is the state the core reads as
+  // "this instance never opted into the execution plane": readiness resolves
+  // `disabled` and every declared-environment run refuses — no matter what the
+  // settings row says (Codex convergence finding 8).
+  if (clientReadiness.state === "not-configured" && !required) {
+    return check(
+      id,
+      label,
+      "degraded",
+      `mode \`${mode}\` is persisted with the rollout on, but neither ${BROKER_URL_ENV_KEY} nor ` +
+        `${BROKER_SECRET_ENV_KEY} is set — the instance reads as "never opted into the execution plane", so ` +
+        "readiness resolves `disabled` and every declared-environment run refuses.",
+      `Run \`cinatra instance execution set-mode ${mode}\` to write both.`,
+    );
+  }
+
+  if (clientReadiness.state === "misconfigured" || clientReadiness.state === "not-configured") {
+    const reason = clientReadiness.reason ?? `missing ${BROKER_URL_ENV_KEY}, ${BROKER_SECRET_ENV_KEY}`;
+    return check(
+      id,
+      label,
+      "degraded",
+      `mode \`${mode}\` with the rollout on, but the execution-plane client config is incomplete: ${reason}. ` +
+        `The health boot phase fails${required ? " and this instance class declares the plane REQUIRED, so the boot is deploy-blocked" : ""}.`,
+      `Set both ${BROKER_URL_ENV_KEY} and ${BROKER_SECRET_ENV_KEY} — re-run \`cinatra instance execution set-mode ${mode}\`.`,
+    );
+  }
+
+  // The provenance key is the OTHER hard precondition for a `ready` plane:
+  // absent, readiness is `unavailable` and every declared-environment run
+  // refuses, even with a perfect broker config and a completed handshake
+  // (Codex convergence finding 1).
+  if (!provenanceKeyPresent) {
+    return check(
+      id,
+      label,
+      "degraded",
+      `mode \`${mode}\` is configured, but ${PROVENANCE_KEY_ENV_KEY} is not set. Environment readiness resolves ` +
+        "`unavailable` on that alone, so every declared-environment run refuses no matter how healthy the rest looks.",
+      `Run \`cinatra instance execution set-mode ${mode}\` — it mints and writes the key (a host-held HMAC key that ` +
+        "never enters a container).",
+    );
+  }
+
+  if (mode === "remote") {
+    return check(
+      id,
+      label,
+      "degraded",
+      "mode `remote` is persisted and configured, but the instance's own boot phase reports remote as NOT OPERABLE " +
+        "yet — it wires nothing and reports `unavailable` with that reason. This is the core's stated state, not a " +
+        "misconfiguration on this host.",
+      "Nothing to fix here: the configuration activates when the core's remote broker service boundary ships. Use " +
+        "`local-dev` if you need sandbox execution on this instance today.",
+    );
+  }
+
+  return check(
+    id,
+    label,
+    "healthy",
+    "mode `local-dev` with the rollout flag on and the client config complete — the boot phase will attempt the " +
+      "broker↔worker handshake.",
+  );
+}
+
+/**
+ * CHECK 2 — BROKER REACHABILITY.
+ *
+ * `remote`: a live probe of the configured URL. `local-dev`: the broker is
+ * in-process, so the reachability question is "is the app process up" — the
+ * same process that owns the broker.
+ */
+export function classifyBrokerReachability({
+  mode = DEFAULT_EXECUTION_MODE,
+  brokerUrl = null,
+  brokerSecretPresent = false,
+  reachable = null,
+} = {}) {
+  const id = "broker-reachability";
+  const label = "Broker reachability";
+  if (mode === "disabled") {
+    return check(id, label, "disabled", "execution mode is disabled — there is no broker to reach.");
+  }
+  if (!brokerUrl) {
+    return check(
+      id,
+      label,
+      "degraded",
+      `${BROKER_URL_ENV_KEY} is not set, so the instance reads as "never opted into the execution plane" and every ` +
+        "declared-environment run refuses.",
+      `Run \`cinatra instance execution set-mode ${mode}\` to write ${BROKER_URL_ENV_KEY} + ${BROKER_SECRET_ENV_KEY}.`,
+    );
+  }
+  if (!brokerSecretPresent) {
+    return check(
+      id,
+      label,
+      "degraded",
+      `${BROKER_SECRET_ENV_KEY} is not set: the app cannot SEAL a job carrier, so the plane reports itself ` +
+        "unavailable before any command is dispatched.",
+      `Run \`cinatra instance execution set-mode ${mode}\`; for \`remote\` supply the broker's own shared secret with ` +
+        "--sandbox-broker-secret (a mismatched secret fails closed on every command).",
+    );
+  }
+  if (mode === "remote") {
+    // The write path refuses a credential-bearing URL, but `.env.local` can be
+    // hand-edited — so redact on DISPLAY too rather than trusting the writer.
+    const shownUrl = redactUrlCredentials(brokerUrl);
+    if (reachable === true) {
+      return check(id, label, "healthy", `the configured broker at ${shownUrl} answered a health request.`);
+    }
+    return check(
+      id,
+      label,
+      "degraded",
+      reachable === false
+        ? `the configured broker at ${shownUrl} did not answer (connection refused, DNS failure, or a non-2xx status).`
+        : `the configured broker at ${shownUrl} could not be probed.`,
+      "Confirm the broker service is up and the URL/port are reachable from this host, then re-run. Until it " +
+        "answers, no sandbox command can be dispatched.",
+    );
+  }
+  // local-dev: the broker is constructed inside the app process.
+  if (reachable === true) {
+    return check(
+      id,
+      label,
+      "healthy",
+      "the local-dev broker is in-process and its host app is up — the boot phase constructed it during this run.",
+    );
+  }
+  return check(
+    id,
+    label,
+    "degraded",
+    reachable === false
+      ? "the app is not running, so the in-process local-dev broker does not exist right now."
+      : "the app could not be probed, so the in-process local-dev broker's state is unknown.",
+    "Start the instance (`cinatra instance start`) and re-run; the broker is constructed by the app's boot phase, " +
+      "not by a separate service.",
+  );
+}
+
+/**
+ * CHECK 3 — HANDSHAKE STATUS, mirroring the boot probe's semantics.
+ *
+ * The boot phase registers the executor factory ONLY when a real container ran
+ * `printf cinatra-exec-handshake` over the L0 image and returned exit 0 with
+ * `termination: "exited"` and exactly that stdout. This check runs the same
+ * probe and applies the same predicate, so a green here is the same claim.
+ */
+export function classifyHandshakeStatus({
+  mode = DEFAULT_EXECUTION_MODE,
+  imagePresent = false,
+  probe = null,
+  imageDigest = null,
+  wallMs = null,
+} = {}) {
+  const id = "handshake";
+  const label = "Broker↔worker handshake";
+  if (mode === "disabled") {
+    return check(id, label, "disabled", "execution mode is disabled — the boot phase runs no handshake.");
+  }
+  if (mode === "remote") {
+    return check(
+      id,
+      label,
+      "degraded",
+      "the handshake is run by the remote worker placement and is not reproducible from this host (and the core's " +
+        "boot phase does not run one for `remote` at all — it wires nothing in that mode today).",
+      "Verify the handshake on the broker deployment. `local-dev` is the placement whose handshake this CLI can prove.",
+    );
+  }
   if (!imagePresent) {
-    return check(id, label, "degraded", "the local-dev L0 image is not built.", "Run `cinatra instance sandbox build` (or `cinatra instance refresh`) to build it.");
+    return check(
+      id,
+      label,
+      "degraded",
+      "the L0 image is not present, so the handshake cannot run: the boot phase would report the plane " +
+        "`unavailable` and register no executor.",
+      "Acquire the image with `cinatra instance execution image pull`, then re-run.",
+    );
   }
-  if (!probeOk) {
-    return check(id, label, "degraded", `the L0 image did not run a hardened probe command${probeDetail ? ` (${probeDetail})` : ""}.`, "Check Docker is running and rebuild with `cinatra instance sandbox build`.");
+  const verdict = probe && probe.ok === true;
+  if (!verdict) {
+    return check(
+      id,
+      label,
+      "degraded",
+      `the handshake probe FAILED — ${probe && probe.reason ? probe.reason : "no probe result"}. This is exactly the ` +
+        "condition under which the boot phase registers nothing and every execution keeps refusing (fail-closed).",
+      "Confirm Docker is running and the L0 image is intact (`cinatra instance execution image verify`); rebuild " +
+        "with `cinatra instance execution image pull --rebuild` if the probe still fails.",
+    );
   }
-  return check(id, label, "healthy", "the L0 image runs a hardened probe command end-to-end.");
+  const digestNote = imageDigest ? ` over image ${imageDigest.slice(0, 19)}…` : "";
+  const timing = typeof wallMs === "number" ? ` in ${wallMs} ms` : "";
+  // HONEST SCOPE (Codex convergence finding 2). The CLI cannot open a real
+  // broker job — that needs the app process, a sealed session carrier and the
+  // run store. What it CAN do, and does, is dispatch the boot phase's exact
+  // probe command over the same image under the same hardened profile and judge
+  // it by the boot phase's exact predicate. So a green here proves the WORKER
+  // half; it does not prove the gateway bring-up, the service-token boundary or
+  // that a factory was actually registered. The instance's own health surface
+  // remains the authority on that, and the other checks cover those inputs.
+  return check(
+    id,
+    label,
+    "healthy",
+    `the probe completed${timing}${digestNote} and returned the expected output, judged by the boot phase's own ` +
+      "predicate (exited, exit 0, exact stdout). This proves the WORKER half of the handshake — the image runs " +
+      "commands under the hardened profile. Whether the boot phase then registered an executor also depends on the " +
+      "gateway + config checks above; the instance's health surface is the authority once it is running.",
+  );
 }
 
-/** Image digest match: the resolved image digest matches the recorded pin. */
-export function classifyImageDigestMatch({ executionMode, imageRef = null, recordedDigest = null, resolvedDigest = null } = {}) {
-  const mode = normalizeExecutionMode(executionMode);
-  const id = "image-digest";
-  const label = "L0 image digest pin";
+/**
+ * CHECK 4 — L0 IMAGE PRESENCE, BY DIGEST (as boot logs it).
+ *
+ * Boot logs `handshake.imageDigest`, the digest the worker RESOLVED for the
+ * image it actually ran. This check resolves the same digest locally and, when
+ * the CLI recorded a pin at acquisition time, reports drift from it.
+ */
+export function classifyL0Image({
+  mode = DEFAULT_EXECUTION_MODE,
+  imageRef = null,
+  resolvedDigest = null,
+  recordedDigest = null,
+  repoDigests = [],
+} = {}) {
+  const id = "l0-image";
+  const label = "L0 sandbox image";
   if (mode === "disabled") {
-    return check(id, label, "disabled", "execution mode is disabled — no image pin to verify.");
+    return check(id, label, "disabled", "execution mode is disabled — no sandbox image is provisioned on this host.");
   }
-  if (mode === "remote") {
-    if (imageRef && !isDigestPinned(imageRef)) {
-      return check(id, label, "degraded", `the configured L0 image "${imageRef}" is not digest-pinned.`, "Set CINATRA_SANDBOX_L0_IMAGE to a name@sha256:… reference (no :latest).");
-    }
-    if (!resolvedDigest) {
-      return check(id, label, "degraded", "the digest-pinned image is not present locally to verify.", "Pull it with `cinatra instance sandbox build` (remote mode pulls the pin).");
-    }
-    return check(id, label, "healthy", `the pinned image is present and resolves to ${resolvedDigest.slice(0, 19)}….`);
+  const ref = effectiveImageRef(imageRef);
+  if (hasLatestTag(ref)) {
+    return check(
+      id,
+      label,
+      "degraded",
+      `the configured L0 image "${ref}" carries the mutable :latest tag, which the execution plane bans — a run's ` +
+        "recorded digest would not identify a reproducible image.",
+      `Set ${L0_IMAGE_ENV_KEY} to an immutable reference (name@sha256:<64-hex> for remote; a dev tag for local-dev).`,
+    );
   }
-  // local-dev
+  if (mode === "remote" && !isDigestPinned(ref)) {
+    return check(
+      id,
+      label,
+      "degraded",
+      `remote mode requires a digest-pinned L0 image; "${ref}" is a floating reference.`,
+      `Set ${L0_IMAGE_ENV_KEY}=name@sha256:<64-hex> (\`cinatra instance execution set-mode remote --sandbox-image=…\`).`,
+    );
+  }
   if (!resolvedDigest) {
-    return check(id, label, "degraded", "the local-dev L0 image is not built, so no digest is resolvable.", "Run `cinatra instance sandbox build`.");
-  }
-  if (!recordedDigest) {
-    return check(id, label, "degraded", "no image digest was recorded at install/build time.", "Rebuild with `cinatra instance sandbox build` to record the digest pin.");
-  }
-  if (recordedDigest !== resolvedDigest) {
     return check(
       id,
       label,
       "degraded",
-      `the built image digest drifted from the recorded pin (recorded ${recordedDigest.slice(0, 19)}…, present ${resolvedDigest.slice(0, 19)}…).`,
-      "Rebuild + re-record with `cinatra instance sandbox build`.",
+      `the L0 image "${ref}" is NOT present on this host — \`docker image inspect\` resolves no digest for it.`,
+      mode === "remote"
+        ? "Pull it with `cinatra instance execution image pull` so the pin is locally verifiable."
+        : "Build it with `cinatra instance execution image pull` (local-dev builds from the checkout's docker/sandbox/Dockerfile).",
     );
   }
-  return check(id, label, "healthy", `the built image matches the recorded pin (${resolvedDigest.slice(0, 19)}…).`);
+  if (recordedDigest && recordedDigest !== resolvedDigest) {
+    return check(
+      id,
+      label,
+      "degraded",
+      `the present image digest DRIFTED from the pin recorded at acquisition (recorded ${recordedDigest.slice(0, 19)}…, ` +
+        `present ${resolvedDigest.slice(0, 19)}…) — the sandbox would run different code than was verified.`,
+      "Re-acquire + re-record with `cinatra instance execution image pull --rebuild`, or `image verify` to inspect.",
+    );
+  }
+  const pinNote = isDigestPinned(ref)
+    ? ""
+    : repoDigests.length > 0
+      ? ` (registry digest ${repoDigests[0].replace(/^.*@/, "").slice(0, 19)}…)`
+      : " (locally built — no registry digest)";
+  return check(
+    id,
+    label,
+    "healthy",
+    `"${ref}" is present and resolves to ${resolvedDigest.slice(0, 19)}…${pinNote}${
+      recordedDigest ? ", matching the recorded pin" : ""
+    }.`,
+  );
 }
 
-/** Egress enforcement: the internal (no-NAT) network exists + the gateway is
- *  live for a gateway mode; `none` is enforced at the kernel with no gateway. */
-export function classifyEgressEnforcement({ executionMode, egressMode = DEFAULT_EGRESS_MODE, networkExists = false, networkInternal = false, gatewayRunning = null, gatewayHealthy = null } = {}) {
-  const mode = normalizeExecutionMode(executionMode);
-  const id = "egress-enforcement";
-  const label = "Egress enforcement";
+/**
+ * CHECK 5 — GATEWAY CONTAINER STATE.
+ *
+ * `constructLocalDevExecutionBroker` starts the attributing gateway BEFORE the
+ * broker for every egress tier except `none`, and returns `ok:false` ("egress
+ * gateway did not start") when it cannot — so a missing gateway is precisely a
+ * plane that never wires.
+ */
+export function classifyGatewayContainer({
+  mode = DEFAULT_EXECUTION_MODE,
+  egressMode = DEFAULT_EGRESS_MODE,
+  networkExists = false,
+  networkInternal = false,
+  gatewayRunning = null,
+  gatewayHealthy = null,
+  appRunning = null,
+  sandboxNetwork = SANDBOX_NETWORK_NAME,
+} = {}) {
+  const id = "gateway-container";
+  // Name the network the doctor ACTUALLY inspected, not the default — an
+  // instance may set EXECUTION_SANDBOX_NETWORK (round-2 finding).
+  const network = typeof sandboxNetwork === "string" && sandboxNetwork.trim() ? sandboxNetwork.trim() : SANDBOX_NETWORK_NAME;
+  const label = "Egress gateway container";
   if (mode === "disabled") {
-    return check(id, label, "disabled", "execution mode is disabled — no egress surface.");
+    return check(id, label, "disabled", "execution mode is disabled — no gateway is provisioned.");
   }
   if (mode === "remote") {
-    return check(id, label, "degraded", "egress is enforced in the remote deployment layer, not locally verifiable from the CLI.", "Verify egress policy on the remote broker/deployment; the app health surface is the authority once wired.");
+    return check(
+      id,
+      label,
+      "degraded",
+      "the attributing gateway runs beside the remote worker, not on this host, so its state is not observable from here.",
+      "Verify the gateway on the broker deployment; the CLI can only prove the `local-dev` gateway.",
+    );
   }
-  // local-dev
   if (egressMode === "none") {
-    return check(id, label, "healthy", "egress mode is `none` — the sandbox runs with `--network none` (kernel-level deny, no gateway needed).");
+    return check(
+      id,
+      label,
+      "healthy",
+      "egress tier `none` — sandboxes run with `--network none` (kernel-level deny), so no gateway is started by design.",
+    );
   }
-  if (!networkExists) {
-    return check(id, label, "degraded", "the internal sandbox network does not exist yet.", "It is created on first sandbox job / gateway bring-up; run a sandbox job or `cinatra instance sandbox build`.");
-  }
-  if (!networkInternal) {
-    return check(id, label, "degraded", `the "${SANDBOX_NETWORK_NAME}" network exists but is NOT internal (it would grant a direct NAT route).`, "Remove the non-internal network so it is recreated `--internal`.");
-  }
-  if (gatewayRunning !== true) {
+  if (gatewayRunning === true) {
+    if (gatewayHealthy === true) {
+      // A running gateway with NO internal network is not a working placement:
+      // the broker attaches every sandbox to that network, so its absence means
+      // the next job cannot start (Codex convergence finding 7). A leftover
+      // healthy gateway must not mask it.
+      if (!networkExists) {
+        return check(
+          id,
+          label,
+          "degraded",
+          `\`${GATEWAY_CONTAINER_NAME}\` is running and healthy, but the internal sandbox network ` +
+            `"${network}" does not exist — every sandbox job attaches to that network, so the ` +
+            "placement cannot actually run a command (this is typically a gateway left over from an earlier run).",
+          "Restart the instance so the boot phase recreates the network and re-attaches the gateway.",
+        );
+      }
+      const netNote = networkInternal
+        ? "; the internal no-NAT network is in place"
+        : "; WARNING: the sandbox network is present but NOT internal";
+      if (networkExists && !networkInternal) {
+        return check(
+          id,
+          label,
+          "degraded",
+          `the gateway container \`${GATEWAY_CONTAINER_NAME}\` is running and healthy, but the "${network}" ` +
+            "network is NOT internal — a sandbox on it would hold a direct NAT route around the gateway.",
+          `Remove the network (\`docker network rm ${network}\`) so the next bring-up recreates it \`--internal\`.`,
+        );
+      }
+      return check(
+        id,
+        label,
+        "healthy",
+        `\`${GATEWAY_CONTAINER_NAME}\` is running and answered ${GATEWAY_HEALTH_PATH}${netNote} — egress tier \`${egressMode}\` is attributed.`,
+      );
+    }
     return check(
       id,
       label,
       "degraded",
-      gatewayRunning === false
-        ? "the internal network is in place but the attributing egress gateway is not running."
-        : "the internal network is in place but the egress gateway state was not verified.",
-      "The gateway starts with the first gateway-mode sandbox job; a persistent gateway is a deployment concern.",
+      `\`${GATEWAY_CONTAINER_NAME}\` is running but ${
+        gatewayHealthy === false ? `did not answer ${GATEWAY_HEALTH_PATH}` : "its health could not be probed"
+      } — the boot phase treats a gateway that does not become healthy as a failure to start and wires nothing.`,
+      `Inspect it with \`docker logs ${GATEWAY_CONTAINER_NAME}\`, then restart the instance to re-run the bring-up.`,
     );
   }
-  if (gatewayHealthy !== true) {
+  // Not running.
+  if (appRunning === false) {
     return check(
       id,
       label,
       "degraded",
-      gatewayHealthy === false
-        ? "the egress gateway is running but did not answer its health probe."
-        : "the egress gateway is running but its health was not verified from the CLI.",
-      "Confirm the gateway admin health endpoint is reachable.",
+      `\`${GATEWAY_CONTAINER_NAME}\` is not running because the instance is not running — the gateway is brought up by ` +
+        "the app's boot phase, not as a standalone service.",
+      "Start the instance (`cinatra instance start`); the gateway comes up with it for any egress tier other than `none`.",
     );
   }
-  return check(id, label, "healthy", `the internal no-NAT network is in place; the health-checked attributing gateway enforces egress (${egressMode}).`);
+  return check(
+    id,
+    label,
+    "degraded",
+    `\`${GATEWAY_CONTAINER_NAME}\` is NOT running while the instance is up and the egress tier is \`${egressMode}\`. The ` +
+      "boot phase returns `egress gateway did not start` in that case, so nothing was wired and every execution refuses.",
+    `Check \`docker logs ${GATEWAY_CONTAINER_NAME}\` (it may have exited) and the instance's boot log for the ` +
+      "`execution-broker` phase reason, then restart the instance.",
+  );
 }
 
-/** Isolation mode: the hardened profile is in effect (non-root fixed UID,
- *  read-only rootfs, no-new-privileges), proven by a probe run. */
-export function classifyIsolationMode({ executionMode, uid = null, readOnlyRootfs = null, noNewPrivileges = null } = {}) {
-  const mode = normalizeExecutionMode(executionMode);
-  const id = "isolation-mode";
-  const label = "Sandbox isolation (hardened container)";
-  if (mode === "disabled") {
-    return check(id, label, "disabled", "execution mode is disabled — no sandbox to isolate.");
-  }
-  if (mode === "remote") {
-    return check(id, label, "degraded", "isolation is enforced by the remote worker placement, not locally verifiable from the CLI.", "The remote worker applies the same hardened run profile; verify on the deployment.");
-  }
-  if (uid === null && readOnlyRootfs === null && noNewPrivileges === null) {
-    return check(id, label, "degraded", "the isolation probe could not run (Docker down or image missing).", "Ensure Docker is running and the L0 image is built.");
-  }
-  // Fail-honest: EVERY hardened property must be explicitly proven true. A null
-  // (unverified) property degrades — never fails open to "healthy".
-  const problems = [];
-  if (uid !== SANDBOX_RUNTIME_UID) problems.push(uid === null ? "runtime uid not verified" : `runs as uid ${uid} (expected ${SANDBOX_RUNTIME_UID})`);
-  if (readOnlyRootfs !== true) problems.push(readOnlyRootfs === null ? "read-only rootfs not verified" : "rootfs is writable (expected read-only)");
-  if (noNewPrivileges !== true) problems.push(noNewPrivileges === null ? "no-new-privileges not verified" : "no-new-privileges is not in effect");
-  if (problems.length > 0) {
-    return check(id, label, "degraded", `the hardened profile is not fully proven: ${problems.join("; ")}.`, "Rebuild the L0 image; the worker applies --user/--read-only/--cap-drop/--no-new-privileges per dispatch.");
-  }
-  return check(id, label, "healthy", `the hardened profile holds: non-root uid ${SANDBOX_RUNTIME_UID}, read-only rootfs, no-new-privileges.`);
-}
-
-/** Audit sink reachability. The durable audit DB is a later S1 slice, so this is
- *  honest: local-dev uses the app-embedded in-process sink (reachable when the
- *  app is up); remote probes the broker; disabled has no sink. */
-export function classifyAuditSink({ executionMode, appReachable = null, brokerReachable = null } = {}) {
-  const mode = normalizeExecutionMode(executionMode);
-  const id = "audit-sink";
-  const label = "Audit sink reachability";
-  if (mode === "disabled") {
-    return check(id, label, "disabled", "execution mode is disabled — no commands to audit.");
-  }
-  if (mode === "remote") {
-    if (brokerReachable === true) return check(id, label, "healthy", "the remote broker (audit emitter) is reachable.");
-    return check(id, label, "degraded", "the remote broker (audit emitter) is not reachable / not probeable.", "Verify the broker; the durable audit DB surface is a later S1 slice.");
-  }
-  // local-dev: the audit sink is the app-embedded host-injected sink.
-  if (appReachable === true) return check(id, label, "healthy", "the app is up — the in-process audit sink receives every command record.");
-  if (appReachable === false) return check(id, label, "degraded", "the app is not running, so the in-process audit sink cannot be exercised.", "Start the app (`cinatra instance start`), then re-run the sandbox doctor.");
-  return check(id, label, "degraded", "the audit sink could not be probed.", "Start the app, then re-run the sandbox doctor.");
-}
-
-/** Roll up an array of sandbox-doctor checks into counts + an overall verdict.
- *  Overall is `degraded` if ANY check is degraded, else `disabled` if ALL are
- *  disabled, else `healthy`. */
-export function summarizeSandboxDoctor(checks = []) {
+/** Roll up checks into counts + an overall verdict. */
+export function summarizeExecutionDoctor(checks = []) {
   const counts = { healthy: 0, degraded: 0, disabled: 0 };
   for (const c of checks) {
     if (counts[c.verdict] === undefined) counts[c.verdict] = 0;
@@ -757,10 +1475,10 @@ export function summarizeSandboxDoctor(checks = []) {
 }
 
 // ---------------------------------------------------------------------------
-// Update coordination (protocol compatibility + rolling order + rollback)
+// Update coordination
 // ---------------------------------------------------------------------------
 
-/** Extract the semver MAJOR of a version string, or null when unparseable. */
+/** Extract the semver MAJOR of a version string, or null. */
 export function versionMajor(version) {
   if (typeof version !== "string") return null;
   const m = version.trim().replace(/^v/i, "").match(/^(\d+)\./);
@@ -768,16 +1486,10 @@ export function versionMajor(version) {
 }
 
 /**
- * Protocol compatibility across app / broker / worker for an update. The
- * execution plane has no runtime protocol-version endpoint yet (a later S1
- * slice), so the CLI uses the deployed `@cinatra-ai/execution-plane` package
- * version's MAJOR as the protocol proxy: same major ⇒ wire-compatible. In
- * local-dev all three run from one checkout, so they are inherently locked and
- * this returns compatible. A missing/unparseable version is reported honestly
- * (not silently "compatible").
- *
- * @param {{ appVersion?: string|null, brokerVersion?: string|null, workerVersion?: string|null }} v
- * @returns {{ compatible: boolean, majors: (number|null)[], detail: string }}
+ * Protocol compatibility across app / broker / worker. In `local-dev` all three
+ * run from one checkout and are locked by construction; `remote` uses the
+ * deployed `@cinatra-ai/execution-plane` major as the protocol proxy. A missing
+ * version is reported as INCOMPATIBLE (fail-honest), never silently compatible.
  */
 export function checkProtocolCompatibility({ appVersion = null, brokerVersion = null, workerVersion = null } = {}) {
   const majors = [versionMajor(appVersion), versionMajor(brokerVersion), versionMajor(workerVersion)];
@@ -792,8 +1504,8 @@ export function checkProtocolCompatibility({ appVersion = null, brokerVersion = 
       compatible: false,
       majors,
       detail:
-        `cannot confirm compatibility — a component did not report a parseable execution-plane version ` +
-        `(known majors ${known.join("/")} ${allSame ? "match" : "DIFFER"}); treating as INCOMPATIBLE (fail-honest) — follow the coordination order.`,
+        "cannot confirm compatibility — a component did not report a parseable execution-plane version " +
+        `(known majors ${known.join("/")} ${allSame ? "match" : "DIFFER"}); treating as INCOMPATIBLE (fail-honest).`,
     };
   }
   return {
@@ -803,19 +1515,11 @@ export function checkProtocolCompatibility({ appVersion = null, brokerVersion = 
   };
 }
 
-/**
- * The ordered rolling-update coordination for the execution plane. The invariant
- * (epic + AC2): DRAIN in-flight sandbox jobs, roll WORKERS before the APP, and
- * keep a reverse ROLLBACK path. local-dev collapses to a single-checkout restart
- * but still surfaces the ordering so the mental model transfers to prod.
- *
- * @param {{ executionMode: string }} args
- * @returns {{ steps: string[], rollback: string[], notes: string[] }}
- */
+/** The ordered rolling-update coordination for the execution plane. */
 export function planUpdateCoordination({ executionMode } = {}) {
   const mode = normalizeExecutionMode(executionMode);
   if (mode === "disabled") {
-    return { steps: [], rollback: [], notes: ["execution mode is disabled — no execution-plane coordination is needed for this update."] };
+    return { steps: [], rollback: [], notes: ["execution mode is disabled — no execution-plane coordination is needed."] };
   }
   if (mode === "remote") {
     return {
@@ -832,71 +1536,38 @@ export function planUpdateCoordination({ executionMode } = {}) {
         "Roll the BROKER + WORKERS back to the previous digest-pinned image.",
         "Resume admitting jobs.",
       ],
-      notes: ["The broker/worker roll + drain is executed in the deployment layer; this CLI documents + checks the order (prod hands the stack to the deployment layer)."],
+      notes: ["The broker/worker roll + drain is executed in the deployment layer; this CLI documents + checks the order."],
     };
   }
-  // local-dev
   return {
     steps: [
       "Drain: stop the local app so no new sandbox jobs are admitted (in-flight containers are per-command and short-lived).",
       "Reconcile the checkout: `cinatra instance refresh` (rebuilds deps, dev DB, AND the L0 sandbox image so worker + app move together).",
-      "Restart the app: `cinatra instance start` — app, broker, and worker all run from the one refreshed checkout, so they are protocol-locked by construction.",
+      "Restart the app: `cinatra instance start` — the boot phase re-runs the broker↔worker handshake before wiring anything.",
     ],
     rollback: [
       "Stop the app.",
       "Move the checkout back (`cinatra update --instance --ref <previous>`), then `cinatra instance refresh` to rebuild the matching L0 image.",
       "Restart the app.",
     ],
-    notes: ["local-dev runs app + broker + worker from one checkout, so a refresh keeps all three on the same execution-plane version automatically."],
+    notes: ["local-dev runs app + broker + worker from one checkout, so a refresh keeps all three on the same version."],
   };
 }
 
-/**
- * Production execution-plane update guidance (extends the base production-runtime
- * guidance): the execution stack is handed to the deployment layer, updated by
- * moving to a release image, drained + rolled workers-before-app with a
- * digest-pinned L0 image. Returns printable lines (no surrounding blank lines).
- *
- * @param {{ indent?: string }} [opts]
- * @returns {string[]}
- */
+/** Production execution-plane update guidance lines. */
 export function prodExecutionUpdateGuidanceLines({ indent = "    " } = {}) {
   return [
     `${indent}Execution plane (sandboxed model execution) is part of the deployment layer, not this checkout:`,
-    `${indent}  - Update the L0 sandbox image by DIGEST (CINATRA_SANDBOX_L0_IMAGE=name@sha256:… — never :latest).`,
+    `${indent}  - Update the L0 sandbox image by DIGEST (${L0_IMAGE_ENV_KEY}=name@sha256:… — never :latest).`,
     `${indent}  - Drain in-flight sandbox jobs, then roll the WORKERS before the APP (a worker must speak the new`,
     `${indent}    protocol before the app emits it); keep a reverse rollback path.`,
     `${indent}  - The broker/worker services are provisioned + rolled by the ops deployment lifecycle, not the CLI.`,
   ];
 }
 
-/**
- * Apply a set of {key,value} upserts to a raw `.env.local` body and return the
- * new body. Pure. For each key it REMOVES EVERY existing occurrence (guarding a
- * hand-edited file with duplicate keys — critical for the disabled/rollout-dark
- * guarantee) and, when value is non-null, appends ONE canonical entry. A
- * value of null just removes the key entirely.
- *
- * @param {string} body
- * @param {Array<{ key: string, value: string|null }>} upserts
- * @returns {string}
- */
-export function applyEnvUpsertsToBody(body, upserts) {
-  const esc = (k) => String(k).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  let out = typeof body === "string" ? body : "";
-  for (const { key, value } of upserts) {
-    // Remove ALL existing lines for this key (global + multiline).
-    out = out.replace(new RegExp(`^${esc(key)}=.*\r?\n?`, "mg"), "");
-    if (value !== null) {
-      if (out.length > 0 && !out.endsWith("\n")) out += "\n";
-      out += `${key}=${value}\n`;
-    }
-  }
-  return out;
-}
-
 export const __test = {
   MODE_ALIASES,
-  looksLikeFlagOrBlank,
+  blankOrFlagLike,
   check,
+  BARE_DIGEST_RE,
 };

@@ -355,36 +355,87 @@ export const COMMAND_DESCRIPTORS = [
     match: "command+mode+sub",
     summary: "List registered previews (slug, sha, image tag, provenance, volume, state).",
   },
-  // cinatra-cli#160 (exec-plane S4): execution-plane sandbox lifecycle verbs.
-  // The execution plane is the core-owned sandboxed executor every LLM run can
-  // reach (S1 #1706). These manage its LOCAL surface — acquire the digest-pinned
-  // L0 image, self-check the worker/egress/isolation/audit surfaces, and show the
-  // configured mode. Namespaced under `instance` (they operate on this instance).
+  // cinatra-cli#174 (exec-plane S4): execution-plane lifecycle verbs. The
+  // execution plane is the core-owned sandboxed executor every LLM run can reach;
+  // its activation merged in cinatra#2144. These manage the instance's placement:
+  // the MODE (which lives in the instance database, because that is what the boot
+  // phase reads), the env contract the activation consumes, the digest-pinned L0
+  // image lifecycle, and the self-check that mirrors the boot handshake.
   {
-    id: "sandbox.build",
-    path: ["instance", "sandbox", "build"],
+    id: "execution.set-mode",
+    path: ["instance", "execution", "set-mode"],
     match: "command+mode+sub",
     summary:
-      "Acquire the execution-plane L0 sandbox image (local-dev: build from docker/sandbox/Dockerfile + record its digest; remote: pull the digest-pinned image). Digest-pinned, never :latest.",
+      "Set this instance's execution mode (remote | local-dev | disabled), writing the env contract the merged activation reads plus the persisted mode the boot phase consults. `disabled` clears everything.",
   },
   {
-    id: "sandbox.doctor",
-    path: ["instance", "sandbox", "doctor"],
+    id: "execution.doctor",
+    path: ["instance", "execution", "doctor"],
     match: "command+mode+sub",
     summary:
-      "Execution-plane self-check: worker health, L0 image-digest match, egress enforcement, isolation mode, audit-sink reachability (healthy / degraded / disabled).",
+      "Execution-plane self-check: mode detection, broker reachability, the broker↔worker handshake (mirroring the boot probe), L0 image presence by digest, and gateway container state (healthy / degraded / disabled).",
   },
   {
-    id: "sandbox.status",
-    path: ["instance", "sandbox", "status"],
+    id: "execution.status",
+    path: ["instance", "execution", "status"],
     match: "command+mode+sub",
-    summary: "Show the configured execution mode, L0 image + recorded digest, and local sandbox topology (read-only).",
+    summary: "Show the persisted mode, rollout flag, client-config readiness, egress tier, L0 image + recorded pin (read-only; never prints a secret).",
   },
   {
-    id: "sandbox.gc",
-    path: ["instance", "sandbox", "gc"],
+    id: "execution.pull",
+    path: ["instance", "execution", "pull"],
+    match: "command+mode+sub",
+    summary:
+      "Acquire the L0 sandbox image (local-dev: build from docker/sandbox/Dockerfile; remote: pull the digest-pinned reference) and record its digest pin. Never :latest.",
+  },
+  {
+    id: "execution.verify",
+    path: ["instance", "execution", "verify"],
+    match: "command+mode+sub",
+    summary: "Verify the L0 image: present, matching its recorded digest pin, and able to run the boot handshake command under the hardened profile.",
+  },
+  {
+    id: "execution.prune",
+    path: ["instance", "execution", "prune"],
+    match: "command+mode+sub",
+    summary: "Reap SUPERSEDED L0 sandbox images (keeps the configured image and anything backing a running container; --yes required).",
+  },
+  {
+    id: "execution.gc",
+    path: ["instance", "execution", "gc"],
     match: "command+mode+sub",
     summary: "Reap orphaned L2 sandbox workspace volumes (dev only; --yes required; read-only plan otherwise).",
+  },
+  // Compatibility aliases for the `instance sandbox …` verbs shipped by #164.
+  // Hidden: the advertised surface is `instance execution …`, but a released CLI
+  // must not break an operator's muscle memory or scripts.
+  {
+    id: "execution.alias.build",
+    path: ["instance", "sandbox", "build"],
+    match: "command+mode+sub",
+    hidden: true,
+    summary: "Alias for `cinatra instance execution pull`.",
+  },
+  {
+    id: "execution.alias.doctor",
+    path: ["instance", "sandbox", "doctor"],
+    match: "command+mode+sub",
+    hidden: true,
+    summary: "Alias for `cinatra instance execution doctor`.",
+  },
+  {
+    id: "execution.alias.status",
+    path: ["instance", "sandbox", "status"],
+    match: "command+mode+sub",
+    hidden: true,
+    summary: "Alias for `cinatra instance execution status`.",
+  },
+  {
+    id: "execution.alias.gc",
+    path: ["instance", "sandbox", "gc"],
+    match: "command+mode+sub",
+    hidden: true,
+    summary: "Alias for `cinatra instance execution gc`.",
   },
   {
     id: "db.migrate",
