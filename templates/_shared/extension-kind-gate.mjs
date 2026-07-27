@@ -82,7 +82,9 @@
 //                    fieldRenderers is the artifact field-renderer surface;
 //                    dashboardContribution is the dashboard-pack carrier
 //                    re-homed to the artifact kind, cinatra#1896/#2005).
-//     - skill     → name ends `-skills`; kind:"skill" (mirrors the kind-at-end
+//     - skill     → name ends `-skill` (the CANONICAL singular suffix; the
+//                    retired plural `-skills` is still accepted while the
+//                    migration runs); kind:"skill" (mirrors the kind-at-end
 //                    naming-conformance rule for skills).
 //   (The `workflow` kind is RETIRED: a package declaring cinatra.kind:"workflow"
 //    is rejected as an unknown kind — there is no workflow per-kind gate.)
@@ -2407,13 +2409,18 @@ export function validateArtifact(packageRoot) {
 
 // ===========================================================================
 // skill gate — mirror of the kind-at-end naming-conformance rule for skills:
-// the dir suffix for kind:"skill" is `-skills`, the package follows
-// @<scope>/<slug>-skills (first-party-plus-vendored scope policy). A vendored
-// skill bundle (e.g. @anthropics/skills) may use a no-suffix VendoredPackageName,
-// allowlisted host-side; standalone we accept either the `-skills` suffix OR a
-// declared cinatra.vendoredFrom.
+// the package follows @<scope>/<slug>-skill (first-party-plus-vendored scope
+// policy). The suffix is SINGULAR: one kind:"skill" extension ships exactly one
+// Anthropic-schema bundle (cinatra#2089, epic #2086 S2), so the plural
+// `-skills` name is retired. It stays ACCEPTED here while the S3 migration
+// (cinatra#2090) renames the four packages that still carry it — the host-side
+// packaging verdict is the authority that refuses a plural name, and it waives
+// exactly those four by name in its expiring ledger. A vendored skill bundle
+// (e.g. @anthropics/skills) may use a no-suffix VendoredPackageName, allowlisted
+// host-side; standalone we accept either suffix OR a declared
+// cinatra.vendoredFrom.
 // ===========================================================================
-export const SKILL_NAME_RE = /^@[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9-]*-skills$/;
+export const SKILL_NAME_RE = /^@[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9-]*-skills?$/;
 
 export function validateSkillPackageShape(pkg) {
   const errors = [];
@@ -2425,7 +2432,7 @@ export function validateSkillPackageShape(pkg) {
   if (typeof pkg?.name !== "string") {
     errors.push("package.json is missing `name`");
   } else if (!SKILL_NAME_RE.test(pkg.name) && !vendored) {
-    errors.push(`package name "${pkg.name}" does not match the kind-at-end convention @<scope>/<slug>-skills (a vendored bundle may use its upstream name with cinatra.vendoredFrom)`);
+    errors.push(`package name "${pkg.name}" does not match the kind-at-end convention @<scope>/<slug>-skill (a vendored bundle may use its upstream name with cinatra.vendoredFrom)`);
   }
   return errors;
 }
