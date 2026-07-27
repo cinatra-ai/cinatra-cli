@@ -59,18 +59,14 @@ import { prodRuntimeGuidanceLines } from "./prod-runtime-guidance.mjs";
 import {
   L0_DOCKERFILE_REL,
   L0_BUILD_CONTEXT_REL,
-  EXECUTION_MODE_ENV_KEY,
-  ROLLOUT_ENV_KEY,
-  ROLLOUT_ON,
-  EGRESS_MODE_ENV_KEY,
-  DEFAULT_EGRESS_MODE,
+  PIN_RECORD_REL,
+  EXECUTION_SETTINGS_METADATA_KEY,
   parseExecutionModeFlags,
   normalizeExecutionMode,
   defaultExecutionModeForInstall,
   resolveExecutionModeForInstall,
   applyEnvUpsertsToBody,
-  validateRemoteConfig,
-  executionEnvUpserts,
+  planExecutionEnv,
   planImageAcquisition,
   l0BuildArgs,
   l0DigestInspectArgs,
@@ -306,8 +302,13 @@ const VALUE_TAKING_INSTALL_FLAGS = new Set([
   "--instance",
   "--execution-mode",
   "--sandbox-broker-url",
+  "--sandbox-broker-secret",
+  "--sandbox-broker-token",
+  "--sandbox-provenance-key",
   "--sandbox-image",
+  "--sandbox-network",
   "--sandbox-egress",
+  "--sandbox-egress-allow",
 ]);
 // The install profiles a `--mode` value maps to. `dev`/`prod` carry no profile
 // (the default, fixtures-off dev behaviour post-cinatra#1237); `demo` carries
@@ -4744,105 +4745,180 @@ async function executeStopExisting({ targetDir, opts, conflicts, classified, log
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Execution plane provisioning (cinatra-cli#160, exec-plane S4)
+// Execution plane provisioning (cinatra-cli#174, exec-plane S4)
 // ---------------------------------------------------------------------------
 //
-// The install-time execution-mode choice + first-class L0 image acquisition.
+// The install-time execution-mode choice, writing the EXACT env contract the
+// merged core activation reads (cinatra#2144 / #2143) plus the persisted mode
+// the boot phase actually consults.
+//
 // Runs on the FULL provision path only (the caller gates it off --dry-run /
-// --no-install / --no-setup). Best-effort by contract: an execution-plane hiccup
-// (missing L0 Dockerfile on an older checkout, Docker down, a docker build
-// failure) WARNS and records what it can — it never fails an otherwise-complete
-// install. The pure decisions live in execution-mode.mjs (unit-tested).
+// --no-install / --no-setup). Best-effort by contract: a hiccup WARNS and
+// records what it can — it never fails an otherwise-complete install. The pure
+// decisions live in execution-mode.mjs (unit-tested, and carrying the grounding
+// citation for every key).
+//
+// THE DEFAULT IS `disabled`, and `disabled` writes NOTHING: the core's own
+// default mode is `disabled` with the rollout flag unset, which makes
+// `executionBrokerPhases()` contribute no boot phase at all. An install that
+// does not ask for the execution plane leaves the instance byte-identically
+// inert.
 
 // Upsert / remove a set of execution env keys in .env.local (create-less: only
 // when the file exists — ensureEnvLocal owns creation). value:null ⇒ remove.
 function persistExecutionEnv(targetDir, upserts) {
+  if (!upserts || upserts.length === 0) return;
   const envPath = path.join(targetDir, ".env.local");
   if (!existsSync(envPath)) return;
   writeFileSync(envPath, applyEnvUpsertsToBody(readFileSync(envPath, "utf8"), upserts), { mode: 0o600 });
 }
 
+/**
+ * Persist the execution-plane SETTINGS ROW into the instance database.
+ *
+ * THIS IS THE STEP #164 MISSED. `readExecutionPlaneSettings()` — the function
+ * the boot phase calls — reads the mode from the platform metadata store, not
+ * from the environment. An install that writes only `.env.local` leaves the
+ * boot phase reading the default `disabled` and wiring nothing, forever.
+ */
+async function persistExecutionSettings(targetDir, settings) {
+  const envPath = path.join(targetDir, ".env.local");
+  if (!existsSync(envPath)) throw new Error("no .env.local to resolve the instance database from");
+  const env = parseEnvBody(readFileSync(envPath, "utf8"));
+  const connectionString = env.SUPABASE_DB_URL;
+  if (!connectionString) throw new Error("SUPABASE_DB_URL is not set, so the execution-plane mode cannot be persisted");
+  const schemaName = (env.SUPABASE_SCHEMA ?? "").trim() || "cinatra";
+  const client = await loadPgClient(connectionString);
+  try {
+    await client.connect();
+    await client.query(
+      `insert into "${schemaName.replaceAll('"', '""')}".metadata (key, value)
+       values ($1, $2)
+       on conflict (key) do update set value = excluded.value`,
+      [EXECUTION_SETTINGS_METADATA_KEY, JSON.stringify(settings)],
+    );
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
+/** Record the acquired L0 image pin (CLI-owned sidecar; the app never reads it). */
+function persistExecutionPin(targetDir, record) {
+  const file = path.join(targetDir, PIN_RECORD_REL);
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, `${JSON.stringify({ ...record, recordedAt: new Date().toISOString() }, null, 2)}\n`);
+}
+
+/** The instance's own loopback origin — the local-dev broker's placement endpoint. */
+function resolveInstanceOrigin(targetDir) {
+  const envPath = path.join(targetDir, ".env.local");
+  if (!existsSync(envPath)) return "http://localhost:3000";
+  const env = parseEnvBody(readFileSync(envPath, "utf8"));
+  const raw = env.BETTER_AUTH_URL || env.NEXT_PUBLIC_BETTER_AUTH_URL || "http://localhost:3000";
+  return String(raw).trim().replace(/\/+$/, "");
+}
+
 async function provisionExecutionPlane({ targetDir, opts, log = console.log }) {
   try {
-    const flags = opts.execution ?? { mode: null, brokerUrl: null, imageRef: null, egressMode: null };
+    const flags = opts.execution ?? {};
     // Install-preflight execution-mode CHOICE. An explicit --execution-mode wins;
-    // otherwise, on an interactive TTY without --yes, PROMPT (defaulting to the
-    // install-mode default); a non-interactive / --yes install takes the default
-    // silently so scripted installs never hang.
+    // otherwise, on an interactive TTY without --yes, PROMPT (defaulting to
+    // `disabled`); a non-interactive / --yes install takes `disabled` silently.
     const interactive = flags.mode == null && !opts.yes && Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
     let mode;
     if (interactive) {
-      const def = defaultExecutionModeForInstall(opts.mode);
+      const def = defaultExecutionModeForInstall();
       const answer = await promptLine(
-        "Execution plane — where should model-run sandboxes execute?\n" +
-          "  local-dev (build + run on this machine) | remote (broker + digest-pinned image) | disabled (no sandbox)\n" +
+        "Execution plane — where should model-authored commands execute?\n" +
+          "  disabled (nothing provisioned; models stay fully usable)\n" +
+          "  local-dev (run sandbox containers ON THIS MACHINE under the hardened L0 profile)\n" +
+          "  remote (dispatch to an out-of-process broker you supply a URL + shared secret for)\n" +
           `Choose [${def}]: `,
         def,
       );
       mode = normalizeExecutionMode((answer && answer.trim()) || def);
     } else {
-      mode = resolveExecutionModeForInstall({ installMode: opts.mode, flagMode: flags.mode, isTty: false }).mode;
+      mode = resolveExecutionModeForInstall({ flagMode: flags.mode, isTty: false }).mode;
     }
-    const egressMode = flags.egressMode ?? null;
 
-    if (mode === "remote") {
-      // Fully validate + record when the operator supplied broker/image; else
-      // record the mode and defer broker/image to the deployment layer (prod
-      // hands the execution stack to the deployment layer — epic + cinatra-cli#146).
-      if (flags.brokerUrl || flags.imageRef) {
-        const { brokerUrl, imageRef } = validateRemoteConfig({ brokerUrl: flags.brokerUrl, imageRef: flags.imageRef });
-        persistExecutionEnv(targetDir, executionEnvUpserts({ executionMode: "remote", imageRef, brokerUrl, egressMode }));
-        log("- Execution plane: remote mode recorded (broker URL + digest-pinned L0 image).");
-      } else {
-        persistExecutionEnv(targetDir, [
-          { key: EXECUTION_MODE_ENV_KEY, value: "remote" },
-          { key: ROLLOUT_ENV_KEY, value: ROLLOUT_ON },
-          { key: EGRESS_MODE_ENV_KEY, value: egressMode ?? DEFAULT_EGRESS_MODE },
-        ]);
+    // Acquire the L0 image BEFORE writing anything, so `local-dev` never records
+    // a placement whose image does not exist. A build failure downgrades the
+    // messaging, not the correctness of what was written.
+    let acquired = null;
+    if (mode === "local-dev") {
+      const dockerfileAbs = path.join(targetDir, L0_DOCKERFILE_REL);
+      if (!existsSync(dockerfileAbs)) {
         log(
-          "- Execution plane: remote mode recorded. Configure the broker URL + a DIGEST-PINNED L0 image in the " +
-            "deployment layer (CINATRA_EXECUTION_BROKER_URL / CINATRA_SANDBOX_L0_IMAGE=name@sha256:… — never :latest).",
+          `- Execution plane: the L0 Dockerfile (${L0_DOCKERFILE_REL}) is not in this checkout — recording the ` +
+            "placement and skipping the image build (run `cinatra instance execution pull` once it is present).",
         );
+      } else if (!commandExists("docker", ["--version"])) {
+        log(
+          "- Execution plane: Docker is not available — recording the placement and skipping the image build " +
+            "(run `cinatra instance execution pull` when Docker is up).",
+        );
+      } else {
+        const plan = planImageAcquisition({ executionMode: "local-dev", imageRef: flags.imageRef, dockerfileExists: true });
+        log(`- Execution plane: building the L0 sandbox image ${plan.imageRef}…`);
+        runOrThrow(
+          "docker",
+          l0BuildArgs({
+            imageRef: plan.imageRef,
+            dockerfile: dockerfileAbs,
+            buildContext: path.join(targetDir, L0_BUILD_CONTEXT_REL),
+          }),
+          "Failed to build the sandbox L0 image",
+          { cwd: targetDir },
+        );
+        const digest = parseInspectedDigest(capture("docker", l0DigestInspectArgs(plan.imageRef), { cwd: targetDir }));
+        acquired = { imageRef: plan.imageRef, digest };
+        log(`- Execution plane: L0 image built${digest ? ` (digest ${digest.slice(0, 19)}… recorded)` : ""}.`);
       }
+    }
+
+    const plan = planExecutionEnv({
+      mode,
+      appOrigin: resolveInstanceOrigin(targetDir),
+      brokerUrl: flags.brokerUrl ?? null,
+      brokerSecret: flags.brokerSecret ?? null,
+      serviceToken: flags.serviceToken ?? null,
+      provenanceKey: flags.provenanceKey ?? null,
+      imageRef: flags.imageRef ?? acquired?.imageRef ?? null,
+      sandboxNetwork: flags.sandboxNetwork ?? null,
+      egressMode: flags.egressMode ?? null,
+      egressAllowlist: flags.egressAllowlist ?? null,
+      // A fresh install has never provisioned the plane, so `disabled` is a
+      // genuine no-op (nothing to clear, no settings row to create).
+      alreadyProvisioned: false,
+      mintSecret: () => randomBytes(32).toString("hex"),
+    });
+
+    persistExecutionEnv(targetDir, plan.upserts);
+    if (acquired?.digest) {
+      persistExecutionPin(targetDir, { mode, imageRef: acquired.imageRef, digest: acquired.digest, action: "build" });
+    }
+
+    if (plan.mode === "disabled") {
+      log("- Execution plane: disabled — nothing written (models stay fully usable; the instance boots inert).");
       return;
     }
 
-    if (mode === "disabled") {
-      persistExecutionEnv(targetDir, executionEnvUpserts({ executionMode: "disabled" }));
-      log("- Execution plane: disabled (models stay usable; no sandbox provisioned on this host).");
-      return;
-    }
+    // The mode goes in the DATABASE, because that is what the boot phase reads.
+    await persistExecutionSettings(targetDir, plan.settings);
 
-    // local-dev: acquire the L0 image as a first-class step + record its digest pin.
-    const dockerfileAbs = path.join(targetDir, L0_DOCKERFILE_REL);
-    if (!existsSync(dockerfileAbs)) {
-      persistExecutionEnv(targetDir, executionEnvUpserts({ executionMode: "local-dev", imageDigest: null, egressMode }));
-      log(
-        `- Execution plane: local-dev mode recorded; the L0 Dockerfile (${L0_DOCKERFILE_REL}) is not in this checkout — ` +
-          "skipping the image build (run `cinatra instance sandbox build` once it is present).",
-      );
-      return;
+    const written = plan.upserts.filter((u) => u.value !== null).map((u) => u.key);
+    log(`- Execution plane: mode \`${plan.mode}\` provisioned.`);
+    log(`  .env.local: ${written.join(", ")}`);
+    if (plan.minted.length > 0) log(`  Minted internal secrets (values never printed): ${plan.minted.join(", ")}`);
+    log(`  Persisted mode in the instance database (\`${EXECUTION_SETTINGS_METADATA_KEY}\`) — the boot phase reads it from there.`);
+    for (const note of plan.notes) log(`  ${note}`);
+    if (plan.mode === "local-dev") {
+      log("  On the next boot the execution-broker phase runs a real broker↔worker handshake and only then wires the executor.");
     }
-    if (!commandExists("docker", ["--version"])) {
-      persistExecutionEnv(targetDir, executionEnvUpserts({ executionMode: "local-dev", imageDigest: null, egressMode }));
-      log("- Execution plane: local-dev mode recorded; Docker is not available — skipping the image build (run `cinatra instance sandbox build` when Docker is up).");
-      return;
-    }
-    const plan = planImageAcquisition({ executionMode: "local-dev", dockerfileExists: true });
-    log(`- Execution plane: building the L0 sandbox image ${plan.imageRef} (digest-pinned, never :latest)…`);
-    runOrThrow(
-      "docker",
-      l0BuildArgs({ imageRef: plan.imageRef, dockerfile: dockerfileAbs, buildContext: path.join(targetDir, L0_BUILD_CONTEXT_REL) }),
-      "Failed to build the sandbox L0 image",
-      { cwd: targetDir },
-    );
-    const inspected = capture("docker", l0DigestInspectArgs(plan.imageRef), { cwd: targetDir });
-    const digest = parseInspectedDigest(inspected);
-    persistExecutionEnv(targetDir, executionEnvUpserts({ executionMode: "local-dev", imageDigest: digest, egressMode }));
-    log(`- Execution plane: L0 image built${digest ? ` (digest ${digest.slice(0, 19)}… recorded)` : ""}.`);
   } catch (err) {
     log(
-      `  ⚠ Execution-plane provisioning had an issue (continuing; run \`cinatra instance sandbox doctor\` to reconcile): ${err && err.message ? err.message : err}`,
+      "  ⚠ Execution-plane provisioning had an issue (continuing; run `cinatra instance execution doctor` to " +
+        `reconcile): ${err && err.message ? err.message : err}`,
     );
   }
 }

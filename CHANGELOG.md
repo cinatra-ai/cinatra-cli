@@ -8,21 +8,33 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **Execution-plane lifecycle (`cinatra instance sandbox …`, exec-plane S4).**
-  `install` now offers an execution-mode choice — `local-dev` (build + run the
-  sandbox on this machine), `remote` (a broker URL + a digest-pinned image), or
-  `disabled` (no sandbox; models stay usable) — interactive on a TTY, otherwise
-  the mode default (dev/demo → local-dev, prod → remote) or an explicit
-  `--execution-mode` flag. Image acquisition is now a first-class install step.
-  New `cinatra instance sandbox build | doctor | status | gc` verbs manage the
-  digest-pinned L0 sandbox image and self-check the worker, image-digest pin,
-  egress enforcement, isolation, and audit-sink surfaces (each reported
-  distinctly as healthy / degraded / disabled; unverifiable-because-not-yet-wired
-  app surfaces degrade honestly rather than reporting a false pass).
-  `cinatra update` surfaces the execution-plane update coordination (protocol
-  compatibility, drain → roll workers before the app, rollback path, prod
-  guidance), and `cinatra instance refresh` now rebuilds the local L0 image so
-  the worker moves with the app.
+- **Execution-plane lifecycle (`cinatra instance execution …`, exec-plane S4).**
+  `install` offers an execution-mode choice — `disabled` (the default; nothing is
+  provisioned and models stay fully usable), `local-dev` (run sandbox containers
+  on this machine under the hardened L0 profile), or `remote` (an out-of-process
+  broker you supply a URL + shared secret for) — interactive on a TTY, otherwise
+  `disabled` or an explicit `--execution-mode`. Choosing a mode writes the
+  execution-plane configuration for you: the env keys the instance actually reads
+  plus the persisted placement mode, so a `local-dev` install boots straight into
+  a successful broker↔worker handshake with **no manual env editing**. New
+  `cinatra instance execution set-mode | doctor | status | pull | verify | prune |
+  gc` verbs manage the mode, the digest-pinned L0 sandbox image, and the
+  self-check. `cinatra doctor` gained an execution-plane section, and `cinatra
+  update` / `cinatra instance refresh` keep the local image and the app moving
+  together.
+- **Execution self-check with five actionable checks.** `cinatra instance
+  execution doctor` reports mode detection, broker reachability, the
+  broker↔worker handshake (running the boot phase's own probe command over the
+  L0 image and applying the boot phase's own success predicate), L0 image
+  presence by digest, and egress-gateway container state — each `healthy`,
+  `degraded` (with a remediation that names the actual consequence) or
+  `disabled`. `--strict` exits non-zero on any degraded check.
+- **L0 image lifecycle.** `execution pull` acquires the image (build for
+  local-dev, digest-pinned pull for remote) and records its digest;
+  `execution verify` proves the image is present, matches its recorded pin, and
+  can run the handshake command under the hardened profile; `execution prune`
+  reaps superseded L0 images while keeping the configured one and anything
+  backing a running container.
 
 ### Changed
 
@@ -30,6 +42,20 @@ project adheres to [Semantic Versioning](https://semver.org/).
   image (built from `docker/sandbox/Dockerfile`, its resolved digest recorded).
   The retired `:latest` skill-shell image is no longer built by
   `instance reset --full` (or any other CLI path) — digest pins only.
+- **The execution-plane configuration the CLI writes now matches what the
+  instance actually reads.** The previous release wrote four settings no released
+  Cinatra reads, so an instance configured for `local-dev` silently never started
+  its sandbox. Choosing a mode now writes the real configuration — including the
+  placement mode, which lives in the instance database rather than the
+  environment file — and generates the instance-local secrets the plane needs.
+  Existing instances configured by the previous release should re-run
+  `cinatra instance execution set-mode local-dev` (or `disabled`); the old
+  settings are inert and can be deleted.
+- The install default is now `disabled` for every install mode. A sandbox that
+  can run model-authored commands is never provisioned by omission; it is always
+  an explicit choice. (Previously a dev install silently selected `local-dev`.)
+- `cinatra instance sandbox build | doctor | status | gc` still work as hidden
+  aliases of the new `instance execution` verbs.
 
 
 ### Removed
