@@ -29,8 +29,9 @@
 //   COMMON (every kind):
 //     - manifest shape: cinatra.kind ∈ the four kinds; cinatra.apiVersion ===
 //       "cinatra.ai/v1"; cinatra.dependencies is an array of well-formed
-//       ExtensionDependency entries (mirrors extension-deps-gate.mjs +
-//       inventory.isValidExtensionDependency).
+//       ExtensionDependency entries, INCLUDING the optional skill-edge `role`
+//       (mirrors extension-deps-gate.mjs + inventory.isValidExtensionDependency
+//       + the install-time validateExtensionDependencyShape authority).
 //     - port names: every cinatra.requestedHostPorts entry is a real
 //       HOST_PORT_NAME (mirrors sdk-extensions host-context.HOST_PORT_NAMES).
 //     - sdkAbiRange grammar: a declared range parses to supported bounds
@@ -167,6 +168,14 @@ export const FIRST_PARTY_SCOPE = "@cinatra-ai";
 // inventory dependency enums.
 const VALID_DEPENDENCY_EDGE_TYPES = new Set(["runtime", "install-time", "peer"]);
 const VALID_DEPENDENCY_REQUIREMENTS = new Set(["required", "optional"]);
+
+// The declared skill-edge ROLE vocabulary (cinatra#2090 S3) — mirrors
+// canonical-types.DEPENDENCY_SKILL_ROLES. A consumer may declare SEVERAL skill
+// edges (an artifact extension declares both the rules its classifier follows
+// and the methodology the chat follows when a user asks it to author one), so
+// the edge has to say WHICH host surface it feeds. OPTIONAL and additive: every
+// edge authored before the vocabulary stays valid.
+const VALID_DEPENDENCY_SKILL_ROLES = new Set(["matcher", "authoring"]);
 
 // sdk-extensions register.SDK_EXTENSIONS_ABI_VERSION — used only for the
 // advisory ABI-compat WARNING (host-side runtime verdict, not author-time validity).
@@ -319,10 +328,37 @@ export function readPackageJson(packageRoot) {
   return JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
 }
 
+/** The optional skill-edge `role` on ONE cinatra.dependencies entry. Returns a
+ * precise problem string, or null when the role is absent or valid. Mirrors the
+ * install-time authority `validateExtensionDependencyShape` exactly, including
+ * the ORDER of its two checks: an unknown VALUE is reported before the
+ * target-kind mismatch.
+ *
+ * Fail-LOUD rather than ignore-unknown, because both failure modes are silent
+ * at runtime: a typo'd role simply stops resolving, and a consumer whose
+ * `matcher` edge does not resolve classifies NOTHING at all.
+ *
+ * The rule keys on the TARGET KIND only — a role is meaningful solely on a
+ * kind:"skill" edge. `edgeType` is deliberately NOT part of it: the authority
+ * does not constrain it, so a role on an install-time or peer skill edge is a
+ * valid SHAPE here exactly as it is at install, and a gate that refused one
+ * would reject a manifest the host accepts. */
+export function dependencyRoleProblem(dep) {
+  if (!dep || typeof dep !== "object" || dep.role === undefined) return null;
+  if (!VALID_DEPENDENCY_SKILL_ROLES.has(dep.role)) {
+    return `role, when present, must be one of ${[...VALID_DEPENDENCY_SKILL_ROLES].join("|")} (got ${JSON.stringify(dep.role)})`;
+  }
+  if (dep.kind !== "skill") {
+    return `role is only meaningful on a kind:"skill" edge (got kind ${JSON.stringify(dep.kind ?? null)})`;
+  }
+  return null;
+}
+
 /** Validate ONE cinatra.dependencies entry. Mirrors the install-time
  * `validateExtensionDependencyShape` (packages/extensions/src/manifest-dependencies):
- * right shape + a self-edge is MALFORMED. (The cross-package kind-match + the
- * duplicate-packageName check need the full list — done in validateCommon.) */
+ * right shape + a self-edge is MALFORMED + a well-formed optional `role`. (The
+ * cross-package kind-match + the duplicate-packageName check need the full list
+ * — done in validateCommon.) */
 export function isValidDependencyEntry(dep, selfName = null) {
   if (!dep || typeof dep !== "object") return false;
   if (typeof dep.packageName !== "string" || dep.packageName.length === 0) return false;
@@ -341,6 +377,7 @@ export function isValidDependencyEntry(dep, selfName = null) {
     return false;
   }
   if (dep.kind !== undefined && !VALID_KINDS.includes(dep.kind)) return false;
+  if (dependencyRoleProblem(dep) !== null) return false;
   return true;
 }
 
@@ -698,7 +735,16 @@ export function validateCommon(packageRoot) {
     const seenDeps = new Set();
     cinatra.dependencies.forEach((dep, i) => {
       if (!isValidDependencyEntry(dep, selfPkgName)) {
-        errors.push(`cinatra.dependencies[${i}] is malformed: need {packageName (not self), edgeType∈{runtime,install-time,peer}, versionConstraint:{kind∈{semver-range,exact,git-ref},…}, requirement∈{required,optional}[, kind]} (got ${JSON.stringify(dep)})`);
+        // Report a role problem PRECISELY. The generic shape message would send
+        // an author hunting through an otherwise well-formed edge for a typo in
+        // one optional field; the entry JSON rides along either way, so a second
+        // problem in the same entry is still visible.
+        const roleProblem = dependencyRoleProblem(dep);
+        errors.push(
+          roleProblem !== null
+            ? `cinatra.dependencies[${i}] is malformed: ${roleProblem} (got ${JSON.stringify(dep)})`
+            : `cinatra.dependencies[${i}] is malformed: need {packageName (not self), edgeType∈{runtime,install-time,peer}, versionConstraint:{kind∈{semver-range,exact,git-ref},…}, requirement∈{required,optional}[, kind][, role∈{matcher,authoring} on a kind:"skill" edge]} (got ${JSON.stringify(dep)})`,
+        );
         return;
       }
       if (seenDeps.has(dep.packageName)) {
