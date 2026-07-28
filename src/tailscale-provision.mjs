@@ -11,10 +11,13 @@
 //
 //   MagicDNS hostname-collision guard
 //     After a node registers, the registered `Self.DNSName` hostname
-//     segment MUST equal `deriveDevTailscaleHostname(...)`. A Tailscale
-//     `-1` collision suffix yields a dead predicted URL → callers must
-//     fail loud and NOT write `publicBaseUrl`. The guard returns a typed
-//     result (never throws an untyped error).
+//     segment MUST equal this instance's classified identity hostname. A
+//     Tailscale `-1` collision suffix yields a dead predicted URL →
+//     callers must fail loud and NOT write `publicBaseUrl`. The guard
+//     returns a typed result (never throws an untyped error). It stays
+//     in place as DEFENCE IN DEPTH behind the fail-closed identity gate
+//     (cinatra#2172): sanitisation and truncation can still land two
+//     distinct identities on one MagicDNS name.
 //
 //   Write-vs-skip purity
 //     The decision to write `publicBaseUrl` depends ONLY on
@@ -24,9 +27,10 @@
 //     (regression-guarded in the test) that a probe arg can never be
 //     silently threaded in.
 //
-// `deriveDevTailscaleHostname` is the SINGLE source of truth for the
-// predicted hostname — imported via the exact relative specifier
-// `index.mjs` already resolves; this module NEVER re-derives it.
+// `classifyDevTailscaleIdentity` is the SINGLE source of truth for the
+// predicted hostname — discovered through the dev-CLI module manifest;
+// this module NEVER re-derives it and never falls back to a legacy
+// derivation shape.
 //
 // Public surface:
 //   - TailscaleProvisionError (typed, `.code`)
@@ -35,7 +39,7 @@
 //   - shouldWritePublicBaseUrl({ funnelUrl, hostnameCheck })
 // ---------------------------------------------------------------------------
 
-// `deriveDevTailscaleHostname` (the single source of truth for the predicted
+// `classifyDevTailscaleIdentity` (the single source of truth for the predicted
 // hostname) lives in the gitignored `extensions/cinatra-ai/` clone-back target,
 // ABSENT on a fresh checkout. It is loaded lazily inside
 // `verifyRegisteredHostnameMatchesPrediction` so this module — and any host
@@ -56,6 +60,11 @@
  * Codes:
  *   - "tailscale.hostname_collision"  registered segment !== prediction
  *   - "tailscale.hostname_unresolved" registered DNSName couldn't be parsed
+ *   - "tailscale.unregistered_dev_identity" / "tailscale.conflicting_dev_identity"
+ *     this instance has no sanctioned identity, so there IS no prediction to
+ *     compare against (cinatra#2172) — surfaced verbatim from the classifier
+ *   - "tailscale.identity_helper_unusable" the installed identity helper is
+ *     absent, too old, or speaks an unknown contract version
  */
 export class TailscaleProvisionError extends Error {
   /**
@@ -125,7 +134,7 @@ export function extractTailscaleHostnameSegment(dnsNameOrUrl) {
 /**
  * Collision guard. Compare the registered Tailscale hostname segment
  * against the deterministic prediction from the SINGLE source of truth
- * (`deriveDevTailscaleHostname`). Returns a typed result — NEVER throws.
+ * (`classifyDevTailscaleIdentity`). Returns a typed result — NEVER throws.
  *
  *   - segment === prediction          → { ok: true, predicted, registered }
  *   - segment !== prediction          → { ok: false, predicted, registered,
@@ -138,11 +147,20 @@ export function extractTailscaleHostnameSegment(dnsNameOrUrl) {
  * `error` is ALWAYS a `TailscaleProvisionError` (has `.code`), never a
  * bare `Error`.
  *
+ * cinatra#2172 — an instance with NO sanctioned identity has no prediction at
+ * all. That is reported as a typed `ok:false` result (never a throw), so this
+ * guard keeps its "never throws an untyped error" contract while the caller's
+ * existing `shouldWritePublicBaseUrl` gate refuses the write.
+ *
  * @param {object} args
  * @param {string | null | undefined} args.registered  registered Self.DNSName
  *   (trailing-dot / `.ts.net` / full `https://` URL forms all accepted)
  * @param {string | null | undefined} args.dbUrl   SUPABASE_DB_URL
  * @param {string | null | undefined} args.schema  SUPABASE_SCHEMA
+ * @param {string | null | undefined} [args.mainDatabase]  the explicit
+ *   reserved-main declaration (CINATRA_DEV_MAIN_DATABASE)
+ * @param {string} [args.repoRoot]  the operator checkout to discover the
+ *   identity helper from
  * @returns {Promise<{ ok: boolean, predicted: string, registered: string,
  *             error?: TailscaleProvisionError }>}
  */
@@ -150,6 +168,7 @@ export async function verifyRegisteredHostnameMatchesPrediction({
   registered,
   dbUrl,
   schema,
+  mainDatabase,
   repoRoot,
 }) {
   // Single source of truth — NEVER re-derive here. Discovered + loaded lazily
@@ -167,11 +186,56 @@ export async function verifyRegisteredHostnameMatchesPrediction({
   // load throws even though the connector IS present. Threading the resolved
   // root (getRepoRoot() at the call sites) fixes the published-CLI discovery.
   const { loadDevCliModule } = await import("./dev-cli-modules.mjs");
-  const { deriveDevTailscaleHostname } = await loadDevCliModule(
-    "tailscale-hostname",
-    repoRoot,
+  const { DEV_TUNNEL_IDENTITY_CONTRACT_VERSION } = await import(
+    "./dev-tunnel-identity.mjs"
   );
-  const predicted = deriveDevTailscaleHostname({ dbUrl, schema });
+  const helper = await loadDevCliModule("tailscale-hostname", repoRoot);
+  // cinatra#2172 — the classifier is the single source of truth. NEVER fall
+  // back to the retired `deriveDevTailscaleHostname` shape on an old helper:
+  // that one fell through to the reserved main hostname, which would make this
+  // guard PASS for an instance that owns nothing.
+  if (
+    typeof helper?.classifyDevTailscaleIdentity !== "function" ||
+    typeof helper?.describeDevTailscaleIdentityRefusal !== "function"
+  ) {
+    return {
+      ok: false,
+      predicted: "",
+      registered: extractTailscaleHostnameSegment(registered),
+      error: new TailscaleProvisionError(
+        "tailscale.identity_helper_unusable",
+        `The installed tunnel-identity helper does not export the identity ` +
+          `classifier. Refusing to write publicBaseUrl — update the extension ` +
+          `(\`cinatra instance setup dev\`).`,
+      ),
+    };
+  }
+  const identity = helper.classifyDevTailscaleIdentity({ dbUrl, schema, mainDatabase });
+  if (identity?.version !== DEV_TUNNEL_IDENTITY_CONTRACT_VERSION) {
+    return {
+      ok: false,
+      predicted: "",
+      registered: extractTailscaleHostnameSegment(registered),
+      error: new TailscaleProvisionError(
+        "tailscale.identity_helper_unusable",
+        `The installed tunnel-identity helper speaks contract version ` +
+          `${String(identity?.version)}; this CLI understands ` +
+          `${DEV_TUNNEL_IDENTITY_CONTRACT_VERSION}. Refusing to write publicBaseUrl.`,
+      ),
+    };
+  }
+  if (!identity.ok) {
+    return {
+      ok: false,
+      predicted: "",
+      registered: extractTailscaleHostnameSegment(registered),
+      error: new TailscaleProvisionError(
+        identity.code,
+        helper.describeDevTailscaleIdentityRefusal(identity, dbUrl),
+      ),
+    };
+  }
+  const predicted = identity.hostname;
   const segment = extractTailscaleHostnameSegment(registered);
 
   if (!segment) {
