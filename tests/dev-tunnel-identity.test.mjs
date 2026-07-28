@@ -218,6 +218,31 @@ describe("dev tunnel runtime-directory ownership", () => {
     );
   });
 
+  it("REFUSES to adopt manifest-less state with an FQDN-placeholder serve config (cinatra-cli#177 fail-closed)", () => {
+    // Post-#177 serve configs are identity-independent (`${TS_CERT_DOMAIN}`
+    // keys, no hostname) — but post-#177 provisioning always writes the
+    // ownership manifest BEFORE the serve config, so a manifest-less directory
+    // holding a placeholder-keyed config can only be tampered/hand-assembled
+    // state. It names no node, so adoption must refuse, not assume ownership.
+    const tampered = path.join(dir, DEV_MAIN_SLUG);
+    mkdirSync(tampered, { recursive: true });
+    writeFileSync(
+      path.join(tampered, "tailscale-serve.json"),
+      JSON.stringify({
+        TCP: { 443: { HTTPS: true } },
+        Web: { "${TS_CERT_DOMAIN}:443": { Handlers: { "/": { Proxy: "http://host.docker.internal:3000" } } } },
+        AllowFunnel: { "${TS_CERT_DOMAIN}:443": true },
+      }),
+    );
+    const identity = ok("main", "main:h:5432/db", "cinatra-main");
+    expect(() =>
+      assertDevTunnelRuntimeDirOwnership({ runtimeDir: tampered, identity }),
+    ).toThrow(/provisioned for a DIFFERENT node/);
+    expect(() => claimDevTunnelRuntimeDir({ runtimeDir: tampered, identity })).toThrow(
+      /provisioned for a DIFFERENT node/,
+    );
+  });
+
   it("RECORDS an adoption of pre-manifest state instead of stamping it silently", () => {
     const legacy = path.join(dir, DEV_MAIN_SLUG);
     mkdirSync(legacy, { recursive: true });

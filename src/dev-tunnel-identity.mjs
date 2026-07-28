@@ -320,9 +320,19 @@ function assertRuntimeDirIsRealDirectory(runtimeDir) {
 
 /**
  * Pre-manifest state is only adoptable when the state ITSELF names this
- * identity. The rendered Tailscale serve config carries the hostname the
- * sidecar was provisioned for, so a directory whose serve config names a
- * different node demonstrably belongs to someone else.
+ * identity. A pre-ownership-tracking (legacy) Tailscale serve config carried
+ * the hostname the sidecar was provisioned for, so a directory whose serve
+ * config names a different node demonstrably belongs to someone else.
+ *
+ * cinatra-cli#177 made the serve config identity-INDEPENDENT (its keys are the
+ * `${TS_CERT_DOMAIN}` placeholder, never a hostname) — but every post-#177
+ * DEV-TUNNEL provisioning writes the ownership manifest BEFORE the serve
+ * config (clone provisioning does not use this manifest at all), so a
+ * manifest-less directory with a serve config is by construction legacy
+ * (hostname-keyed) and this check still discriminates the population it can
+ * actually meet. A placeholder-keyed serve config WITHOUT a manifest can only
+ * be tampered/hand-assembled state; `serve.includes(hostname)` is false for
+ * it, so adoption refuses — deliberately fail-closed.
  *
  * @param {string} runtimeDir
  * @param {{ hostname?: string | null }} identity

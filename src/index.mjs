@@ -10104,9 +10104,10 @@ async function runCloneStart(argv) {
 
     // Write Tailscale serve config only when the sidecar is enabled.
     if (tailscaleEnabled) {
+      // cinatra-cli#177 — no hostname goes in: the serve keys are the
+      // `${TS_CERT_DOMAIN}` placeholder the sidecar resolves to its own FQDN.
       writeTailscaleServeConfig({
         servePath: tailscaleServePath,
-        tailscaleHostname,
         nextjsPort: slot.nextjsPort,
         hostNetwork: tailscaleHostNetwork,
       });
@@ -11414,9 +11415,10 @@ async function runDevTunnel(argv) {
   //    Linux-only clone affordance; dev-tunnel uses bridge, so the
   //    sidecar proxies to host.docker.internal:<nextjsPort>, which
   //    writeTailscaleServeConfig already produces for hostNetwork:false).
+  //    cinatra-cli#177 — no hostname goes in: the serve keys are the
+  //    `${TS_CERT_DOMAIN}` placeholder the sidecar resolves to its own FQDN.
   writeTailscaleServeConfig({
     servePath,
-    tailscaleHostname,
     nextjsPort,
     hostNetwork: false,
   });
@@ -11630,21 +11632,49 @@ function readEnvFileSnapshot(envPath) {
   return values;
 }
 
-function writeTailscaleServeConfig({ servePath, tailscaleHostname, nextjsPort, hostNetwork }) {
+// cinatra-cli#177 — the serve/funnel keys MUST be the node's tailnet-qualified
+// FQDN (`<host>.<tailnet>.ts.net:443`): tailscaled matches incoming Funnel
+// conns against these keys and REJECTS anything else (daemon log:
+// `handleIngress: got ingress conn for unconfigured <fqdn>:443; rejecting`,
+// seen from outside as connect-then-TLS-EOF). Keying on the bare device
+// hostname produced exactly that rejection. The FQDN is only knowable AFTER
+// the node registers, so the generated file carries containerboot's LITERAL
+// `${TS_CERT_DOMAIN}` placeholder: the tailscale/tailscale sidecar replaces
+// it with the daemon-reported cert domain — the tailnet-qualified name,
+// MagicDNS collision suffix included — and (re-)applies TS_SERVE_CONFIG when
+// that domain surfaces (verified in containerboot `readServeConfig` /
+// `watchServeConfigChanges` at the v1.78.3 tag the compose template pins).
+// A hostname-derived prediction could carry neither the tailnet name nor a
+// collision suffix, so the serve config is deliberately identity-INDEPENDENT:
+// the device identity stays on the compose side (TS_HOSTNAME) and is guarded
+// post-registration by `verifyRegisteredHostnameMatchesPrediction`.
+//
+// NB: a plain double-quoted string, NEVER a template literal — JS
+// interpolation would swallow the placeholder the daemon needs byte-for-byte.
+const TAILSCALE_SERVE_FQDN_KEY = "${TS_CERT_DOMAIN}:443";
+
+function buildTailscaleServeConfig({ nextjsPort, hostNetwork }) {
   const backend = hostNetwork
     ? `http://127.0.0.1:${nextjsPort}`
     : `http://host.docker.internal:${nextjsPort}`;
-  const config = {
+  return {
     TCP: { 443: { HTTPS: true } },
     Web: {
-      [`${tailscaleHostname}:443`]: {
+      [TAILSCALE_SERVE_FQDN_KEY]: {
         Handlers: { "/": { Proxy: backend } },
       },
     },
-    AllowFunnel: { [`${tailscaleHostname}:443`]: true },
+    AllowFunnel: { [TAILSCALE_SERVE_FQDN_KEY]: true },
   };
+}
+
+function writeTailscaleServeConfig({ servePath, nextjsPort, hostNetwork }) {
   ensureDirOf(servePath);
-  writeFileSync(servePath, JSON.stringify(config, null, 2), { mode: 0o600 });
+  writeFileSync(
+    servePath,
+    JSON.stringify(buildTailscaleServeConfig({ nextjsPort, hostNetwork }), null, 2),
+    { mode: 0o600 },
+  );
 }
 
 /**
@@ -13373,6 +13403,11 @@ export {
   NANGO_SETTINGS_KEY,
   seedMetadataScrubKeys,
   scrubSeedMetadata,
+  // cinatra-cli#177 — Tailscale serve-config generation seams: the FQDN
+  // (`${TS_CERT_DOMAIN}`-placeholder) keying is pinned byte-level in tests.
+  TAILSCALE_SERVE_FQDN_KEY,
+  buildTailscaleServeConfig,
+  writeTailscaleServeConfig,
   // cinatra-cli#41 — clone link-invariant seams (pure; injectable fs).
   linkedSetMatchesEmittedSet,
   enumerateEmittedExtensionPackages,
