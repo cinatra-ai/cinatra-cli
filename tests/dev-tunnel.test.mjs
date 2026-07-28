@@ -82,10 +82,16 @@ describe("dev tunnel — reuses clone-start machinery (no duplication)", () => {
       "cloneTailscaleServePath(",
       "cloneComposeProjectName(",
       "cloneRuntimeDir(",
-      "deriveDevTailscaleHostname(",
+      // cinatra#2172 — the hostname comes from the single-source-of-truth
+      // CLASSIFIER, never the retired fallthrough derivation.
+      "classifyDevTunnelIdentityFromModule(",
+      "devTunnelRuntimeSlug(",
     ]) {
       expect(body.includes(helper)).toBe(true);
     }
+    // The retired derivation must NOT be called here: it fell through to the
+    // reserved main hostname for any unclassifiable instance.
+    expect(body.includes("deriveDevTailscaleHostname(")).toBe(false);
   });
 });
 
@@ -221,11 +227,48 @@ describe("dev tunnel — matches runCloneStart hostname and public URL behavior"
     expect(body.includes("DEV_MAIN_UNUSED_WAYFLOW_PORT")).toBe(true);
   });
 
-  it("uses the reserved dev-main slug and asserts no real clone collides", () => {
-    expect(body.includes('const DEV_MAIN_SLUG = "dev-main";')).toBe(true);
+  it("keys runtime state by the DERIVED identity slug and asserts no real clone collides", () => {
+    // cinatra#2172 — the reserved slug is no longer hardcoded into every run;
+    // it is one possible OUTPUT of the identity→slug mapping (declared main
+    // only). The registry-collision guard follows the derived slug.
+    expect(body.includes("const tunnelSlug = devTunnelRuntimeSlug(identity);")).toBe(true);
     expect(
-      body.includes("getClone(readRegistry(defaultRegistryPath()), DEV_MAIN_SLUG)"),
+      body.includes("getClone(readRegistry(defaultRegistryPath()), tunnelSlug)"),
     ).toBe(true);
+    for (const keyed of [
+      "cloneRuntimeDir(tunnelSlug)",
+      "cloneComposePath(tunnelSlug)",
+      "cloneTailscaleServePath(tunnelSlug)",
+      "cloneComposeProjectName(tunnelSlug, DEV_MAIN_INDEX)",
+    ]) {
+      expect(body.includes(keyed)).toBe(true);
+    }
+    // No runtime path may be built from the reserved slug directly.
+    expect(body.includes("(DEV_MAIN_SLUG)")).toBe(false);
+  });
+
+  it("refuses an unsanctioned identity BEFORE any path/registry/Docker work", () => {
+    // Ordering is the whole safety property: the identity gate must sit above
+    // the first `cloneRuntimeDir(` in the function body.
+    const gate = body.indexOf("classifyDevTunnelIdentityFromModule(");
+    const firstPath = body.indexOf("cloneRuntimeDir(");
+    const firstRegistry = body.indexOf("readRegistry(");
+    const firstCompose = body.indexOf("isComposeProjectUp(");
+    expect(gate).toBeGreaterThan(-1);
+    expect(gate).toBeLessThan(firstPath);
+    expect(gate).toBeLessThan(firstRegistry);
+    expect(gate).toBeLessThan(firstCompose);
+    expect(body.includes("if (!identity.ok)")).toBe(true);
+  });
+
+  it("proves runtime-directory ownership before writing into it", () => {
+    const assertOwner = body.indexOf("assertDevTunnelRuntimeDirOwnership({");
+    const writeServe = body.indexOf("writeTailscaleServeConfig({");
+    const renderCompose = body.indexOf("renderCloneComposeTemplate({");
+    expect(assertOwner).toBeGreaterThan(-1);
+    expect(assertOwner).toBeLessThan(writeServe);
+    expect(assertOwner).toBeLessThan(renderCompose);
+    expect(body.includes("claimDevTunnelRuntimeDir({")).toBe(true);
   });
 });
 

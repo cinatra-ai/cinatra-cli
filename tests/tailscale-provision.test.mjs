@@ -257,7 +257,22 @@ describe("verifyRegisteredHostnameMatchesPrediction — cinatra#1919 repoRoot th
     );
     writeFileSync(
       path.join(extDir, "hostname.mjs"),
-      "export function deriveDevTailscaleHostname() { return 'cinatra-fixture'; }\n",
+      // The cinatra#2172 helper contract: a TOTAL classifier plus its
+      // operator-facing refusal text. The retired `deriveDevTailscaleHostname`
+      // shape is deliberately absent — an old helper must fail closed.
+      [
+        "export const DEV_TAILSCALE_IDENTITY_CONTRACT_VERSION = 1;",
+        "export function classifyDevTailscaleIdentity({ schema }) {",
+        "  if (schema === 'no-identity') {",
+        "    return { version: 1, ok: false, kind: 'unregistered', hostname: null, key: null,",
+        "             code: 'tailscale.unregistered_dev_identity', reason: 'no identity' };",
+        "  }",
+        "  return { version: 1, ok: true, kind: 'schema', hostname: 'cinatra-fixture',",
+        "           key: 'schema:fixture', code: null, reason: null };",
+        "}",
+        "export function describeDevTailscaleIdentityRefusal(identity) { return identity.reason; }",
+        "",
+      ].join("\n"),
     );
   });
 
@@ -293,6 +308,60 @@ describe("verifyRegisteredHostnameMatchesPrediction — cinatra#1919 repoRoot th
       });
     } finally {
       rmSync(emptyRoot, { recursive: true, force: true });
+    }
+  });
+
+  // --- cinatra#2172: the guard is fail-closed on identity ------------------
+
+  it("an UNREGISTERED instance yields a typed refusal, never a silent pass", async () => {
+    const res = await verifyRegisteredHostnameMatchesPrediction({
+      registered: "cinatra-fixture.tailnet000.ts.net.",
+      dbUrl: "postgres://127.0.0.1:5432/scratch",
+      schema: "no-identity",
+      repoRoot: fixtureRoot,
+    });
+    expect(res.ok).toBe(false);
+    expect(res.predicted).toBe("");
+    expect(res.error).toBeInstanceOf(TailscaleProvisionError);
+    expect(res.error.code).toBe("tailscale.unregistered_dev_identity");
+    // …and the write decision refuses on that result.
+    expect(
+      shouldWritePublicBaseUrl({
+        funnelUrl: "https://cinatra-fixture.tailnet000.ts.net",
+        hostnameCheck: res,
+      }),
+    ).toBe(false);
+  });
+
+  it("an OLD helper (retired derivation only) fails closed — it must NOT be used", async () => {
+    // The retired `deriveDevTailscaleHostname` fell through to the reserved
+    // main hostname, which would make this guard PASS for an instance that
+    // owns nothing. Refuse instead of falling back.
+    const oldRoot = mkdtempSync(path.join(tmpdir(), "ts-hostname-old-"));
+    const extDir = path.join(oldRoot, "extensions", "cinatra-ai", "tailscale-connector");
+    mkdirSync(extDir, { recursive: true });
+    writeFileSync(
+      path.join(extDir, "package.json"),
+      JSON.stringify({
+        name: "@cinatra-ai/tailscale-connector",
+        cinatra: { devCliModules: { "tailscale-hostname": "./hostname.mjs" } },
+      }),
+    );
+    writeFileSync(
+      path.join(extDir, "hostname.mjs"),
+      "export function deriveDevTailscaleHostname() { return 'cinatra-fixture'; }\n",
+    );
+    try {
+      const res = await verifyRegisteredHostnameMatchesPrediction({
+        registered: "cinatra-fixture.tailnet000.ts.net.",
+        dbUrl: "postgres://127.0.0.1:5432/cinatra",
+        schema: "cinatra",
+        repoRoot: oldRoot,
+      });
+      expect(res.ok).toBe(false);
+      expect(res.error.code).toBe("tailscale.identity_helper_unusable");
+    } finally {
+      rmSync(oldRoot, { recursive: true, force: true });
     }
   });
 });

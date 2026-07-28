@@ -178,6 +178,16 @@ import {
   TailscaleProvisionError,
   verifyRegisteredHostnameMatchesPrediction,
 } from "./tailscale-provision.mjs";
+// Dev-tunnel identity → runtime-state keying (cinatra#2172). Pure module: the
+// classifier arrives as an already-loaded helper module, so this import stays
+// safe on an extension-empty checkout.
+import {
+  assertDevTunnelRuntimeDirOwnership,
+  classifyDevTunnelIdentityFromModule,
+  DEV_MAIN_SLUG,
+  devTunnelRuntimeSlug,
+  claimDevTunnelRuntimeDir,
+} from "./dev-tunnel-identity.mjs";
 
 const AUTH_TABLES = [
   "user",
@@ -9533,9 +9543,22 @@ async function ensureDevPublicMcpUrl({ dbUrl, schemaName, env, operatorUrl, repo
   // module (missing file, missing transitive dep) also surfaces
   // ERR_MODULE_NOT_FOUND from the dynamic import(), and that is a REAL defect
   // that must propagate, not be masked as "declarer absent".
+  // cinatra#2172 — thread the explicit reserved-main declaration so a declared
+  // dev main still predicts its own hostname here. Without it the classifier
+  // would (correctly) report "no sanctioned identity" and self-heal would skip
+  // the write.
+  const declaredMainDatabase =
+    env?.CINATRA_DEV_MAIN_DATABASE ?? process.env.CINATRA_DEV_MAIN_DATABASE ?? null;
   async function verifyHostnameSafe(args) {
     try {
-      return { ok: true, result: await verifyHostname({ ...args, repoRoot: resolvedRepoRoot }) };
+      return {
+        ok: true,
+        result: await verifyHostname({
+          mainDatabase: declaredMainDatabase,
+          ...args,
+          repoRoot: resolvedRepoRoot,
+        }),
+      };
     } catch (err) {
       if (err && err.cinatraDevCliDeclarerMissing === true) {
         return { ok: false, declarerUnresolvable: err };
@@ -10323,12 +10346,15 @@ async function runCloneStart(argv) {
 // runtime dir, a health-probe-before-skip idempotency check, and a
 // cwd-verified SIGTERM→SIGKILL group stop).
 //
-// Reuses the SAME reserved per-main slug as `instance tunnel` ("dev-main") so the
+// Reuses the SAME reserved per-main slug as `instance tunnel` ("dev-main",
+// imported from `dev-tunnel-identity.mjs` — one definition, no drift) so the
 // clone-runtime PURE path builders (`clonePidPath` / `cloneLogPath` /
 // `cloneRuntimeDir`) yield the per-main pid/log under
 // `~/.cinatra/clones/dev-main/`. `instance tunnel` uses that dir only for the
 // compose / Tailscale-serve files (it has no pid file), so there is no
 // collision: `instance start` owns `dev-main/nextjs.pid` + `dev-main/nextjs.log`.
+// NOTE (cinatra#2172): the fail-closed identity keying applies to the TUNNEL's
+// shared state; `instance start`'s pid/log keying is unchanged here.
 //
 // Deliberate divergences from `runCloneStart`: NO clone registry, NO docker
 // compose / WayFlow / Tailscale, NO bridge-token mint. The main instance is
@@ -10336,7 +10362,6 @@ async function runCloneStart(argv) {
 // `instance tunnel`) on the bare `pnpm dev` port (PORT env, default 3000) — the
 // only moving parts are the `pnpm dev` process group, its pid/log files, and
 // the `/api/health` probe.
-const DEV_MAIN_SLUG = "dev-main";
 
 // Resolve the main checkout + its dev port. `getRepoRoot()` is the same
 // resolver `instance tunnel` uses: module-relative in-repo, or the operator's
@@ -10936,9 +10961,9 @@ async function runLogs(argv = []) {
 //
 // This is a CLI verb, not a dev-boot hook: explicit, no surprise sidecars,
 // independently testable, and composed with the flat `runCli` if-ladder exactly
-// like `clone start/stop/status`. It brings the bare `pnpm dev` MAIN instance
-// its OWN dedicated Tailscale Funnel (`cinatra-main` → predicted by
-// `deriveDevTailscaleHostname`) live.
+// like `clone start/stop/status`. It brings a bare `pnpm dev` instance its OWN
+// dedicated Tailscale Funnel, named by the single-source-of-truth identity
+// classifier (`classifyDevTailscaleIdentity`).
 //
 // HARD CONSTRAINT: every piece of provisioning machinery is REUSED from
 // clone-start by direct call — `renderCloneComposeTemplate`,
@@ -10961,12 +10986,17 @@ async function runLogs(argv = []) {
 // a production main is NEVER Funnel-exposed (it keeps the operator-
 // supplied URL model at /configuration/development?tab=tunnel).
 //
-// The reserved per-main slug is the fixed string "dev-main". It is a
-// valid slug shape but is NEVER registered in the clone registry —
-// `runDevTunnel` deliberately bypasses `loadReadyCloneSlot`, using only
-// the slug-parameterised PURE path builders (lowest-risk reuse, no
-// parallel path scheme). A real registered clone literally named
-// "dev-main" would collide; we assert none exists before any side effect.
+// FAIL-CLOSED IDENTITY GATE (cinatra#2172):
+// every runtime path is keyed by the instance's DERIVED identity, not by a
+// hardcoded slug. An instance with no sanctioned identity is REFUSED before
+// any filesystem or Docker side effect — it used to derive the reserved
+// `cinatra-main` identity by fallthrough and write the reserved runtime
+// directory, squatting state it does not own. The reserved `dev-main` slug
+// survives (so the declared main's existing state is not orphaned) but is now
+// reachable ONLY from the declared main identity. A real registered clone
+// holding the computed slug would collide; we assert none exists before any
+// side effect. `runDevTunnel` still deliberately bypasses `loadReadyCloneSlot`,
+// using only the slug-parameterised PURE path builders.
 async function runDevTunnel(argv) {
   const action = String(argv[0] ?? "").trim();
   if (action !== "start" && action !== "stop" && action !== "status") {
@@ -10999,51 +11029,124 @@ async function runDevTunnel(argv) {
     );
   }
 
-  // Reserved per-main slug. NEVER a registered clone — assert no real
-  // clone has claimed this name before doing anything (collision guard;
-  // collision-safety sibling). `readRegistry` is a safe non-throwing
-  // reader; a missing/empty registry just means "no clones", which is
-  // fine.
-  const DEV_MAIN_SLUG = "dev-main";
+  // This instance's identity inputs from the checkout's `.env.local`.
+  // `mainDatabase` is the OPTIONAL explicit declaration that this checkout IS
+  // the dev main (cinatra#2172): it must name this instance's own database
+  // ENDPOINT (`host:port/database`, or a full connection string). The reserved
+  // main identity is DECLARED, never inferred — an undeclared, unisolated
+  // instance has no identity and is refused below.
+  const mainDbUrl =
+    env.SUPABASE_DB_URL ?? process.env.SUPABASE_DB_URL ?? null;
+  const mainSchema =
+    env.SUPABASE_SCHEMA || process.env.SUPABASE_SCHEMA || "cinatra";
+  const declaredMainDatabase =
+    env.CINATRA_DEV_MAIN_DATABASE ?? process.env.CINATRA_DEV_MAIN_DATABASE ?? null;
+
+  // --- identity gate (ALL THREE sub-actions, before ANY side effect) -------
+  //
+  // The identity now keys the runtime directory, so `stop` and `status` need it
+  // too: `stop` runs `docker compose down` on the derived project, which under
+  // the retired hardcoded slug let an unregistered instance tear down the dev
+  // main's live sidecar.
+  //
+  // Cold-checkout posture (cinatra#1919) is preserved WITHOUT reopening that
+  // hole. When NO extension declares the helper the identity is unknowable, so
+  // this verb touches NOTHING — it never falls back to the reserved slug:
+  //   - `status` reports an indeterminate identity (it never throws);
+  //   - `stop` is a clean no-op that exits 0. Nothing can be running: `start`
+  //     requires the helper, so this checkout never provisioned a tunnel
+  //     through this verb;
+  //   - `start` refuses.
+  let helperModule = null;
+  try {
+    helperModule = await loadTailscaleHostnameModule();
+  } catch (err) {
+    if (err?.cinatraDevCliDeclarerMissing !== true) throw err;
+    if (action === "status") {
+      console.log("cinatra instance tunnel — tunnel status");
+      console.log("  tunnel identity: (indeterminate — identity helper not installed)");
+      console.log(
+        "  Run `cinatra instance setup dev` to populate the extensions tree, then retry.",
+      );
+      return;
+    }
+    if (action === "stop") {
+      console.log(
+        "cinatra instance tunnel stopped: no tunnel identity is resolvable " +
+          "(the identity helper is not installed), so nothing was torn down. " +
+          "This verb never guesses an identity — run `cinatra instance setup dev` " +
+          "if a tunnel really is running for this instance.",
+      );
+      return;
+    }
+    throw new Error(
+      `cinatra instance tunnel ${action} cannot resolve this instance's tunnel ` +
+        `identity: no installed extension provides the identity helper. Refusing ` +
+        `to act on shared tunnel state without knowing which instance owns it. ` +
+        `Run \`cinatra instance setup dev\` first.`,
+    );
+  }
+
+  const identity = classifyDevTunnelIdentityFromModule(helperModule, {
+    dbUrl: mainDbUrl,
+    schema: mainSchema,
+    mainDatabase: declaredMainDatabase,
+  });
+  if (!identity.ok) {
+    const refusal =
+      typeof helperModule.describeDevTailscaleIdentityRefusal === "function"
+        ? helperModule.describeDevTailscaleIdentityRefusal(identity, mainDbUrl)
+        : (identity.reason ?? "This dev instance has no sanctioned tunnel identity.");
+    if (action === "status") {
+      // `status` never throws — it reports, and touches nothing.
+      console.log("cinatra instance tunnel — tunnel status");
+      console.log(`  tunnel identity: NONE (${identity.code})`);
+      console.log(refusal);
+      return;
+    }
+    throw new Error(refusal);
+  }
+
+  const tailscaleHostname = identity.hostname;
+  // Runtime state is keyed by the DERIVED identity. The reserved `dev-main`
+  // slug is produced only for the declared main identity, so its existing
+  // state keeps working and no other identity can reach it.
+  const tunnelSlug = devTunnelRuntimeSlug(identity);
   const DEV_MAIN_INDEX = 0;
+
+  // A real registered clone holding this slug would collide on the compose
+  // project + runtime dir. `readRegistry` is a safe non-throwing reader; a
+  // missing/empty registry just means "no clones", which is fine.
   let registeredClone = null;
   try {
-    registeredClone = getClone(readRegistry(defaultRegistryPath()), DEV_MAIN_SLUG);
+    registeredClone = getClone(readRegistry(defaultRegistryPath()), tunnelSlug);
   } catch {
     registeredClone = null;
   }
   if (registeredClone) {
     throw new Error(
-      `A registered clone named "${DEV_MAIN_SLUG}" exists — that name is ` +
-        `reserved by 'cinatra instance tunnel' for the local dev main. Prune or ` +
+      `A registered clone named "${tunnelSlug}" exists — that name is ` +
+        `reserved by 'cinatra instance tunnel' for this instance. Prune or ` +
         `rename the clone (it would collide on the compose project + runtime ` +
         `dir).`,
     );
   }
 
-  // Main's identity inputs from the main repo `.env.local`.
-  const mainDbUrl =
-    env.SUPABASE_DB_URL ?? process.env.SUPABASE_DB_URL ?? null;
-  const mainSchema =
-    env.SUPABASE_SCHEMA || process.env.SUPABASE_SCHEMA || "cinatra";
-
-  // NOTE: the predicted hostname (and its lazy connector-helper import) is
-  // derived in the `start` branch below — NOT here. `stop` needs no hostname,
-  // and `status` derives its own via `verifyRegisteredHostnameMatchesPrediction`
-  // (which lazy-imports internally), so neither must pay the connector-source
-  // import. Computing it in the shared preamble would hard-fail `stop`/`status`
-  // on an extension-empty checkout, defeating the cold-boot fix.
-
-  // Stable per-main runtime paths under the reserved "dev-main" slug.
-  // These clone-runtime helpers are slug-parameterised PURE path builders
-  // — passing the reserved slug is the lowest-risk reuse (no parallel
-  // path scheme invented).
-  const composePath = cloneComposePath(DEV_MAIN_SLUG);
-  const servePath = cloneTailscaleServePath(DEV_MAIN_SLUG);
-  const projectName = cloneComposeProjectName(DEV_MAIN_SLUG, DEV_MAIN_INDEX);
-  // The local dev main's Next.js port is the bare `pnpm dev` default
+  // Per-identity runtime paths. These clone-runtime helpers are
+  // slug-parameterised PURE path builders — passing the derived slug is the
+  // lowest-risk reuse (no parallel path scheme invented).
+  const runtimeDir = cloneRuntimeDir(tunnelSlug);
+  const composePath = cloneComposePath(tunnelSlug);
+  const servePath = cloneTailscaleServePath(tunnelSlug);
+  const projectName = cloneComposeProjectName(tunnelSlug, DEV_MAIN_INDEX);
+  // The local dev instance's Next.js port is the bare `pnpm dev` default
   // (3000) — NOT the 3100+ clone band.
   const nextjsPort = Number(env.PORT) || 3000;
+
+  // Defence in depth behind the slug: no 30-char slug mapping can be
+  // collision-free over 63-char hostnames, so the directory itself records its
+  // FULL canonical owner and a mismatch refuses rather than sharing state.
+  assertDevTunnelRuntimeDirOwnership({ runtimeDir, identity });
 
   if (action === "status") {
     // Never throws on "not running". Predicted hostname is already
@@ -11076,6 +11179,8 @@ async function runDevTunnel(argv) {
       registered: registeredDnsName,
       dbUrl: mainDbUrl,
       schema: mainSchema,
+      // cinatra#2172 — the reserved main identity is declared, never inferred.
+      mainDatabase: declaredMainDatabase,
       // cinatra#1919 — discover the tailscale-hostname declarer from THIS
       // checkout (getRepoRoot()), not the loader's monorepo-relative default.
       repoRoot,
@@ -11101,7 +11206,9 @@ async function runDevTunnel(argv) {
         await client.end().catch(() => null);
       }
     }
-    console.log("cinatra instance tunnel — main Tailscale Funnel status");
+    console.log("cinatra instance tunnel — Tailscale Funnel status");
+    console.log(`  tunnel identity:     ${identity.kind} (${identity.key})`);
+    console.log(`  runtime slug:        ${tunnelSlug}`);
     console.log(`  predicted hostname:  ${hostnameCheck.predicted}`);
     console.log(
       `  registered hostname: ${registeredDnsName ? hostnameCheck.registered : "(not running)"}`,
@@ -11162,7 +11269,7 @@ async function runDevTunnel(argv) {
         try {
           await writeClonePublicBaseUrl(mainDbUrl, null, { schemaName: mainSchema });
           console.log(
-            "cinatra instance tunnel stopped for main; publicBaseUrl cleared.",
+            `cinatra instance tunnel stopped for ${tunnelSlug}; publicBaseUrl cleared.`,
           );
         } catch (err) {
           console.warn(
@@ -11171,31 +11278,27 @@ async function runDevTunnel(argv) {
         }
       } else {
         console.log(
-          "cinatra instance tunnel stopped for main; left operator-set " +
+          `cinatra instance tunnel stopped for ${tunnelSlug}; left operator-set ` +
             `publicBaseUrl (source: ${src ?? "unknown"}) untouched.`,
         );
       }
       return;
     }
-    console.log("cinatra instance tunnel stopped for main; publicBaseUrl cleared.");
+    console.log(
+      `cinatra instance tunnel stopped for ${tunnelSlug}; publicBaseUrl cleared.`,
+    );
     return;
   }
 
   // --- action === "start" -------------------------------------------------
 
-  // SINGLE source of truth for the predicted hostname — never re-derive by
-  // hand. Expected `cinatra-main` for a default main. The connector helper is
-  // loaded lazily here (the `start` path is post-config, so the extension is
-  // present); `stop`/`status` already returned above without needing it.
-  const { deriveDevTailscaleHostname } = await loadTailscaleHostnameModule();
-  const tailscaleHostname = deriveDevTailscaleHostname({
-    dbUrl: mainDbUrl,
-    schema: mainSchema,
-  });
+  // `tailscaleHostname` came from the identity gate above — the SINGLE source
+  // of truth (`classifyDevTailscaleIdentity`). Never re-derived by hand, and
+  // never a fallthrough to the reserved literal.
 
-  // 1. Idempotency: skip if the dev-main compose project is already up.
+  // 1. Idempotency: skip if this identity's compose project is already up.
   if (isComposeProjectUp(projectName)) {
-    console.log("cinatra instance tunnel already running for main.");
+    console.log(`cinatra instance tunnel already running for ${tunnelSlug}.`);
     return;
   }
 
@@ -11250,7 +11353,21 @@ async function runDevTunnel(argv) {
     );
   }
 
-  // 4. Tailscale serve config — bridge networking (host-network is the
+  // 4. CLAIM the runtime directory for this identity BEFORE the first write
+  //    into it (an exclusive-create of the ownership manifest — two concurrent
+  //    runs on one slug cannot both win), so a crash mid-provision still leaves
+  //    the directory provably owned.
+  const { adoptedPreManifestState } = claimDevTunnelRuntimeDir({ runtimeDir, identity });
+  if (adoptedPreManifestState) {
+    console.warn(
+      `  NOTE: adopted pre-existing tunnel state in ${runtimeDir} that predates ` +
+        `ownership tracking; recording this instance as its owner. If that state ` +
+        `was provisioned by a DIFFERENT instance, stop this tunnel and remove ` +
+        `the directory.`,
+    );
+  }
+
+  //    Tailscale serve config — bridge networking (host-network is the
   //    Linux-only clone affordance; dev-tunnel uses bridge, so the
   //    sidecar proxies to host.docker.internal:<nextjsPort>, which
   //    writeTailscaleServeConfig already produces for hostNetwork:false).
@@ -11261,8 +11378,8 @@ async function runDevTunnel(argv) {
     hostNetwork: false,
   });
 
-  // 5. Render the per-main compose.yml from the SAME clone template, then
-  //    bring up ONLY the `tailscale` service: the dev main already runs
+  // 5. Render this identity's compose.yml from the SAME clone template, then
+  //    bring up ONLY the `tailscale` service: the dev instance already runs
   //    its own Next.js + WayFlow via `pnpm dev`, so starting wayflow/next
   //    here would clash on ports. WAYFLOW_PORT is set
   //    to an intentionally-unused high port (the wayflow service is never
@@ -11289,7 +11406,7 @@ async function runDevTunnel(argv) {
       WAYFLOW_PORT: DEV_MAIN_UNUSED_WAYFLOW_PORT,
       WORKTREE_PATH: repoRoot,
       TS_HOSTNAME: tailscaleHostname,
-      CLONE_STATE_DIR: cloneRuntimeDir(DEV_MAIN_SLUG),
+      CLONE_STATE_DIR: runtimeDir,
       TAILSCALE_NETWORK_MODE: "bridge",
     },
   });
@@ -11351,6 +11468,8 @@ async function runDevTunnel(argv) {
       registered: registeredDnsName,
       dbUrl: mainDbUrl,
       schema: mainSchema,
+      // cinatra#2172 — the reserved main identity is declared, never inferred.
+      mainDatabase: declaredMainDatabase,
       // cinatra#1919 — discover the tailscale-hostname declarer from THIS
       // checkout (getRepoRoot()), not the loader's monorepo-relative default.
       repoRoot,
@@ -11396,7 +11515,7 @@ async function runDevTunnel(argv) {
   }
 
   console.log("");
-  console.log("cinatra instance tunnel started for main.");
+  console.log(`cinatra instance tunnel started for ${tunnelSlug}.`);
   console.log(`  Funnel:  https://${tailscaleHostname}.<tailnet>.ts.net`);
   console.log(
     "  The dev tab at /configuration/development?tab=tunnel now reflects this URL.",
@@ -11686,17 +11805,38 @@ async function resolveCloneTailscaleHostname({
   } catch {
     // fall through to fresh derivation
   }
-  // Fresh: pure deterministic derivation, identical to the app preview. The
-  // connector hostname helper is loaded lazily (present on this post-config
+  // Fresh: pure deterministic classification, identical to the app preview. The
+  // connector identity helper is loaded lazily (present on this post-config
   // path); an absent extension falls through to the legacy name, honoring this
   // function's "never throws past this boundary" contract.
+  //
+  // cinatra#2172 — the fallback is NARROW and deliberately safe: `legacyHostname`
+  // is `cinatra-<slug>-<index>`, which is UNIQUE PER CLONE SLOT and can never be
+  // the reserved main identity, so falling back cannot bypass the fail-closed
+  // classification into a squat. A clone that classifies as unregistered is
+  // announced rather than silently downgraded.
+  let helperModule = null;
   try {
-    const { deriveDevTailscaleHostname } = await loadTailscaleHostnameModule();
-    return deriveDevTailscaleHostname({
+    helperModule = await loadTailscaleHostnameModule();
+  } catch {
+    return legacyHostname;
+  }
+  try {
+    const identity = classifyDevTunnelIdentityFromModule(helperModule, {
       dbUrl: cloneConnString,
       schema: schemaName,
     });
-  } catch {
+    if (identity.ok) return identity.hostname;
+    console.warn(
+      `  Clone has no classified tunnel identity (${identity.code}); using the ` +
+        `per-slot name "${legacyHostname}". ${identity.reason ?? ""}`.trim(),
+    );
+    return legacyHostname;
+  } catch (err) {
+    console.warn(
+      `  Could not classify the clone's tunnel identity (${err?.message ?? err}); ` +
+        `using the per-slot name "${legacyHostname}".`,
+    );
     return legacyHostname;
   }
 }

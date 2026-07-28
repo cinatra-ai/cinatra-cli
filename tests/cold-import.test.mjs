@@ -228,12 +228,12 @@ describe("extension-empty CLI bootstrap — post-config handlers degrade gracefu
     expect(output).toMatch(/cannot reach clone database/);
   });
 
-  it("`instance tunnel stop` tears down (exit 0, no ERR_MODULE_NOT_FOUND) when the connector is absent", () => {
-    // MEDIUM regression: `stop` needs no hostname derivation, so the lazy
-    // hostname-helper import lives in the `start` branch — not the shared
-    // preamble. An empty SUPABASE_DB_URL keeps the teardown DB-free, and the
-    // temp HOME means no dev-main compose project exists, so stop is a clean
-    // best-effort no-op that exits 0.
+  it("`instance tunnel stop` exits 0 (no ERR_MODULE_NOT_FOUND) and touches NOTHING when the connector is absent", () => {
+    // MEDIUM regression: an absent hostname-helper declarer must not crash the
+    // teardown path. cinatra#2172 tightened WHAT it does: the runtime state is
+    // keyed by the derived identity, so with no helper the identity is
+    // unknowable and `stop` is a clean no-op — it must NEVER fall back to the
+    // reserved slug and tear down a compose project it cannot prove it owns.
     const home = makeTempHome();
     const res = runCliExtensionAbsent(["instance", "tunnel", "stop"], {
       home,
@@ -245,5 +245,8 @@ describe("extension-empty CLI bootstrap — post-config handlers degrade gracefu
     expect(output).not.toMatch(/ERR_MODULE_NOT_FOUND/);
     expect(res.status).toBe(0);
     expect(output).toMatch(/cinatra instance tunnel stopped/);
+    // The honest no-op: identity unresolvable ⇒ nothing torn down.
+    expect(output).toMatch(/no tunnel identity is resolvable/);
+    expect(output).toMatch(/nothing was torn down/);
   });
 });
