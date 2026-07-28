@@ -24,13 +24,19 @@
 // All three are asserted from the index.mjs SOURCE TEXT (1 + 3) or via a
 // `runCli` call that throws before touching anything (2).
 
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { describe, it, expect } from "vitest";
 
-import { runCli } from "../src/index.mjs";
+import {
+  TAILSCALE_SERVE_FQDN_KEY,
+  buildTailscaleServeConfig,
+  runCli,
+  writeTailscaleServeConfig,
+} from "../src/index.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const INDEX_SRC = readFileSync(
@@ -265,12 +271,19 @@ describe("dev tunnel — matches runCloneStart hostname and public URL behavior"
 
   it("proves runtime-directory ownership before writing into it", () => {
     const assertOwner = body.indexOf("assertDevTunnelRuntimeDirOwnership({");
+    const claimOwner = body.indexOf("claimDevTunnelRuntimeDir({");
     const writeServe = body.indexOf("writeTailscaleServeConfig({");
     const renderCompose = body.indexOf("renderCloneComposeTemplate({");
     expect(assertOwner).toBeGreaterThan(-1);
     expect(assertOwner).toBeLessThan(writeServe);
     expect(assertOwner).toBeLessThan(renderCompose);
-    expect(body.includes("claimDevTunnelRuntimeDir({")).toBe(true);
+    // cinatra-cli#177 leans on this ordering: the CLAIM (manifest write) lands
+    // BEFORE the serve config, so a manifest-less dir holding a serve config is
+    // by construction legacy (hostname-keyed) — the adoption check depends on
+    // never meeting a post-#177 placeholder config without a manifest.
+    expect(claimOwner).toBeGreaterThan(assertOwner);
+    expect(claimOwner).toBeLessThan(writeServe);
+    expect(claimOwner).toBeLessThan(renderCompose);
   });
 });
 
@@ -478,5 +491,123 @@ describe("dev tunnel — post-sidecar failures tear the sidecar down (cinatra-cl
     );
     expect(stopBranch.includes("tearDownDevTunnelSidecar(")).toBe(true);
     expect(stopBranch.includes('"down"')).toBe(false);
+  });
+});
+
+// --- 7. cinatra-cli#177: serve config keys are tailnet-qualified -----------
+//
+// tailscaled matches incoming Funnel conns against the serve-config Web /
+// AllowFunnel keys and REJECTS anything else as unconfigured (`handleIngress:
+// got ingress conn for unconfigured <host>.<tailnet>.ts.net:443; rejecting`
+// in the daemon log; connect-then-TLS-EOF from outside). Keying on the bare
+// device hostname produced exactly that rejection. The generated config
+// therefore carries the LITERAL containerboot `${TS_CERT_DOMAIN}` placeholder,
+// which the sidecar substitutes with the daemon-reported tailnet-qualified
+// cert domain (MagicDNS collision suffix included) when applying
+// TS_SERVE_CONFIG — the byte-level shape is pinned here hermetically; only
+// the substitution itself needs a live daemon and stays out of unit scope.
+
+describe("serve config — FQDN-keyed via ${TS_CERT_DOMAIN} (cinatra-cli#177)", () => {
+  it("the key is the LITERAL containerboot placeholder (no JS interpolation)", () => {
+    // The regression class this pins: a template literal (or an env-expanded
+    // shell string) would swallow the placeholder at build time; containerboot
+    // needs the exact bytes `${TS_CERT_DOMAIN}` in the file.
+    expect(TAILSCALE_SERVE_FQDN_KEY).toBe("${TS_CERT_DOMAIN}:443");
+  });
+
+  it("builder is defined exactly once (not forked)", () => {
+    expect(defCount("buildTailscaleServeConfig")).toBe(1);
+  });
+
+  it("keys Web + AllowFunnel on the placeholder — bridge networking (dev tunnel + default clone)", () => {
+    expect(buildTailscaleServeConfig({ nextjsPort: 3100, hostNetwork: false })).toEqual({
+      TCP: { 443: { HTTPS: true } },
+      Web: {
+        "${TS_CERT_DOMAIN}:443": {
+          Handlers: { "/": { Proxy: "http://host.docker.internal:3100" } },
+        },
+      },
+      AllowFunnel: { "${TS_CERT_DOMAIN}:443": true },
+    });
+  });
+
+  it("keys Web + AllowFunnel on the placeholder — host networking (Linux clone affordance)", () => {
+    expect(buildTailscaleServeConfig({ nextjsPort: 3105, hostNetwork: true })).toEqual({
+      TCP: { 443: { HTTPS: true } },
+      Web: {
+        "${TS_CERT_DOMAIN}:443": {
+          Handlers: { "/": { Proxy: "http://127.0.0.1:3105" } },
+        },
+      },
+      AllowFunnel: { "${TS_CERT_DOMAIN}:443": true },
+    });
+  });
+
+  it("writes the file BYTE-IDENTICAL to the built shape, FQDN-keyed only, mode 0600", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "cinatra-cli177-serve-"));
+    try {
+      const servePath = path.join(dir, "state", "tailscale-serve.json");
+      writeTailscaleServeConfig({ servePath, nextjsPort: 3111, hostNetwork: false });
+      const bytes = readFileSync(servePath, "utf8");
+      expect(bytes).toBe(
+        JSON.stringify(
+          buildTailscaleServeConfig({ nextjsPort: 3111, hostNetwork: false }),
+          null,
+          2,
+        ),
+      );
+      const parsed = JSON.parse(bytes);
+      // EXACTLY one Web key and one AllowFunnel key, both the placeholder —
+      // no bare-hostname key can ride along.
+      expect(Object.keys(parsed.Web)).toEqual(["${TS_CERT_DOMAIN}:443"]);
+      expect(Object.keys(parsed.AllowFunnel)).toEqual(["${TS_CERT_DOMAIN}:443"]);
+      expect(statSync(servePath).mode & 0o777).toBe(0o600);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("serve-config generation is identity-INDEPENDENT (takes no hostname at all)", () => {
+    // The identity/normalization path (cinatra#2172 fail-closed classifier)
+    // decides the DEVICE hostname; the daemon then derives the FQDN itself.
+    // No identity outcome may leak into the serve config — a mis-normalized
+    // hostname must not be able to produce an unconfigured-ingress file.
+    const buildStart = INDEX_SRC.indexOf("function buildTailscaleServeConfig(");
+    const writeStart = INDEX_SRC.indexOf("function writeTailscaleServeConfig(");
+    expect(buildStart).toBeGreaterThan(-1);
+    expect(writeStart).toBeGreaterThan(buildStart);
+    const writeEnd = INDEX_SRC.indexOf("\n}", writeStart);
+    const helpers = INDEX_SRC.slice(buildStart, writeEnd);
+    expect(helpers.includes("tailscaleHostname")).toBe(false);
+    expect(helpers.includes("TAILSCALE_SERVE_FQDN_KEY")).toBe(true);
+  });
+
+  it("NO call site passes an identity hostname into the serve config", () => {
+    // Sweeps the definition AND every call site (clone start, dev tunnel,
+    // and any future one) in a single invariant. Paren-BALANCED slicing, not
+    // first-`})`: a future nested call inside the args must not truncate the
+    // inspected window and hide a hostname property behind it.
+    const sliceBalancedParens = (src, from) => {
+      const open = src.indexOf("(", from);
+      let depth = 0;
+      for (let i = open; i < src.length; i += 1) {
+        if (src[i] === "(") depth += 1;
+        else if (src[i] === ")") {
+          depth -= 1;
+          if (depth === 0) return src.slice(from, i + 1);
+        }
+      }
+      throw new Error("unbalanced parens after writeTailscaleServeConfig(");
+    };
+    let idx = INDEX_SRC.indexOf("writeTailscaleServeConfig({");
+    let occurrences = 0;
+    while (idx !== -1) {
+      occurrences += 1;
+      const args = sliceBalancedParens(INDEX_SRC, idx);
+      expect(args.includes("tailscaleHostname")).toBe(false);
+      idx = INDEX_SRC.indexOf("writeTailscaleServeConfig({", idx + 1);
+    }
+    // definition + clone-start call + dev-tunnel call.
+    expect(occurrences).toBe(3);
   });
 });
