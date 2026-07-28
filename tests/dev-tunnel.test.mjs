@@ -221,9 +221,11 @@ describe("dev tunnel — matches runCloneStart hostname and public URL behavior"
   });
 
   it("brings up ONLY the tailscale compose service with an inert WAYFLOW_PORT", () => {
-    expect(
-      body.includes('"up",\n    "-d",\n    "tailscale",'),
-    ).toBe(true);
+    // Whitespace-insensitive on purpose: the assertion is about the compose
+    // ARGUMENTS (only the `tailscale` service is started), not about how deeply
+    // the array happens to be indented (cinatra-cli#176 nests it inside the
+    // teardown guard).
+    expect(/"up",\s*"-d",\s*"tailscale",/.test(body)).toBe(true);
     expect(body.includes("DEV_MAIN_UNUSED_WAYFLOW_PORT")).toBe(true);
   });
 
@@ -376,5 +378,105 @@ describe("auto-bring-up Docker spawns carry a finite timeout (Step 3 must-fix)",
       const window = INDEX_SRC.slice(i, i + 600);
       expect(window.includes("timeout: DOCKER_CLI_PROBE_TIMEOUT_MS")).toBe(true);
     }
+  });
+});
+
+// --- 6. cinatra-cli#176: the start path is never left half-up ------------------
+//
+// `runDevTunnel` brings the Tailscale sidecar up and only then reads the
+// registered identity, checks it, and writes `publicBaseUrl`. Every step in
+// that window can throw; an unguarded throw leaves a registered node with no
+// URL, which the next `start` reports as "already running". The behavioural
+// contract of the guard itself is covered hermetically in
+// tests/dev-tunnel-cleanup.test.mjs; what is asserted here — from the SOURCE,
+// because this path needs Docker + Tailscale + a DB — is that the start path
+// actually routes through it, and that the teardown is reused, not forked.
+
+describe("dev tunnel — post-sidecar failures tear the sidecar down (cinatra-cli#176)", () => {
+  const start = INDEX_SRC.indexOf("async function runDevTunnel(");
+  const nextFn = INDEX_SRC.indexOf("\nfunction readPidFromFile(", start);
+  const body = INDEX_SRC.slice(start, nextFn);
+  // `status` reads the Funnel and runs the hostname check too — scope every
+  // ordering assertion to the START branch, which is the one that owns a
+  // sidecar it can leave half-up.
+  const startBranch = body.slice(body.indexOf('// --- action === "start"'));
+
+  it("wraps the post-sidecar segment in the teardown guard", () => {
+    expect(start).toBeGreaterThan(-1);
+    expect(nextFn).toBeGreaterThan(start);
+    expect(body.includes("runPostSidecarProvisioning(")).toBe(true);
+    // The guard is imported as a module, not re-implemented inline.
+    expect(
+      INDEX_SRC.includes(
+        'import { runPostSidecarProvisioning } from "./dev-tunnel-cleanup.mjs";',
+      ),
+    ).toBe(true);
+  });
+
+  it("the guarded window opens BEFORE the `compose up` spawn and closes ON the write", () => {
+    const guardIndex = startBranch.indexOf("runPostSidecarProvisioning(");
+    const upIndex = startBranch.indexOf('"up",');
+    const writeIndex = startBranch.indexOf(
+      "await writeClonePublicBaseUrl(mainDbUrl, funnelUrl",
+    );
+    const markIndex = startBranch.indexOf("markProvisioned();");
+    expect(guardIndex).toBeGreaterThan(-1);
+    // codex must-fix: `compose up` can leave a container behind on its own
+    // error/timeout path, so the up spawn AND its throw sit inside the guard.
+    expect(upIndex).toBeGreaterThan(guardIndex);
+    expect(startBranch.indexOf("docker compose up failed")).toBeGreaterThan(guardIndex);
+    expect(writeIndex).toBeGreaterThan(guardIndex);
+    // The durable write closes the guard — a later throw must not undo a
+    // legitimately provisioned tunnel.
+    expect(markIndex).toBeGreaterThan(writeIndex);
+  });
+
+  it("every fallible sidecar-owning call sits INSIDE the guarded window", () => {
+    const guardIndex = startBranch.indexOf("runPostSidecarProvisioning(");
+    expect(guardIndex).toBeGreaterThan(-1);
+    for (const call of [
+      'spawnSync("docker", upArgs',
+      "waitForTailscaleFunnelUrl({",
+      "verifyRegisteredHostnameMatchesPrediction({",
+      "writeClonePublicBaseUrl(mainDbUrl, funnelUrl",
+    ]) {
+      expect(startBranch.indexOf(call)).toBeGreaterThan(guardIndex);
+    }
+  });
+
+  it("bounds the cleanup `compose down` and names a teardown that could not finish", () => {
+    const i = INDEX_SRC.indexOf("function tearDownDevTunnelSidecar(");
+    expect(i).toBeGreaterThan(-1);
+    const helperSrc = INDEX_SRC.slice(i, INDEX_SRC.indexOf("\n}\n", i));
+    // CODE only — the rationale comments legitimately name the probe.
+    const helper = helperSrc
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("//"))
+      .join("\n");
+    // A hung teardown would hang the very command that is already failing.
+    expect(INDEX_SRC.includes("const COMPOSE_DOWN_TIMEOUT_MS = 120_000;")).toBe(true);
+    expect(helper.includes("timeout: COMPOSE_DOWN_TIMEOUT_MS")).toBe(true);
+    // codex round-2 must-fix: `isComposeAvailable()` is false for BOTH "docker
+    // absent" and "the probe hung", so it must NOT short-circuit the teardown
+    // into a claimed success — the `down` is always attempted once a compose
+    // file exists.
+    expect(helper.includes("isComposeAvailable()")).toBe(false);
+    // codex must-fix: a cleanup that could not complete is surfaced, not
+    // silently dropped — only the operator can finish it.
+    expect(startBranch.includes("cinatra instance tunnel stop`")).toBe(true);
+  });
+
+  it("tears down through the SHARED helper, defined exactly once", () => {
+    expect(defCount("tearDownDevTunnelSidecar")).toBe(1);
+    expect(body.includes("tearDownDevTunnelSidecar({ projectName, composePath })")).toBe(
+      true,
+    );
+    // `stop` uses the same helper — the teardown is never duplicated.
+    const stopBranch = body.slice(
+      body.indexOf('if (action === "stop") {'),
+      body.indexOf("// --- action === \"start\""),
+    );
+    expect(stopBranch.includes("tearDownDevTunnelSidecar(")).toBe(true);
+    expect(stopBranch.includes('"down"')).toBe(false);
   });
 });

@@ -149,6 +149,9 @@ import {
 // Manifest-driven dev-CLI module discovery (local leaf module — static import
 // is extension-empty safe; the actual extension reach stays a lazy import()).
 import { loadDevCliModule } from "./dev-cli-modules.mjs";
+// cinatra-cli#176 — post-sidecar atomicity guard for `instance tunnel start`. Pure
+// leaf (no I/O, no builtins); the teardown itself is injected at the call site.
+import { runPostSidecarProvisioning } from "./dev-tunnel-cleanup.mjs";
 // Tailscale OAuth-client (Design C) auth-key minting via the Nango Proxy. Local
 // leaf module (no `@cinatra-ai/*` reach — same minimal-dep doctrine as the
 // API-key read path); the worker receives only the minted auth-key, never the
@@ -3326,6 +3329,10 @@ const TOKEN_MINT_PROBE_TIMEOUT_MS = 5000;
 // `error.code === "ETIMEDOUT"`, surfaced as a soft-failed bring-up.
 const WAYFLOW_BUILD_TIMEOUT_MS = 600_000; // 10m — cold image build ceiling
 const COMPOSE_UP_TIMEOUT_MS = 120_000; // 2m — `compose up -d tailscale` ceiling
+// Ceiling for `compose down`. It runs on the cinatra-cli#176 cleanup path of a
+// command that is ALREADY failing, so a hung teardown would hang the failure
+// itself; the operator is told to finish the stop by hand instead.
+const COMPOSE_DOWN_TIMEOUT_MS = 120_000; // 2m — `compose down` ceiling
 // Per-`docker compose exec … tailscale status` ceiling. A single status read
 // is sub-second; cap it so a HUNG exec is killed and the polling loop's
 // `timeoutMs` deadline always stays reachable (a stuck exec must never make
@@ -10956,6 +10963,51 @@ async function runLogs(argv = []) {
   );
 }
 
+// Bring the dev-tunnel Tailscale sidecar DOWN. Single definition, used by BOTH
+// `instance tunnel stop` and the cinatra-cli#176 half-up guard on `start` — the
+// teardown is never forked (the reuse-not-duplication invariant asserted in
+// tests/dev-tunnel.test.mjs).
+//
+// Best-effort and NON-throwing: it runs on the failure path of `start`, where
+// throwing would replace the operator's actual cause with a cleanup error.
+// BOUNDED like every other docker spawn on the setup auto-bring-up path — a
+// hung `compose down` on the cleanup path would hang the very command that is
+// already failing.
+//
+// @returns {boolean} true when the sidecar is provably NOT left running:
+//   either there was nothing to tear down (no rendered compose file ⇒ no
+//   bring-up was ever attempted), or `docker compose down` exited 0. false
+//   whenever the teardown could not be completed OR could not be verified —
+//   the case the caller must surface, because only the operator can finish it.
+function tearDownDevTunnelSidecar({ projectName, composePath }) {
+  // No rendered compose file ⇒ no bring-up was ever attempted for this slug.
+  if (!existsSync(composePath)) {
+    return true;
+  }
+  // Deliberately NOT gated on `isComposeAvailable()` (codex round-2 must-fix):
+  // that probe returns false for BOTH "docker is not installed" AND "the docker
+  // CLI hung / the probe timed out". Treating the ambiguous case as "nothing to
+  // tear down" would silently leave a half-up sidecar — exactly the state this
+  // exists to prevent. A rendered compose file means a bring-up was attempted,
+  // so always ATTEMPT the bounded `down` and report what actually happened.
+  const downResult = spawnSync(
+    "docker",
+    ["compose", "-p", projectName, "-f", composePath, "down"],
+    { stdio: ["ignore", "inherit", "inherit"], timeout: COMPOSE_DOWN_TIMEOUT_MS },
+  );
+  if (downResult.error || downResult.status !== 0) {
+    const why =
+      downResult.error?.code === "ETIMEDOUT"
+        ? " (timed out)"
+        : downResult.error?.code === "ENOENT"
+          ? " (docker CLI not available)"
+          : ` (exit ${downResult.status})`;
+    console.warn(`docker compose down failed${why}.`);
+    return false;
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // `cinatra instance tunnel <start|stop|status>`.
 //
@@ -11235,16 +11287,7 @@ async function runDevTunnel(argv) {
     // tailscale-auto / tailscale-funnel); an
     // operator-pasted manual URL (e.g. a named Cloudflare/ngrok tunnel)
     // must NOT be silently destroyed by `instance tunnel stop`.
-    if (existsSync(composePath) && isComposeAvailable()) {
-      const downResult = spawnSync(
-        "docker",
-        ["compose", "-p", projectName, "-f", composePath, "down"],
-        { stdio: ["ignore", "inherit", "inherit"] },
-      );
-      if (downResult.status !== 0) {
-        console.warn(`docker compose down exited ${downResult.status}.`);
-      }
-    }
+    tearDownDevTunnelSidecar({ projectName, composePath });
     if (mainDbUrl) {
       const client = await createClient(mainDbUrl);
       let src = null;
@@ -11415,104 +11458,144 @@ async function runDevTunnel(argv) {
   // Start ONLY the tailscale service (mirror how clone-start scopes
   // services.push("tailscale") — but here that is the ONLY service).
   composeEnv.TS_AUTHKEY = tsAuthkey;
-  const upArgs = [
-    "compose",
-    "-p",
-    projectName,
-    "-f",
-    composePath,
-    "up",
-    "-d",
-    "tailscale",
-  ];
-  const upResult = spawnSync("docker", upArgs, {
-    env: composeEnv,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-    // Finite safety bound (cinatra#260 Step 3): the auto-bring-up from `cinatra
-    // setup dev` calls this — a hung `compose up` must not block setup forever.
-    // On timeout spawnSync kills the child; the throw below surfaces it (soft-
-    // failed by the setup caller).
-    timeout: COMPOSE_UP_TIMEOUT_MS,
-  });
-  const upStdout = scrubTailscaleAuthkey(upResult.stdout ?? "", tsAuthkey);
-  const upStderr = scrubTailscaleAuthkey(upResult.stderr ?? "", tsAuthkey);
-  if (upStdout) process.stdout.write(upStdout);
-  if (upStderr) process.stderr.write(upStderr);
-  if (upResult.error || upResult.status !== 0) {
-    throw new Error(
-      `docker compose up failed${
-        upResult.error?.code === "ETIMEDOUT" ? " (timed out)" : ` (exit ${upResult.status})`
-      }.`,
-    );
-  }
 
-  // Same shared path as runCloneStart: derive funnelUrl → guard on the RAW
-  // registered Self.DNSName → optimistic immediate write into the MAIN app
-  // DB's connector_config:mcp_server row → one honest informational log line
-  // (NO background poll in a one-shot CLI) → on a guard mismatch a typed
-  // TailscaleProvisionError, NO write.
-  const tailscaleFunnel = await waitForTailscaleFunnelUrl({
-    projectName,
-    composePath,
-    composeEnv,
-    timeoutMs: 60_000,
-  });
-  const funnelUrl = tailscaleFunnel?.url ?? null;
-  // Guard the RAW registered Self.DNSName, never a prediction-reconstructed
-  // value, because that would be circular.
-  const registeredDnsName = tailscaleFunnel?.registeredDnsName ?? null;
-  if (funnelUrl) {
-    console.log(`Tailscale Funnel URL: ${funnelUrl}`);
-    const hostnameCheck = await verifyRegisteredHostnameMatchesPrediction({
-      registered: registeredDnsName,
-      dbUrl: mainDbUrl,
-      schema: mainSchema,
-      // cinatra#2172 — the reserved main identity is declared, never inferred.
-      mainDatabase: declaredMainDatabase,
-      // cinatra#1919 — discover the tailscale-hostname declarer from THIS
-      // checkout (getRepoRoot()), not the loader's monorepo-relative default.
-      repoRoot,
-    });
-    // Tag the source so the dev tab can distinguish auto-provisioned
-    // (Nango OAuth client) from operator-pasted URLs.
-    const urlSource =
-      tailscaleAuthkeySource === "nango" ? "tailscale-auto" : "tailscale-funnel";
-    if (shouldWritePublicBaseUrl({ funnelUrl, hostnameCheck })) {
-      // Honor the resolved SUPABASE_SCHEMA (cinatra#260 Step 3 codex must-fix):
-      // a non-default-schema dev main must NOT have its publicBaseUrl written
-      // into a hardcoded "cinatra" schema as a side effect.
-      await writeClonePublicBaseUrl(mainDbUrl, funnelUrl, { source: urlSource, schemaName: mainSchema });
-      // A detached reachability poll is architecturally incoherent in a
-      // one-shot non-daemon CLI: the process exits on event-loop drain and the
-      // unref'd inter-iteration timer makes the loop unreachable after the
-      // first failed probe. The optimistic write above is the fix; the URL is
-      // deterministic and proven byte-identical to `Self.DNSName`.
-      // Reachability is propagation timing outside this CLI's lifecycle, so it
-      // is stated honestly in one line and the command exits promptly. No
-      // probe, no timers.
-      console.log(
-        `  publicBaseUrl written (source: ${urlSource}). Tailscale Funnel ` +
-          `cert/DNS for a fresh node typically takes a few minutes to ` +
-          `propagate — the URL is deterministic and correct; it becomes ` +
-          `reachable once propagation completes. (One-shot CLI does not ` +
-          `probe.)`,
-      );
-    } else {
-      const err = hostnameCheck.error;
+  // Then: derive funnelUrl → guard on the RAW registered Self.DNSName →
+  // optimistic immediate write into the MAIN app DB's connector_config:mcp_server
+  // row → one honest informational log line (NO background poll in a one-shot
+  // CLI) → on a guard mismatch a typed TailscaleProvisionError, NO write. The
+  // same shared path as runCloneStart.
+  //
+  // cinatra-cli#176 — everything from `compose up` on runs under a teardown guard.
+  // A THROWN failure before the publicBaseUrl write is durable (a `compose up`
+  // that fails or TIMES OUT after the container already started, a dev-CLI
+  // module that will not resolve, a dead `compose exec`, a failed DB write)
+  // tears the sidecar down and rethrows the ORIGINAL error, instead of leaving
+  // a registered Tailscale node that the next `start` short-circuits on and
+  // reports as "already running". The window opens BEFORE the up spawn on
+  // purpose: `compose up` can leave a container behind on the error/timeout
+  // path, and a `compose down` for a project that never came up is a no-op.
+  // `markProvisioned()` closes the guard the instant the write lands, so a
+  // later throw can never undo a good tunnel.
+  // Scope: only THROWS. A typed non-ok hostname check and a Funnel URL that
+  // never surfaces are RETURNED decisions — their policy is untouched here.
+  await runPostSidecarProvisioning(
+    async (markProvisioned) => {
+      const upArgs = [
+        "compose",
+        "-p",
+        projectName,
+        "-f",
+        composePath,
+        "up",
+        "-d",
+        "tailscale",
+      ];
+      const upResult = spawnSync("docker", upArgs, {
+        env: composeEnv,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        // Finite safety bound (cinatra#260 Step 3): the auto-bring-up from `cinatra
+        // setup dev` calls this — a hung `compose up` must not block setup forever.
+        // On timeout spawnSync kills the child; the throw below surfaces it (soft-
+        // failed by the setup caller).
+        timeout: COMPOSE_UP_TIMEOUT_MS,
+      });
+      const upStdout = scrubTailscaleAuthkey(upResult.stdout ?? "", tsAuthkey);
+      const upStderr = scrubTailscaleAuthkey(upResult.stderr ?? "", tsAuthkey);
+      if (upStdout) process.stdout.write(upStdout);
+      if (upStderr) process.stderr.write(upStderr);
+      if (upResult.error || upResult.status !== 0) {
+        throw new Error(
+          `docker compose up failed${
+            upResult.error?.code === "ETIMEDOUT" ? " (timed out)" : ` (exit ${upResult.status})`
+          }.`,
+        );
+      }
+
+      const tailscaleFunnel = await waitForTailscaleFunnelUrl({
+        projectName,
+        composePath,
+        composeEnv,
+        timeoutMs: 60_000,
+      });
+      const funnelUrl = tailscaleFunnel?.url ?? null;
+      // Guard the RAW registered Self.DNSName, never a prediction-reconstructed
+      // value, because that would be circular.
+      const registeredDnsName = tailscaleFunnel?.registeredDnsName ?? null;
+      if (funnelUrl) {
+        console.log(`Tailscale Funnel URL: ${funnelUrl}`);
+        const hostnameCheck = await verifyRegisteredHostnameMatchesPrediction({
+          registered: registeredDnsName,
+          dbUrl: mainDbUrl,
+          schema: mainSchema,
+          // cinatra#2172 — the reserved main identity is declared, never inferred.
+          mainDatabase: declaredMainDatabase,
+          // cinatra#1919 — discover the tailscale-hostname declarer from THIS
+          // checkout (getRepoRoot()), not the loader's monorepo-relative default.
+          repoRoot,
+        });
+        // Tag the source so the dev tab can distinguish auto-provisioned
+        // (Nango OAuth client) from operator-pasted URLs.
+        const urlSource =
+          tailscaleAuthkeySource === "nango" ? "tailscale-auto" : "tailscale-funnel";
+        if (shouldWritePublicBaseUrl({ funnelUrl, hostnameCheck })) {
+          // Honor the resolved SUPABASE_SCHEMA (cinatra#260 Step 3 codex must-fix):
+          // a non-default-schema dev main must NOT have its publicBaseUrl written
+          // into a hardcoded "cinatra" schema as a side effect.
+          await writeClonePublicBaseUrl(mainDbUrl, funnelUrl, { source: urlSource, schemaName: mainSchema });
+          // The durable outcome has landed: the sidecar is in service and must
+          // survive any later failure in this function.
+          markProvisioned();
+          // A detached reachability poll is architecturally incoherent in a
+          // one-shot non-daemon CLI: the process exits on event-loop drain and the
+          // unref'd inter-iteration timer makes the loop unreachable after the
+          // first failed probe. The optimistic write above is the fix; the URL is
+          // deterministic and proven byte-identical to `Self.DNSName`.
+          // Reachability is propagation timing outside this CLI's lifecycle, so it
+          // is stated honestly in one line and the command exits promptly. No
+          // probe, no timers.
+          console.log(
+            `  publicBaseUrl written (source: ${urlSource}). Tailscale Funnel ` +
+              `cert/DNS for a fresh node typically takes a few minutes to ` +
+              `propagate — the URL is deterministic and correct; it becomes ` +
+              `reachable once propagation completes. (One-shot CLI does not ` +
+              `probe.)`,
+          );
+        } else {
+          const err = hostnameCheck.error;
+          console.warn(
+            `  Tailscale hostname check failed: ${
+              err instanceof TailscaleProvisionError
+                ? `${err.code} — ${err.message}`
+                : err?.message ?? "unknown"
+            }. publicBaseUrl NOT written.`,
+          );
+        }
+      } else {
+        console.warn(
+          "Tailscale sidecar started but did not surface a Funnel URL within 60s.",
+        );
+      }
+    },
+    (cause) => {
+      // SECRET BOUNDARY: name the failure class, never re-echo a payload — the
+      // original error propagates to the CLI entrypoint, which prints it.
       console.warn(
-        `  Tailscale hostname check failed: ${
-          err instanceof TailscaleProvisionError
-            ? `${err.code} — ${err.message}`
-            : err?.message ?? "unknown"
-        }. publicBaseUrl NOT written.`,
+        `  Provisioning failed after the Tailscale sidecar came up (${
+          cause?.code ?? cause?.name ?? "error"
+        }) — tearing the sidecar down so nothing is left half-up.`,
       );
-    }
-  } else {
-    console.warn(
-      "Tailscale sidecar started but did not surface a Funnel URL within 60s.",
-    );
-  }
+      // A cleanup that could NOT complete must be named: the operator is the
+      // only one who can finish it, and silence here would recreate exactly the
+      // half-up state this guard exists to prevent.
+      if (!tearDownDevTunnelSidecar({ projectName, composePath })) {
+        console.warn(
+          "  Sidecar teardown did not complete — a Tailscale node may still be " +
+            "running for this instance. Run `cinatra instance tunnel stop`.",
+        );
+      }
+    },
+  );
 
   console.log("");
   console.log(`cinatra instance tunnel started for ${tunnelSlug}.`);
