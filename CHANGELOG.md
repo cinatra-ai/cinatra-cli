@@ -173,7 +173,7 @@ extension-acquisition fix, so the app can pin a fixed CLI without adopting the
 ### Fixed
 
 - **Production extension acquisition no longer fails on the pnpm workspace
-  symlink.** Backports the `cinatra-ai/cinatra#735` fix onto the 0.1.3 command
+  symlink.** Backports the production extension-acquisition fix onto the 0.1.3 command
   surface: the acquired-tree re-verify walk (`computeTreeSha256FromDir`) now
   skips a `node_modules` install root even when pnpm lands it as a symlink — the
   in-repo `@cinatra-ai/sdk-extensions` workspace package linked into each acquired
@@ -181,14 +181,13 @@ extension-acquisition fix, so the app can pin a fixed CLI without adopting the
   Branched from `v0.1.3` and ports ONLY this fix (none of the `dev`→`instance`,
   `setup`→internal-phase, or bare-form-removal refactors). Integrity is unchanged:
   a device/FIFO `node_modules`, and any symlink OUTSIDE `node_modules`, still
-  hard-fail. (`cinatra-ai/cinatra#735`)
+  hard-fail.
 
 ## [0.1.5] - 2026-06-30
 
 The new/reorganized command surface plus the production extension-acquisition fix
 at the new boundary. Published, but the Cinatra app stays on the 0.1.6 backport
-for this release cycle; adopting this surface is tracked in
-`cinatra-ai/cinatra#742`.
+for this release cycle.
 
 ### Changed
 
@@ -205,17 +204,17 @@ for this release cycle; adopting this surface is tracked in
   + **`configSchema`**, artifact descriptor, skill naming, workflow BPMN). The
   `connector/`, `artifact/`, and `skill/` template CI workflows now run it as a
   real `kind-gates` job instead of a no-op echo. Authors catch what the
-  marketplace would reject BEFORE publishing, for every kind. (cinatra-cli#72)
+  marketplace would reject BEFORE publishing, for every kind.
 - **Scaffolded connectors now declare `cinatra.uiSurface: "schema-config"` with a
   starter `cinatra.configSchema`** (a `text` + `secret` setup form) — the
   hot-installable declarative setup surface the host renders WITHOUT a rebuild.
   This replaces the old bundled-React `setup-page.tsx` assumption as the default.
-  The gate validates the `configSchema` (the extended cinatra#658 vocabulary:
+  The gate validates the `configSchema` (the extended setup-field vocabulary:
   `select`, `record-list`, `banner`, `advisory` in addition to `text`, `secret`,
   `nango-connect`, `repeatable-list`, `status-probe`, `copyable-credential`,
   `named-action`) and rejects any smuggled per-field key — the configSchema is
   pure data, never executable code or HTML. See **Migrating to hot-installable
-  extensions** in `templates/_shared/MIGRATING-HOT-INSTALL.md`. (cinatra-cli#72)
+  extensions** in `templates/_shared/MIGRATING-HOT-INSTALL.md`.
 
 ### Removed
 
@@ -228,8 +227,8 @@ for this release cycle; adopting this surface is tracked in
 
 - **Production extension acquisition.** The acquired-tree re-verify walk
   (`computeTreeSha256FromDir`) now skips a `node_modules` install root even when
-  pnpm lands it as a symlink, fixing a fail-closed production install
-  (`cinatra-ai/cinatra#735`). Integrity is unchanged: a device/FIFO
+  pnpm lands it as a symlink, fixing a fail-closed production install.
+  Integrity is unchanged: a device/FIFO
   `node_modules`, and any symlink OUTSIDE `node_modules`, still hard-fail. (#86)
 
 ## [0.1.4] - 2026-06-29
