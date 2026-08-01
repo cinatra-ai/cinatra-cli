@@ -91,9 +91,43 @@ jobs:
           fi
 
       - name: Test
+        # WHY THIS SKIP EXISTS, AND WHAT IT ACTUALLY DEPENDS ON.
+        #
+        # A repo declaring host-internal @cinatra-ai/* peers cannot run its
+        # tests standalone: those peers live only in the cinatra monorepo and
+        # resolve nowhere else. The host runs them instead — but that is a
+        # CONDITIONAL claim, and this workflow can verify none of it, so the
+        # conditions are written down rather than assumed:
+        #
+        #   1. NECESSARY: the repo is ENROLLED in one of the host's clone-back
+        #      locks (cinatra-required-extensions.lock.json for the production
+        #      bootable set, cinatra-dev-extensions.lock.json otherwise). Until
+        #      it is, the host never materializes this package, and NOTHING runs
+        #      these tests — not this workflow, not the host. A freshly
+        #      scaffolded repo is in exactly that state.
+        #   2. RECOMMENDED: ship a package-local vitest.config.ts. A package
+        #      without one does still run — the host discovers it — but it
+        #      inherits the HOST ROOT config, whose `include` is written for the
+        #      host tree, so any test file outside that shape is collected by
+        #      nobody. The host gate treats that as a failure rather than
+        #      ignoring it, which is a red build instead of silent non-coverage.
+        #
+        # Once enrolled, the host's discovery gate
+        # (scripts/ci/extension-suite-gate.mjs, inside the REQUIRED "Perpetual
+        # system loops invariants" check) runs this suite on every non-skipped
+        # host validation run — draft and docs-only PRs green-stub that job by
+        # design — and fails if any on-disk test file went unexecuted. That gate
+        # also fails if a repo skips its tests here while the host does not run
+        # them, so the claim below cannot go quietly stale.
+        #
+        # This wording replaces "the cinatra monorepo runs these", asserted
+        # unconditionally and false for 32 of 36 repos when cinatra#2288
+        # measured it: ~1,600 tests across 30+ suites were running in no gate
+        # anywhere, each repo's CI pointing at a host that was not looking.
         run: |
           if [ "$first_party" = "1" ]; then
-            echo "Skipping standalone tests (host-internal @cinatra-ai/* peers are tested by the host workspace)."
+            echo "Skipping standalone tests: host-internal @cinatra-ai/* peers resolve only in the cinatra monorepo."
+            echo "The host runs this suite ONLY once this repo is enrolled in a cinatra clone-back lock — until then nothing runs these tests. See the comment above."
             exit 0
           fi
           corepack pnpm test --if-present
