@@ -76,7 +76,7 @@ export const COMMAND_DESCRIPTORS = [
     path: ["install"],
     match: "command",
     summary:
-      "Bootstrap OR reconcile a Cinatra dev/prod/demo instance — the single idempotent entrypoint (--mode demo = a dev superset with the bundled apps + sample data, pre-connected).",
+      "Bootstrap OR reconcile a Cinatra instance — the single idempotent entrypoint. --mode dev|prod|demo|preview: `demo` is a strict superset of dev (bundled apps + sample data, pre-connected); `preview` is NOT a runtime mode but a COMPOSITION — the dev install, then `instance preview create` builds + boots a local non-production image at the resolved SHA, health-gated, while the checkout stays CINATRA_RUNTIME_MODE=development.",
   },
   {
     id: "update",
@@ -328,7 +328,10 @@ export const COMMAND_DESCRIPTORS = [
   // local / non-production (the image-based successor to host-prod-of-main the
   // S4 runtime contract declined, cinatra-ai/cinatra#1580). It is a DISTINCT
   // lifecycle with its own create/refresh verbs and its own registry
-  // (previews.json), NOT a third `install --mode` value.
+  // (previews.json), NOT a runtime `install --mode` value. cinatra-cli#188 adds
+  // `install --mode preview` as a documented FRONT DOOR — a composition that
+  // performs a dev install and then calls THESE verbs; the lifecycle, registry
+  // and port pool below stay the single implementation.
   {
     id: "preview.create",
     path: ["instance", "preview", "create"],

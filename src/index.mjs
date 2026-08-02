@@ -478,17 +478,31 @@ Commands:
                     phase; a dirty checkout is refused unless --force (stashes).
                     --dir <path>      Install location (default: ./cinatra; prompts on a TTY).
                     --ref <ref>       Branch, tag, or commit to install (default: main).
-                    [dev|prod|demo]   Install mode as a POSITIONAL — \`cinatra
+                    [dev|prod|demo|preview]
+                                      Install mode as a POSITIONAL — \`cinatra
                                       install demo\` is equivalent to \`--mode demo\`
                                       (pass it ONE way; conflicting forms like
                                       \`install demo --mode prod\` are refused, as is
                                       any unknown trailing argument).
-                    --mode dev|prod|demo
+                    --mode dev|prod|demo|preview
                                       Install mode (default: dev). "demo" is a
                                       strict superset of dev: the same dev base
                                       plus the bundled apps (WordPress/Drupal/
                                       Twenty/Plane) with sample data, pre-connected
                                       (needs a checkout shipping the demo overlay).
+                                      "preview" is NOT a runtime mode — it is a
+                                      COMPOSITION (cinatra-cli#188): the normal dev
+                                      provisioning, then this instance's config wired
+                                      into \`cinatra instance preview create\` (build +
+                                      boot a local non-production image at the resolved
+                                      SHA, health-gated on /api/health). The checkout
+                                      stays CINATRA_RUNTIME_MODE=development —
+                                      production semantics live only inside the
+                                      container — and the created preview is managed by
+                                      \`instance preview refresh|status|list\`, not by
+                                      re-running install (a rerun reconciles the
+                                      checkout, reports the existing preview, and points
+                                      ref drift at \`refresh\`).
                     --repo-url <url>  Override the cinatra repo remote (HTTPS-token or SSH).
                     --yes             Accept defaults / confirmations (non-interactive / CI).
                     --force           Update a DIRTY checkout (stash first); clone into a non-empty dir.
@@ -13609,9 +13623,16 @@ function buildHandlers() {
       const { runPreviewCreate } = await import("./preview.mjs");
       await runPreviewCreate(rest, { checkoutDir: getRepoRoot() });
     },
+    // cinatra-cli#188: refresh routes through the front door's continuation so a
+    // preview created by `install --mode preview` can actually be rebuilt by the
+    // command its own handoff names — the boot key it minted lives in the CLI's
+    // secrets store, and its endpoints must stay container-reachable. Purely
+    // additive for every other preview: the composed values are only a BASE that
+    // an exported environment overrides, and a checkout with no `.env.local`
+    // composes nothing, so an env-driven refresh is byte-unchanged.
     "preview.refresh": async (rest) => {
-      const { runPreviewRefresh } = await import("./preview.mjs");
-      await runPreviewRefresh(rest, { checkoutDir: getRepoRoot() });
+      const { runInstallPreviewRefresh } = await import("./install-preview.mjs");
+      await runInstallPreviewRefresh(rest, { checkoutDir: getRepoRoot() });
     },
     "preview.status": async (rest) => {
       const { runPreviewStatus } = await import("./preview.mjs");

@@ -27,6 +27,7 @@ Requires Node.js >= 24.
     cinatra install --mode dev       # set up OR reconcile a dev instance (single entrypoint)
     cinatra install --mode prod      # set up OR reconcile a production instance
     cinatra install --mode demo      # a dev superset: bundled apps + sample data, pre-connected
+    cinatra install --mode preview   # a dev install, then build + boot a local preview container
     cinatra status                   # check an instance's status
     cinatra doctor                   # diagnose your local setup
     cinatra agents install <name>    # add an agent to your instance
@@ -47,6 +48,18 @@ and rides an orthogonal `CINATRA_INSTALL_PROFILE=demo` signal, so `dev`/`prod`
 behaviour is unchanged. Demo requires a Cinatra checkout that ships the demo overlay;
 on a checkout that predates it, `--mode demo` refuses with a clear message rather
 than producing a half-populated instance.
+
+`--mode preview` is **not a runtime mode — it is a composition**: the same dev
+provisioning, then that instance's configuration wired into `cinatra instance
+preview create`, which builds a local, explicitly non-production image at the
+resolved commit SHA and boots it health-gated on `/api/health`. One command takes
+you from zero to a running preview of a given ref. The checkout it leaves behind
+is an ordinary dev install — `CINATRA_RUNTIME_MODE=development`, `pnpm dev` still
+works — because the production runtime lives only inside the container. The
+preview it creates is managed by its own verbs (`cinatra instance preview
+refresh | status | list`), not by re-running `install`: a re-run reconciles the
+checkout, reports the existing preview, and points ref drift at `refresh`, so an
+image rebuild is always something you ask for explicitly.
 
 The other local host/monorepo bootstrap commands you run from inside a Cinatra
 checkout live under `cinatra instance …`:
