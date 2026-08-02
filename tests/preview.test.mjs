@@ -28,6 +28,10 @@ const {
   assertPreviewCheckoutAllowed,
   readCheckoutEnvMode,
   buildPreviewRunEnvArgs,
+  rewriteLoopbackUrlForContainer,
+  CONTAINER_HOST_GATEWAY,
+  CONTAINER_REWRITE_ENV_KEYS,
+  PASSTHROUGH_ENV_KEYS,
   classifyHealthResponse,
   pollHealthGate,
   usedPreviewHostPorts,
@@ -232,6 +236,121 @@ describe("preview — production runtime env (AC2)", () => {
     expect(joined).toContain("SUPABASE_DB_URL=postgres://x");
     // Never a published image name anywhere in the env.
     expect(joined).not.toContain("ghcr.io/cinatra-ai/cinatra");
+  });
+});
+
+// --------------------------------------------------------------------------
+// cinatra-cli#190 — the registry env reaches the container, container-reachable
+// --------------------------------------------------------------------------
+
+describe("preview — agent-registry env forwarding (cinatra-cli#190)", () => {
+  it("AC1: both registry keys are in the passthrough set and are forwarded when present", () => {
+    expect(PASSTHROUGH_ENV_KEYS).toContain("CINATRA_AGENT_REGISTRY_URL");
+    expect(PASSTHROUGH_ENV_KEYS).toContain("CINATRA_AGENT_REGISTRY_UI_URL");
+    const args = buildPreviewRunEnvArgs({
+      encryptionKey: KEY_64,
+      env: {
+        [ENCRYPTION_KEY_ENV]: KEY_64,
+        CINATRA_AGENT_REGISTRY_URL: "https://registry.example.test",
+        CINATRA_AGENT_REGISTRY_UI_URL: "https://registry.example.test",
+      },
+    });
+    const joined = args.join(" ");
+    expect(joined).toContain("CINATRA_AGENT_REGISTRY_URL=https://registry.example.test");
+    expect(joined).toContain("CINATRA_AGENT_REGISTRY_UI_URL=https://registry.example.test");
+  });
+
+  it("AC2: the container-DIALED registry address is rewritten to the gateway host", () => {
+    const args = buildPreviewRunEnvArgs({
+      encryptionKey: KEY_64,
+      env: {
+        [ENCRYPTION_KEY_ENV]: KEY_64,
+        CINATRA_AGENT_REGISTRY_URL: "http://127.0.0.1:4973",
+        CINATRA_AGENT_REGISTRY_UI_URL: "http://127.0.0.1:4973",
+      },
+    });
+    const joined = args.join(" ");
+    expect(joined).toContain(`CINATRA_AGENT_REGISTRY_URL=http://${CONTAINER_HOST_GATEWAY}:4973`);
+    // The UI URL is BROWSER-resolved (it only feeds a display field), so it is
+    // forwarded verbatim — a container-only name would not resolve on the host.
+    expect(joined).toContain("CINATRA_AGENT_REGISTRY_UI_URL=http://127.0.0.1:4973");
+    expect(joined).not.toContain(`CINATRA_AGENT_REGISTRY_UI_URL=http://${CONTAINER_HOST_GATEWAY}`);
+  });
+
+  it("AC2: browser-resolved URLs are never rewritten", () => {
+    for (const key of ["NEXT_PUBLIC_APP_URL", "BETTER_AUTH_URL", "NEXT_PUBLIC_SITE_URL", "CINATRA_AGENT_REGISTRY_UI_URL"]) {
+      expect(CONTAINER_REWRITE_ENV_KEYS).not.toContain(key);
+    }
+    const args = buildPreviewRunEnvArgs({
+      encryptionKey: KEY_64,
+      env: {
+        [ENCRYPTION_KEY_ENV]: KEY_64,
+        NEXT_PUBLIC_APP_URL: "http://localhost:3400",
+        BETTER_AUTH_URL: "http://localhost:3400",
+      },
+    });
+    const joined = args.join(" ");
+    expect(joined).toContain("NEXT_PUBLIC_APP_URL=http://localhost:3400");
+    expect(joined).toContain("BETTER_AUTH_URL=http://localhost:3400");
+    expect(joined).not.toContain(`NEXT_PUBLIC_APP_URL=http://${CONTAINER_HOST_GATEWAY}`);
+  });
+
+  it("AC6: with no registry configured on the host, NOTHING is forwarded (hosted default stands)", () => {
+    const args = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env: { [ENCRYPTION_KEY_ENV]: KEY_64 } });
+    const joined = args.join(" ");
+    expect(joined).not.toContain("CINATRA_AGENT_REGISTRY_URL");
+    expect(joined).not.toContain("CINATRA_AGENT_REGISTRY_UI_URL");
+    // An empty-string value is equally "not configured".
+    const empty = buildPreviewRunEnvArgs({
+      encryptionKey: KEY_64,
+      env: { [ENCRYPTION_KEY_ENV]: KEY_64, CINATRA_AGENT_REGISTRY_URL: "" },
+    });
+    expect(empty.join(" ")).not.toContain("CINATRA_AGENT_REGISTRY_URL");
+  });
+
+  it("the boot maps the gateway host so the rewritten value resolves on a Linux engine too", async () => {
+    const { deps, fake } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' } },
+      { env: { [ENCRYPTION_KEY_ENV]: KEY_64, CINATRA_AGENT_REGISTRY_URL: "http://127.0.0.1:4973" } },
+    );
+    await runPreviewCreate(["--slug", "main"], deps);
+    const run = fake.calls.find((c) => c[0] === "run");
+    expect(run.join(" ")).toContain(`--add-host ${CONTAINER_HOST_GATEWAY}:host-gateway`);
+    expect(run.join(" ")).toContain(`CINATRA_AGENT_REGISTRY_URL=http://${CONTAINER_HOST_GATEWAY}:4973`);
+  });
+
+  it("the rewrite preserves everything but the host, is idempotent, and never guesses", () => {
+    const g = CONTAINER_HOST_GATEWAY;
+    // Origin-only URL keeps its exact shape (no appended root path).
+    expect(rewriteLoopbackUrlForContainer("http://127.0.0.1:4973")).toBe(`http://${g}:4973`);
+    // localhost, the whole 127/8 loopback block, and IPv6 loopback all count.
+    expect(rewriteLoopbackUrlForContainer("http://localhost:4973/-/ping")).toBe(`http://${g}:4973/-/ping`);
+    expect(rewriteLoopbackUrlForContainer("http://127.0.0.2:4973")).toBe(`http://${g}:4973`);
+    expect(rewriteLoopbackUrlForContainer("redis://[::1]:6379")).toBe(`redis://${g}:6379`);
+    // userinfo, port, path, query and fragment survive untouched.
+    expect(rewriteLoopbackUrlForContainer("postgresql://u:p@127.0.0.1:5434/postgres?sslmode=disable")).toBe(
+      `postgresql://u:p@${g}:5434/postgres?sslmode=disable`,
+    );
+    // Idempotent — a value already at the gateway is not loopback.
+    expect(rewriteLoopbackUrlForContainer(`http://${g}:4973`)).toBe(`http://${g}:4973`);
+    // Never guesses: a non-loopback host, a non-URL, and empty are unchanged.
+    expect(rewriteLoopbackUrlForContainer("https://registry.cinatra.ai")).toBe("https://registry.cinatra.ai");
+    expect(rewriteLoopbackUrlForContainer("not a url")).toBe("not a url");
+    expect(rewriteLoopbackUrlForContainer("")).toBe("");
+    // A loopback-LOOKING hostname that is not loopback is left alone.
+    expect(rewriteLoopbackUrlForContainer("http://localhost.example.test:4973")).toBe(
+      "http://localhost.example.test:4973",
+    );
+    // A NON-SPECIAL scheme keeps an opaque host, so an out-of-range "127.x" is
+    // NOT a loopback address and must not be rewritten.
+    expect(rewriteLoopbackUrlForContainer("postgresql://127.999.999.999:5434/db")).toBe(
+      "postgresql://127.999.999.999:5434/db",
+    );
+    // Odd-but-accepted spellings are normalised by the URL parser, never spliced
+    // into a corrupt value.
+    expect(rewriteLoopbackUrlForContainer("http:////127.0.0.1:4973")).toBe(`http://${g}:4973`);
+    // A trailing slash the operator actually wrote is preserved.
+    expect(rewriteLoopbackUrlForContainer("http://127.0.0.1:4973/")).toBe(`http://${g}:4973/`);
   });
 });
 

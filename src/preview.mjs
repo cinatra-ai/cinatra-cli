@@ -151,6 +151,56 @@ export const PASSTHROUGH_ENV_KEYS = [
   "NANGO_ENCRYPTION_KEY",
   "OPENAI_API_KEY",
   "CINATRA_BRIDGE_TOKEN",
+  // cinatra-cli#190: the agent-registry (Verdaccio) client URLs. Without them
+  // the container falls back to the HOSTED default
+  // (`https://registry.cinatra.ai`, `packages/registries` `loadVerdaccioConfig`)
+  // for which it holds no credentials, so every marketplace/extension install
+  // inside a preview fails 401 and the vendor-application reconcile sweep
+  // reports its marketplace bearer unavailable. `install.mjs` already treats
+  // exactly these two keys as isolation-critical (`ISOLATED_INFRA_ENV_KEYS`,
+  // cinatra-cli#36): a WRONG value aborts an isolated install, so shipping NO
+  // value — and landing on the public hosted registry — is the same
+  // mis-routing. When neither is set on the host, nothing is forwarded and the
+  // hosted default still applies (#190 AC6).
+  "CINATRA_AGENT_REGISTRY_URL",
+  "CINATRA_AGENT_REGISTRY_UI_URL",
+];
+
+// The container-side name for "the operator's host" (cinatra-cli#190). Docker
+// Desktop resolves `host.docker.internal` natively; `bootPreviewContainer` also
+// maps it explicitly via `--add-host …:host-gateway` so a Linux engine (Docker
+// >= 20.10) resolves the same name. This mirrors the host-loopback treatment
+// `rewriteConnectionStringForDocker` (`src/index.mjs`) already applies before
+// handing a host connection string to a container.
+export const CONTAINER_HOST_GATEWAY = "host.docker.internal";
+
+// Hostnames that mean "the machine I am running on". On the HOST they address
+// host services; INSIDE the container they address the container itself, so a
+// forwarded value carrying one of these is not merely wrong, it is silently
+// wrong — it trades the 401 for a connection refused.
+const HOST_LOOPBACK_HOSTNAMES = new Set(["localhost", "::1"]);
+
+// The forwarded keys whose value is an endpoint the CONTAINER ITSELF dials on
+// the operator's host, and which therefore needs the host-loopback rewrite.
+//
+// Deliberately NARROW — a forwarded value is rewritten only when the CONTAINER
+// is the thing that resolves it:
+//   - CINATRA_AGENT_REGISTRY_URL is the registry the server-side install/publish
+//     path fetches from (`packages/registries` verdaccio client), so it IS
+//     rewritten.
+//   - CINATRA_AGENT_REGISTRY_UI_URL is NOT. In the app it feeds only the
+//     `uiUrl` → `registryUiUrl` display field on package summaries; nothing
+//     fetches it. It is resolved by the operator's BROWSER, where a
+//     container-only name does not resolve — so it is forwarded VERBATIM
+//     (still fixing the "falls back to the hosted registry" half of #190).
+//   - `NEXT_PUBLIC_APP_URL` / `BETTER_AUTH_URL` / `NEXT_PUBLIC_SITE_URL` are
+//     browser-resolved for the same reason and are likewise never rewritten.
+// This is the split cinatra-cli#188 AC5 draws between host-infra endpoints and
+// app/auth URLs; the DB/Redis endpoints named there are the other members of
+// the container-dialed class and join this list through the SAME helper rather
+// than a second rewrite.
+export const CONTAINER_REWRITE_ENV_KEYS = [
+  "CINATRA_AGENT_REGISTRY_URL",
 ];
 
 // --- slug / name / tag -----------------------------------------------------
@@ -329,6 +379,69 @@ export function readCheckoutEnvMode(checkoutDir) {
   return null;
 }
 
+// --- host-loopback → container-reachable rewrite (cinatra-cli#190) ---------
+
+/**
+ * True for a hostname that resolves to the local machine: `localhost`, the IPv6
+ * loopback, or any address in the IPv4 loopback block 127.0.0.0/8. Octets are
+ * range-checked because a NON-SPECIAL scheme (`postgresql:`, `redis:`) keeps an
+ * opaque host, so `127.999.999.999` reaches here without the URL parser having
+ * rejected it — and that is not a loopback address.
+ */
+function isHostLoopbackHostname(hostname) {
+  const h = String(hostname ?? "").toLowerCase().replace(/^\[|\]$/g, "");
+  if (HOST_LOOPBACK_HOSTNAMES.has(h)) return true;
+  const m = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  return m !== null && m.slice(1).every((o) => Number(o) <= 255);
+}
+
+/**
+ * Rewrite a host-loopback URL to one the preview CONTAINER can reach.
+ *
+ * The single rewrite mechanism for this file: `install --mode dev` seeds
+ * `.env.local` with host-loopback endpoints (an isolated install writes
+ * `CINATRA_AGENT_REGISTRY_URL=http://127.0.0.1:<verdaccio>`, `install.mjs`
+ * cinatra-cli#36), and the preview container is bridged (`docker run -p`), so
+ * forwarding such a value verbatim points the container at itself.
+ *
+ * Only the HOST changes. The rewrite goes through the URL parser rather than
+ * splicing the raw string, so odd-but-accepted spellings (`http:////host`,
+ * backslash forms) are normalised instead of corrupted; the one normalisation
+ * that would visibly alter an operator's value — the root path `new URL()`
+ * appends to an origin-only URL — is undone so `http://127.0.0.1:4873` stays
+ * `http://<gateway>:4873`.
+ *
+ * Non-loopback hosts and values that are not URLs are returned UNCHANGED — the
+ * rewrite never guesses. It is also idempotent: a value already pointing at the
+ * gateway host parses to a non-loopback hostname and is left alone.
+ *
+ * @param {string} value
+ * @param {string} [gatewayHost]
+ * @returns {string}
+ */
+export function rewriteLoopbackUrlForContainer(value, gatewayHost = CONTAINER_HOST_GATEWAY) {
+  if (typeof value !== "string" || value.length === 0) return value;
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return value; // not a URL — leave it exactly as the operator set it
+  }
+  if (!isHostLoopbackHostname(parsed.hostname)) return value;
+  parsed.hostname = gatewayHost;
+  const rewritten = parsed.toString();
+  if (
+    parsed.pathname === "/" &&
+    parsed.search === "" &&
+    parsed.hash === "" &&
+    rewritten.endsWith("/") &&
+    !value.endsWith("/")
+  ) {
+    return rewritten.slice(0, -1);
+  }
+  return rewritten;
+}
+
 // --- runtime env for `docker run` (AC2 + the NEVERs) -----------------------
 
 /**
@@ -337,7 +450,11 @@ export function readCheckoutEnvMode(checkoutDir) {
  *  - ALWAYS sets CINATRA_RUNTIME_MODE=production (AC2).
  *  - ALWAYS sets CINATRA_EXTENSION_DATA_ROOT to the durable-volume mount path (AC4).
  *  - Requires + forwards CINATRA_ENCRYPTION_KEY (AC6, validated by caller).
- *  - Forwards the known DB/auth/redis passthrough keys when present in `env`.
+ *  - Forwards the known DB/auth/redis/registry passthrough keys when present in `env`.
+ *  - Rewrites the host-loopback endpoints the CONTAINER dials
+ *    (CONTAINER_REWRITE_ENV_KEYS) to the container-reachable gateway host
+ *    (cinatra-cli#190) — forwarding `127.0.0.1:<port>` verbatim would only trade
+ *    a 401 for a connection refused.
  *  - NEVER forwards CINATRA_DISABLE_REQUIRED_EXTENSION_MATERIALIZE (AC7-iii): it
  *    is not in PASSTHROUGH_ENV_KEYS and is asserted-absent before boot.
  *
@@ -347,6 +464,7 @@ export function readCheckoutEnvMode(checkoutDir) {
  */
 export function buildPreviewRunEnvArgs({ encryptionKey, env = process.env }) {
   assertMaterializeNotDisabled(env);
+  const rewriteKeys = new Set(CONTAINER_REWRITE_ENV_KEYS);
   const pairs = [];
   pairs.push([ "CINATRA_RUNTIME_MODE", PREVIEW_RUNTIME_MODE ]);
   pairs.push([ EXTENSION_DATA_ROOT_ENV, EXTENSION_DATA_ROOT_IN_CONTAINER ]);
@@ -355,7 +473,7 @@ export function buildPreviewRunEnvArgs({ encryptionKey, env = process.env }) {
   for (const key of PASSTHROUGH_ENV_KEYS) {
     const value = env[key];
     if (typeof value === "string" && value.length > 0) {
-      pairs.push([ key, value ]);
+      pairs.push([ key, rewriteKeys.has(key) ? rewriteLoopbackUrlForContainer(value) : value ]);
     }
   }
   // Defense in depth: even if a caller mutated PASSTHROUGH_ENV_KEYS, never emit
@@ -939,6 +1057,10 @@ export function dumpContainerLogs(name, deps) {
  * extension-data root (AC4), and the host port published. NEVER a host `next
  * start` (AC7-i): the ONLY boot path is docker run of the built image.
  *
+ * The run also maps CONTAINER_HOST_GATEWAY to the host gateway
+ * (cinatra-cli#190) so the rewritten host-loopback endpoints in the boot env
+ * resolve on a Linux engine too (Docker Desktop already provides the name).
+ *
  * @returns {string} the container name
  */
 export function bootPreviewContainer({ slug, tag, hostPort, encryptionKey, provenance, sha, deps }) {
@@ -949,6 +1071,7 @@ export function bootPreviewContainer({ slug, tag, hostPort, encryptionKey, prove
   const args = [
     "run", "-d",
     "--name", containerName,
+    "--add-host", `${CONTAINER_HOST_GATEWAY}:host-gateway`,
     "-v", `${volumeName}:${EXTENSION_DATA_ROOT_IN_CONTAINER}`,
     "-p", `${hostPort}:3000`,
     ...envArgs,
@@ -1408,9 +1531,12 @@ export const __test = {
   MATERIALIZE_DISABLE_ENV,
   FORBIDDEN_PRODUCTION_IMAGE_NAMES,
   PASSTHROUGH_ENV_KEYS,
+  CONTAINER_REWRITE_ENV_KEYS,
+  CONTAINER_HOST_GATEWAY,
   PREVIEW_HOST_PORT_MIN,
   PREVIEW_HOST_PORT_MAX,
   // pure helpers
+  rewriteLoopbackUrlForContainer,
   isValidSlug,
   isImmutableSha,
   previewImageTag,
