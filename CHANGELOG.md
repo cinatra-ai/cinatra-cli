@@ -67,6 +67,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The recreate preflight no longer blocks an install over services it is not
+  bringing up. It now derives each service's profile state from the profiles
+  actually active for the bring-up — the same profile rules Compose applies to
+  the `up` itself, including `COMPOSE_PROFILES` from the environment and from
+  `--env-file` — instead of treating every service in the resolved config as
+  deployed. A stateful service in a profile the install does not activate is
+  reported as skipped and cannot block; the most visible symptom was a fresh
+  `install --on-conflict isolated` aborting on `twenty-redis`, a service in the
+  opt-in `twenty` profile that the install never starts. Services in an
+  activated profile are still checked in full, so the fail-closed protection
+  against recreating a stateful container across a data-format boundary is
+  unchanged. (#189)
 - `install --mode prod` now provisions AND validates the full hard-required
   secret set before reporting success. It mints a valid 32-byte
   `CINATRA_ENCRYPTION_KEY` (and the distinct WayFlow `CINATRA_CONTEXT_ATTEST_KEY`)
