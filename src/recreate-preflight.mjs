@@ -27,6 +27,18 @@
 // wires the real spawnSync-backed docker seams so install.mjs's recreate sites
 // call ONE gate with no docker plumbing of their own.
 //
+// ONLY THE SERVICES THE BRING-UP DEPLOYS. The gate protects containers a recreate
+// REPLACES, so the transport's `profileEnabled` predicate is derived from the
+// profiles ACTIVE for this bring-up (cinatra-cli#189): the compose config is
+// resolved twice — once with `--profile "*"` (the recreate INTENT, which must keep
+// profile-gated services visible so their targets/volumes are known) and once with
+// the exact argv the `up` uses, where compose itself drops every service whose
+// profile is not active. A service that is profile-gated AND absent from that
+// active set resolves to the preflight's existing SKIPPED verdict; everything else
+// — including every service in an ACTIVATED profile — is still fully evaluated, so
+// the #1417 protection is unchanged. When the active resolve fails, the predicate
+// falls back to evaluating everything (never skipping on a guess).
+//
 // FAIL-CLOSED, BUT NEVER FALSE-BLOCKING A FRESH INSTALL. An empty / absent volume
 // is a fresh init (PASS); an existing non-empty volume whose version cannot be
 // read is FAIL-CLOSED (the crash-loop direction). When the compose config cannot
@@ -223,10 +235,22 @@ export function buildDeploymentPreflight({
   const volumeImages = new Map(); // volumeName → image (emptiness probe)
   const serviceVolume = new Map(); // service → data volume name (marker read)
   const serviceImage = new Map(); // service → own image (--pull=never reader)
+  // Profile facts for the `profileEnabled` predicate (cinatra-cli#189), populated
+  // by discover(): the services this bring-up ACTUALLY deploys (null ⇒ could not
+  // be determined) and the services the full config marks as profile-gated.
+  const profileFacts = { activeServices: null, profileGated: new Set() };
   const state = { configResolved: false };
 
   const discover = () => {
     const specs = new Map();
+    // Every closured fact below describes THIS discovery. Reset first so a second
+    // discover() on the same builder cannot leave stale entries behind (e.g. a
+    // service dropped from the config still counted as profile-gated).
+    volumeImages.clear();
+    serviceVolume.clear();
+    serviceImage.clear();
+    profileFacts.profileGated.clear();
+    profileFacts.activeServices = null;
     if (slug) {
       const { ledger } = readLedger(slug, ledgerDir);
       for (const e of Object.values(ledger.services ?? {})) {
@@ -261,6 +285,35 @@ export function buildDeploymentPreflight({
       for (const s of skipped) {
         specs.set(s.service, { service: s.service, volumeName: null, target: null, volumeUnidentified: s.reason });
       }
+      // Which services carry a profile at all. A service with no `profiles` key
+      // (or an empty one) is in the default set — compose ALWAYS starts it, so it
+      // can never be excluded on profile grounds.
+      for (const [service, svc] of Object.entries(config.services ?? {})) {
+        if (Array.isArray(svc?.profiles) && svc.profiles.length) profileFacts.profileGated.add(service);
+      }
+      // Which services this bring-up ACTUALLY deploys. Resolved with the exact
+      // file/project/env-file set the `up` uses and WITHOUT `--profile "*"`, so
+      // compose itself applies its own profile rules and drops every service whose
+      // profile is not active — no re-implementation of COMPOSE_PROFILES parsing
+      // here (cinatra-cli#189). Skipped entirely when the INTENT resolve already
+      // failed: the gate refuses on `configResolved === false` before the predicate
+      // is ever consulted, so a second doomed docker call would only add latency.
+      // A failure (or a document whose `services` is not a plain object) leaves it
+      // null → the predicate falls back to evaluating everything (fail closed;
+      // never skip on a guess).
+      const activeConfig = resolveComposeConfig({
+        targetDir,
+        composeFiles,
+        composeProject: composeProject && composeProject !== "cinatra" ? composeProject : null,
+        envFile,
+        allProfiles: false,
+        capture: composeConfigCapture,
+      });
+      const activeServices = activeConfig?.services;
+      profileFacts.activeServices =
+        activeServices && typeof activeServices === "object" && !Array.isArray(activeServices)
+          ? new Set(Object.keys(activeServices))
+          : null;
     }
     return [...specs.values()];
   };
@@ -345,7 +398,25 @@ export function buildDeploymentPreflight({
       imageFor: (svc) => serviceImage.get(svc) ?? null,
       dockerReadVolume,
     }),
-    profileEnabled: () => true,
+    // Is the service one this bring-up actually deploys? (cinatra-cli#189.)
+    // The gate exists to protect containers a recreate REPLACES; a service whose
+    // profile is not active is never started, so evaluating it can only
+    // manufacture a block on data the `up` will not touch. Deliberately NARROW —
+    // false is returned ONLY when the service is positively known to be
+    // profile-gated AND positively absent from the active set:
+    //   * active set unknown (the active resolve failed)      → true (evaluate)
+    //   * service present in the active set                   → true (evaluate)
+    //   * service not in the active set but NOT profile-gated → true (evaluate)
+    //   * profile-gated AND excluded from the active set      → false (SKIPPED)
+    // So every service in an ACTIVATED profile is still fully evaluated and the
+    // fail-closed guarantee of cinatra-ai/cinatra#1417 is untouched: this can only
+    // exempt a service compose is not bringing up.
+    profileEnabled: (service) => {
+      const { activeServices, profileGated } = profileFacts;
+      if (!activeServices) return true;
+      if (activeServices.has(service)) return true;
+      return !profileGated.has(service);
+    },
   };
 
   return { discover, transport, state };

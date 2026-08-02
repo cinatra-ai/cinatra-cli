@@ -260,11 +260,21 @@ function composeBaseArgs({ composeFiles = null, composeProject = null, envFile =
 }
 
 /** Resolve the compose config (json) with the SAME file/project/env-file set an
- *  `up` used. `--profile "*"` keeps profile-gated stateful services visible in
- *  the document (deployment proof is the RUNNING container, never the profile
- *  flag). Null on any failure. */
-export function resolveComposeConfig({ targetDir, composeFiles = null, composeProject = null, envFile = null, capture = defaultCapture }) {
-  const args = [...composeBaseArgs({ composeFiles, composeProject, envFile }), "--profile", "*", "config", "--format", "json"];
+ *  `up` used. Null on any failure.
+ *
+ *  `allProfiles` (default true) adds `--profile "*"`, which keeps profile-gated
+ *  stateful services visible in the document — the CAPTURE view, where deployment
+ *  proof is the RUNNING container and never the profile flag.
+ *
+ *  `allProfiles: false` omits the flag, so the document is exactly what a plain
+ *  `up` of this file/project/env-file set would bring up: compose applies its OWN
+ *  profile rules (the `COMPOSE_PROFILES` value from the environment AND from the
+ *  `--env-file`, plus implicit activation) and DROPS every service whose profile
+ *  is not active. That is the ACTIVE view — the authority on which services a
+ *  bring-up actually deploys (cinatra-cli#189). */
+export function resolveComposeConfig({ targetDir, composeFiles = null, composeProject = null, envFile = null, allProfiles = true, capture = defaultCapture }) {
+  const profileArgs = allProfiles ? ["--profile", "*"] : [];
+  const args = [...composeBaseArgs({ composeFiles, composeProject, envFile }), ...profileArgs, "config", "--format", "json"];
   const raw = capture("docker", args, { cwd: targetDir });
   if (!raw) return null;
   try {

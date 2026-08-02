@@ -489,6 +489,197 @@ describe("buildDeploymentPreflight — docker-backed discover + transport (mocke
 });
 
 // ---------------------------------------------------------------------------
+// cinatra-cli#189 — `profileEnabled` derived from the ACTIVE profiles.
+//
+// The docker-backed transport used to hardcode `profileEnabled: () => true`, so a
+// service in a profile the bring-up never activates was still fail-closed —
+// turning cinatra-ai/cinatra#2329 (`twenty-redis` declares no named data volume)
+// into a hard block on a fresh isolated install.
+//
+// The two-sided fixture the issue demands: ONE profile-gated stateful service with
+// an UNIDENTIFIABLE volume, checked in both directions. Driven over the docker-
+// backed transport with a mocked `spawn` that reproduces the REAL compose engine's
+// contract (verified live in recreate-preflight-profiles-docker.test.mjs): a plain
+// `config` DROPS profile-gated services, `--profile "*"` includes them WITH their
+// `profiles` attribute.
+// ---------------------------------------------------------------------------
+describe("buildDeploymentPreflight — profileEnabled from the ACTIVE profiles (cinatra-cli#189)", () => {
+  // The `--profile "*"` view: the default `postgres` + the profile-gated
+  // `twenty-redis` copied shape-for-shape from cinatra's compose (redis:7,
+  // profiles: ["twenty"], NO volumes at all → data volume unidentifiable).
+  const ALL_PROFILES_CONFIG = {
+    name: "cinatra_acme",
+    services: {
+      postgres: {
+        image: "postgres:18-alpine",
+        volumes: [{ type: "volume", source: "cinatra-postgres", target: "/var/lib/postgresql" }],
+      },
+      "twenty-redis": { image: "redis:7", profiles: ["twenty"] },
+    },
+    volumes: { "cinatra-postgres": { name: VOL.name } },
+  };
+  // The ACTIVE view with the `twenty` profile OFF — compose drops the gated service.
+  const ACTIVE_WITHOUT_TWENTY = {
+    name: "cinatra_acme",
+    services: { postgres: ALL_PROFILES_CONFIG.services.postgres },
+    volumes: ALL_PROFILES_CONFIG.volumes,
+  };
+  // The ACTIVE view with the `twenty` profile ON (COMPOSE_PROFILES=twenty).
+  const ACTIVE_WITH_TWENTY = ALL_PROFILES_CONFIG;
+
+  /** A spawn whose `config` answer depends on whether `--profile *` is present —
+   *  the ONLY difference between the intent view and the active view. */
+  function spawnWithProfiles(activeConfig, { activeResolveFails = false } = {}) {
+    return (_cmd, args) => {
+      const joined = args.join(" ");
+      if (joined.includes("config --format json")) {
+        if (joined.includes("--profile * config")) {
+          return { status: 0, stdout: JSON.stringify(ALL_PROFILES_CONFIG), stderr: "" };
+        }
+        if (activeResolveFails) return { status: 1, stdout: "", stderr: "service twenty-redis depends on undefined profile" };
+        return { status: 0, stdout: JSON.stringify(activeConfig), stderr: "" };
+      }
+      if (joined.includes("volume inspect")) {
+        return { status: 0, stdout: JSON.stringify([{ Name: VOL.name, CreatedAt: VOL.createdAt }]), stderr: "" };
+      }
+      if (joined.startsWith("run ") && joined.includes("__preflight_probe")) {
+        return { status: 0, stdout: "18\ndocker", stderr: "" }; // non-empty pg volume
+      }
+      if (joined.startsWith("run ")) return { status: 0, stdout: "18\n", stderr: "" }; // PG_VERSION marker
+      return { status: 0, stdout: "", stderr: "" };
+    };
+  }
+
+  function runGate(spawn) {
+    const { discover, transport } = buildDeploymentPreflight({
+      slug: SLUG,
+      targetDir: dir,
+      composeProject: "cinatra_acme",
+      ledgerDir: dir,
+      spawn,
+    });
+    const services = discover();
+    let thrown = null;
+    let decision = null;
+    try {
+      decision = assertRecreateSafe({ slug: SLUG, ledgerDir: dir, discover: () => services, transport });
+    } catch (err) {
+      thrown = err;
+    }
+    const report = decision?.report ?? thrown?.report ?? null;
+    return { thrown, report, transport };
+  }
+
+  it("the ACTIVE profile set is resolved WITHOUT `--profile \"*\"` (the argv a plain `up` uses)", () => {
+    const seen = [];
+    const spawn = (_cmd, args) => {
+      const joined = args.join(" ");
+      if (joined.includes("config --format json")) {
+        seen.push(joined);
+        return { status: 0, stdout: JSON.stringify(joined.includes("--profile *") ? ALL_PROFILES_CONFIG : ACTIVE_WITHOUT_TWENTY), stderr: "" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    buildDeploymentPreflight({ slug: SLUG, targetDir: dir, composeProject: "cinatra_acme", ledgerDir: dir, spawn }).discover();
+    // Exactly two resolves: the INTENT view (all profiles) + the ACTIVE view.
+    expect(seen).toHaveLength(2);
+    expect(seen.filter((s) => s.includes("--profile * config"))).toHaveLength(1);
+    expect(seen.filter((s) => !s.includes("--profile"))).toHaveLength(1);
+  });
+
+  it("an unresolvable INTENT view skips the second resolve entirely (the gate already refuses on configResolved)", () => {
+    const seen = [];
+    const spawn = (_cmd, args) => {
+      const joined = args.join(" ");
+      if (joined.includes("config --format json")) {
+        seen.push(joined);
+        return { status: 1, stdout: "", stderr: "no configuration file provided" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    const built = buildDeploymentPreflight({ slug: SLUG, targetDir: dir, ledgerDir: dir, spawn });
+    built.discover();
+    expect(seen).toHaveLength(1); // no second doomed docker call
+    expect(built.state.configResolved).toBe(false);
+    expect(built.transport.profileEnabled("twenty-redis")).toBe(true); // still permissive
+  });
+
+  it("profile NOT activated → the unidentifiable-volume service is SKIPPED and never blocks", () => {
+    const { thrown, report } = runGate(spawnWithProfiles(ACTIVE_WITHOUT_TWENTY));
+    expect(thrown).toBeNull(); // the bring-up proceeds — cinatra-ai/cinatra#2329 no longer fail-closes it
+    expect(report.ok).toBe(true);
+    expect(report.findings).toEqual([]);
+    const gated = report.results.find((r) => r.service === "twenty-redis");
+    expect(gated.verdict).toBe(VERDICTS.SKIPPED);
+    expect(gated.reason).toBe("profile disabled — service not deployed here");
+    // …while the default-profile service is still REALLY evaluated (not skipped).
+    expect(report.results.find((r) => r.service === "postgres").verdict).toBe(VERDICTS.PASS);
+  });
+
+  it("profile ACTIVATED → the SAME service is fully evaluated and BLOCKS (fail-closed guarantee unchanged)", () => {
+    const { thrown, report } = runGate(spawnWithProfiles(ACTIVE_WITH_TWENTY));
+    expect(thrown).toBeInstanceOf(RecreatePreflightError);
+    const finding = report.findings.find((f) => f.service === "twenty-redis");
+    expect(finding.verdict).toBe(VERDICTS.FAIL_CLOSED);
+    expect(finding.reason).toMatch(/data volume could not be identified/);
+  });
+
+  it("an UNRESOLVABLE active view never skips on a guess → the service is still evaluated (fail closed)", () => {
+    const { thrown, report } = runGate(spawnWithProfiles(ACTIVE_WITHOUT_TWENTY, { activeResolveFails: true }));
+    expect(thrown).toBeInstanceOf(RecreatePreflightError);
+    expect(report.findings.find((f) => f.service === "twenty-redis").verdict).toBe(VERDICTS.FAIL_CLOSED);
+  });
+
+  it("a DEFAULT-profile service missing from the active view is still evaluated (only profile-gated services may be skipped)", () => {
+    // A pathological active view that omits `postgres` even though it declares no
+    // profiles. Absence alone must never authorize a skip — the predicate demands
+    // positive proof the service is profile-gated.
+    const spawn = spawnWithProfiles({ name: "cinatra_acme", services: {}, volumes: ALL_PROFILES_CONFIG.volumes });
+    const built = buildDeploymentPreflight({ slug: SLUG, targetDir: dir, composeProject: "cinatra_acme", ledgerDir: dir, spawn });
+    built.discover();
+    expect(built.transport.profileEnabled("postgres")).toBe(true);
+    expect(built.transport.profileEnabled("twenty-redis")).toBe(false);
+  });
+
+  it("before discover() runs, the predicate is permissive (no facts ⇒ evaluate everything)", () => {
+    const { transport } = buildDeploymentPreflight({ slug: SLUG, targetDir: dir, ledgerDir: dir, spawn: spawnWithProfiles(ACTIVE_WITHOUT_TWENTY) });
+    expect(transport.profileEnabled("twenty-redis")).toBe(true);
+  });
+
+  it("an `services: []` (array, not object) active view is NOT authoritative → still evaluated", () => {
+    // `resolveComposeConfig` only validates JSON syntax. A valid-JSON document whose
+    // `services` is an array must never be read as proof of an empty active set —
+    // that would skip every gated service on a malformed response.
+    const spawn = spawnWithProfiles({ name: "cinatra_acme", services: [], volumes: {} });
+    const built = buildDeploymentPreflight({ slug: SLUG, targetDir: dir, composeProject: "cinatra_acme", ledgerDir: dir, spawn });
+    built.discover();
+    expect(built.transport.profileEnabled("twenty-redis")).toBe(true);
+  });
+
+  it("a second discover() does not leave stale profile facts behind", () => {
+    // Run 1 sees the gated service; run 2's config no longer declares it. The
+    // closured facts describe the CURRENT discovery, so it must not stay "gated".
+    let call = 0;
+    const spawn = (_cmd, args) => {
+      const joined = args.join(" ");
+      if (joined.includes("config --format json")) {
+        const gatedRun = call++ < 2; // the first discover()'s two resolves
+        if (joined.includes("--profile * config")) {
+          return { status: 0, stdout: JSON.stringify(gatedRun ? ALL_PROFILES_CONFIG : ACTIVE_WITHOUT_TWENTY), stderr: "" };
+        }
+        return { status: 0, stdout: JSON.stringify(ACTIVE_WITHOUT_TWENTY), stderr: "" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    const built = buildDeploymentPreflight({ slug: SLUG, targetDir: dir, composeProject: "cinatra_acme", ledgerDir: dir, spawn });
+    built.discover();
+    expect(built.transport.profileEnabled("twenty-redis")).toBe(false);
+    built.discover(); // the service is gone from the config entirely
+    expect(built.transport.profileEnabled("twenty-redis")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // preflightRecreate — install.mjs's glue: rethrow a verdict, swallow a bug.
 // ---------------------------------------------------------------------------
 describe("preflightRecreate — the install/refresh glue over the gate", () => {
