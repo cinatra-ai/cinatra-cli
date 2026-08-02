@@ -275,6 +275,44 @@ function readOption(argv, flag) {
 // `--mode` enum (rather than a `--demo` flag) matches the documented
 // `--mode dev|prod` surface and lets the marker/reconcile round-trip it.
 const VALID_MODES = new Set(["dev", "prod", "demo"]);
+// cinatra-cli#188: `preview` is a SURFACE-ONLY mode — a documented COMPOSITION
+// over the existing preview lifecycle (`instance preview create`), not a fourth
+// runtime topology and not a second implementation of it. It performs the normal
+// `--mode dev` provisioning and then wires THAT instance's configuration into
+// `preview create`, terminating in a handoff to the `instance preview …` verbs.
+//
+// It resolves to the underlying mode `dev` BEFORE any install site sees it (AC6)
+// — env generation, setup, the checkout marker and instance-registry bookkeeping
+// all read `opts.mode`, which is already `dev`. That is what makes the
+// load-bearing invariant structural rather than a convention: nothing downstream
+// can write `CINATRA_RUNTIME_MODE=production` into the checkout's `.env.local`
+// on this path, because nothing downstream ever observes "preview" as a mode.
+// (Adding `preview` to VALID_MODES alone would be insufficient AND wrong:
+// `isDevLikeMode("preview")` is false, so it would fall through to prod handling,
+// and `instance-registry.mjs` rejects modes outside dev|prod|demo.)
+const PREVIEW_SURFACE_MODE_VALUE = "preview";
+const SURFACE_ONLY_MODES = new Set([PREVIEW_SURFACE_MODE_VALUE]);
+/** Every `--mode` value the CLI surface ACCEPTS (runtime modes + surface-only). */
+const ACCEPTED_MODES = new Set([...VALID_MODES, ...SURFACE_ONLY_MODES]);
+/** The underlying install mode each surface-only mode resolves to (AC6). */
+const UNDERLYING_MODE_FOR_SURFACE = { [PREVIEW_SURFACE_MODE_VALUE]: "dev" };
+/** Map a CLI-surface mode to the install mode every downstream site must see. */
+export function underlyingInstallMode(mode) {
+  return UNDERLYING_MODE_FOR_SURFACE[mode] ?? mode;
+}
+/** True iff `mode` is a surface-only composition (not a runtime topology). */
+export function isSurfaceOnlyMode(mode) {
+  return SURFACE_ONLY_MODES.has(mode);
+}
+/** What the operator SEES for the mode they asked for. A surface-only mode is
+ *  reported as itself plus the underlying install it performed, so a summary
+ *  reading "Mode: dev" can never hide that `--mode preview` was requested — nor
+ *  imply preview is a runtime mode of the checkout. */
+export function installModeLabel(opts = {}) {
+  const surface = opts.surfaceMode ?? opts.mode;
+  if (!isSurfaceOnlyMode(surface)) return String(opts.mode ?? surface);
+  return `${surface} (composition: ${underlyingInstallMode(surface)} install + a preview container)`;
+}
 // Every `install` flag that consumes a FOLLOWING argv token as its value in the
 // space form (`--flag value`). Used ONLY by `extractInstallPositionals` so the
 // positional-mode scan (cinatra-cli#122 / cinatra#1238 item 1) can skip a flag's
@@ -414,19 +452,19 @@ export function extractInstallPositionals(argv = []) {
  *  cannot bypass mode validation by reaching it directly (codex round). The
  *  positional form is validated on its own path below. */
 export function resolveInstallMode(argv, modeOpt) {
-  if (modeOpt != null && !VALID_MODES.has(modeOpt)) {
+  if (modeOpt != null && !ACCEPTED_MODES.has(modeOpt)) {
     throw new Error(
-      `Invalid --mode "${modeOpt}". Use one of: ${[...VALID_MODES].join(", ")}.`,
+      `Invalid --mode "${modeOpt}". Use one of: ${[...ACCEPTED_MODES].join(", ")}.`,
     );
   }
   const positionals = extractInstallPositionals(argv);
   let positionalMode = null;
   if (positionals.length > 0) {
     const first = positionals[0];
-    if (!VALID_MODES.has(first)) {
+    if (!ACCEPTED_MODES.has(first)) {
       throw new Error(
         `Unknown argument "${first}". \`cinatra install\` takes an optional mode ` +
-          `(${[...VALID_MODES].join("|")}) plus flags — e.g. \`cinatra install demo\` or ` +
+          `(${[...ACCEPTED_MODES].join("|")}) plus flags — e.g. \`cinatra install demo\` or ` +
           `\`cinatra install --mode demo\`. Run \`cinatra install --help\`.`,
       );
     }
@@ -434,7 +472,7 @@ export function resolveInstallMode(argv, modeOpt) {
       throw new Error(
         `Unexpected extra argument(s) after \`install ${first}\`: ` +
           `${positionals.slice(1).map((s) => `"${s}"`).join(", ")}. ` +
-          `\`cinatra install\` takes at most one mode positional (${[...VALID_MODES].join("|")}).`,
+          `\`cinatra install\` takes at most one mode positional (${[...ACCEPTED_MODES].join("|")}).`,
       );
     }
     positionalMode = first;
@@ -469,13 +507,21 @@ export function parseInstallArgs(argv = []) {
   // (don't silently ignore it). The positional was previously dropped on the
   // floor — `install demo` silently ran a plain dev install. `resolveInstallMode`
   // also validates the `--mode` value (single source of truth).
-  const mode = resolveInstallMode(argv, modeOpt);
+  //
+  // cinatra-cli#188: the value the CLI SURFACE accepted (may be `preview`) and
+  // the mode every downstream site must see are split here, at the single point
+  // where the mode is decided. `mode` is what the whole install reads; a
+  // surface-only value never reaches it (AC6) — which is what makes "dev
+  // `.env.local` on disk, production semantics only inside the container"
+  // structural rather than a convention.
+  const surfaceMode = resolveInstallMode(argv, modeOpt);
+  const mode = underlyingInstallMode(surfaceMode);
 
   // cinatra-cli#122: `--skip-dev-apps` skips cloning/bringing up the bundled dev
   // apps — which are exactly what `demo` exists to populate. Silently honouring
   // it would produce a hollow demo (no apps to seed/connect), so reject the
   // combination loudly rather than quietly degrade the superset guarantee.
-  if (mode === "demo" && argv.includes("--skip-dev-apps")) {
+  if (surfaceMode === "demo" && argv.includes("--skip-dev-apps")) {
     throw new Error(
       "--skip-dev-apps cannot be combined with demo mode (demo exists to bring up + seed the bundled apps). " +
         "Use `install dev` if you want the dev base without the demo apps.",
@@ -530,11 +576,44 @@ export function parseInstallArgs(argv = []) {
   const redisDb = readOption(argv, "--redis-db");
   const bullmqQueue = readOption(argv, "--bullmq-queue");
 
+  // cinatra-cli#40: the presence of ANY gated co-use signal routes to the T5b
+  // loud-fail / the co-use executor. Computed BEFORE the return so the preview
+  // refusal below is keyed on the EXACT same predicate the terminal co-use branch
+  // reads — a narrower hand-written signal list would let a sidecar flag through.
+  const couseRequested =
+    infra === GATED_INFRA ||
+    onConflict === GATED_ON_CONFLICT ||
+    reuseFrom != null ||
+    dbName != null ||
+    redisDb != null ||
+    bullmqQueue != null;
+
+  // cinatra-cli#188: co-use is TERMINAL — `executeCoUse` owns the whole install
+  // tail and returns before the preview composition could run. Rather than let
+  // `--mode preview` + a co-use signal report a "preview composition" and silently
+  // produce only a dev co-use checkout, refuse the combination HERE, before any
+  // side effect, and name the two supported ways to get a preview.
+  if (surfaceMode === PREVIEW_SURFACE_MODE_VALUE && couseRequested) {
+    throw new Error(
+      "--mode preview cannot be combined with co-use (--infra=share / --on-conflict=co-use / --reuse-from / " +
+        "--db-name / --redis-db / --bullmq-queue): co-use owns the whole install tail and returns before a " +
+        "preview could be composed, so the preview would silently never be created. Install the co-use " +
+        "instance first, then run `cinatra instance preview create` in that checkout — or use --mode preview " +
+        "with --on-conflict=isolated for a preview over its own stack.",
+    );
+  }
+
   return {
     dir: dirOpt, // null → resolved later (prompt on TTY, else default).
     ref,
     repoUrl,
     mode,
+    // cinatra-cli#188: the CLI-surface mode (dev|prod|demo|preview). Equal to
+    // `mode` for every runtime topology; `preview` only here. Read ONLY for what
+    // the operator sees (summaries/help) and to arm the preview composition —
+    // never as an install mode.
+    surfaceMode,
+    previewFrontDoor: surfaceMode === PREVIEW_SURFACE_MODE_VALUE,
     yes: argv.includes("--yes"),
     force: argv.includes("--force"),
     resetEnv: argv.includes("--reset-env"),
@@ -568,14 +647,8 @@ export function parseInstallArgs(argv = []) {
     externalDbDisposable: argv.includes("--external-db-disposable"),
     external: { dbUrl, redisUrl, nangoUrl, graphitiUrl },
     // The presence of ANY gated co-use signal (the gated enum values or the
-    // co-use sidecar flags) routes to the T5b loud-fail.
-    couseRequested:
-      infra === GATED_INFRA ||
-      onConflict === GATED_ON_CONFLICT ||
-      reuseFrom != null ||
-      dbName != null ||
-      redisDb != null ||
-      bullmqQueue != null,
+    // co-use sidecar flags) routes to the T5b loud-fail. Computed above.
+    couseRequested,
     couseSidecar: { reuseFrom, dbName, redisDb, bullmqQueue },
     // cinatra-cli#160 (exec-plane S4): the execution-mode choice + remote/egress
     // config (parse-time validated; null-filled when absent).
@@ -5103,8 +5176,16 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     log(`    Directory:     ${targetDir}${alreadyCheckout ? " (existing cinatra checkout)" : ""}`);
     log(`    Ref / commit:  ${opts.ref} (${resolvedSha})`);
     log(`    Repo URL:      ${opts.repoUrl}`);
-    log(`    Mode:          ${opts.mode}`);
+    log(`    Mode:          ${installModeLabel(opts)}`);
     log(`    Infra plan:    ${infraPlanIntent}`);
+    if (opts.previewFrontDoor) {
+      // cinatra-cli#188: name the SECOND half of the composition in the plan —
+      // a dry run of `--mode preview` that only described the dev install would
+      // understate what the real run does (build + boot a container).
+      log("    Then:          build + boot a preview image at the resolved SHA and health-gate it");
+      log("                   on /api/health (`instance preview create`, its own registry + port pool);");
+      log("                   the checkout stays CINATRA_RUNTIME_MODE=development.");
+    }
     log(`    Project name:  ${isValidSlug(defaultSlug) ? defaultSlug : "(unnamed — would not record)"}`);
     log(`    Compose -p:    ${defaultComposeProject} (explicit; ownership preflight runs at install)`);
     if (selfOwnership.ports.size > 0) {
@@ -5324,7 +5405,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
       log("✓ Cinatra co-use install complete.");
       log(`  Directory:     ${targetDir}`);
       log(`  Ref / commit:  ${opts.ref} (${resolvedSha})`);
-      log(`  Mode:          ${opts.mode}`);
+      log(`  Mode:          ${installModeLabel(opts)}`);
       log(`  Instance:      ${couse.instance?.slug} (co-use — shares the donor's infra; separate DB ${couse.instance?.dbName ?? coUseDbName(deriveCoUseSlug(targetDir, opts))})`);
       log("");
       log("  Next:");
@@ -5486,13 +5567,37 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     log("✓ Cinatra co-use install complete.");
     log(`  Directory:     ${targetDir}`);
     log(`  Instance:      ${resolution?.instance?.slug} (co-use — shares the donor's infra)`);
-    if (RUNTIME_MODE[opts.mode] === "production") {
+    // cinatra-cli#188: co-use is a TERMINAL tail, so `--mode preview` must compose
+    // HERE too — otherwise an interactively-picked co-use would report a preview
+    // composition, provision only the checkout, and never create or hand off a
+    // preview. (An EXPLICIT co-use request with --mode preview is refused at parse
+    // time, before any side effect; this covers the interactive menu pick.)
+    let couPreview = null;
+    if (opts.previewFrontDoor) {
+      couPreview = await bootstrapPreviewFrontDoor({
+        targetDir,
+        opts,
+        instanceSlug: resolution?.instance?.slug ?? null,
+        log,
+        deps,
+      });
+      const { previewHandoffLines } = await import("./install-preview.mjs");
+      for (const line of previewHandoffLines({
+        slug: couPreview?.slug ?? "main",
+        ref: opts.ref,
+        hostPort: couPreview?.hostPort ?? null,
+        running: previewFrontDoorLeftItRunning(couPreview),
+      })) {
+        log(line);
+      }
+    } else if (RUNTIME_MODE[opts.mode] === "production") {
       // cinatra-cli#146: never steer a production checkout at `pnpm dev`.
       for (const line of prodRuntimeGuidanceLines()) log(line);
     } else {
       log(`    cd ${targetDir} && pnpm dev   # http://localhost:${resolution?.instance?.appPort}`);
     }
     return {
+      ...(opts.previewFrontDoor ? { preview: couPreview } : {}),
       targetDir,
       ref: opts.ref,
       sha: resolvedSha,
@@ -5698,12 +5803,43 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   log("✓ Cinatra install complete.");
   log(`  Directory:     ${targetDir}`);
   log(`  Ref / commit:  ${opts.ref} (${resolvedSha})`);
-  log(`  Mode:          ${opts.mode}`);
+  log(`  Mode:          ${installModeLabel(opts)}`);
   if (recordedSlug) log(`  Instance:      ${recordedSlug}${infraPlan === "isolated" ? ` (isolated, project ${resolution?.instance?.composeProject})` : ""}`);
   if (infraPlan === "external") log("  Infra:         external (operator-owned; not install-managed)");
+  // 8a. cinatra-cli#188 — the `--mode preview` FRONT DOOR: the dev provisioning
+  //     above is complete, so now wire THIS instance's configuration into the
+  //     EXISTING `instance preview create` path and terminate in the handoff to
+  //     the `instance preview …` verb family. Never a second preview
+  //     implementation, and never a production `.env.local` on this checkout —
+  //     `opts.mode` is `dev` here by construction (underlyingInstallMode).
+  let previewResult = null;
+  if (opts.previewFrontDoor) {
+    previewResult = await bootstrapPreviewFrontDoor({
+      targetDir,
+      opts,
+      instanceSlug: recordedSlug,
+      log,
+      deps,
+    });
+  }
+
   log("");
   log("  Next:");
-  if (RUNTIME_MODE[opts.mode] === "production") {
+  if (opts.previewFrontDoor) {
+    // AC9: state the lifecycle divergence rather than leaving it to be
+    // discovered — the preview is managed by its OWN verbs, not by `install`.
+    const { previewHandoffLines } = await import("./install-preview.mjs");
+    for (const line of previewHandoffLines({
+      slug: previewResult?.slug ?? "main",
+      ref: opts.ref,
+      hostPort: previewResult?.hostPort ?? null,
+      // Only a preview this run left RUNNING is openable — an in-flight claim or
+      // a non-ready row must not be advertised with an "Open it at …" line.
+      running: previewFrontDoorLeftItRunning(previewResult),
+    })) {
+      log(line);
+    }
+  } else if (RUNTIME_MODE[opts.mode] === "production") {
     // cinatra-cli#146: production runs the pinned published RELEASE IMAGE, never a
     // host `pnpm dev` (production-runtime contract). Steer to the supported image
     // lifecycle — the dev hint below is emitted only for dev/demo.
@@ -5718,10 +5854,59 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     ref: opts.ref,
     sha: resolvedSha,
     mode: opts.mode,
+    surfaceMode: opts.surfaceMode,
     instance: recordedSlug,
     infraPlan,
     appPort: appPortForSummary,
+    ...(opts.previewFrontDoor ? { preview: previewResult } : {}),
   };
+}
+
+/** cinatra-cli#188 — true only when this run leaves a preview actually SERVING:
+ *  it created one, or it skipped over a row the registry records as `ready`. An
+ *  in-flight claim, a `degraded` row, or a skipped composition has a recorded
+ *  port with nothing behind it, so the handoff must not offer to open it. */
+function previewFrontDoorLeftItRunning(result) {
+  if (!result) return false;
+  if (result.created) return true;
+  return result.skipped === true && result.inFlight !== true && result.state === "ready";
+}
+
+/**
+ * cinatra-cli#188 — run the preview composition at the tail of a `--mode preview`
+ * install, or state precisely why it was NOT run.
+ *
+ * The composition needs a REACHABLE, MIGRATED instance: it boots an image
+ * against the infra this install just provisioned, and the app's boot expects
+ * the schema the setup phase applies. So the two "checkout/env only" escape
+ * hatches (`--no-install` / `--no-setup`) do not silently produce a preview that
+ * would boot degraded — they hand off with the exact command to run once the
+ * install is complete (the epic's "produce, or hand off with an explicit,
+ * actionable message, never a silent success" principle, cinatra-cli#142).
+ */
+async function bootstrapPreviewFrontDoor({ targetDir, opts, instanceSlug = null, log, deps = {} }) {
+  if (opts.noInstall || opts.noSetup) {
+    const skipped = opts.noInstall ? "--no-install" : "--no-setup";
+    log("");
+    log(`- Preview front door: SKIPPED because ${skipped} was passed.`);
+    log("  A preview boots a built image against this instance's infra and DB schema, which the");
+    log(`  skipped phase provisions — building one now would boot degraded. Re-run without ${skipped}:`);
+    log(`      cinatra install --mode preview --dir ${targetDir} --ref ${opts.ref}`);
+    return { slug: null, created: false, skipped: true, reason: skipped };
+  }
+  const { runInstallPreviewBootstrap } = await import("./install-preview.mjs");
+  return runInstallPreviewBootstrap({
+    targetDir,
+    ref: opts.ref,
+    // The preview belongs to the instance this install recorded, so it is named
+    // after it (via the preview lifecycle's own `--slug` seam). The front door
+    // bootstraps the FIRST preview only — additional coexisting previews stay
+    // `instance preview create --slug <slug>`, reused unchanged.
+    instanceSlug,
+    rest: [],
+    log,
+    deps: deps.previewDeps ?? {},
+  });
 }
 
 /** Clone a fresh host repo or update an existing checkout to `ref`; return the

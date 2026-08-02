@@ -8,6 +8,28 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`cinatra install --mode preview` — a front door over the preview lifecycle.**
+  Both spellings (`--mode preview` and the positional `install preview`) are
+  accepted and run a documented composition: the normal dev provisioning
+  (checkout at `--ref`, infra, `.env.local`), then that instance's configuration
+  wired into the existing `cinatra instance preview create`, which builds a
+  local non-production image at the resolved SHA and health-gates it on
+  `/api/health`. Preview stays one lifecycle with one registry, one slug scheme
+  and one host-port pool — `install` is a caller, not a second implementation.
+  The composition supplies the four things neither side did alone: the
+  passthrough environment sourced from the install rather than ambient shell
+  state, a boot `CINATRA_ENCRYPTION_KEY` provisioned and persisted outside the
+  checkout (so the dev `.env.local` contract gains no production-only secret),
+  host-loopback Postgres/Redis endpoints rewritten to a container-reachable
+  address while the app and auth URLs are re-pointed at the preview's own
+  published port, and a mode translation that resolves `preview` to the
+  underlying `dev` install everywhere. The checkout is left as an ordinary dev
+  install — production semantics exist only inside the container — and the run
+  ends with the handoff to `cinatra instance preview refresh | status | list`.
+  Re-running `install --mode preview` reconciles the checkout, skips create,
+  reports the existing preview's slug/SHA/port, and points ref drift at
+  `refresh`; image rebuilds stay explicit.
+
 - **Execution-plane lifecycle (`cinatra instance execution …`, exec-plane S4).**
   `install` offers an execution-mode choice — `disabled` (the default; nothing is
   provisioned and models stay fully usable), `local-dev` (run sandbox containers

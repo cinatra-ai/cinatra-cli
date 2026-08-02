@@ -40,9 +40,17 @@
 //
 // Tracking (AC8): preview has its OWN registry (`previews.json`), modeled on
 // `clone-registry.mjs`, SEPARATE from `instance-registry.mjs`'s dev/prod/demo
-// instances — preview is NOT a third `install --mode` value and does NOT reuse
+// instances — preview is NOT a runtime `install --mode` value and does NOT reuse
 // `install --mode prod` (which provisions infra/DB only and never builds/boots
 // an image).
+//
+// cinatra-cli#188 adds `install --mode preview` as a documented FRONT DOOR over
+// this module: a COMPOSITION (dev install, then `runPreviewCreate` with that
+// instance's configuration) living in `install-preview.mjs`. It is a caller, not
+// a fork — this registry, the slug rules, the 3400–3499 host-port pool, the
+// image tagging and every invariant below are reused UNCHANGED, and the surface
+// mode resolves to underlying `dev` before any install site sees it, so no
+// front-door path can write a production `.env.local` into the checkout.
 //
 // Plain ESM `.mjs`, node builtins only — importable from the light CLI core and
 // the eager-`pg`-free unit tests. The pure helpers + the injectable-`deps`
@@ -201,6 +209,14 @@ const HOST_LOOPBACK_HOSTNAMES = new Set(["localhost", "::1"]);
 // than a second rewrite.
 export const CONTAINER_REWRITE_ENV_KEYS = [
   "CINATRA_AGENT_REGISTRY_URL",
+  // cinatra-cli#188 AC5: the other members of the container-dialed class. A dev
+  // install seeds `.env.local` with host-loopback Postgres/Redis endpoints
+  // (`127.0.0.1:<port>`), and `install --mode preview` forwards that instance's
+  // configuration into the container — where those addresses resolve to the
+  // CONTAINER. They join the list above rather than getting a second rewrite, so
+  // there is exactly one mechanism (and one `--add-host` mapping) for all of it.
+  "SUPABASE_DB_URL",
+  "REDIS_URL",
 ];
 
 // --- slug / name / tag -----------------------------------------------------
@@ -1052,6 +1068,30 @@ export function dumpContainerLogs(name, deps) {
 }
 
 /**
+ * Derive the FINAL container env once the preview's host port is known.
+ *
+ * The app's own base URLs (`NEXT_PUBLIC_APP_URL` / `BETTER_AUTH_URL` / …) can
+ * only be correct after the host port is CLAIMED, and the claim happens under
+ * the registry lock. A caller that pre-allocated a port outside the lock and
+ * baked it into `deps.env` would race a concurrent create for the same port, so
+ * callers that need port-dependent env supply `deps.composeRuntimeEnv` instead
+ * and it is invoked HERE, against the port this operation actually claimed.
+ *
+ * Absent the hook the ambient/injected env is used unchanged, so every existing
+ * caller is byte-identical. The materialize invariant is re-asserted on the
+ * RESULT — a hook can never introduce the bypass flag.
+ */
+function resolveRuntimeEnv({ deps, env, hostPort }) {
+  const composed =
+    typeof deps.composeRuntimeEnv === "function" ? deps.composeRuntimeEnv({ hostPort, env }) : env;
+  if (!composed || typeof composed !== "object") {
+    throw new Error("preview: composeRuntimeEnv must return an environment object.");
+  }
+  assertMaterializeNotDisabled(composed);
+  return composed;
+}
+
+/**
  * Boot a preview container: `docker run -d` the built local image with
  * production runtime env (AC2), the durable named volume mounted at the
  * extension-data root (AC4), and the host port published. NEVER a host `next
@@ -1191,8 +1231,11 @@ export async function runPreviewCreate(rest, injected = {}) {
   const checkoutDir = deps.checkoutDir ?? process.cwd();
   const env = deps.env ?? process.env;
 
-  // AC6: encryption-key gate BEFORE any build/boot (fail early, actionable).
-  const encryptionKey = assertEncryptionKey(env);
+  // AC6: encryption-key gate BEFORE any build/boot (fail early, actionable). The
+  // key the container actually boots with is re-derived from the resolved runtime
+  // env below (a `composeRuntimeEnv` hook may supply it), so this stays purely a
+  // fail-fast ordering gate.
+  assertEncryptionKey(env);
   // AC7-iii: never route around the materialize safety invariant.
   assertMaterializeNotDisabled(env);
   // AC9: refuse a genuine `--mode prod` checkout up front — before we even
@@ -1271,6 +1314,15 @@ export async function runPreviewCreate(rest, injected = {}) {
   };
 
   try {
+    // Port-dependent env is derived AGAINST THE CLAIMED PORT (never a port a
+    // caller pre-allocated outside the lock — that would race a concurrent
+    // create), and it is resolved + VALIDATED HERE, before the build: an invalid
+    // boot key, a materialize bypass, or a throwing hook must fail fast, not
+    // after a 30-minute image build. A throw lands in the catch below, which
+    // releases the claim and cleans up.
+    const runtimeEnv = resolveRuntimeEnv({ deps, env, hostPort });
+    const bootKey = assertEncryptionKey(runtimeEnv);
+
     const ctx = deps.prepareContext({ sha, checkoutDir });
     try {
       buildPreviewImage({ tag, contextDir: ctx.contextDir, deps, provenance, sha });
@@ -1282,7 +1334,15 @@ export async function runPreviewCreate(rest, injected = {}) {
       }
     }
 
-    const container = bootPreviewContainer({ slug, tag, hostPort, encryptionKey, provenance, sha, deps });
+    const container = bootPreviewContainer({
+      slug,
+      tag,
+      hostPort,
+      encryptionKey: bootKey,
+      provenance,
+      sha,
+      deps: { ...deps, env: runtimeEnv },
+    });
     deps.log(`  booted ${container}; health-gating http://localhost:${hostPort}/api/health ...`);
     const result = await pollHealthGate({
       url: `http://localhost:${hostPort}/api/health`,
@@ -1329,7 +1389,7 @@ export async function runPreviewRefresh(rest, injected = {}) {
   const checkoutDir = deps.checkoutDir ?? process.cwd();
   const env = deps.env ?? process.env;
 
-  const encryptionKey = assertEncryptionKey(env); // AC6
+  assertEncryptionKey(env); // AC6 — fail-fast gate; the boot key is re-derived below.
   assertMaterializeNotDisabled(env); // AC7-iii
   // AC9: refuse a genuine `--mode prod` checkout up front — checkout-derived and
   // unconditional. Critically NOT gated on an existing registry row: refresh
@@ -1414,6 +1474,13 @@ export async function runPreviewRefresh(rest, injected = {}) {
   };
 
   try {
+    // Same seam as create, resolved + VALIDATED FIRST: before the build and —
+    // critically — before the healthy old container is torn down. A bad boot key,
+    // a materialize bypass, or a throwing hook must never destroy a working
+    // preview; failing here leaves `replaced` false, so abort restores the row to
+    // `ready` and the running container is untouched.
+    const runtimeEnv = resolveRuntimeEnv({ deps, env, hostPort });
+    const bootKey = assertEncryptionKey(runtimeEnv);
     // Build the NEW image FIRST (a build failure leaves the running preview
     // untouched — we only replace the container after a successful build).
     const ctx = deps.prepareContext({ sha: newSha, checkoutDir });
@@ -1431,7 +1498,15 @@ export async function runPreviewRefresh(rest, injected = {}) {
     // no orphan accumulation), REUSING the durable volume (never dropped).
     replaced = true;
     removeContainer(previewContainerName(slug), deps);
-    const container = bootPreviewContainer({ slug, tag: newTag, hostPort, encryptionKey, provenance, sha: newSha, deps });
+    const container = bootPreviewContainer({
+      slug,
+      tag: newTag,
+      hostPort,
+      encryptionKey: bootKey,
+      provenance,
+      sha: newSha,
+      deps: { ...deps, env: runtimeEnv },
+    });
     deps.log(`  booted ${container}; health-gating http://localhost:${hostPort}/api/health ...`);
     const result = await pollHealthGate({
       url: `http://localhost:${hostPort}/api/health`,
