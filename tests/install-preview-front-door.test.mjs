@@ -138,6 +138,11 @@ function makeBootstrapDeps(state = {}) {
   const deps = {
     registryPath,
     previewSecretsPath: secretsPath,
+    // cinatra-cli#194: the image-build budget is read from the OPERATOR's
+    // environment, so pin an EMPTY map here — without it a developer who
+    // exports CINATRA_PREVIEW_BUILD_TIMEOUT_MS in their shell changes (or, with
+    // a deliberately invalid value, breaks) this suite.
+    buildControlEnv: {},
     log: (...m) => logs.push(m.join(" ")),
     logError: (...m) => logs.push(m.join(" ")),
     now: () => 1000,
@@ -870,6 +875,36 @@ describe("install --mode preview — terminal-tail safety", () => {
     }
     // dev/prod/demo co-use requests are untouched.
     expect(() => parseInstallArgs(["--mode", "dev", "--infra=share"])).not.toThrow();
+  });
+
+  // cinatra-cli#194: the front door is a COMPOSITION — the whole dev install
+  // runs before the preview lifecycle is reached — so a malformed build budget
+  // has to be caught while parsing arguments, or a typo costs a full install
+  // before it surfaces.
+  it("rejects a malformed build-budget override at ARG-PARSE time, before the install runs", () => {
+    const KEY = "CINATRA_PREVIEW_BUILD_TIMEOUT_MS";
+    const original = process.env[KEY];
+    const restore = () => {
+      if (original === undefined) delete process.env[KEY];
+      else process.env[KEY] = original;
+    };
+    try {
+      for (const bad of ["90m", "0", "-1", "Infinity", "99999999999"]) {
+        process.env[KEY] = bad;
+        expect(() => parseInstallArgs(["--mode", "preview"]), `expected ${bad} to be rejected`).toThrow(
+          new RegExp(KEY),
+        );
+        // The variable is meaningless for a plain dev/prod/demo install, so it
+        // must NOT break an operator who simply exports it in their profile.
+        expect(() => parseInstallArgs(["--mode", "dev"])).not.toThrow();
+      }
+      process.env[KEY] = "10800000";
+      expect(() => parseInstallArgs(["--mode", "preview"])).not.toThrow();
+      delete process.env[KEY];
+      expect(() => parseInstallArgs(["--mode", "preview"])).not.toThrow();
+    } finally {
+      restore();
+    }
   });
 });
 

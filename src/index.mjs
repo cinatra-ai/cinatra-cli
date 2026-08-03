@@ -768,6 +768,9 @@ Usage:
   cinatra instance clone list
   cinatra instance preview create [--ref <git-ref>] [--slug <slug>] [--port <port>]
   cinatra instance preview refresh [--ref <git-ref>] [--slug <slug>]
+                               # CINATRA_PREVIEW_BUILD_TIMEOUT_MS overrides the image-build
+                               # budget (default 5400000 = 90m; 1000 .. 21600000 = 1s .. 6h).
+                               # Env-only so it applies to \`install --mode preview\` too.
   cinatra instance preview status [--slug <slug>]
   cinatra instance preview list
   cinatra instance execution set-mode <remote|local-dev|disabled> [--sandbox-broker-url <url>]
@@ -829,6 +832,28 @@ Commands:
                       + boots + health-gates on /api/health; refresh rebuilds at
                       a new SHA, reuses the durable volume, and cleans up the
                       superseded image. Requires CINATRA_ENCRYPTION_KEY at boot.
+
+                      BUILD BUDGET: the image build is bounded, defaulting to
+                      90 minutes (5400000 ms) — sized for a COLD build, which
+                      runs the checkout's whole multi-stage Dockerfile (two
+                      pnpm installs, extensions acquire-prod, the required-OAS
+                      seed, manifest regen, the esbuild bundles, next build,
+                      then the runtime-stage copies). On a slow or loaded host
+                      that can still be too short, so raise it with
+
+                        CINATRA_PREVIEW_BUILD_TIMEOUT_MS=<milliseconds>
+
+                      accepted range 1000 .. 21600000 (1s .. 6h). It is env-only
+                      (not a flag) so the same lever applies to create, refresh
+                      AND \`install --mode preview\`. A malformed or out-of-range
+                      value is a hard error, never a silent fallback — and the
+                      maximum is finite by design, so the timeout always still
+                      bounds a genuinely HUNG build. A build cancelled by the
+                      budget is partly resumable: a re-run reuses every layer
+                      that COMPLETED and restarts at the interrupted step — but
+                      that step starts over, so if one single step is longer
+                      than the budget, retrying alone will never get past it and
+                      the budget has to be raised.
   instance preview status|list
                       Show a preview's (or all previews') resolved SHA, built
                       image tag, provenance, durable volume, and state.

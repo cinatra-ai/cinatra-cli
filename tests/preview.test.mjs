@@ -46,6 +46,13 @@ const {
   runPreviewCreate,
   runPreviewRefresh,
   runPreviewStatus,
+  resolveBuildTimeoutMs,
+  formatBuildBudget,
+  buildPreviewImage,
+  PREVIEW_BUILD_TIMEOUT_DEFAULT_MS,
+  PREVIEW_BUILD_TIMEOUT_ENV,
+  PREVIEW_BUILD_TIMEOUT_MIN_MS,
+  PREVIEW_BUILD_TIMEOUT_MAX_MS,
   PREVIEW_IMAGE_TAG_PREFIX,
   PREVIEW_RUNTIME_MODE,
   PREVIEW_HOST_PORT_MIN,
@@ -80,11 +87,25 @@ afterEach(() => {
 // (container liveness) + a scripted health probe from a shared state object.
 function makeFakeDocker(state) {
   const calls = [];
-  const runDocker = (args, _opts = {}) => {
+  // The per-invocation options (timeoutMs / stdio) alongside the argv, so the
+  // BOUNDS on each subprocess are assertable — cinatra-cli#194 makes the build
+  // budget configurable, and a lever nothing asserts is a lever that can rot.
+  const opts = [];
+  const runDocker = (args, callOpts = {}) => {
     calls.push(args);
+    opts.push(callOpts);
     const [verb, sub] = args;
-    // `docker build ...` — success unless state.buildFails.
+    // `docker build ...` — success unless state.buildFails / state.buildTimesOut.
     if (verb === "build") {
+      if (state.buildTimesOut) {
+        return {
+          status: null,
+          stdout: "",
+          stderr: "",
+          error: Object.assign(new Error("spawnSync docker ETIMEDOUT"), { code: "ETIMEDOUT" }),
+          timedOut: true,
+        };
+      }
       return state.buildFails ? { status: 1, stdout: "", stderr: "build boom", error: null } : { status: 0, stdout: "", stderr: "" };
     }
     // `docker run -d ...` — records the run; container becomes "running".
@@ -129,17 +150,24 @@ function makeFakeDocker(state) {
     if (verb === "logs") return { status: 0, stdout: "app log tail", stderr: "" };
     return { status: 0, stdout: "", stderr: "" };
   };
-  return { calls, runDocker };
+  /** The options the `docker build` invocation was bounded with. */
+  const buildOpts = () => opts[calls.findIndex((a) => a[0] === "build")];
+  return { calls, opts, buildOpts, runDocker };
 }
 
 // Build an injected deps object for the orchestration functions.
-function makeDeps(state, { env, checkoutDir } = {}) {
+function makeDeps(state, { env, checkoutDir, buildControlEnv } = {}) {
   const fake = makeFakeDocker(state);
   const logs = [];
   const deps = {
     registryPath,
     checkoutDir: checkoutDir ?? tmp,
     env: env ?? { [ENCRYPTION_KEY_ENV]: KEY_64 },
+    // cinatra-cli#194: the build budget is read from the OPERATOR's environment,
+    // not the container env contract. Default it to an EMPTY map so the suite is
+    // hermetic — a developer with CINATRA_PREVIEW_BUILD_TIMEOUT_MS exported in
+    // their shell must not change what these tests assert.
+    buildControlEnv: buildControlEnv ?? {},
     log: (...m) => logs.push(m.join(" ")),
     logError: (...m) => logs.push(m.join(" ")),
     now: () => state.now ?? 1000,
@@ -864,5 +892,216 @@ describe("preview — host-port allocation (no default-stack / sibling collision
     expect(out.hostPort).toBe(4444);
     const run = fake.calls.find((c) => c[0] === "run");
     expect(run.join(" ")).toContain("-p 4444:3000");
+  });
+});
+
+// --------------------------------------------------------------------------
+// The image-build budget + its operator lever (cinatra-cli#194)
+//
+// A fixed 30-minute ceiling could not fit a COLD build (the `next build` compile
+// alone measured 31.6 min on a 24GB M4 Pro during #188's proof), so the first
+// preview on a machine with no layer cache was a guaranteed cancel with no
+// lever. The budget is now a raised DEFAULT plus a documented, BOUNDED env
+// override. These tests pin all three acceptance criteria: the default is big
+// enough to be sized for a cold build, the lever actually reaches the real
+// `docker build`, and no override can remove the bound on a hung build.
+// --------------------------------------------------------------------------
+
+describe("preview build budget — default + bounded override (#194)", () => {
+  const withOverride = (v) => ({ [PREVIEW_BUILD_TIMEOUT_ENV]: v });
+
+  it("defaults to 90m — a budget sized for a COLD multi-stage build, not the old 30m", () => {
+    expect(PREVIEW_BUILD_TIMEOUT_DEFAULT_MS).toBe(5_400_000);
+    // The regression this issue is about: the old ceiling was BELOW the measured
+    // cost of one stage of the build it was supposed to bound.
+    expect(PREVIEW_BUILD_TIMEOUT_DEFAULT_MS).toBeGreaterThan(1_800_000);
+    expect(resolveBuildTimeoutMs({})).toBe(PREVIEW_BUILD_TIMEOUT_DEFAULT_MS);
+    expect(resolveBuildTimeoutMs(undefined)).toBe(PREVIEW_BUILD_TIMEOUT_DEFAULT_MS);
+  });
+
+  it("an absent / empty / all-whitespace override means `not set` and takes the default", () => {
+    expect(resolveBuildTimeoutMs(withOverride(""))).toBe(PREVIEW_BUILD_TIMEOUT_DEFAULT_MS);
+    expect(resolveBuildTimeoutMs(withOverride("   "))).toBe(PREVIEW_BUILD_TIMEOUT_DEFAULT_MS);
+    // A non-string (an env map is strings, but be explicit) is not an override.
+    expect(resolveBuildTimeoutMs({ [PREVIEW_BUILD_TIMEOUT_ENV]: 12345 })).toBe(PREVIEW_BUILD_TIMEOUT_DEFAULT_MS);
+  });
+
+  it("a valid override wins, including at both ends of the accepted range", () => {
+    expect(resolveBuildTimeoutMs(withOverride("10800000"))).toBe(10_800_000); // 3h
+    expect(resolveBuildTimeoutMs(withOverride(" 60000 "))).toBe(60_000); // surrounding space tolerated
+    expect(resolveBuildTimeoutMs(withOverride(String(PREVIEW_BUILD_TIMEOUT_MIN_MS)))).toBe(PREVIEW_BUILD_TIMEOUT_MIN_MS);
+    expect(resolveBuildTimeoutMs(withOverride(String(PREVIEW_BUILD_TIMEOUT_MAX_MS)))).toBe(PREVIEW_BUILD_TIMEOUT_MAX_MS);
+  });
+
+  it("AC3: no override can DISABLE the bound — the maximum is finite and enforced", () => {
+    expect(PREVIEW_BUILD_TIMEOUT_MAX_MS).toBe(21_600_000); // 6h
+    expect(Number.isFinite(PREVIEW_BUILD_TIMEOUT_MAX_MS)).toBe(true);
+    for (const v of ["0", "-1", "Infinity", "never", "none", "off", "-0"]) {
+      expect(() => resolveBuildTimeoutMs(withOverride(v))).toThrow(new RegExp(PREVIEW_BUILD_TIMEOUT_ENV));
+    }
+    expect(() => resolveBuildTimeoutMs(withOverride(String(PREVIEW_BUILD_TIMEOUT_MAX_MS + 1)))).toThrow(/exceeds the .* maximum/);
+    expect(() => resolveBuildTimeoutMs(withOverride(String(PREVIEW_BUILD_TIMEOUT_MIN_MS - 1)))).toThrow(/below the .* minimum/);
+  });
+
+  it("a malformed override is a HARD error naming the var, the value and the range — never a silent fallback", () => {
+    for (const v of ["90m", "1.5", "1e6", "0x10", "+5", "abc", "5 minutes"]) {
+      let err;
+      try {
+        resolveBuildTimeoutMs(withOverride(v));
+      } catch (e) {
+        err = e;
+      }
+      expect(err, `expected ${v} to be rejected`).toBeTruthy();
+      expect(err.message).toContain(PREVIEW_BUILD_TIMEOUT_ENV);
+      expect(err.message).toContain(JSON.stringify(v)); // the offending value is quoted back
+      expect(err.message).toContain(String(PREVIEW_BUILD_TIMEOUT_MAX_MS)); // the accepted range
+      expect(err.message).toMatch(/no value that disables it/);
+    }
+    // "Silently ignored" is the failure mode that would strand an operator back
+    // on the budget that cancelled them, so it must never resolve to the default.
+    expect(() => resolveBuildTimeoutMs(withOverride("90m"))).toThrow();
+  });
+
+  it("formats budgets readably for the log line and the timeout error", () => {
+    expect(formatBuildBudget(5_400_000)).toBe("90m");
+    expect(formatBuildBudget(21_600_000)).toBe("6h");
+    expect(formatBuildBudget(1_000)).toBe("1s");
+    expect(formatBuildBudget(1_500)).toBe("1500ms");
+  });
+
+  it("the resolved budget actually BOUNDS the real `docker build` invocation", () => {
+    const state = {};
+    const fake = makeFakeDocker(state);
+    // Default.
+    buildPreviewImage({ tag: previewImageTag(SHA_A), contextDir: "/ctx", deps: { runDocker: fake.runDocker, buildControlEnv: {} } });
+    expect(fake.buildOpts().timeoutMs).toBe(PREVIEW_BUILD_TIMEOUT_DEFAULT_MS);
+
+    // Override — the lever reaches the subprocess bound, which is the whole point.
+    const fake2 = makeFakeDocker({});
+    buildPreviewImage({
+      tag: previewImageTag(SHA_B),
+      contextDir: "/ctx",
+      deps: { runDocker: fake2.runDocker, buildControlEnv: withOverride("10800000") },
+    });
+    expect(fake2.buildOpts().timeoutMs).toBe(10_800_000);
+  });
+
+  it("logs the budget before the build, and names the lever only when it is NOT already set", () => {
+    const lines = [];
+    const fake = makeFakeDocker({});
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: "/ctx",
+      deps: { runDocker: fake.runDocker, buildControlEnv: {}, log: (m) => lines.push(m) },
+    });
+    expect(lines.join("\n")).toContain("budget 90m");
+    expect(lines.join("\n")).toContain(PREVIEW_BUILD_TIMEOUT_ENV);
+
+    const lines2 = [];
+    const fake2 = makeFakeDocker({});
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: "/ctx",
+      deps: { runDocker: fake2.runDocker, buildControlEnv: withOverride("10800000"), log: (m) => lines2.push(m) },
+    });
+    expect(lines2.join("\n")).toContain("budget 3h");
+    expect(lines2.join("\n")).toContain("override");
+  });
+
+  it("a timeout says the elapsed budget, how to raise it, and that a retry RESUMES from cache", () => {
+    const fake = makeFakeDocker({ buildTimesOut: true });
+    let err;
+    try {
+      buildPreviewImage({
+        tag: previewImageTag(SHA_A),
+        contextDir: "/ctx",
+        deps: { runDocker: fake.runDocker, buildControlEnv: {} },
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeTruthy();
+    expect(err.message).toContain("timed out after 90m");
+    expect(err.message).toContain(PREVIEW_BUILD_TIMEOUT_ENV);
+    // The resumability guidance must be HONEST: completed layers are reused and
+    // the retry picks up at the interrupted step, but that step restarts — so a
+    // single step longer than the budget is never fixed by retrying alone.
+    expect(err.message).toMatch(/reuses every layer that COMPLETED/);
+    expect(err.message).toMatch(/restarts at the interrupted step/);
+    expect(err.message).toMatch(/raising the budget is required, not just retrying/);
+    // A NON-timeout failure must NOT suggest raising the budget — that would
+    // send an operator with a real build error off chasing a timeout.
+    const fake2 = makeFakeDocker({ buildFails: true });
+    expect(() =>
+      buildPreviewImage({ tag: previewImageTag(SHA_A), contextDir: "/ctx", deps: { runDocker: fake2.runDocker, buildControlEnv: {} } }),
+    ).toThrow(/build boom/);
+    try {
+      buildPreviewImage({ tag: previewImageTag(SHA_A), contextDir: "/ctx", deps: { runDocker: makeFakeDocker({ buildFails: true }).runDocker, buildControlEnv: {} } });
+    } catch (e) {
+      expect(e.message).not.toMatch(/reuses every layer that COMPLETED/);
+      expect(e.message).not.toMatch(/budget problem/);
+    }
+  });
+
+  it("the lever is read from the OPERATOR env, NOT the container env contract", async () => {
+    // This is the `install --mode preview` trap: that front door REPLACES
+    // `deps.env` with a fresh object composed from the install's own .env.local
+    // precisely so ambient shell state cannot leak into the container (#188 AC3).
+    // A budget read from `deps.env` would therefore be silently inert on exactly
+    // the front door #194 names. The container env carries a DECOY value here.
+    const { deps, fake } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' } },
+      {
+        env: { [ENCRYPTION_KEY_ENV]: KEY_64, [PREVIEW_BUILD_TIMEOUT_ENV]: "1234" },
+        buildControlEnv: withOverride("7200000"),
+      },
+    );
+    await runPreviewCreate(["--slug", "main"], deps);
+    expect(fake.buildOpts().timeoutMs).toBe(7_200_000);
+    // And the budget is never forwarded INTO the container.
+    const run = fake.calls.find((c) => c[0] === "run");
+    expect(run.join(" ")).not.toContain(PREVIEW_BUILD_TIMEOUT_ENV);
+  });
+
+  it("create honours the override and FAILS FAST on a malformed one — before claiming the slug", async () => {
+    const { deps, fake } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' } },
+      { buildControlEnv: withOverride("3600000") },
+    );
+    await runPreviewCreate(["--slug", "main"], deps);
+    expect(fake.buildOpts().timeoutMs).toBe(3_600_000);
+
+    const { deps: bad, fake: badFake } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' } },
+      { buildControlEnv: withOverride("nope") },
+    );
+    await expect(runPreviewCreate(["--slug", "other"], bad)).rejects.toThrow(new RegExp(PREVIEW_BUILD_TIMEOUT_ENV));
+    // Nothing was built and NO registry row was claimed — the gate ran first.
+    expect(badFake.calls.find((c) => c[0] === "build")).toBeUndefined();
+    expect(getPreview(readRegistry(registryPath).registry ?? { previews: {} }, "other")).toBeFalsy();
+  });
+
+  it("refresh honours the override and FAILS FAST on a malformed one — the running preview is untouched", async () => {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+    });
+    const { deps: bad, fake: badFake } = makeDeps(
+      { sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' } },
+      { buildControlEnv: withOverride("0") },
+    );
+    await expect(runPreviewRefresh(["--slug", "main"], bad)).rejects.toThrow(new RegExp(PREVIEW_BUILD_TIMEOUT_ENV));
+    expect(badFake.calls.find((c) => c[0] === "build")).toBeUndefined();
+    // The existing row is intact and was never flipped to `provisioning`.
+    const row = getPreview(readRegistry(registryPath).registry, "main");
+    expect(row.sha).toBe(SHA_A);
+    expect(row.state).toBe("ready");
+
+    const { deps, fake } = makeDeps(
+      { sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' } },
+      { buildControlEnv: withOverride("4500000") },
+    );
+    await runPreviewRefresh(["--slug", "main"], deps);
+    expect(fake.buildOpts().timeoutMs).toBe(4_500_000);
   });
 });

@@ -337,14 +337,14 @@ export const COMMAND_DESCRIPTORS = [
     path: ["instance", "preview", "create"],
     match: "command+mode+sub",
     summary:
-      "Build + boot a LOCAL non-production image at a resolved SHA (CINATRA_RUNTIME_MODE=production, provenance local-image:<sha>); health-gates on /api/health.",
+      "Build + boot a LOCAL non-production image at a resolved SHA (CINATRA_RUNTIME_MODE=production, provenance local-image:<sha>); health-gates on /api/health. The image build is bounded (default 90m); raise it on a slow/cold host with CINATRA_PREVIEW_BUILD_TIMEOUT_MS (ms, 1000..21600000).",
   },
   {
     id: "preview.refresh",
     path: ["instance", "preview", "refresh"],
     match: "command+mode+sub",
     summary:
-      "Rebuild the preview at a NEW resolved SHA, reboot, reuse the durable volume, health-gate, and clean up the superseded image.",
+      "Rebuild the preview at a NEW resolved SHA, reboot, reuse the durable volume, health-gate, and clean up the superseded image. Honours the same CINATRA_PREVIEW_BUILD_TIMEOUT_MS build budget as create.",
   },
   {
     id: "preview.status",
