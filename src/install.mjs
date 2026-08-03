@@ -118,6 +118,10 @@ import {
   removeEnvKey,
 } from "./isolated-a2a.mjs";
 import { rejectTailscaleAuthkeyFlag } from "./clone-runtime.mjs";
+// cinatra-cli#194: the preview image-build budget lever. `preview.mjs` is plain
+// ESM over node builtins (importable from the light CLI core), and only the pure
+// validator is used here — the lifecycle itself stays lazy-imported below.
+import { resolveBuildTimeoutMs } from "./preview.mjs";
 import {
   deriveCoUseSlug,
   coUseDbName,
@@ -601,6 +605,17 @@ export function parseInstallArgs(argv = []) {
         "instance first, then run `cinatra instance preview create` in that checkout — or use --mode preview " +
         "with --on-conflict=isolated for a preview over its own stack.",
     );
+  }
+
+  // cinatra-cli#194: validate the preview build-budget override HERE, in the
+  // same "before any side effect" position as the refusal above. The front door
+  // is a COMPOSITION — the whole dev install runs before the preview lifecycle
+  // is reached — so validating only at the preview stage would let a typo'd
+  // budget cost an operator a full install before surfacing. Preview-only: the
+  // variable has no meaning for a plain dev/prod/demo install, and rejecting it
+  // there would break an operator who simply exports it in their shell profile.
+  if (surfaceMode === PREVIEW_SURFACE_MODE_VALUE) {
+    resolveBuildTimeoutMs(process.env);
   }
 
   return {

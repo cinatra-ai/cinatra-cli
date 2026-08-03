@@ -61,6 +61,30 @@ refresh | status | list`), not by re-running `install`: a re-run reconciles the
 checkout, reports the existing preview, and points ref drift at `refresh`, so an
 image rebuild is always something you ask for explicitly.
 
+The first preview on a machine builds the image **cold** — the checkout's whole
+multi-stage Dockerfile, which is a long job (the `next build` compile alone has
+been measured at over half an hour on a fast laptop). That build is bounded so a
+hung Docker can never wedge the CLI, and the bound defaults to **90 minutes**. On
+a slower or heavily loaded host, raise it:
+
+    CINATRA_PREVIEW_BUILD_TIMEOUT_MS=10800000 cinatra install --mode preview   # 3 hours
+
+Accepted range **1000 .. 21600000** ms (1 second .. 6 hours). Notes:
+
+- **It is an environment variable, not a flag**, so one lever covers `install
+  --mode preview`, `instance preview create` and `instance preview refresh`.
+- **A bad value is a hard error**, not a silent fallback: a non-integer, `0`, a
+  negative, `Infinity` or an out-of-range number is rejected up front, naming the
+  variable and the accepted range. `install --mode preview` rejects it while
+  parsing its arguments — before the install does anything — and the `instance
+  preview` verbs reject it before the image is built or a registry slot claimed.
+- **The bound never goes away.** The maximum is finite on purpose — there is no
+  value that disables the timeout, so a genuinely hung build is still cancelled.
+- **A cancelled build is partly resumable.** Re-running reuses every layer that
+  already **completed** and picks up at the step that was interrupted — but that
+  step starts over from the beginning. So if a *single* step takes longer than
+  the budget, retrying will never get past it; raise the budget instead.
+
 The other local host/monorepo bootstrap commands you run from inside a Cinatra
 checkout live under `cinatra instance …`:
 

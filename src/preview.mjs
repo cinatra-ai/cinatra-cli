@@ -125,7 +125,35 @@ export const FORBIDDEN_PRODUCTION_IMAGE_NAMES = [
 
 // Bounded-subprocess convention, mirroring `WAYFLOW_BUILD_TIMEOUT_MS` /
 // `DOCKER_CLI_PROBE_TIMEOUT_MS` (AC5): a HUNG docker must never block the CLI.
-export const PREVIEW_BUILD_TIMEOUT_MS = 1_800_000; // 30m — full multi-stage cold build ceiling
+//
+// cinatra-cli#194 — the build budget is a DEFAULT with an operator LEVER, not a
+// fixed ceiling. The original fixed 30m could not fit a COLD build: the `next
+// build` compile ALONE measured 31.6 minutes on a 24GB M4 Pro during #188's
+// end-to-end proof, and it is one step among many in the checkout's multi-stage
+// Dockerfile (two `pnpm install --frozen-lockfile` passes, a network
+// `extensions acquire-prod`, the required-OAS seed, presence-aware manifest
+// regen, bundled-digest recording, four esbuild bundles, `next build`,
+// standalone assembly, then ~15 runtime-stage copies). So a first-ever preview
+// on a machine with no layer cache was a GUARANTEED cancel with no lever.
+//
+// The default is therefore raised to 90m — evidence-INFORMED, not measured
+// end-to-end: 31.6m is the one stage that was timed, and the rest of the cold
+// build plus a slower or loaded host is the headroom. Because no single default
+// can be right for every host, `CINATRA_PREVIEW_BUILD_TIMEOUT_MS` overrides it.
+//
+// The override is BOUNDED, deliberately (#194 AC3 — "the timeout still bounds a
+// genuinely hung build"): it is validated to an integer in
+// [PREVIEW_BUILD_TIMEOUT_MIN_MS, PREVIEW_BUILD_TIMEOUT_MAX_MS] and anything else
+// — a non-integer, 0, a negative, `Infinity`, `never` — is a HARD, actionable
+// error, never a silent fallback and never a silent clamp. There is no value
+// that turns the bound OFF, so the hung-build ceiling survives the lever.
+export const PREVIEW_BUILD_TIMEOUT_DEFAULT_MS = 5_400_000; // 90m — cold multi-stage build default
+export const PREVIEW_BUILD_TIMEOUT_ENV = "CINATRA_PREVIEW_BUILD_TIMEOUT_MS";
+// 1s floor: low enough that the lever itself is provable against a REAL build
+// (an artificially low override must actually cancel one), which is how #194's
+// acceptance is demonstrated without burning a full cold build.
+export const PREVIEW_BUILD_TIMEOUT_MIN_MS = 1_000; // 1s
+export const PREVIEW_BUILD_TIMEOUT_MAX_MS = 21_600_000; // 6h — the bound the lever can never remove
 export const PREVIEW_HEALTH_TIMEOUT_MS = 180_000; // 3m health-gate budget (mirrors prod-boot-e2e default)
 export const PREVIEW_HEALTH_POLL_INTERVAL_MS = 3_000; // 3s (mirrors prod-boot-e2e sleep 3)
 export const DOCKER_CLI_PROBE_TIMEOUT_MS = 15_000; // 15s fast docker-CLI metadata probes
@@ -965,30 +993,105 @@ export function defaultDeps({ registryPath = defaultRegistryPath(), log = consol
 
 // --- docker steps (via injected runDocker) ---------------------------------
 
+/** Render a millisecond budget as a human duration for logs/errors ("90m", "1s"). */
+export function formatBuildBudget(ms) {
+  if (ms % 3_600_000 === 0) return `${ms / 3_600_000}h`;
+  if (ms % 60_000 === 0) return `${ms / 60_000}m`;
+  if (ms % 1_000 === 0) return `${ms / 1_000}s`;
+  return `${ms}ms`;
+}
+
+/**
+ * Resolve the docker-build budget: `CINATRA_PREVIEW_BUILD_TIMEOUT_MS` when the
+ * operator set it, else `PREVIEW_BUILD_TIMEOUT_DEFAULT_MS` (cinatra-cli#194).
+ *
+ * FAIL-CLOSED on a bad value. A malformed or out-of-range override THROWS with
+ * the variable name, the offending value and the accepted range — it is never
+ * silently ignored (which would strand the operator back on the default that
+ * cancelled their build and look like the lever does not work) and never
+ * silently clamped (which would conceal a configuration mistake). An absent or
+ * ALL-WHITESPACE value means "not set" and takes the default; every other
+ * non-integer input — `0`, a negative, `1.5`, `90m`, `Infinity`, `never` — is
+ * rejected.
+ *
+ * The accepted band is what keeps #194 AC3 true: the maximum is finite, so no
+ * override can disable the bound on a genuinely hung build.
+ */
+export function resolveBuildTimeoutMs(env = {}) {
+  const raw = env?.[PREVIEW_BUILD_TIMEOUT_ENV];
+  if (typeof raw !== "string" || raw.trim() === "") return PREVIEW_BUILD_TIMEOUT_DEFAULT_MS;
+  const value = raw.trim();
+  const reject = (why) => {
+    throw new Error(
+      `${PREVIEW_BUILD_TIMEOUT_ENV}=${JSON.stringify(raw)} is invalid — ${why}. ` +
+        `Set it to a whole number of MILLISECONDS between ${PREVIEW_BUILD_TIMEOUT_MIN_MS} ` +
+        `(${formatBuildBudget(PREVIEW_BUILD_TIMEOUT_MIN_MS)}) and ${PREVIEW_BUILD_TIMEOUT_MAX_MS} ` +
+        `(${formatBuildBudget(PREVIEW_BUILD_TIMEOUT_MAX_MS)}), or unset it to use the default ` +
+        `${PREVIEW_BUILD_TIMEOUT_DEFAULT_MS} (${formatBuildBudget(PREVIEW_BUILD_TIMEOUT_DEFAULT_MS)}). ` +
+        `The build timeout is always bounded — there is no value that disables it.`,
+    );
+  };
+  // Digits only: rules out "1.5", "1e6", "90m", "0x10", "+5", "-1", "Infinity",
+  // "never" in one predicate, so the parse below cannot silently truncate.
+  if (!/^\d+$/.test(value)) reject("it is not a whole number of milliseconds");
+  const ms = Number(value);
+  if (!Number.isSafeInteger(ms)) reject("it is not a representable whole number");
+  if (ms < PREVIEW_BUILD_TIMEOUT_MIN_MS) reject(`it is below the ${PREVIEW_BUILD_TIMEOUT_MIN_MS}ms minimum`);
+  if (ms > PREVIEW_BUILD_TIMEOUT_MAX_MS) reject(`it exceeds the ${PREVIEW_BUILD_TIMEOUT_MAX_MS}ms maximum`);
+  return ms;
+}
+
 /**
  * Build the preview image at `tag` from `contextDir` using the checkout's OWN
  * multi-stage Dockerfile (the same one build-image.yml uses: acquire-prod +
  * OAS-seed + presence-aware manifest regen + `next build` standalone + runtime
- * copy). Bounded by PREVIEW_BUILD_TIMEOUT_MS; fails loudly on error/timeout.
+ * copy). Bounded by `resolveBuildTimeoutMs`; fails loudly on error/timeout.
  * AC7-ii is enforced here: the tag can never be a published production name.
+ *
+ * The budget is read from `deps.buildControlEnv ?? process.env` — deliberately
+ * NOT from `deps.env` (cinatra-cli#194). `deps.env` is the CONTAINER env
+ * contract, and the `install --mode preview` front door replaces it with a fresh
+ * object composed from the install's own `.env.local` precisely so ambient shell
+ * state cannot leak into the container (#188 AC3). Reading the budget from there
+ * would make the documented override silently inert on that front door — which
+ * is one of the two entrypoints #194 names. The build budget is a property of
+ * the operator's INVOCATION, not of the container, so it is read from the
+ * operator's environment and is immune to any future env composition; the
+ * injectable `buildControlEnv` seam keeps the unit suite hermetic.
  */
 export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
   assertNotProductionImageTag(tag);
+  const timeoutMs = resolveBuildTimeoutMs(deps.buildControlEnv ?? process.env);
+  const overridden = timeoutMs !== PREVIEW_BUILD_TIMEOUT_DEFAULT_MS;
+  deps.log?.(
+    `  building ${tag} — budget ${formatBuildBudget(timeoutMs)}` +
+      (overridden
+        ? ` (${PREVIEW_BUILD_TIMEOUT_ENV} override).`
+        : `; a slower/cold host can raise it with ${PREVIEW_BUILD_TIMEOUT_ENV} ` +
+          `(up to ${formatBuildBudget(PREVIEW_BUILD_TIMEOUT_MAX_MS)}).`),
+  );
   const args = ["build", "-t", tag];
   if (provenance) args.push("--label", `cinatra.preview.provenance=${provenance}`);
   if (sha) args.push("--label", `cinatra.preview.sha=${sha}`);
   args.push(contextDir);
   const r = deps.runDocker(args, {
-    timeoutMs: PREVIEW_BUILD_TIMEOUT_MS,
+    timeoutMs,
     stdio: ["ignore", "inherit", "inherit"],
   });
   if (r.timedOut || r.error || r.status !== 0) {
     throw new Error(
       `docker build of ${tag} failed` +
-        (r.timedOut ? " (timed out)" : "") +
+        (r.timedOut ? ` (timed out after ${formatBuildBudget(timeoutMs)})` : "") +
         (r.stderr ? `: ${r.stderr.trim()}` : ".") +
         ` The build runs the checkout's own multi-stage Dockerfile (acquire-prod, required-OAS seed, ` +
-        `manifest regen, next build); fix the underlying error and retry.`,
+        `manifest regen, next build); fix the underlying error and retry.` +
+        (r.timedOut
+          ? ` If the build was still ADVANCING, this is a budget problem, not a hang: re-run with a larger ` +
+            `${PREVIEW_BUILD_TIMEOUT_ENV} (milliseconds, max ${PREVIEW_BUILD_TIMEOUT_MAX_MS} = ` +
+            `${formatBuildBudget(PREVIEW_BUILD_TIMEOUT_MAX_MS)}). A retry reuses every layer that COMPLETED, ` +
+            `so it restarts at the interrupted step rather than from scratch — but that step itself starts ` +
+            `over, so if ONE step is longer than the budget, raising the budget is required, not just retrying.`
+          : ""),
     );
   }
   return tag;
@@ -1238,6 +1341,11 @@ export async function runPreviewCreate(rest, injected = {}) {
   assertEncryptionKey(env);
   // AC7-iii: never route around the materialize safety invariant.
   assertMaterializeNotDisabled(env);
+  // cinatra-cli#194: a malformed build-budget override is a hard error, and it
+  // is raised HERE — before the slug claim, the port allocation and the volume
+  // probe — so a typo costs nothing to recover from. `buildPreviewImage`
+  // re-resolves the same value at the build itself (single source of truth).
+  resolveBuildTimeoutMs(deps.buildControlEnv ?? process.env);
   // AC9: refuse a genuine `--mode prod` checkout up front — before we even
   // resolve a SHA against or touch its `.git`. Checkout-derived, unconditional on
   // the env mode (never gated on a registry row).
@@ -1318,7 +1426,7 @@ export async function runPreviewCreate(rest, injected = {}) {
     // caller pre-allocated outside the lock — that would race a concurrent
     // create), and it is resolved + VALIDATED HERE, before the build: an invalid
     // boot key, a materialize bypass, or a throwing hook must fail fast, not
-    // after a 30-minute image build. A throw lands in the catch below, which
+    // after a multi-hour image build. A throw lands in the catch below, which
     // releases the claim and cleans up.
     const runtimeEnv = resolveRuntimeEnv({ deps, env, hostPort });
     const bootKey = assertEncryptionKey(runtimeEnv);
@@ -1391,6 +1499,10 @@ export async function runPreviewRefresh(rest, injected = {}) {
 
   assertEncryptionKey(env); // AC6 — fail-fast gate; the boot key is re-derived below.
   assertMaterializeNotDisabled(env); // AC7-iii
+  // cinatra-cli#194: validate the build-budget override HERE too, before the
+  // registry claim and the container replacement — a typo'd override must not
+  // surface only after the old preview has been put into `provisioning`.
+  resolveBuildTimeoutMs(deps.buildControlEnv ?? process.env);
   // AC9: refuse a genuine `--mode prod` checkout up front — checkout-derived and
   // unconditional. Critically NOT gated on an existing registry row: refresh
   // requires an existing row to proceed, so gating the refusal on "a row exists"
@@ -1610,7 +1722,13 @@ export const __test = {
   CONTAINER_HOST_GATEWAY,
   PREVIEW_HOST_PORT_MIN,
   PREVIEW_HOST_PORT_MAX,
+  PREVIEW_BUILD_TIMEOUT_DEFAULT_MS,
+  PREVIEW_BUILD_TIMEOUT_ENV,
+  PREVIEW_BUILD_TIMEOUT_MIN_MS,
+  PREVIEW_BUILD_TIMEOUT_MAX_MS,
   // pure helpers
+  resolveBuildTimeoutMs,
+  formatBuildBudget,
   rewriteLoopbackUrlForContainer,
   isValidSlug,
   isImmutableSha,
