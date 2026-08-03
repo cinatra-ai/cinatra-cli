@@ -1,8 +1,10 @@
 // Production required-extension acquisition.
 //
 // The prod base image needs the full "bootable set" of extension packages on
-// disk at build time: every package declared in `cinatra.extensions`
-// (root package.json). That set is the union of the genuine system packages
+// disk at build time: every package in the host's extension declaration —
+// `cinatra.systemExtensions` post-cinatra#2331, the legacy `cinatra.extensions`
+// before it (see the schema-discriminated reader below for how the two shapes
+// are told apart). That set is the union of the genuine system packages
 // and every extension package the host source still value-imports — see the
 // coverage gate (scripts/audit/required-extensions-cover-host-imports.mjs),
 // which keeps the declaration honest against the real import graph.
@@ -147,28 +149,130 @@ export function readRequiredExtensionsLock(lockPath) {
   return { schemaVersion: doc.schemaVersion ?? null, packages };
 }
 
+// --------------------------------------------------------------------------
+// Host extension DECLARATION reader (transitional, schema-discriminated).
+//
+// cinatra#2331 collapses the host's two parallel declarations — the legacy
+// `cinatra.extensions` (`name@range` specs) and `cinatra.systemExtensions`
+// (BARE names) — into a single `cinatra.systemExtensions` carrying RANGED
+// specs. This published CLI is consumed by the prod `docker build` at a pinned
+// version, so it must read BOTH shapes across the cutover.
+//
+// A naive `systemExtensions ?? extensions` fallback is UNSOUND: the bare-name
+// `systemExtensions` already exists in every pre-cutover manifest and would
+// win with `range === null`, silently skipping the version-satisfaction check
+// in prod-extension-verify. So the choice is made by SCHEMA, not by presence:
+// `systemExtensions` is selected ONLY when it is a NON-EMPTY array in which
+// EVERY entry is a valid RANGED spec (a well-formed scoped package name plus a
+// non-empty range) and every NAME is unique. Anything else — absent, empty,
+// mixed, malformed, rangeless, duplicated — falls back to the legacy
+// `cinatra.extensions`. An EMPTY array must never vacuously select the new
+// schema.
+//
+// This discrimination is TRANSITIONAL: it is removed in the CLI release AFTER
+// the cutover has landed, when `cinatra.systemExtensions` is the only shape in
+// the wild.
+// --------------------------------------------------------------------------
+
+/** Which declaration a read resolved to. */
+export const DECLARATION_SCHEMA = Object.freeze({
+  SYSTEM: "cinatra.systemExtensions",
+  LEGACY: "cinatra.extensions",
+  NONE: "none",
+});
+
 /**
- * The declared `cinatra.extensions` package NAMES (ranges stripped —
- * the same last-`@` split as the canonical host parser in
- * packages/extensions/src/required-in-prod.ts). Returns an empty set when the
- * manifest or block is absent/unreadable (the caller treats that as
+ * Split ONE declaration entry on its LAST `@` — the same split as the
+ * canonical host parser in packages/extensions/src/required-in-prod.ts.
+ * Returns `{ name, range }` (`range === null` for a bare/unpinned entry), or
+ * `null` when the entry is not a usable non-empty string.
+ */
+function splitDeclarationEntry(entry) {
+  if (typeof entry !== "string") return null;
+  const trimmed = entry.trim();
+  if (trimmed.length === 0) return null;
+  const at = trimmed.lastIndexOf("@");
+  if (at <= 0) return { name: trimmed, range: null }; // bare (scoped names start with `@`)
+  const range = trimmed.slice(at + 1).trim();
+  return { name: trimmed.slice(0, at), range: range.length > 0 ? range : null };
+}
+
+/**
+ * A RANGED spec: a well-formed `@scope/name` (the only shape the acquisition
+ * layout supports) followed by a NON-EMPTY version range. Bare entries and a
+ * trailing-`@` entry are rejected. The range itself is NOT semver-validated
+ * here (that stays with the async `versionSatisfiesRange` cross-check, which
+ * fails closed on a garbage range) — this predicate answers only "is this the
+ * new, ranged schema".
+ */
+function isRangedSpec(entry) {
+  const parsed = splitDeclarationEntry(entry);
+  return parsed !== null && parsed.range !== null && SCOPED_PKG_RE.test(parsed.name);
+}
+
+/**
+ * The new schema is a SET of ranged specs: every entry ranged AND every name
+ * unique. A duplicated name is rejected because the specs collapse into a
+ * name-keyed map — a second entry for the same package would silently
+ * overwrite the first one's range, which is exactly the silent range-drop this
+ * discrimination exists to prevent. A duplicate therefore falls back like any
+ * other malformed shape: to the legacy list during the transition, and to
+ * "nothing declared" once the legacy list is gone — where the lock<->declaration
+ * bijection fails loud. (The LEGACY path keeps its historical last-write-wins
+ * behaviour byte for byte; nothing about it changes here.)
+ */
+function isRangedSpecSet(entries) {
+  if (!entries.every(isRangedSpec)) return false;
+  const names = new Set(entries.map((e) => splitDeclarationEntry(e).name));
+  return names.size === entries.length;
+}
+
+/**
+ * Read the host's extension declaration, discriminating between the new
+ * `cinatra.systemExtensions` (ranged specs) and the legacy `cinatra.extensions`
+ * per the rule documented above.
+ *
+ * @returns {{ schema: string, specs: Map<string, string|null> }} `specs` maps
+ * package name -> version range (`null` when the entry carried none). Returns
+ * an empty map with `schema: "none"` when the manifest is absent/unreadable or
+ * declares neither key (the callers treat that as "nothing to cross-check",
+ * never as a read failure — the lock<->declaration bijection still fails loud
+ * on a real drift).
+ */
+export function readDeclaredExtensionSpecs(packageJsonPath) {
+  let pkg;
+  try {
+    pkg = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+  } catch {
+    return { schema: DECLARATION_SCHEMA.NONE, specs: new Map() };
+  }
+  const collect = (raw) => {
+    const specs = new Map();
+    for (const entry of raw) {
+      const parsed = splitDeclarationEntry(entry);
+      if (parsed) specs.set(parsed.name, parsed.range);
+    }
+    return specs;
+  };
+  const system = pkg?.cinatra?.systemExtensions;
+  if (Array.isArray(system) && system.length > 0 && isRangedSpecSet(system)) {
+    return { schema: DECLARATION_SCHEMA.SYSTEM, specs: collect(system) };
+  }
+  const legacy = pkg?.cinatra?.extensions;
+  if (Array.isArray(legacy)) {
+    return { schema: DECLARATION_SCHEMA.LEGACY, specs: collect(legacy) };
+  }
+  return { schema: DECLARATION_SCHEMA.NONE, specs: new Map() };
+}
+
+/**
+ * The declared extension package NAMES (ranges stripped) from whichever
+ * declaration `readDeclaredExtensionSpecs` resolves to. Returns an empty set
+ * when the manifest or block is absent/unreadable (the caller treats that as
  * "nothing to cross-check", never as an acquisition failure).
  */
 export function readDeclaredRequiredExtensionNames(packageJsonPath) {
-  try {
-    const pkg = JSON.parse(readFileSync(packageJsonPath, "utf8"));
-    const raw = Array.isArray(pkg?.cinatra?.extensions) ? pkg.cinatra.extensions : [];
-    const names = new Set();
-    for (const entry of raw) {
-      if (typeof entry !== "string" || entry.trim().length === 0) continue;
-      const trimmed = entry.trim();
-      const at = trimmed.lastIndexOf("@");
-      names.add(at <= 0 ? trimmed : trimmed.slice(0, at));
-    }
-    return names;
-  } catch {
-    return new Set();
-  }
+  return new Set(readDeclaredExtensionSpecs(packageJsonPath).specs.keys());
 }
 
 /**
@@ -571,13 +675,18 @@ export async function acquireProdRequiredExtensions({
   // packages is itself drift and fails loud.
   const rootManifestPath = path.join(repoRoot, "package.json");
   if (existsSync(rootManifestPath)) {
-    const declared = readDeclaredRequiredExtensionNames(rootManifestPath);
+    const { schema, specs } = readDeclaredExtensionSpecs(rootManifestPath);
+    const declared = new Set(specs.keys());
+    const declarationLabel =
+      schema === DECLARATION_SCHEMA.NONE
+        ? "the host extension declaration (cinatra.systemExtensions / cinatra.extensions)"
+        : schema;
     const lockedNames = new Set(lock.packages.map((p) => p.packageName));
     const missingFromLock = [...declared].filter((n) => !lockedNames.has(n)).sort();
     const staleInLock = [...lockedNames].filter((n) => !declared.has(n)).sort();
     if (missingFromLock.length > 0 || staleInLock.length > 0) {
       throw new Error(
-        `[prod-extension-acquisition] the acquisition lock does not match cinatra.extensions:` +
+        `[prod-extension-acquisition] the acquisition lock does not match ${declarationLabel}:` +
           (missingFromLock.length ? `\n  declared but not locked: ${missingFromLock.join(", ")}` : "") +
           (staleInLock.length ? `\n  locked but not declared: ${staleInLock.join(", ")}` : "") +
           `\nRegenerate with \`node scripts/extensions/update-required-extension-lock.mjs\` and commit the lock.`,

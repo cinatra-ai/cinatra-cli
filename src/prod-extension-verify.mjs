@@ -8,8 +8,13 @@
 //                                `extensions acquire-prod` (or baked into the
 //                                image), each stamped with an acquisition marker
 //                                `.cinatra-acquired.json`.
-//   (B) baked seed / declared  — the host's `cinatra.extensions` declaration in
-//                                the root package.json (the required-in-prod set).
+//   (B) baked seed / declared  — the host's extension declaration in the root
+//                                package.json (the required-in-prod set):
+//                                `cinatra.systemExtensions` (ranged specs) post
+//                                cinatra#2331, the legacy `cinatra.extensions`
+//                                before it. Which one is read is decided by
+//                                SCHEMA, not presence — see the discriminated
+//                                reader in prod-extension-acquisition.mjs.
 //   (C) the committed LOCK      — cinatra-required-extensions.lock.json, the ONLY
 //                                source prod acquires from (pinned SHA + tree hash
 //                                + version per package).
@@ -42,7 +47,7 @@
 //
 // This module NEVER writes, renames, downloads, or removes anything. It reuses
 // the acquisition module's PURE read helpers (`readRequiredExtensionsLock`,
-// `readDeclaredRequiredExtensionNames`, `computeTreeSha256FromDir`,
+// `readDeclaredExtensionSpecs`, `computeTreeSha256FromDir`,
 // `readAcquisitionMarker`, `destDirForExtension`) so there is no logic
 // duplication and no accidental mutation path (the acquisition download/extract/
 // swap routine is never entered).
@@ -74,10 +79,11 @@ import path from "node:path";
 
 import { deriveKindFromName, destDirForExtension } from "./cinatra-dev-extensions.mjs";
 import {
+  DECLARATION_SCHEMA,
   LOCK_FILENAME,
   computeTreeSha256FromDir,
   readAcquisitionMarker,
-  readDeclaredRequiredExtensionNames,
+  readDeclaredExtensionSpecs,
   readRequiredExtensionsLock,
 } from "./prod-extension-acquisition.mjs";
 
@@ -269,13 +275,22 @@ export async function verifyProdRequiredExtensions({
   const lock = readRequiredExtensionsLock(lockPath ?? path.join(repoRoot, LOCK_FILENAME));
   const lockedByName = new Map(lock.packages.map((p) => [p.packageName, p]));
 
-  // (B) declared/seed set from the root package.json.
+  // (B) declared/seed set from the root package.json. The declaration is read
+  // ONCE, schema-discriminated (new `cinatra.systemExtensions` ranged specs vs
+  // the legacy `cinatra.extensions`) — see prod-extension-acquisition.mjs. Both
+  // the name set and the pinned RANGE per name (for the version-satisfaction
+  // cross-check) come from that single resolution, so the two can never
+  // disagree about which declaration won.
   const rootManifestPath = path.join(repoRoot, "package.json");
-  const declared = existsSync(rootManifestPath)
-    ? readDeclaredRequiredExtensionNames(rootManifestPath)
-    : new Set();
-  // The pinned RANGE per declared name (for the version-satisfaction cross-check).
-  const declaredRanges = existsSync(rootManifestPath) ? readDeclaredRanges(rootManifestPath) : new Map();
+  const declaration = existsSync(rootManifestPath)
+    ? readDeclaredExtensionSpecs(rootManifestPath)
+    : { schema: DECLARATION_SCHEMA.NONE, specs: new Map() };
+  const declaredRanges = declaration.specs;
+  const declared = new Set(declaredRanges.keys());
+  const declarationLabel =
+    declaration.schema === DECLARATION_SCHEMA.NONE
+      ? "the host extension declaration (cinatra.systemExtensions / cinatra.extensions)"
+      : declaration.schema;
 
   // lock <-> seed bijection (class: lock-mismatch). Only when a root manifest
   // exists (a scratch root with no manifest is not "drift", it is "nothing to
@@ -287,7 +302,7 @@ export async function verifyProdRequiredExtensions({
       findings.push(
         finding(
           "lock-mismatch",
-          `declared in cinatra.extensions but absent from ${LOCK_FILENAME} (seed<->lock bijection broken)`,
+          `declared in ${declarationLabel} but absent from ${LOCK_FILENAME} (seed<->lock bijection broken)`,
           {
             packageName: name,
             remediation:
@@ -300,11 +315,11 @@ export async function verifyProdRequiredExtensions({
       findings.push(
         finding(
           "lock-mismatch",
-          `pinned in ${LOCK_FILENAME} but not declared in cinatra.extensions (seed<->lock bijection broken)`,
+          `pinned in ${LOCK_FILENAME} but not declared in ${declarationLabel} (seed<->lock bijection broken)`,
           {
             packageName: name,
             remediation:
-              "Either declare it in cinatra.extensions or regenerate the lock to drop it: " +
+              `Either declare it in ${declarationLabel} or regenerate the lock to drop it: ` +
               "`node scripts/extensions/update-required-extension-lock.mjs`.",
           },
         ),
@@ -481,11 +496,11 @@ export async function verifyProdRequiredExtensions({
       findings.push(
         finding(
           "lock-mismatch",
-          `locked version ${entry.packageVersion} does not satisfy the declared pin "${range}" in cinatra.extensions`,
+          `locked version ${entry.packageVersion} does not satisfy the declared pin "${range}" in ${declarationLabel}`,
           {
             packageName: name,
             remediation:
-              "Align the cinatra.extensions pin with the locked version, or re-lock a satisfying version.",
+              `Align the ${declarationLabel} pin with the locked version, or re-lock a satisfying version.`,
           },
         ),
       );
@@ -665,28 +680,16 @@ export function verifyWayflowVisibility(packageName, installDir, seedManifest) {
 // Small pure helpers
 // ---------------------------------------------------------------------------
 
-/** The pinned RANGE per declared `cinatra.extensions` name (name@range split). */
+/**
+ * The pinned RANGE per declared package name, from whichever declaration the
+ * schema-discriminated reader resolves to (`cinatra.systemExtensions` ranged
+ * specs, else the legacy `cinatra.extensions`). A bare/unpinned entry maps to
+ * `null`; an unreadable manifest yields an empty map (the bijection check
+ * still runs off the names set). Thin wrapper — the ONE spec parser lives in
+ * prod-extension-acquisition.mjs; this module never re-implements the split.
+ */
 export function readDeclaredRanges(packageJsonPath) {
-  const ranges = new Map();
-  try {
-    const pkg = JSON.parse(readFileSync(packageJsonPath, "utf8"));
-    const raw = Array.isArray(pkg?.cinatra?.extensions) ? pkg.cinatra.extensions : [];
-    for (const entry of raw) {
-      if (typeof entry !== "string" || entry.trim().length === 0) continue;
-      const trimmed = entry.trim();
-      const at = trimmed.lastIndexOf("@");
-      if (at <= 0) {
-        ranges.set(trimmed, null); // bare / unpinned
-      } else {
-        const name = trimmed.slice(0, at);
-        const range = trimmed.slice(at + 1).trim();
-        ranges.set(name, range.length > 0 ? range : null);
-      }
-    }
-  } catch {
-    /* unreadable -> empty map; the bijection check still runs off the names set */
-  }
-  return ranges;
+  return readDeclaredExtensionSpecs(packageJsonPath).specs;
 }
 
 function relFromRoot(repoRoot, dest) {
