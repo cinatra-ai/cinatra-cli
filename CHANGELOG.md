@@ -60,6 +60,21 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The host's extension declaration is read by SCHEMA, not by presence.** A
+  Cinatra checkout may declare its extension set either as
+  `cinatra.systemExtensions` — a list of versioned specs such as
+  `"@cinatra-ai/nango-connector@^0.1.0"` — or as the older `cinatra.extensions`.
+  `extensions acquire-prod` (which the production image build runs) and
+  `extensions verify-prod` read `cinatra.systemExtensions` only when it is a
+  non-empty list of well-formed versioned specs with unique names, and read
+  `cinatra.extensions` otherwise. Presence alone is not enough, because a
+  checkout can carry a `cinatra.systemExtensions` list of bare package names:
+  reading that would discard every version range and stop enforcing that the
+  locked version satisfies the declared pin. A declaration that is empty, mixed,
+  malformed, unversioned or duplicated is never read as the versioned shape, and
+  when no other declaration is available nothing is treated as declared — so the
+  lock↔declaration bijection fails loudly instead of passing vacuously.
+  Diagnostics name the declaration that was actually read.
 - The CLI-managed sandbox image path is now the digest-pinned execution-plane L0
   image (built from `docker/sandbox/Dockerfile`, its resolved digest recorded).
   The retired `:latest` skill-shell image is no longer built by
