@@ -41,7 +41,16 @@
 //                            front door SOURCES the passthrough values from the
 //                            install it just performed and hands them to create
 //                            as an explicit `deps.env`, rather than relying on
-//                            ambient shell state.
+//                            ambient shell state. cinatra-cli#197: an install's
+//                            configuration is only PARTLY written down —
+//                            `.env.example` defines neither REDIS_URL nor the
+//                            agent-registry URL, so the app resolves those by
+//                            fallback. "Sourced from the install" therefore
+//                            means its EFFECTIVE configuration, not only its
+//                            explicit lines: the caller supplies this instance's
+//                            own endpoints for the implicit keys
+//                            (`instance-endpoints.mjs`), and an explicit
+//                            `.env.local` value always wins over them.
 //   AC4  ENCRYPTION KEY    — a runtime-BOOT requirement of preview that a dev
 //                            install deliberately does not mint. Provisioned +
 //                            persisted HERE, outside the checkout, so the dev
@@ -69,7 +78,10 @@
 //
 // Plain ESM `.mjs`, node builtins + `preview.mjs` only (no import back into
 // `install.mjs`, which lazy-imports THIS module — so there is no cycle). The
-// pure helpers are re-exported as `__test` for hermetic vitest.
+// effective endpoints #197 composes are DERIVED BY THE CALLER and handed in,
+// which is what keeps that rule intact: only `install.mjs` knows the infra plan
+// they are valid for. The pure helpers are re-exported as `__test` for hermetic
+// vitest.
 //
 // LEAK DISCIPLINE: the passthrough surface carries secrets (BETTER_AUTH_SECRET,
 // OPENAI_API_KEY, a password-bearing SUPABASE_DB_URL, the minted encryption
@@ -193,16 +205,24 @@ export function readInstalledEnvValues(targetDir) {
  *
  * Returns key NAMES only alongside the map — never values (leak discipline).
  *
+ * `effectiveDefaults` (cinatra-cli#197) supplies the instance's own value for a
+ * container-dialed key the install leaves IMPLICIT in `.env.local`. It fills
+ * only what is absent — an explicit value always wins — and the caller decides
+ * whether the composition is entitled to it at all.
+ *
  * @param {{ envValues: Record<string,string>, previewHostPort: number,
- *           passthroughKeys?: readonly string[] }} args
+ *           passthroughKeys?: readonly string[], onlyDefinedKeys?: boolean,
+ *           effectiveDefaults?: Record<string,string> }} args
  * @returns {{ env: Record<string,string>, appUrlKeys: string[],
- *             containerDialedKeys: string[], forwardedKeys: string[], missingKeys: string[] }}
+ *             containerDialedKeys: string[], forwardedKeys: string[],
+ *             missingKeys: string[], synthesizedKeys: string[] }}
  */
 export function derivePreviewEnvFromInstall({
   envValues = {},
   previewHostPort,
   passthroughKeys = PASSTHROUGH_ENV_KEYS,
   onlyDefinedKeys = false,
+  effectiveDefaults = {},
 }) {
   if (!Number.isInteger(previewHostPort) || previewHostPort <= 0) {
     throw new Error(
@@ -217,6 +237,7 @@ export function derivePreviewEnvFromInstall({
   const containerDialedKeys = [];
   const forwardedKeys = [];
   const missingKeys = [];
+  const synthesizedKeys = [];
 
   for (const key of passthroughKeys) {
     if (appUrlKeys.has(key)) {
@@ -236,17 +257,28 @@ export function derivePreviewEnvFromInstall({
       usedAppUrlKeys.push(key);
       continue;
     }
-    const raw = envValues[key];
-    if (typeof raw !== "string" || raw.length === 0) {
+    const explicit = envValues[key];
+    const defined = typeof explicit === "string" && explicit.length > 0;
+    // cinatra-cli#197: a key the install leaves IMPLICIT still has an effective
+    // value — `.env.example` writes SUPABASE_DB_URL but not REDIS_URL and not
+    // CINATRA_AGENT_REGISTRY_URL, so the app resolves those by FALLBACK. On the
+    // host that fallback is correct; inside the container `127.0.0.1` is the
+    // container itself and the registry default is the hosted one. The caller
+    // supplies this instance's own effective endpoints for exactly those keys
+    // (empty for a continuation, which must never invent env — see
+    // `makePreviewComposition`), and an EXPLICIT `.env.local` value always wins.
+    const synthesized = !defined && typeof effectiveDefaults?.[key] === "string" && effectiveDefaults[key].length > 0;
+    if (!defined && !synthesized) {
       missingKeys.push(key);
       continue;
     }
-    env[key] = raw;
+    env[key] = defined ? explicit : effectiveDefaults[key];
+    if (synthesized) synthesizedKeys.push(key);
     // Reported (by NAME) so the operator can see which values `preview.mjs` will
     // re-point at the host gateway before the container dials them.
     (containerDialed.has(key) ? containerDialedKeys : forwardedKeys).push(key);
   }
-  return { env, appUrlKeys: usedAppUrlKeys, containerDialedKeys, forwardedKeys, missingKeys };
+  return { env, appUrlKeys: usedAppUrlKeys, containerDialedKeys, forwardedKeys, missingKeys, synthesizedKeys };
 }
 
 // --- AC4: the preview's boot encryption key --------------------------------
@@ -543,14 +575,22 @@ export function previewSlugArgs({ instanceSlug = null, rest = [] } = {}) {
  * Everything side-effecting rides `preview.mjs`'s own injectable `deps`, so the
  * unit suite exercises this whole composition with no docker/git/network.
  *
+ * `effectiveEndpoints` (cinatra-cli#197) carries this instance's own
+ * container-dialed endpoints for the keys `.env.local` leaves implicit. The
+ * caller (`install.mjs`) derives them, because only it knows which infra plan
+ * this install took — an external/co-use instance dials infra the checkout's own
+ * compose band does not describe, and gets nothing.
+ *
  * @param {{ targetDir: string, ref?: string, rest?: string[], log?: Function,
- *           deps?: object, env?: Record<string,string> }} args
+ *           deps?: object, env?: Record<string,string>,
+ *           effectiveEndpoints?: Record<string,string> }} args
  */
 export async function runInstallPreviewBootstrap({
   targetDir,
   ref = "main",
   rest = [],
   instanceSlug = null,
+  effectiveEndpoints = {},
   log = console.log,
   deps: injected = {},
   env: ambientEnv = process.env,
@@ -659,6 +699,9 @@ export async function runInstallPreviewBootstrap({
     targetDir,
     slug,
     encryptionKey: secret.key,
+    // #197: the front-door create OWNS the instance it just built, so supplying
+    // that instance's own effective endpoints is not inventing operator env.
+    effectiveEndpoints,
     log,
     deps,
   });
@@ -710,6 +753,7 @@ export function makePreviewComposition({
   encryptionKey = null,
   baseEnv = null,
   continuation = false,
+  effectiveEndpoints = {},
   log = null,
   deps = {},
 }) {
@@ -722,8 +766,19 @@ export function makePreviewComposition({
   // else, and it adds the host-gateway mapping ONLY when a loopback endpoint was
   // actually rewritten (there is nothing to reach otherwise). A front-door create
   // owns the instance it just built, so it always sets the app URLs.
+  //
+  // `effectiveEndpoints` (cinatra-cli#197) is the instance's own value for the
+  // container-dialed keys `.env.local` leaves implicit. Passing it is the
+  // CALLER's assertion that this composition owns the instance — the front-door
+  // create always does; a refresh does only for a preview the front door itself
+  // built (#197 AC6: never invent env for a preview it did not build).
   const derive = (previewHostPort) =>
-    derivePreviewEnvFromInstall({ envValues, previewHostPort, onlyDefinedKeys: continuation });
+    derivePreviewEnvFromInstall({
+      envValues,
+      previewHostPort,
+      onlyDefinedKeys: continuation,
+      effectiveDefaults: effectiveEndpoints ?? {},
+    });
 
   const probe = derive(3000);
 
@@ -755,6 +810,15 @@ export function makePreviewComposition({
           `${composed.containerDialedKeys.join(", ") || "(none)"}`,
       );
       log(`    forwarded unchanged: ${composed.forwardedKeys.join(", ") || "(none)"}`);
+      // cinatra-cli#197: name the keys whose value came from this instance's
+      // EFFECTIVE endpoints rather than an explicit `.env.local` line, so the
+      // composition never quietly supplies something the operator cannot see.
+      if (composed.synthesizedKeys.length > 0) {
+        log(
+          `    implicit in .env.local — supplied from this instance's own endpoints: ` +
+            `${composed.synthesizedKeys.join(", ")}`,
+        );
+      }
       if (composed.missingKeys.length > 0) {
         log(`    not set by this install (omitted): ${composed.missingKeys.join(", ")}`);
       }
@@ -763,6 +827,33 @@ export function makePreviewComposition({
   };
 
   return { preEnv, composeRuntimeEnv, envValues, composes: Object.keys(probe.env).length > 0 };
+}
+
+/**
+ * cinatra-cli#197 — the lines a CONTINUATION prints when this checkout leaves a
+ * container-dialed key implicit.
+ *
+ * The front door's own handoff points at `refresh` ("the ONLY way to rebuild the
+ * image"), and a create made healthy by the install's effective endpoints will
+ * rebuild WITHOUT them, because a continuation forwards only what the install
+ * WROTE DOWN (AC6). That difference must not be discovered from a health-gate
+ * timeout: state it before the rebuild, with the remedy.
+ *
+ * Returns key NAMES only — never values.
+ */
+export function continuationImplicitEndpointLines({
+  envValues = {},
+  keys = CONTAINER_REWRITE_ENV_KEYS,
+} = {}) {
+  const implicit = keys.filter((k) => !(typeof envValues[k] === "string" && envValues[k].length > 0));
+  if (implicit.length === 0) return [];
+  return [
+    `  NOTE: this checkout's .env.local leaves these container-dialed keys implicit: ${implicit.join(", ")}.`,
+    `  A refresh CONTINUES an existing preview: it forwards what the install wrote down and invents`,
+    `  nothing (cinatra-cli#197 AC6), so the rebuilt container resolves them by its own in-container`,
+    `  fallback — which for a host-loopback endpoint means the CONTAINER, not this instance.`,
+    `  Set them explicitly in .env.local (or export them) before refreshing if this preview needs them.`,
+  ];
 }
 
 /**
@@ -795,6 +886,18 @@ export async function runInstallPreviewRefresh(rest = [], injected = {}) {
       ? null
       : lookupPreviewEncryptionKey({ slug, filePath: secretsFile });
 
+  // cinatra-cli#197 AC6, deliberately: a CONTINUATION invents NOTHING. It is
+  // tempting to treat "a persisted boot key exists for this slug" as proof the
+  // front door built this preview and therefore owns its endpoints, but that
+  // marker is not sound — the key store is historical per-SLUG state, bound to
+  // neither the current `previews.json` row nor the checkout nor the infra plan.
+  // A slug reused after a registry repair (or a plain `instance preview create`
+  // with the same slug) would inherit a stale key and, with it, endpoints
+  // invented for someone else's preview. Worse, refresh cannot see the infra
+  // plan at all, so it could not exclude an `external`/co-use instance the way
+  // the front-door create does — it would synthesize a LOCAL Redis/Verdaccio for
+  // infrastructure that was never started. So `effectiveEndpoints` stays empty
+  // here and `onlyDefinedKeys` remains the whole story for a continuation.
   const plan = makePreviewComposition({
     targetDir: checkoutDir,
     slug,
@@ -810,6 +913,11 @@ export async function runInstallPreviewRefresh(rest = [], injected = {}) {
   if (!plan.composes && !storedKey) {
     return runPreviewRefresh(rest, { ...injected, checkoutDir });
   }
+
+  // #197: this checkout HAS an `.env.local` we are composing from, so say which
+  // container-dialed keys it does not define before the rebuild starts.
+  const log = deps.log ?? console.log;
+  for (const line of continuationImplicitEndpointLines({ envValues: plan.envValues })) log(line);
 
   return runPreviewRefresh(rest, {
     ...injected,
@@ -835,6 +943,7 @@ export const __test = {
   persistPreviewEncryptionKey,
   lookupPreviewEncryptionKey,
   makePreviewComposition,
+  continuationImplicitEndpointLines,
   previewHandoffLines,
   previewSlugArgs,
   decidePreviewAction,
