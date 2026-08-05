@@ -50,6 +50,11 @@ import { fileURLToPath } from "node:url";
 import { syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
 import { isValidSlug } from "./clone-registry.mjs";
 import {
+  SETUP_EXIT_REGISTRY_SKEW,
+  claimRegistrySkewExitCode,
+  registrySkewVerdictLines,
+} from "./seed-local-registry.mjs";
+import {
   ATTEST_KEY,
   checkProdEnv,
   formatHardFailureMessage,
@@ -1870,6 +1875,35 @@ export function assertTargetSupportsDemo(targetDir) {
   }
 }
 
+/** cinatra-cli#200 — read the setup child's exit status at the install boundary.
+ *
+ *  The child is a separate process, so its exit code is the whole vocabulary it
+ *  has. `runOrThrow`'s "any non-zero means the command failed" is right for
+ *  every command whose failure is total — but the setup child also has a
+ *  SUBSTANTIVELY COMPLETED outcome that is merely loud: the local-registry seed
+ *  found a same-version skew it could not attribute to the extension sync
+ *  (`SETUP_EXIT_REGISTRY_SKEW`). Nothing the rest of the install needs is
+ *  missing in that state — the schema is migrated, the manifests are
+ *  regenerated, the seed republished nothing on purpose — so the install must
+ *  NAME that condition and carry on to the composition instead of reporting a
+ *  failed setup over a completed one.
+ *
+ *  Fail-closed: exactly one typed code is tolerated, and ONLY for a setup mode
+ *  that can actually mint it — the local-registry seed is dev-only, so a prod
+ *  setup exiting with that status is an unexplained failure, not a skew
+ *  (codex review). 0 is success and EVERY other status (including a null
+ *  status from a signal-killed child) is a real failure that still throws. */
+export function classifySetupChildExit(status, { canReportRegistrySkew = false } = {}) {
+  if (canReportRegistrySkew && status === SETUP_EXIT_REGISTRY_SKEW) {
+    return {
+      tolerated: true,
+      registrySkew: true,
+      lines: registrySkewVerdictLines([], { context: "install" }),
+    };
+  }
+  return { tolerated: status === 0, registrySkew: false, lines: [] };
+}
+
 function runSetupInTarget({ targetDir, mode, skipDevApps, log = console.log }) {
   // The command-routing contract (renamed cinatra-cli#61): invoke the CANONICAL namespaced form
   // (`cinatra instance setup <mode>`) — the only form that resolves (the bare
@@ -1886,10 +1920,28 @@ function runSetupInTarget({ targetDir, mode, skipDevApps, log = console.log }) {
   if (setupMode === "dev" && skipDevApps) setupArgs.push("--skip-dev-apps");
   const label = profile ? `${setupMode} (${profile} profile)` : setupMode;
   log(`- Running \`cinatra instance setup ${setupMode}\` inside ${targetDir}${profile ? ` [${profile} profile]` : ""}…`);
-  runOrThrow(process.execPath, setupArgs, `cinatra instance setup ${label} failed inside the target.`, {
+  // cinatra-cli#200: NOT `runOrThrow` — the setup child has one non-zero status
+  // that is a named, non-fatal verdict rather than a failure (see
+  // classifySetupChildExit). Everything else still throws the same message.
+  const message = `cinatra instance setup ${label} failed inside the target.`;
+  const result = spawnSync(process.execPath, setupArgs, {
+    stdio: "inherit",
     cwd: targetDir,
     env: buildSetupChildEnv({ mode, targetDir }),
   });
+  if (result.error) throw new Error(`${message} (${result.error.message})`);
+  // Only the DEV setup path runs the local-registry seed, so only it can mint
+  // the typed skew status (`demo` maps onto `setupMode === "dev"` above).
+  const verdict = classifySetupChildExit(result.status, {
+    canReportRegistrySkew: setupMode === "dev",
+  });
+  if (!verdict.tolerated) {
+    // A signal-killed child reports a null status; name the signal rather than
+    // leaving the operator with an unexplained failure.
+    throw new Error(result.signal ? `${message} (killed by ${result.signal})` : message);
+  }
+  for (const line of verdict.lines) log(line);
+  return verdict;
 }
 
 /** Build the environment for the target `instance setup` child (cinatra-cli#122).
@@ -2409,7 +2461,15 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
     // Run setup with NO infra bring-up (the donor's stack is the backing infra).
     if (!opts.noSetup && deps.runSetup !== false) {
       const runSetup = deps.runSetup ?? ((d) => runSetupInTarget({ ...d }));
-      runSetup({ targetDir, mode: opts.mode, skipDevApps: opts.skipDevApps, log });
+      const setupVerdict = runSetup({ targetDir, mode: opts.mode, skipDevApps: opts.skipDevApps, log });
+      // cinatra-cli#200 — co-use terminates on its OWN tail (below), so it must
+      // carry the typed skew outcome itself: the same completed-with-skew setup
+      // that exits non-zero on the default install path cannot silently exit 0
+      // here (codex review).
+      if (setupVerdict?.registrySkew === true) {
+        for (const line of registrySkewVerdictLines([], { context: "install-tail" })) log(line);
+        process.exitCode = claimRegistrySkewExitCode(process.exitCode);
+      }
     }
 
     // cinatra-cli#143: a PROD co-use instance INHERITS its crypto secrets from the
@@ -5726,6 +5786,11 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   //    first `pnpm install` resolves the workspace.
   const usePnpmDirect = !commandExists("corepack", ["--version"]) && commandExists("pnpm", ["--version"]);
 
+  // cinatra-cli#200 — set when the setup child reported the named, non-fatal
+  // local-registry skew verdict. Restated at the tail (below) so the operator
+  // sees it after the wall of install output, not only where it happened.
+  let setupRegistrySkew = false;
+
   if (isDevLikeMode(opts.mode)) {
     // (demo overlay support was verified right after checkout, above.)
     log("- Cloning declared companion extension repos (cinatra.devExtensions)…");
@@ -5751,7 +5816,13 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
         // through honors the operator's choice. (We do NOT sync devApps here to
         // avoid double-cloning.) `demo` drives the same dev setup path + the
         // orthogonal CINATRA_INSTALL_PROFILE=demo signal (see runSetupInTarget).
-        runSetupInTarget({ targetDir, mode: opts.mode, skipDevApps: opts.skipDevApps, log });
+        const setupVerdict = runSetupInTarget({
+          targetDir,
+          mode: opts.mode,
+          skipDevApps: opts.skipDevApps,
+          log,
+        });
+        setupRegistrySkew = setupVerdict?.registrySkew === true;
       }
     }
   } else if (opts.noInstall) {
@@ -5853,6 +5924,17 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   //     reconcile exempts exactly those and refuses everything else, so say so
   //     when there IS something else (drift signal + operator warning).
   for (const line of installByproductDriftLines(classifyTargetDirt(targetDir))) log(line);
+
+  // 8c. cinatra-cli#200 — the deferred skew verdict. The install DID complete
+  //     (including the preview composition above), so this is stated as the
+  //     named condition it is, at the end where the operator will see it, and
+  //     the typed code is re-raised as this process's exit status: loud, and
+  //     never a bare "setup failed" over a substantively completed setup.
+  if (setupRegistrySkew) {
+    for (const line of registrySkewVerdictLines([], { context: "install-tail" })) log(line);
+    // Never overwrite a non-zero this install already set for a real failure.
+    process.exitCode = claimRegistrySkewExitCode(process.exitCode);
+  }
 
   log("");
   log("  Next:");

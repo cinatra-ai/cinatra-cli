@@ -1,6 +1,11 @@
 import path from "node:path";
 import { readFileSync } from "node:fs";
-import { defaultRepoSyncDeps, normalizeGitHubRemote, syncOneRepo } from "./dev-repo-sync.mjs";
+import {
+  attestationStillHolds,
+  defaultRepoSyncDeps,
+  normalizeGitHubRemote,
+  syncOneRepo,
+} from "./dev-repo-sync.mjs";
 
 // ---------------------------------------------------------------------------
 // `cinatra instance setup` dev-extension clone bootstrap.
@@ -250,6 +255,57 @@ export function parseDevExtensionFlags(argv = []) {
     // pinned path has no stash/reset semantics.
     pinned: argv.includes("--pinned"),
   };
+}
+
+/**
+ * Partition a `syncCinatraDevExtensions` result into the two SKEW-EXEMPT
+ * provenance sets the local-registry seed consumes (cinatra-cli#200).
+ *
+ * The seed refuses to republish a version whose bytes changed; the question it
+ * must answer is WHO changed them. This sync knows, and says so with a positive
+ * attestation per checkout (see dev-repo-sync.mjs "SYNC PROVENANCE"):
+ *   - `pinnedSha` → verified AT the committed lock pin → `pinnedSourceDirs`
+ *   - `syncedSha` → verified AT the fetched branch tip → `syncedSourceDirs`
+ * Both mean "this content is what the sync put there", so a same-version skew
+ * is the expected update-path state rather than un-versioned local edits.
+ *
+ * Anything else — a dirty-tree skip, a detached checkout carrying local
+ * commits, a failed/skipped sync, or an on-disk package this sync does not
+ * manage at all — lands in NEITHER set: unattributed content stays a
+ * meaningful, exit-affecting skew (fail-closed).
+ *
+ * Two properties this deliberately has (codex review):
+ *   - keyed by resolved DIRECTORY, never by package name. The seed enumerates
+ *     on-disk directories, so a name key would exempt any OTHER directory that
+ *     happens to declare the same manifest name — content this sync never
+ *     touched. The exemption applies to exactly the checkout that was verified.
+ *   - RE-VERIFIED at collection time (`attestationStillHolds`), because setup
+ *     does real work between the sync and the seed. An attestation that no
+ *     longer holds is dropped rather than trusted.
+ *
+ * This is the SINGLE construction site for those sets (`setup dev` wires it in
+ * index.mjs) so the exemption can never drift between callers. `verify` is
+ * injectable for tests only.
+ */
+const ATTESTED_SHA_RE = /^[0-9a-f]{40}$/;
+
+export function collectSkewExemptSources(extensionSync, { verify = attestationStillHolds } = {}) {
+  const results = Array.isArray(extensionSync?.results) ? extensionSync.results : [];
+  const pinnedSourceDirs = new Set();
+  const syncedSourceDirs = new Set();
+  for (const r of results) {
+    if (!r || typeof r.dest !== "string" || !r.dest) continue;
+    const sha =
+      typeof r.pinnedSha === "string" && ATTESTED_SHA_RE.test(r.pinnedSha)
+        ? { value: r.pinnedSha, set: pinnedSourceDirs }
+        : typeof r.syncedSha === "string" && ATTESTED_SHA_RE.test(r.syncedSha)
+          ? { value: r.syncedSha, set: syncedSourceDirs }
+          : null;
+    if (!sha) continue;
+    if (!verify({ dest: r.dest, sha: sha.value })) continue;
+    sha.set.add(path.resolve(r.dest));
+  }
+  return { pinnedSourceDirs, syncedSourceDirs };
 }
 
 /** Apply `--select` / `--kind` / `--exclude` (match full or short name). */

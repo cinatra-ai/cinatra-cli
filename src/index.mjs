@@ -22,8 +22,18 @@ import { resolveTeardownNames } from "./teardown-config.mjs";
 // from the checkout's installed `@cinatra-ai/migrations`.
 import { importFromCheckout } from "./checkout-resolve.mjs";
 import { syncDevApps, readDevAppsConfig } from "./dev-apps.mjs";
-import { deriveKindFromName, syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
-import { LOCAL_REGISTRY_URL, seedLocalRegistryExtensions } from "./seed-local-registry.mjs";
+import {
+  collectSkewExemptSources,
+  deriveKindFromName,
+  syncCinatraDevExtensions,
+} from "./cinatra-dev-extensions.mjs";
+import {
+  LOCAL_REGISTRY_URL,
+  SETUP_EXIT_REGISTRY_SKEW,
+  classifySetupExitCode,
+  registrySkewVerdictLines,
+  seedLocalRegistryExtensions,
+} from "./seed-local-registry.mjs";
 import { parseDevRefreshFlags, describeDockerDecision } from "./dev-refresh.mjs";
 import { prodRuntimeGuidanceLines } from "./prod-runtime-guidance.mjs";
 import {
@@ -6029,6 +6039,11 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
     // subprocess outside the Next.js runtime. Boot-time is the right place
     // anyway: it's idempotent + soft-fails + invisible to the operator.
     if (mode === "dev") {
+      // cinatra-cli#200 — same-version local-registry skews this run could NOT
+      // attribute to the extension sync. Collected from the seed below and
+      // classified at the very END of the dev tail, once every other
+      // exit-affecting step has had its say (a real failure always wins).
+      let registrySkewUnexempted = [];
       // Sync the WordPress plugin + Drupal module clones into the working tree
       // so the dev docker stack + boot auto-setup find them. Source of truth is
       // the companion repos (cinatra-ai/{wordpress-plugin,drupal-module}).
@@ -6070,21 +6085,24 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
         // :4873. `env` already merges .env.local + process.env (process.env
         // wins). seedLocalRegistryExtensions keeps the loopback-only guard.
         const seedRegistryUrl = env.CINATRA_AGENT_REGISTRY_URL?.trim() || LOCAL_REGISTRY_URL;
-        // cinatra#1136 — sources the sync just verified at a committed lock
-        // pin (detached, sha-verified: pinned/repinned/pinned-clone, or
-        // confirmed-at-lock). For those a same-version registry skew is the
-        // expected update-path state, not local drift — the seed warns
-        // without flipping the exit code (see seed-local-registry.mjs).
-        const pinnedSourceNames = new Set(
-          (extensionSync?.results ?? [])
-            .filter((r) => typeof r.pinnedSha === "string")
-            .map((r) => r.pkgName),
-        );
-        await seedLocalRegistryExtensions({
+        // cinatra#1136 + cinatra-cli#200 — the checkouts THIS (setup-phase) sync
+        // positively attested: verified at a committed lock pin (`pinnedSha`),
+        // or verified clean at the freshly-fetched branch tip (`syncedSha`).
+        // For both, a same-version registry skew is the expected update-path
+        // state, not local drift — the seed warns without making it
+        // exit-affecting. Read from the SETUP-phase sync deliberately: an
+        // install runs the extension sync twice, and only a state THIS run
+        // verified may be attested. `collectSkewExemptSources` RE-VERIFIES each
+        // attestation here, at the point of use — setup has done real work
+        // (dependency linking, manifest regeneration) since the sync ran.
+        const { pinnedSourceDirs, syncedSourceDirs } = collectSkewExemptSources(extensionSync);
+        const seedSummary = await seedLocalRegistryExtensions({
           repoRoot,
           registryUrl: seedRegistryUrl,
-          pinnedSourceNames,
+          pinnedSourceDirs,
+          syncedSourceDirs,
         });
+        registrySkewUnexempted = seedSummary?.unexemptedSkew ?? [];
       } catch (err) {
         // Defensive: the helper is already loud-but-non-fatal, but never let an
         // unexpected escape undo the completed setup.
@@ -6142,6 +6160,19 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
           }`,
         );
       }
+
+      // cinatra-cli#200 — the LAST word on this dev run's exit code, placed
+      // after every other exit-affecting step so "was the skew the only thing
+      // wrong?" is answerable. A real failure keeps whatever code it set; an
+      // otherwise-clean run carrying unattributed registry skew exits with the
+      // typed SETUP_EXIT_REGISTRY_SKEW, which `cinatra install` names and
+      // continues past (the setup itself is complete — see the seed module's
+      // cross-process contract).
+      const classifiedExitCode = classifySetupExitCode(process.exitCode, registrySkewUnexempted);
+      if (classifiedExitCode === SETUP_EXIT_REGISTRY_SKEW) {
+        for (const line of registrySkewVerdictLines(registrySkewUnexempted)) console.warn(line);
+      }
+      process.exitCode = classifiedExitCode;
     }
   } finally {
     await client.end();

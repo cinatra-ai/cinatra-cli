@@ -18,6 +18,18 @@ import path from "node:path";
 //   - non-empty non-git dir                  -> fail with remediation
 //
 // Per-repo URL overrides via env: CINATRA_<NAME>_REPO_URL (HTTPS or SSH).
+//
+// SYNC PROVENANCE (what a result ATTESTS about the working tree):
+//   - `pinnedSha`  — the tree is VERIFIED at that committed lock pin (detached,
+//                    sha-verified, clean). Pinned mode + the detached-at-lock
+//                    non-pinned paths.
+//   - `syncedSha`  — the tree is VERIFIED at that freshly-fetched
+//                    `origin/<branch>` tip, clean (cinatra-cli#200). The
+//                    branch-tracking twin of `pinnedSha`.
+// Both are POSITIVE attestations of a state this sync just verified, never a
+// mere "we touched it": a consumer reading either one may treat the on-disk
+// source as MANAGED upstream content rather than operator edits. Absent both,
+// the content is unattributed — consumers must fail closed.
 // ---------------------------------------------------------------------------
 
 /** "@cinatra-ai/wordpress-plugin" -> "CINATRA_WORDPRESS_PLUGIN_REPO_URL" */
@@ -78,6 +90,101 @@ export function isAllowedGitRemote(url) {
   return false;
 }
 
+/**
+ * Re-verify a sync attestation (`pinnedSha` / `syncedSha`) AT THE MOMENT OF USE
+ * (cinatra-cli#200, codex review). An attestation is a statement about a
+ * checkout at the instant the sync made it, and setup does real work between
+ * the sync and the consumers that read it (dependency linking, manifest
+ * regeneration, …). A consumer that acts on stale provenance would be trusting
+ * content it never verified, so it re-asks here: is `dest` STILL at exactly
+ * `sha`, and is its worktree STILL free of local work?
+ *
+ * Fail-closed: a missing/invalid argument, a non-git or unreadable directory,
+ * or any git error answers `false`. Stray published-marker debris is not local
+ * work (see PUBLISHED_MARKER_BASENAME) and does not withdraw an attestation,
+ * consistent with the dirty computation everywhere else in this module.
+ *
+ * SCOPE (deliberate, documented boundary): this is a statement about the
+ * GIT-VISIBLE working tree. Content git cannot see — files hidden with
+ * `assume-unchanged`/`skip-worktree`, or ignored build output a package's
+ * `files` field nevertheless packs — is outside what any git-based provenance
+ * can attest. The consequence of that gap is bounded: the consumer (the local
+ * registry seed) still WARNS loudly on such a skew; only the exit-affecting
+ * classification is relaxed.
+ */
+export function attestationStillHolds({ dest, sha, deps } = {}) {
+  if (typeof dest !== "string" || !dest) return false;
+  if (typeof sha !== "string" || !COMMIT_SHA_RE.test(sha)) return false;
+  const d = deps ?? defaultRepoSyncDeps();
+  try {
+    if (!d.exists(dest) || !d.exists(path.join(dest, ".git"))) return false;
+    const head = d.git(["rev-parse", "HEAD"], dest).trim();
+    if (head !== sha) return false;
+    const lines = d
+      .git(STATUS_PORCELAIN_ARGS, dest)
+      .split("\n")
+      .map((l) => l.replace(/\r$/, ""))
+      .filter((l) => l.trim() !== "");
+    return lines.every((l) => l === STRAY_MARKER_STATUS_LINE);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * SECOND-STAGE provenance (cinatra-cli#200, codex review): does git vouch for
+ * the exact file set that was PACKED?
+ *
+ * `attestationStillHolds` proves the checkout is at the attested commit with a
+ * clean status — but `npm pack` does not pack "what git status shows". Two file
+ * classes slip between the two views:
+ *   - files hidden from status with `assume-unchanged` / `skip-worktree` (git
+ *     reports the tree clean while the working copy differs);
+ *   - files git IGNORES that a package's `files`/`.npmignore` nevertheless
+ *     packs (typically build output).
+ * Either can change the packed bytes while the checkout still looks pristine,
+ * which would let genuinely local content inherit the sync's exemption.
+ *
+ * So every packed path must be present in the index with the plain `H` (cached)
+ * flag: not missing (untracked/ignored), not `S` (skip-worktree), not a
+ * lowercase letter (assume-unchanged). This deliberately compares NOTHING
+ * byte-wise — a byte/blob comparison would false-positive on any checkout using
+ * `core.autocrlf`, a `.gitattributes` clean/smudge filter, or git-LFS, and a
+ * false positive here re-breaks the very update path this issue is about.
+ *
+ * The one allowance is the runtime-written published-marker debris: UNTRACKED
+ * by definition, packable when the checkout does not ignore it, and already
+ * classified module-wide as tool output rather than local work. The allowance
+ * is untracked-only — a marker that IS tracked and then hidden from the index
+ * is a real tree divergence, exactly as elsewhere in this module.
+ *
+ * Fail-closed: an empty/absent file list, an unreadable index, or any git error
+ * answers `false`. ONE git call, made only when a skew actually needs deciding.
+ */
+export function packedPathsAreTrackedAndUnhidden({ dir, files, deps } = {}) {
+  if (typeof dir !== "string" || !dir) return false;
+  if (!Array.isArray(files) || files.length === 0) return false;
+  const d = deps ?? defaultRepoSyncDeps();
+  try {
+    // `-v` prefixes each entry with its index flag; `-z` keeps paths that
+    // contain spaces/newlines intact.
+    const records = d.git(["ls-files", "-v", "-z"], dir).split("\0");
+    const flags = new Map();
+    for (const record of records) {
+      if (record.length < 3) continue;
+      flags.set(record.slice(2), record[0]);
+    }
+    return files.every((file) => {
+      const flag = flags.get(file);
+      if (flag === "H") return true;
+      // Untracked-only allowance for the marker debris (see above).
+      return file === PUBLISHED_MARKER_BASENAME && flag === undefined;
+    });
+  } catch {
+    return false;
+  }
+}
+
 export function defaultRepoSyncDeps() {
   return {
     git: (args, cwd) =>
@@ -109,6 +216,17 @@ export const PUBLISHED_MARKER_BASENAME = ".cinatra-published.json";
 // TRACKED (committed, then modified/deleted) marker is deliberately NOT
 // matched — that is a real tree divergence, not debris.
 const STRAY_MARKER_STATUS_LINE = `?? ${PUBLISHED_MARKER_BASENAME}`;
+
+// The tree-state read, with `status.showUntrackedFiles` PINNED (codex review):
+// a repo/global config set to `no` would hide untracked files, so a tree
+// carrying un-added work would read as clean and could be attested. Dirtiness
+// must not depend on a display preference.
+const STATUS_PORCELAIN_ARGS = [
+  "-c",
+  "status.showUntrackedFiles=normal",
+  "status",
+  "--porcelain",
+];
 
 function dirIsEmpty(dir, deps) {
   try {
@@ -223,7 +341,7 @@ export function syncOneRepo({
   // Tree state, with the untracked published-marker debris classified apart
   // from real local work (see PUBLISHED_MARKER_BASENAME above).
   const readTreeState = () => {
-    const lines = git(["status", "--porcelain"], dest)
+    const lines = git(STATUS_PORCELAIN_ARGS, dest)
       .split("\n")
       .map((l) => l.replace(/\r$/, ""))
       .filter((l) => l.trim() !== "");
@@ -232,6 +350,36 @@ export function syncOneRepo({
       dirty: lines.length > strayMarkers.length,
       hasStrayMarker: strayMarkers.length > 0,
     };
+  };
+  // POSITIVE, VERIFIED branch-tip attestation (cinatra-cli#200) — the
+  // branch-tracking twin of `pinnedSha`. Emitted ONLY when this sync just left
+  // the checkout in exactly the state it manages: HEAD at the freshly-fetched
+  // `origin/<branch>` tip AND no local work in the tree. A consumer may then
+  // classify the on-disk SOURCE CONTENT as sync-produced upstream content
+  // rather than operator edits (the local-registry seed's skew policy).
+  //
+  // It is deliberately NOT "the sync just ran": an in-place update syncs the
+  // extensions twice (install phase, then setup phase) and only the second
+  // run's results are read downstream, so the attestation must re-verify the
+  // state rather than report an action. Fail-closed: an unreadable ref, a HEAD
+  // that is not the tip (e.g. local commits ahead of upstream), or a dirty tree
+  // yields `undefined` — an unverifiable state is never attested. Untracked
+  // published-marker debris is tool output, not local work (see
+  // PUBLISHED_MARKER_BASENAME), and does not block the attestation — exactly as
+  // it does not make the tree `dirty`.
+  const attestSyncedBranchTip = () => {
+    try {
+      const head = git(["rev-parse", "HEAD"], dest).trim();
+      const tip = git(["rev-parse", `refs/remotes/origin/${branch}`], dest).trim();
+      if (!COMMIT_SHA_RE.test(head) || head !== tip) return undefined;
+      return readTreeState().dirty ? undefined : head;
+    } catch {
+      return undefined;
+    }
+  };
+  const withSyncedSha = (result) => {
+    const syncedSha = attestSyncedBranchTip();
+    return syncedSha ? { ...result, syncedSha } : result;
   };
   const dropStrayPublishedMarker = () => {
     log(
@@ -255,7 +403,7 @@ export function syncOneRepo({
       ensurePinnedCommit();
       return { pkgName, action: "cloned", changed: true, pinnedSha: sha };
     }
-    return { pkgName, action: "cloned" };
+    return withSyncedSha({ pkgName, action: "cloned" });
   }
 
   // non-empty non-git dir -> fail
@@ -425,12 +573,15 @@ export function syncOneRepo({
   git(["fetch", "origin", branch], dest);
   if (force) {
     git(["reset", "--hard", `origin/${branch}`], dest);
-    return { pkgName, action: "force-reset" };
+    return withSyncedSha({ pkgName, action: "force-reset" });
   }
   git(["merge", "--ff-only", `origin/${branch}`], dest);
   const headAfter = git(["rev-parse", "HEAD"], dest).trim();
   // `updated` covers BOTH a no-op pull and a real fast-forward. `changed`
   // distinguishes them so a post-sync workspace re-link runs only when HEAD
   // actually moved (a ff that may have added/changed deps), not on every warm run.
-  return { pkgName, action: "updated", changed: headBefore !== headAfter };
+  // `syncedSha` (when attested) additionally states that the tree IS the fetched
+  // tip and carries no local work — true for the no-op pull too, which is the
+  // whole point on an in-place update (cinatra-cli#200).
+  return withSyncedSha({ pkgName, action: "updated", changed: headBefore !== headAfter });
 }
