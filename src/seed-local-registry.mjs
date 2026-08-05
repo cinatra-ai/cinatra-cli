@@ -38,16 +38,25 @@
 //     dist-tag). Re-running setup is a cheap no-op.
 //   - VERSION-SKEW DETECTION: if `name@version` already exists but the local
 //     packed bytes differ from the registry tarball integrity, warn LOUDLY and
-//     set a non-zero exit code (don't republish the same version) — the operator
-//     must purge/reset the local Verdaccio or bump the extension version.
+//     do NOT republish the same version — the operator must purge/reset the
+//     local Verdaccio or bump the extension version. Whether that skew is
+//     EXIT-AFFECTING depends on the source's sync provenance, and the DECISION
+//     belongs to the caller (cinatra-cli#200): this module records the
+//     unattributed skews in `summary.unexemptedSkew` and NEVER sets the exit
+//     code for a skew itself. See `classifySetupExitCode` below — a skew-only
+//     setup exits with the TYPED `SETUP_EXIT_REGISTRY_SKEW` code, which the
+//     install boundary names and continues past instead of reporting a failed
+//     setup over a substantively completed one.
 //   - PRIVATE/SHAPE FILTER: only publish packages whose `package.json` has a
 //     valid `name` + `version` and is not `"private": true`.
 //   - FAILURE DISCIPLINE: a per-package publish failure warns, continues to the
 //     remaining packages, and leaves setup loud-but-non-fatal.
 //
-// This module is intentionally self-contained (node builtins + the `npm` binary
-// that ships alongside node): like its `agents-install.mjs` sibling it cannot
-// import the @cinatra-ai/registries TS source from a `.mjs` CLI script.
+// This module is intentionally dependency-light (node builtins, the declared
+// `tar` package, and the `npm`/`git` binaries): like its `agents-install.mjs`
+// sibling it cannot import the @cinatra-ai/registries TS source from a `.mjs`
+// CLI script. Its ONE first-party import is the git-provenance helper from
+// `dev-repo-sync.mjs`, itself a builtins-only module (cinatra-cli#200).
 // -----------------------------------------------------------------------------
 
 import {
@@ -63,6 +72,10 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+
+import { Parser as TarParser } from "tar";
+
+import { packedPathsAreTrackedAndUnhidden } from "./dev-repo-sync.mjs";
 
 // The bundled local Verdaccio — the ONLY sanctioned publish target for this
 // dev seed. Matches docker-compose `verdaccio` (host port 4873) and the
@@ -335,6 +348,55 @@ function packTarball(dir, outDir, registryUrl, userconfigPath) {
   return existsSync(abs) ? abs : null;
 }
 
+// Tar entry types that carry a real package path a consumer must account for.
+// `Link` matters as much as `File` (codex review): node-tar writes the SECOND
+// and later members sharing an inode as hard links, so a filter that kept only
+// `File` would silently drop a packed path from verification.
+const PACKED_PATH_ENTRY_TYPES = new Set(["File", "ContiguousFile", "Link", "SymbolicLink"]);
+// Structural entries that carry no packable content of their own.
+const PACKED_SKIPPABLE_ENTRY_TYPES = new Set(["Directory", "GNUDumpDir"]);
+
+/**
+ * The package-relative paths inside a packed tarball (npm prefixes every entry
+ * with `package/`). Used to ask git whether it vouches for exactly what was
+ * packed.
+ *
+ * Fail-closed, and COMPLETE: an unreadable tarball, an entry type this does not
+ * model, or an entry the tar parser itself ignored yields `null` — which the
+ * provenance check treats as "cannot vouch". The parser is driven directly
+ * rather than through `tar.list` because a type node-tar does not support
+ * (sparse files, Solaris ACL/inode records, anything unrecognized) is reported
+ * on `ignoredEntry`, which an `onentry`-only listener never sees — leaving an
+ * archive member silently unaccounted for (codex review).
+ */
+export function listPackedMembers(tarballPath) {
+  const files = [];
+  let unaccountedEntry = false;
+  try {
+    const parser = new TarParser({
+      onReadEntry: (entry) => {
+        const type = String(entry.type ?? "");
+        if (!PACKED_SKIPPABLE_ENTRY_TYPES.has(type)) {
+          if (PACKED_PATH_ENTRY_TYPES.has(type)) {
+            const rel = String(entry.path).replace(/^package\//, "");
+            if (rel) files.push(rel);
+          } else {
+            unaccountedEntry = true;
+          }
+        }
+        entry.resume();
+      },
+    });
+    parser.on("ignoredEntry", () => {
+      unaccountedEntry = true;
+    });
+    parser.end(readFileSync(tarballPath));
+  } catch {
+    return null;
+  }
+  return unaccountedEntry ? null : files;
+}
+
 /** sha512 base64 integrity string (`sha512-<base64>`) for a tarball file. */
 function tarballIntegrity(tarballPath) {
   const bytes = readFileSync(tarballPath);
@@ -342,12 +404,152 @@ function tarballIntegrity(tarballPath) {
   return `sha512-${digest}`;
 }
 
+// ---------------------------------------------------------------------------
+// The CROSS-PROCESS skew contract (cinatra-cli#200).
+//
+// `cinatra install` runs `cinatra instance setup <mode>` as a CHILD process, so
+// the child's exit code is the only channel the two share. Before this contract
+// existed, a local-registry version skew set a bare `process.exitCode = 1`,
+// which the install boundary could only read as "setup failed inside the
+// target" — aborting an install whose setup had substantively completed
+// (checkout DDL applied, migrations applied, manifests regenerated, `0 failed`
+// in the seed itself) and, on `--mode preview`, killing the run before the
+// preview composition. The module's own "loud-but-non-fatal, NEVER aborts
+// setup" contract held inside the process and was lost at its boundary.
+//
+// So a skew now gets a TYPED code that says what it is:
+//   0                          nothing to report
+//   SETUP_EXIT_REGISTRY_SKEW   the ONLY exit-affecting condition was an
+//                              unattributed same-version registry skew — the
+//                              instance is fully set up; the local registry
+//                              just keeps serving the previously seeded bytes
+//                              for those versions until a bump/purge
+//   1 (or any other non-zero)  a REAL failure, which always WINS over a skew
+// Everything a real failure sets keeps flowing through `process.exitCode`
+// untouched; this only claims the otherwise-clean case.
+// ---------------------------------------------------------------------------
+
+/** Typed setup exit code: "local-registry version skew, nothing else".
+ *
+ *  The VALUE matters (codex review): node reserves 1–12 for its own fatal
+ *  conditions (3 is an internal JavaScript parse error, 7 a bootstrap
+ *  exception, …) and 128+N for signal deaths, while 64–78 are the BSD
+ *  `sysexits` conventions other tooling may assume. A code in any of those
+ *  ranges would let an unrelated fatal child be MISREAD as a benign skew — the
+ *  exact fail-open this fix must not introduce. 20 sits above node's reserved
+ *  block and below every convention above. */
+export const SETUP_EXIT_REGISTRY_SKEW = 20;
+
+/**
+ * PROVABLY zero — the only state in which the typed skew code may be claimed.
+ * `process.exitCode` may be unset, a number, or a numeric string; anything else
+ * (or anything unparseable) is treated as a failure already in flight rather
+ * than coerced to "clean" (codex review: `Number("")`, `Number(false)` and
+ * friends are 0, which would let a skew mask a failure).
+ */
+function isProvablyCleanExitCode(value) {
+  if (value === undefined || value === null) return true;
+  if (typeof value === "number") return value === 0;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed !== "" && Number.isFinite(Number(trimmed)) && Number(trimmed) === 0;
+  }
+  return false;
+}
+
+function resolveSkewExitCode(currentExitCode, hasUnattributedSkew) {
+  if (!isProvablyCleanExitCode(currentExitCode)) return currentExitCode;
+  return hasUnattributedSkew ? SETUP_EXIT_REGISTRY_SKEW : 0;
+}
+
+/**
+ * Decide the setup process's final exit code. Pure + fail-closed: any non-zero
+ * code already set by a REAL failure is preserved unchanged (a skew must never
+ * mask or downgrade it), and the typed skew code is claimed ONLY when the run
+ * is otherwise clean and at least one unattributed skew was recorded.
+ */
+export function classifySetupExitCode(currentExitCode, unexemptedSkew = []) {
+  return resolveSkewExitCode(
+    currentExitCode,
+    Array.isArray(unexemptedSkew) && unexemptedSkew.length > 0,
+  );
+}
+
+/**
+ * The same decision for a process that already KNOWS it is carrying the skew
+ * outcome — `cinatra install` re-raising the typed code its setup child
+ * reported. Assigning the code unconditionally there would let it overwrite a
+ * non-zero the install had already set for a real failure (codex review).
+ */
+export function claimRegistrySkewExitCode(currentExitCode) {
+  return resolveSkewExitCode(currentExitCode, true);
+}
+
+/**
+ * The operator-facing verdict for a skew-only exit: WHAT happened, WHAT it
+ * means for the instance, and the remedy. Shared by the setup tail and the
+ * install boundary so both name the same condition (never a bare "setup
+ * failed"). `names` are `pkg@version` ids.
+ */
+export function registrySkewVerdictLines(names = [], { context = "setup" } = {}) {
+  const ids = Array.isArray(names) ? names.filter(Boolean) : [];
+  if (context === "install-tail") {
+    // The compact restatement at the very end of a completed install (the
+    // in-context statement already printed right after the setup phase).
+    return [
+      "",
+      `⚠ Completed WITH local-registry version skew (see the seed warnings above) — exit ` +
+        `code ${SETUP_EXIT_REGISTRY_SKEW}.`,
+      "  The instance is fully provisioned; the local registry still serves the previously seeded",
+      "  bytes for the affected version(s). Remedy: bump the extension version, or purge/reset the",
+      "  local Verdaccio, then re-run.",
+    ];
+  }
+  if (context === "install") {
+    // The install boundary sees only the child's exit CODE — the per-extension
+    // warnings already streamed through the inherited stdio above — so it names
+    // the condition and its remedy without re-deriving the list.
+    return [
+      "",
+      "⚠ Local-registry version skew reported by the setup phase (see the seed warnings above).",
+      "  This is NOT a failed setup: the instance is fully provisioned. The affected extension",
+      "  version(s) are already published in the local registry with different bytes, so the same",
+      "  version was not republished and the registry keeps serving the previously seeded content.",
+      "  Remedy: bump the extension version, or purge/reset the local Verdaccio, then re-run.",
+      "  Continuing the install.",
+      "",
+    ];
+  }
+  return [
+    "",
+    `⚠ Setup completed; the local-registry seed reported version skew on ${ids.length} ` +
+      `extension${ids.length === 1 ? "" : "s"}:`,
+    ...ids.map((id) => `    ${id}`),
+    "  Those versions are already published in the local registry with DIFFERENT bytes, and the",
+    "  on-disk source is not attributable to the extension sync (uncommitted local edits, or a",
+    "  checkout the sync does not manage). The same version is never republished, so the local",
+    "  registry keeps serving the previously seeded content for it — everything else in this",
+    "  instance is fully provisioned.",
+    "  Remedy: bump the extension version, or purge/reset the local Verdaccio, then re-run.",
+    "",
+  ];
+}
+
 /**
  * Seed every on-disk first-party extension into the LOCAL bundled Verdaccio.
  *
- * Loud-but-non-fatal: returns a summary and may set `process.exitCode = 1` on a
- * meaningful failure/skew, but NEVER throws past the caller and NEVER aborts
- * setup. Returns `{ status, registryUrl, published, skipped, failed, skew }`.
+ * Loud-but-non-fatal, END-TO-END (cinatra-cli#200): it never throws past the
+ * caller, never aborts setup, and — the part that used to be lost at the
+ * process boundary — a version SKEW never sets the exit code here at all. A
+ * skew is reported in the returned summary (`skew` = every skew seen,
+ * `unexemptedSkew` = the ones no sync provenance accounts for) and the CALLER
+ * classifies it via `classifySetupExitCode`, so a skew-only run exits with the
+ * typed `SETUP_EXIT_REGISTRY_SKEW` code that the install boundary names and
+ * continues past. `process.exitCode = 1` is still set here for REAL failures —
+ * a publish failure, an unprovisionable publish user, or an unexpected error.
+ *
+ * Returns `{ status, registryUrl, published, skipped, failed, skew,
+ * unexemptedSkew, divergentVersion }`.
  *
  * `status`:
  *   - "skipped-not-loopback"  registry target is not loopback → refused
@@ -359,17 +561,43 @@ function tarballIntegrity(tarballPath) {
 export async function seedLocalRegistryExtensions({
   repoRoot,
   registryUrl = LOCAL_REGISTRY_URL,
-  // Package names whose on-disk source the just-completed extension sync
-  // verified to sit AT a committed lock pin (detached, sha-verified). For
-  // those, a same-version/different-content skew is the EXPECTED update-path
-  // state (cinatra#1136): the local registry still carries the tarball seeded
-  // from the PREVIOUS release's pin, while the source legitimately moved with
-  // the committed lock — that must not turn a successful reconcile into a
-  // non-zero exit. The warning still prints (the local registry keeps serving
-  // the previous content for that version until a bump/purge); only ad-hoc,
-  // non-pinned divergence (local edits without a version bump) stays a
-  // meaningful, exit-flipping skew.
-  pinnedSourceNames = null,
+  // Resolved extension DIRECTORIES whose on-disk source the just-completed
+  // extension sync verified to sit AT a committed lock pin (detached,
+  // sha-verified). For those, a same-version/different-content skew is the
+  // EXPECTED update-path state (cinatra#1136): the local registry still carries
+  // the tarball seeded from the PREVIOUS release's pin, while the source
+  // legitimately moved with the committed lock — that must not turn a
+  // successful reconcile into a non-zero exit. The warning still prints (the
+  // local registry keeps serving the previous content for that version until a
+  // bump/purge).
+  pinnedSourceDirs = null,
+  // Resolved extension DIRECTORIES the just-completed extension sync verified
+  // CLEAN at the freshly-fetched `origin/<branch>` tip (cinatra-cli#200 —
+  // `syncedSha`). Dev-mode companion checkouts track branch tips and never
+  // carry a lock pin, so they could never join the exemption above; yet their
+  // upstream moving without a version bump is ROUTINE across a checkout's whole
+  // dev-extension set, and the sync itself is what moved them. A clean worktree
+  // at the tip the sync just fetched is the same "expected update-path state"
+  // the pinned exemption describes, so it is exempted on the same terms.
+  //
+  // Both sets are keyed by DIRECTORY, not package name: this loop enumerates
+  // directories, and only the exact checkout the sync verified may be exempt
+  // (a second on-disk package declaring the same name is unattested content).
+  //
+  // What stays EXIT-AFFECTING (fail-closed — anything the sync did not attest):
+  // a dirty worktree the sync skipped, a detached checkout carrying local
+  // commits, a checkout whose sync failed or was filtered out, an attestation
+  // that no longer held when it was collected, and any on-disk package the
+  // dev-extension sync does not manage at all.
+  syncedSourceDirs = null,
+  // SECOND-STAGE provenance for an attested source that actually skews: does
+  // git vouch for the exact file set `npm pack` produced? A checkout can be at
+  // the attested commit with a clean status and STILL pack different bytes
+  // (files hidden with assume-unchanged/skip-worktree, or ignored build output
+  // a `files` field packs). Consulted ONLY on a skew — never on the hot path —
+  // and fail-closed: no vouch means the skew is treated as unattributed.
+  // Injectable for tests; the default is the real git check.
+  verifyPackedProvenance = packedPathsAreTrackedAndUnhidden,
 } = {}) {
   const summary = {
     status: "ok",
@@ -378,6 +606,9 @@ export async function seedLocalRegistryExtensions({
     skipped: [],
     failed: [],
     skew: [],
+    // The subset of `skew` no sync provenance accounts for — the caller's input
+    // to `classifySetupExitCode`. Everything in `skew` is warned about either way.
+    unexemptedSkew: [],
     divergentVersion: [],
   };
 
@@ -446,14 +677,25 @@ export async function seedLocalRegistryExtensions({
           const packed = packTarball(ext.dir, tmpDir, registryUrl, userconfigPath);
           if (packed) {
             const localIntegrity = tarballIntegrity(packed);
+            const drifted = localIntegrity !== registryIntegrity;
+            const extDir = path.resolve(ext.dir);
+            const attestedPin = Boolean(pinnedSourceDirs?.has(extDir));
+            const attestedTip = Boolean(syncedSourceDirs?.has(extDir));
+            // Second stage, and ONLY where it can change the verdict: the file
+            // set that actually got packed must be one git vouches for. Read
+            // before the tarball is removed.
+            const packedProvenanceOk =
+              drifted && (attestedPin || attestedTip)
+                ? verifyPackedProvenance({ dir: ext.dir, files: listPackedMembers(packed) }) === true
+                : false;
             try {
               rmSync(packed, { force: true });
             } catch {
               /* ignore */
             }
-            if (localIntegrity !== registryIntegrity) {
+            if (drifted) {
               summary.skew.push(id);
-              if (pinnedSourceNames?.has(ext.name)) {
+              if (attestedPin && packedProvenanceOk) {
                 // Committed-lock pin → expected after an update; informational.
                 console.warn(
                   `\n⚠ Local registry seed: ${id} is already published from a previous pin; the on-disk ` +
@@ -461,13 +703,35 @@ export async function seedLocalRegistryExtensions({
                     `version — the local registry serves the previously seeded content for ${ext.version} ` +
                     `until the extension version bumps (or the local Verdaccio is purged/reset).\n`,
                 );
+              } else if (attestedTip && packedProvenanceOk) {
+                // Branch-tip dev clone the sync just verified clean AT the
+                // fetched tip → routine upstream drift on the update path;
+                // informational, exactly like the pinned case.
+                console.warn(
+                  `\n⚠ Local registry seed: ${id} is already published from an earlier seed; the on-disk ` +
+                    `source now sits at the freshly-synced branch tip with the same version. NOT republishing ` +
+                    `the same version — the local registry serves the previously seeded content for ` +
+                    `${ext.version} until the extension version bumps (or the local Verdaccio is ` +
+                    `purged/reset).\n`,
+                );
               } else {
+                // Unattributed divergence — local edits without a version bump,
+                // a source this sync does not manage, or packed content git does
+                // not vouch for. Exit-affecting, but the CALLER decides the code
+                // (classifySetupExitCode).
+                summary.unexemptedSkew.push(id);
+                const reason =
+                  attestedPin || attestedTip
+                    ? `the packed contents include files git does not track for this checkout (or that are ` +
+                      `hidden from it with assume-unchanged/skip-worktree), so the difference is not ` +
+                      `attributable to the extension sync`
+                    : `the extension sync did not attest this checkout (no committed-lock pin, no clean ` +
+                      `branch-tip state) — it looks like local edits without a version bump`;
                 console.warn(
                   `\n⚠ Local registry seed: ${id} is already published but the on-disk source ` +
-                    `differs from the published tarball. NOT republishing the same version. ` +
+                    `differs from the published tarball, and ${reason}. NOT republishing the same version. ` +
                     `Purge/reset the local Verdaccio or bump the extension version to refresh it.\n`,
                 );
-                process.exitCode = 1;
               }
               continue;
             }
@@ -536,7 +800,13 @@ export async function seedLocalRegistryExtensions({
         (summary.divergentVersion.length
           ? `, ${summary.divergentVersion.length} different-version (left as-is)`
           : "") +
-        (summary.skew.length ? `, ${summary.skew.length} version-skew (NOT republished)` : "") +
+        (summary.skew.length
+          ? `, ${summary.skew.length} version-skew (NOT republished` +
+            (summary.unexemptedSkew.length
+              ? `; ${summary.unexemptedSkew.length} unattributed to the extension sync`
+              : "") +
+            ")"
+          : "") +
         ` (bundled extensions → ${registryUrl}).`,
     );
   } catch (err) {
