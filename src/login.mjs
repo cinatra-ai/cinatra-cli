@@ -15,11 +15,26 @@
 //     `~/.config/cinatra/credentials.json` at mode 0600, and refreshes with the
 //     stored `refresh_token` before expiry.
 //
-// All OAuth mechanics come from `@modelcontextprotocol/sdk/client/auth.js`
-// (already a CLI dependency, ships an OAuth client) — we drive its pure
-// primitives (`discoverAuthorizationServerMetadata`, `registerClient`,
-// `startAuthorization`, `exchangeAuthorization`, `refreshAuthorization`) rather
-// than reimplementing the protocol.
+// All OAuth mechanics come from `@modelcontextprotocol/client` (already a CLI
+// dependency, ships an OAuth client) — we drive its pure primitives
+// (`discoverAuthorizationServerMetadata`, `registerClient`, `startAuthorization`,
+// `exchangeAuthorization`, `refreshAuthorization`) rather than reimplementing
+// the protocol.
+//
+// WHAT THIS PATH TALKS TO, and why it carries no `versionNegotiation`
+// (cinatra#2218, CLI leg — grounded before choosing, not assumed):
+// this module opens NO MCP session. It has no `Client`, no transport, and no
+// JSON-RPC peer. Its only peer is the target instance's OAuth AUTHORIZATION
+// SERVER (better-auth, mounted at `/api/auth`), reached over plain HTTPS with
+// RFC 8414 / OIDC discovery, RFC 7591 dynamic client registration, and the
+// RFC 7636 PKCE authorization-code flow. There is no protocol revision to
+// negotiate on this surface, so a `versionNegotiation` constant here would be
+// inert decoration; the sibling marketplace path is the one that negotiates.
+//
+// The path does carry ONE revision-bearing knob, and it is pinned below rather
+// than left to a default: `discoverAuthorizationServerMetadata` stamps an
+// `MCP-Protocol-Version` request header from the package's
+// `LATEST_PROTOCOL_VERSION`.
 //
 // SECURITY: tokens are NEVER logged. The cache file is created/chmod'd 0600.
 // The loopback listener binds 127.0.0.1 on an ephemeral port, accepts exactly
@@ -38,7 +53,88 @@ import {
   startAuthorization,
   exchangeAuthorization,
   refreshAuthorization,
-} from "@modelcontextprotocol/sdk/client/auth.js";
+  IssuerMismatchError,
+} from "@modelcontextprotocol/client";
+
+/**
+ * The RFC 6749 §4.1.2.1 authorization-error codes, plus the two OIDC additions
+ * a Cinatra instance can return. Used to decide whether the `error` value on a
+ * redirect may be shown to the operator at all.
+ *
+ * SECURITY: everything on an authorization callback — `error`,
+ * `error_description`, `error_uri`, `iss` — is attacker-controllable in a mix-up
+ * attack, and `bin/cinatra.mjs` prints `error.message` straight to a terminal.
+ * Echoing those values would put attacker-chosen text (and control characters)
+ * on an operator's console. An allowlist of known codes is safe to display and
+ * still diagnostic; anything else is replaced with a fixed label.
+ */
+const DISPLAYABLE_OAUTH_ERROR_CODES = new Set([
+  "invalid_request",
+  "unauthorized_client",
+  "access_denied",
+  "unsupported_response_type",
+  "invalid_scope",
+  "server_error",
+  "temporarily_unavailable",
+  "interaction_required",
+  "login_required",
+]);
+
+/** An authorization-callback `error` value, reduced to something safe to print. */
+function displayableAuthorizationError(raw) {
+  return DISPLAYABLE_OAUTH_ERROR_CODES.has(raw) ? raw : "unrecognized error code (not shown)";
+}
+
+/**
+ * Rethrow a token-exchange failure with the attacker-controllable issuer value
+ * REMOVED from the operator-facing message.
+ *
+ * `IssuerMismatchError`'s own message embeds the `received` issuer, and the
+ * upstream contract states callers MUST NOT display it on the
+ * `authorization_response` path — it is exactly the value an attacker controls
+ * in a mix-up attack, and `bin/cinatra.mjs` prints `error.message` to a
+ * terminal. The replacement message keeps every fact that came from a source we
+ * trust (the failure, the RFC, and the issuer WE expected, read from our own
+ * validated metadata) and drops only the received value. The original error is
+ * preserved on `.cause` for a caller that wants to inspect it programmatically —
+ * nothing in this CLI does, and nothing prints a `.cause`.
+ *
+ * The `metadata` arm is left alone deliberately: there the `received` value came
+ * from a document fetched from the operator's OWN configured origin, it is a
+ * configuration error they must be able to see to fix, and the upstream warning
+ * does not extend to it.
+ */
+export function rethrowWithoutUntrustedIssuer(err) {
+  if (err instanceof IssuerMismatchError && err.kind === "authorization_response") {
+    throw new Error(
+      "Sign-in aborted: the authorization server that answered is not the one this " +
+        `login started with (RFC 9207 issuer check failed; expected ${JSON.stringify(err.expected)}). ` +
+        "The value it returned is not shown because it is attacker-controllable. " +
+        "No authorization code was redeemed.",
+      { cause: err },
+    );
+  }
+  throw err;
+}
+
+/**
+ * The `MCP-Protocol-Version` header value this CLI stamps on its OAuth
+ * metadata-discovery requests, pinned EXPLICITLY.
+ *
+ * `discoverAuthorizationServerMetadata` defaults this to the package's
+ * `LATEST_PROTOCOL_VERSION`. Measured, that constant is `"2025-11-25"` in BOTH
+ * `@modelcontextprotocol/sdk@1.29.0` (the package this CLI is migrating off) and
+ * `@modelcontextprotocol/core@2.0.0` (which `@modelcontextprotocol/client@2.0.0`
+ * exact-pins), so writing it out is wire-neutral TODAY — the discovery request
+ * is byte-identical across the migration.
+ *
+ * It is written out anyway because leaving it defaulted makes a header this CLI
+ * sends to every operator's authorization server move on a dependency bump, with
+ * no diff in this repo to review. Discovery is not the negotiated MCP surface,
+ * so the header is a claim rather than a negotiation, and a claim should be a
+ * decision. Bump it deliberately, with a probe.
+ */
+export const OAUTH_DISCOVERY_PROTOCOL_VERSION = "2025-11-25";
 
 // The OAuth scopes the CLI requests. `mcp:connect` is the instance's admission
 // scope for the control plane; the `cli:*` scopes (the CLI remote-target security model) admit the
@@ -220,9 +316,15 @@ export async function saveProfile(profileKey, record, options = {}, env = proces
 
 /**
  * Start a one-shot loopback listener on 127.0.0.1:<ephemeral>. Resolves with
- * `{ redirectUrl, waitForCode() }`. `waitForCode()` resolves with the `code`
- * once the browser is redirected back (validating `state`), or rejects on an
- * OAuth error redirect / state mismatch. The server is always closed.
+ * `{ redirectUrl, waitForCode() }`. `waitForCode()` resolves with
+ * `{ code, iss }` once the browser is redirected back (validating `state`), or
+ * rejects on an OAuth error redirect / state mismatch. The server is always
+ * closed.
+ *
+ * `iss` is the RFC 9207 issuer identifier the authorization server puts on the
+ * authorization RESPONSE. It is forwarded to `exchangeAuthorization`, which
+ * validates it against the discovered metadata's `issuer` before redeeming the
+ * code — the mix-up defence. It is `undefined` when the server does not send one.
  */
 export async function startLoopbackListener(expectedState) {
   return await new Promise((resolveListener, rejectListener) => {
@@ -242,6 +344,9 @@ export async function startLoopbackListener(expectedState) {
       const error = url.searchParams.get("error");
       const code = url.searchParams.get("code");
       const state = url.searchParams.get("state");
+      // RFC 9207 `iss` — absent on servers that do not implement it, in which
+      // case `undefined` (not `null`) is what the validator expects.
+      const iss = url.searchParams.get("iss") ?? undefined;
 
       const finish = (statusText) => {
         res.writeHead(200, { "Content-Type": "text/html" });
@@ -255,7 +360,8 @@ export async function startLoopbackListener(expectedState) {
 
       if (error) {
         finish("Sign-in failed. See your terminal for details.");
-        rejectCode(new Error(`Authorization error: ${error}`));
+        // NOT interpolated raw — see DISPLAYABLE_OAUTH_ERROR_CODES.
+        rejectCode(new Error(`Authorization error: ${displayableAuthorizationError(error)}`));
         return;
       }
       if (!code) {
@@ -269,7 +375,7 @@ export async function startLoopbackListener(expectedState) {
         return;
       }
       finish("Signed in successfully.");
-      resolveCode(code);
+      resolveCode({ code, iss });
     });
 
     server.on("error", rejectListener);
@@ -327,7 +433,9 @@ export async function runLogin(opts) {
 
   // 1. Discover the authorization-server metadata.
   log(`Discovering OAuth configuration at ${origin} …`);
-  const metadata = await discoverAuthorizationServerMetadata(origin);
+  const metadata = await discoverAuthorizationServerMetadata(origin, {
+    protocolVersion: OAUTH_DISCOVERY_PROTOCOL_VERSION,
+  });
   if (!metadata) {
     throw new Error(
       `Could not discover OAuth metadata at ${origin}/.well-known/oauth-authorization-server.`,
@@ -385,17 +493,28 @@ export async function runLogin(opts) {
     open(authorizationUrl.toString());
 
     // 5. Wait for the redirect + exchange the code for tokens.
-    const code = await listener.waitForCode();
+    //
+    // `iss` (RFC 9207) is forwarded so `exchangeAuthorization` can run the
+    // mix-up check against `metadata.issuer` BEFORE the code is redeemed. This
+    // is REQUIRED, not optional hardening: `exchangeAuthorization` runs
+    // `validateAuthorizationResponseIssuer` unconditionally, and when the
+    // metadata advertises `authorization_response_iss_parameter_supported: true`
+    // an ABSENT `iss` is itself a failure (`IssuerMismatchError`). A live cinatra
+    // instance advertises exactly that, so dropping `iss` here would break every
+    // sign-in at the token exchange. Servers that do not advertise it and send
+    // no `iss` are unaffected — that row of the decision table is a no-op.
+    const { code, iss } = await listener.waitForCode();
     const tokens = await exchangeAuthorization(origin, {
       metadata,
       clientInformation,
       authorizationCode: code,
+      iss,
       codeVerifier,
       redirectUri: listener.redirectUrl,
       // Same `resource` as the authorize request — the exchange must echo it so
       // the minted token's audience is `<origin>/api/cli`.
       resource,
-    });
+    }).catch(rethrowWithoutUntrustedIssuer);
 
     // 6. Persist the profile (tokens never logged). Persist `resource` so a
     //    later refresh re-sends it and keeps the token audience-bound.
@@ -483,7 +602,9 @@ export async function resolveAccessToken(opts = {}) {
       `Login for "${profileKey}" expired and has no refresh token. Run \`cinatra login\` again.`,
     );
   }
-  const metadata = await discoverAuthorizationServerMetadata(record.origin);
+  const metadata = await discoverAuthorizationServerMetadata(record.origin, {
+    protocolVersion: OAUTH_DISCOVERY_PROTOCOL_VERSION,
+  });
   if (!metadata) {
     throw new Error(`Could not discover OAuth metadata at ${record.origin} to refresh.`);
   }

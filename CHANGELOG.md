@@ -60,6 +60,46 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The MCP client moves from `@modelcontextprotocol/sdk@^1.29.0` to
+  `@modelcontextprotocol/client@2.0.0` (exact pin).** This is a package
+  migration, not a version bump: the v1 line contains zero occurrences of the
+  `2026-07-28` protocol revision, so it was not a route to it at all. Both
+  consumers move — `src/marketplace-mcp.mjs` (the marketplace submit path) and
+  `src/login.mjs` (the OAuth primitives behind `cinatra login`).
+
+  The marketplace path now negotiates with an explicit
+  `versionNegotiation: { mode: "auto" }`: it probes for `2026-07-28` with
+  `server/discover` and falls back to the 2025-era `initialize` handshake when
+  the peer refuses. Measured live against the real marketplace, that peer is
+  still 2025-era today (it answers the probe HTTP 400 and selects `2025-06-18`),
+  so the negotiated result is unchanged — but the peer is an independently
+  operated hosted service that can adopt the new revision with no change here,
+  and `auto` follows it without one. The mode is passed as an options OBJECT and
+  asserted to be one at module load: written as a bare string the client reads
+  `mode` as `undefined` and silently selects the legacy era, producing a working
+  client that never negotiated.
+
+  `cinatra login` gains RFC 9207 authorization-response issuer validation: the
+  `iss` parameter the authorization server returns on the redirect is now
+  captured and validated against the discovered metadata's issuer before the
+  authorization code is redeemed. This is required by the new client, not
+  optional hardening — when a server advertises
+  `authorization_response_iss_parameter_supported` (a Cinatra instance does), an
+  absent `iss` is itself a failure. Servers that do not implement RFC 9207 are
+  unaffected. Metadata discovery also now enforces the RFC 8414 issuer echo, and
+  the `MCP-Protocol-Version` header it sends is pinned explicitly rather than
+  inherited from the package default (the value is unchanged: `2025-11-25`).
+
+  No CLI error surface changes shape: no command branched on an SDK error class
+  or parsed an SDK message prefix, and every first-party failure message on the
+  marketplace path is preserved verbatim. Two login messages deliberately change,
+  both to keep attacker-controlled text off an operator's terminal: a failed
+  RFC 9207 check now reports the issuer the CLI *expected* instead of the one it
+  received, and an authorization-callback `error` value is shown only when it is
+  a recognized OAuth error code. `bin/cinatra.mjs` prints `error.message`
+  verbatim, so a value chosen by an attacker — including terminal control
+  characters — would otherwise reach the console.
+
 - **The host's extension declaration is read by SCHEMA, not by presence.** A
   Cinatra checkout may declare its extension set either as
   `cinatra.systemExtensions` — a list of versioned specs such as
