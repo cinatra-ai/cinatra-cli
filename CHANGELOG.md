@@ -162,7 +162,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
   published `issuer` requires. The failure message now names every well-known
   URL that was actually tried. An authorization server that serves ONLY the root
   document is no longer discovered — no Cinatra instance is in that population.
-  (cinatra-cli#203)
+  (#203)
 
 - The recreate preflight no longer blocks an install over services it is not
   bringing up. It now derives each service's profile state from the profiles
