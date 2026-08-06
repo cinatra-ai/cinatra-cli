@@ -43,9 +43,9 @@ describe("server-down guarantee — static boundary on the db/setup path", () =>
     .join("\n");
 
   it("index.mjs does NOT statically import the Class-A MCP client", () => {
-    // The MCP/OAuth client (`@modelcontextprotocol/sdk`) lives in login.mjs and
-    // is lazy-imported only inside the login/status handlers.
-    expect(topLevelImports).not.toMatch(/@modelcontextprotocol\/sdk/);
+    // The MCP/OAuth client (`@modelcontextprotocol/client`) lives in login.mjs
+    // and is lazy-imported only inside the login/status handlers.
+    expect(topLevelImports).not.toMatch(/@modelcontextprotocol\//);
   });
 
   it("index.mjs does NOT statically import login.mjs (the network client module)", () => {

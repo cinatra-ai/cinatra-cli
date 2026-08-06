@@ -1,30 +1,37 @@
 // Tests for the CLI's marketplace MCP helper.
-// SDK is mocked via vi.mock so we can assert wiring without a live server.
+// The client is mocked via vi.mock so we can assert WIRING without a live
+// server. The wire BEHAVIOUR (negotiated era, headers on the wire) is proven
+// against real peers in `marketplace-mcp-negotiation.test.mjs` and, for the real
+// hosted peer, in `marketplace-wire-negotiation.manual.test.mjs`.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const { connectMock, callToolMock, closeMock, transportCtor } = vi.hoisted(() => ({
+const { connectMock, callToolMock, closeMock, transportCtor, clientCtor } = vi.hoisted(() => ({
   connectMock: vi.fn().mockResolvedValue(undefined),
   callToolMock: vi.fn(),
   closeMock: vi.fn().mockResolvedValue(undefined),
   transportCtor: vi.fn(),
+  clientCtor: vi.fn(),
 }));
 
-vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
-  Client: vi.fn(function () {
+vi.mock("@modelcontextprotocol/client", () => ({
+  Client: vi.fn(function (info, options) {
+    clientCtor(info, options);
     this.connect = connectMock;
     this.callTool = callToolMock;
     this.close = closeMock;
   }),
-}));
-vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
   StreamableHTTPClientTransport: vi.fn(function (url, opts) {
     transportCtor(url, opts);
   }),
 }));
 
-const { callMarketplaceTool, resolveMarketplaceBaseUrl, MARKETPLACE_BASE_URL } =
-  await import("../src/marketplace-mcp.mjs");
+const {
+  callMarketplaceTool,
+  resolveMarketplaceBaseUrl,
+  MARKETPLACE_BASE_URL,
+  MARKETPLACE_VERSION_NEGOTIATION,
+} = await import("../src/marketplace-mcp.mjs");
 
 describe("callMarketplaceTool", () => {
   afterEach(() => {
@@ -32,7 +39,24 @@ describe("callMarketplaceTool", () => {
     callToolMock.mockReset();
     closeMock.mockClear();
     transportCtor.mockClear();
+    clientCtor.mockClear();
     vi.unstubAllEnvs();
+  });
+
+  it("passes the negotiation OPTIONS OBJECT to the Client constructor", async () => {
+    // The bare-string trap (cinatra#2218): `versionNegotiation: "auto"` leaves
+    // `options?.mode` undefined and the client silently selects legacy — a
+    // working client that never negotiated. Assert the OBJECT arrives, with the
+    // mode explicitly set, at the exact seam that decides it.
+    callToolMock.mockResolvedValue({ structuredContent: {} });
+    await callMarketplaceTool("vendor_get_self", {}, { baseUrl: "https://mk.test", token: "t" });
+
+    const [, options] = clientCtor.mock.calls[0];
+    expect(options.versionNegotiation).toBe(MARKETPLACE_VERSION_NEGOTIATION);
+    expect(typeof options.versionNegotiation).toBe("object");
+    expect(typeof options.versionNegotiation).not.toBe("string");
+    expect(options.versionNegotiation.mode).toBe("auto");
+    expect(options.versionNegotiation.mode).not.toBe("legacy");
   });
 
   it("throws when no marketplace token is set", async () => {

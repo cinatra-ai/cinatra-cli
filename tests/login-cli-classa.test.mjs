@@ -2,7 +2,7 @@
 // refresh, the audience-bound byte helpers, the loopback-unauthenticated read
 // path, and the target-origin destructive guard.
 //
-// The MCP SDK auth primitives are mocked so the test asserts the CLI passes
+// The MCP client's OAuth primitives are mocked so the test asserts the CLI passes
 // `resource=<origin>/api/cli` WITHOUT a live server. `fetch` is injected.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -41,9 +41,18 @@ const sdkMocks = vi.hoisted(() => ({
   })),
 }));
 
-vi.mock("@modelcontextprotocol/sdk/client/auth.js", () => sdkMocks);
+// The OAuth primitives are mocked, but `IssuerMismatchError` is the REAL class:
+// `login.mjs` branches on `instanceof`, so a stand-in would make the
+// sanitization test below pass against a shape production never sees.
+vi.mock("@modelcontextprotocol/client", async () => {
+  const actual = await vi.importActual("@modelcontextprotocol/client");
+  return { ...sdkMocks, IssuerMismatchError: actual.IssuerMismatchError };
+});
+
+const { IssuerMismatchError } = await import("@modelcontextprotocol/client");
 
 const {
+  OAUTH_DISCOVERY_PROTOCOL_VERSION,
   runLogin,
   resolveAccessToken,
   buildProfileRecord,
@@ -116,7 +125,10 @@ describe("RFC 8707 resource on interactive login", () => {
     const state = startArgs.state;
     const redirectUri = sdkMocks.registerClient.mock.calls[0][1].clientMetadata
       .redirect_uris[0];
-    await fetch(`${redirectUri}?code=abc&state=${encodeURIComponent(state)}`);
+    const issuer = "https://instance.example.com/api/auth";
+    await fetch(
+      `${redirectUri}?code=abc&state=${encodeURIComponent(state)}&iss=${encodeURIComponent(issuer)}`,
+    );
     await loginPromise;
 
     // resource present + URL-typed on BOTH authorize and exchange.
@@ -130,8 +142,23 @@ describe("RFC 8707 resource on interactive login", () => {
     expect(startArgs.scope).toContain("cli:extensions:read");
     expect(startArgs.scope).toContain("cli:extensions:write");
 
+    // The discovery request carries the PINNED MCP-Protocol-Version, read at
+    // the production call site rather than supplied by the test. Deleting the
+    // `protocolVersion` option in `runLogin` fails here.
+    expect(sdkMocks.discoverAuthorizationServerMetadata).toHaveBeenCalledTimes(1);
+    const [discoverTarget, discoverOpts] =
+      sdkMocks.discoverAuthorizationServerMetadata.mock.calls[0];
+    expect(discoverTarget).toBe("https://instance.example.com");
+    expect(discoverOpts?.protocolVersion).toBe(OAUTH_DISCOVERY_PROTOCOL_VERSION);
+
     expect(sdkMocks.exchangeAuthorization).toHaveBeenCalledTimes(1);
     const exchangeArgs = sdkMocks.exchangeAuthorization.mock.calls[0][1];
+    // The authorization code, and the RFC 9207 `iss` the AS put on the
+    // redirect, both reach the exchange. `iss` is REQUIRED whenever the
+    // metadata advertises `authorization_response_iss_parameter_supported`
+    // (cinatra#2218 CLI leg) — a live cinatra instance does.
+    expect(exchangeArgs.authorizationCode).toBe("abc");
+    expect(exchangeArgs.iss).toBe(issuer);
     expect(exchangeArgs.resource).toBeInstanceOf(URL);
     expect(exchangeArgs.resource.href).toBe(
       "https://instance.example.com/api/cli",
@@ -143,6 +170,51 @@ describe("RFC 8707 resource on interactive login", () => {
       env,
     });
     expect(out.accessToken).toBe("AT");
+  });
+});
+
+describe("runLogin never surfaces an attacker-controlled issuer", () => {
+  it("sanitizes an RFC 9207 mismatch raised by the real exchange, end to end", async () => {
+    // Drives the PRODUCTION path — `runLogin`, not the helper — so that
+    // removing the `.catch(rethrowWithoutUntrustedIssuer)` wiring fails here.
+    // `bin/cinatra.mjs` prints whatever message `runLogin` throws.
+    const ESC = "\u001b";
+    const hostile = `https://evil.example/${ESC}[2KBank of Cinatra: enter your password`;
+    sdkMocks.exchangeAuthorization.mockRejectedValueOnce(
+      new IssuerMismatchError(
+        "authorization_response",
+        "https://instance.example.com/api/auth",
+        hostile,
+      ),
+    );
+
+    const loginPromise = runLogin({
+      appUrl: "https://instance.example.com",
+      open: () => {},
+      log: () => {},
+      env,
+    });
+    const settled = loginPromise.catch((e) => e);
+
+    await vi.waitFor(() => {
+      expect(sdkMocks.startAuthorization).toHaveBeenCalledTimes(1);
+    });
+    const state = sdkMocks.startAuthorization.mock.calls[0][1].state;
+    const redirectUri =
+      sdkMocks.registerClient.mock.calls[0][1].clientMetadata.redirect_uris[0];
+    await fetch(
+      `${redirectUri}?code=abc&state=${encodeURIComponent(state)}&iss=${encodeURIComponent(hostile)}`,
+    );
+
+    const err = await settled;
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).not.toContain("evil.example");
+    expect(err.message).not.toContain("Bank of Cinatra");
+    expect(err.message).not.toContain(ESC);
+    expect(err.message).toMatch(/RFC 9207 issuer check failed/);
+    expect(err.message).toMatch(/No authorization code was redeemed/);
+    // The original survives for programmatic inspection, just not for display.
+    expect(err.cause).toBeInstanceOf(IssuerMismatchError);
   });
 });
 
@@ -171,6 +243,13 @@ describe("resource on refresh", () => {
     expect(refreshArgs.resource.href).toBe(
       "https://instance.example.com/api/cli",
     );
+
+    // The refresh path re-discovers metadata, and it must carry the SAME pinned
+    // MCP-Protocol-Version as the interactive path. Asserted at the production
+    // call site: deleting the option in `resolveAccessToken` fails here.
+    expect(sdkMocks.discoverAuthorizationServerMetadata).toHaveBeenCalledTimes(1);
+    const [, discoverOpts] = sdkMocks.discoverAuthorizationServerMetadata.mock.calls[0];
+    expect(discoverOpts?.protocolVersion).toBe(OAUTH_DISCOVERY_PROTOCOL_VERSION);
   });
 
   it("buildProfileRecord defaults resource to <origin>/api/cli when not supplied", () => {
