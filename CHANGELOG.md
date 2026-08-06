@@ -144,6 +144,26 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`cinatra login` can discover OAuth metadata against a real instance again.**
+  Both the interactive sign-in and the token refresh passed the instance's bare
+  ORIGIN as the authorization-server URL. Discovery builds its well-known URLs
+  from that value and, for a URL with no path, tries only the two ROOT
+  locations — which a Cinatra instance answers `404`, because its authorization
+  server is mounted at `/api/auth` and the documents live at the path-suffixed
+  `/.well-known/oauth-authorization-server/api/auth`. Discovery therefore
+  resolved to nothing and the command aborted with `Could not discover OAuth
+  metadata …` before opening a browser; an expired profile could not be
+  refreshed either, and no interactive re-login was possible to repair it. The
+  origin is the RESOURCE server (it is what the profile is keyed by and what the
+  RFC 8707 `resource` `<origin>/api/cli` is built from); the authorization
+  server is a distinct URL underneath it. Every primitive that takes an
+  `authorizationServerUrl` now receives `<origin>/api/auth`, which is also the
+  only value that can satisfy the RFC 8414 §3.3 issuer-echo check the instance's
+  published `issuer` requires. The failure message now names every well-known
+  URL that was actually tried. An authorization server that serves ONLY the root
+  document is no longer discovered — no Cinatra instance is in that population.
+  (#203)
+
 - The recreate preflight no longer blocks an install over services it is not
   bringing up. It now derives each service's profile state from the profiles
   actually active for the bring-up — the same profile rules Compose applies to
