@@ -5,8 +5,11 @@
 //
 // cinatra#255 (G2). Builds STRICTLY on the instance's EXISTING OAuth surface —
 // it invents no new server auth:
-//   * Discovers OAuth metadata via the standard
-//     `/.well-known/oauth-authorization-server` document.
+//   * Discovers OAuth metadata for the instance's authorization server, which
+//     is mounted at `<origin>/api/auth` — so the RFC 8414 document lives at the
+//     PATH-SUFFIXED `/.well-known/oauth-authorization-server/api/auth`, not at
+//     the root well-known location (cinatra-cli#203; see
+//     `authorizationServerUrlFor`).
 //   * Registers a PUBLIC client via Dynamic Client Registration (DCR is on by
 //     default on the instance), no secret stored.
 //   * Runs the `authorization_code` + PKCE flow with a loopback redirect
@@ -177,6 +180,83 @@ const CLI_RESOURCE_PATH = "/api/cli";
  */
 export function cliResourceFor(origin) {
   return new URL(`${origin}${CLI_RESOURCE_PATH}`);
+}
+
+/**
+ * The path a Cinatra instance mounts its better-auth AUTHORIZATION SERVER at.
+ *
+ * The instance origin and the authorization server are TWO DIFFERENT URLs and
+ * this module used to conflate them (cinatra-cli#203). The origin is the
+ * RESOURCE server — it is what `--app-url` names, what a profile is keyed by,
+ * and what the RFC 8707 `resource` (`<origin>/api/cli`) is built from. The
+ * authorization server is mounted UNDERNEATH it at `/api/auth`, and every
+ * OAuth-side URL the instance publishes is relative to THAT.
+ */
+const AUTH_BASE_PATH = "/api/auth";
+
+/**
+ * The authorization-server URL for a target instance origin — the value the
+ * `@modelcontextprotocol/client` OAuth primitives call `authorizationServerUrl`.
+ *
+ * WHY THIS EXISTS (cinatra-cli#203). Passing the bare ORIGIN here made metadata
+ * discovery fail against every real instance. `buildDiscoveryUrls` branches on
+ * `url.pathname !== "/"`: for a pathless URL it tries ONLY the two ROOT
+ * well-known locations, and a Cinatra instance serves neither. Measured live
+ * against a deployed instance, anonymously (2026-08-06):
+ *
+ *   GET /.well-known/oauth-authorization-server           -> 404
+ *   GET /.well-known/openid-configuration                 -> 404
+ *   GET /.well-known/oauth-authorization-server/api/auth  -> 200
+ *   GET /.well-known/openid-configuration/api/auth        -> 200
+ *
+ * Both root probes 404, the library treats 4xx as "try the next URL", the list
+ * runs out, and discovery returns `undefined` — so `cinatra login` aborted with
+ * "Could not discover OAuth metadata …" before ever opening a browser.
+ *
+ * With the `/api/auth` suffix the URL HAS a path, so the library asks for the
+ * path-suffixed well-known locations the instance actually serves. The suffixed
+ * value is also the ONLY one that can satisfy v2's RFC 8414 §3.3 issuer-echo
+ * check, which is run on every `200`: the document published there carries
+ * `issuer: <origin>/api/auth`, and the check requires the issuer to equal the
+ * URL that was requested. Requesting the bare origin could never satisfy it.
+ *
+ * NOT DERIVED FROM RFC 9728 protected-resource metadata, and that is measured
+ * rather than assumed. The instance does publish
+ * `/.well-known/oauth-protected-resource/api/cli` with an `authorization_servers`
+ * entry, which would be the spec-correct way to learn this URL — but on a
+ * reverse-proxied deployment that document is emitted with the app's INTERNAL
+ * bind address, so following it would send the CLI to a dead host. Reported
+ * separately; the conventional mount is what actually works, and it is the same
+ * assumption this module already makes for `/api/cli`.
+ *
+ * @param {string} origin a normalized instance origin (no path / trailing slash)
+ * @returns {string} e.g. `https://instance.example.com/api/auth`
+ */
+export function authorizationServerUrlFor(origin) {
+  return new URL(AUTH_BASE_PATH, origin).href;
+}
+
+/**
+ * The well-known URLs metadata discovery will actually request for `origin`,
+ * in the library's own priority order. Diagnostics only — the library builds
+ * its own list internally — so it is pinned against the library's exported
+ * `buildDiscoveryUrls` in the tests rather than trusted to stay in step.
+ */
+export function discoveryUrlsFor(origin) {
+  return [
+    new URL(`/.well-known/oauth-authorization-server${AUTH_BASE_PATH}`, origin).href,
+    new URL(`/.well-known/openid-configuration${AUTH_BASE_PATH}`, origin).href,
+    new URL(`${AUTH_BASE_PATH}/.well-known/openid-configuration`, origin).href,
+  ];
+}
+
+/** The "discovery found nothing" message, naming every URL that was tried. */
+function discoveryFailureMessage(origin, purpose) {
+  return (
+    `Could not discover OAuth metadata for ${origin}${purpose}. ` +
+    `No authorization-server document at any of: ${discoveryUrlsFor(origin).join(", ")}. ` +
+    `Check that ${origin} is a Cinatra instance and is reachable.`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -431,15 +511,20 @@ export async function runLogin(opts) {
   const profileKey = opts.profile ?? appUrlToProfileKey(opts.appUrl);
   const origin = appUrlToProfileKey(opts.appUrl);
 
+  // The instance's AUTHORIZATION SERVER — `<origin>/api/auth`, not the bare
+  // origin. See `authorizationServerUrlFor`: the origin is the resource server,
+  // and passing it here is what made discovery 404 on every real instance
+  // (cinatra-cli#203). Every primitive below that takes an
+  // `authorizationServerUrl` gets this value, not `origin`.
+  const authorizationServerUrl = authorizationServerUrlFor(origin);
+
   // 1. Discover the authorization-server metadata.
-  log(`Discovering OAuth configuration at ${origin} …`);
-  const metadata = await discoverAuthorizationServerMetadata(origin, {
+  log(`Discovering OAuth configuration at ${authorizationServerUrl} …`);
+  const metadata = await discoverAuthorizationServerMetadata(authorizationServerUrl, {
     protocolVersion: OAUTH_DISCOVERY_PROTOCOL_VERSION,
   });
   if (!metadata) {
-    throw new Error(
-      `Could not discover OAuth metadata at ${origin}/.well-known/oauth-authorization-server.`,
-    );
+    throw new Error(discoveryFailureMessage(origin, ""));
   }
 
   // 2. Start the loopback listener so we have the concrete redirect URI for DCR.
@@ -448,7 +533,7 @@ export async function runLogin(opts) {
 
   try {
     // 3. Register a PUBLIC client (DCR). No secret is requested or stored.
-    const clientInformation = await registerClient(origin, {
+    const clientInformation = await registerClient(authorizationServerUrl, {
       metadata,
       clientMetadata: {
         client_name: CLIENT_NAME,
@@ -479,7 +564,7 @@ export async function runLogin(opts) {
     //    token to the `/api/cli` resource (RFC 8707) so it is JWKS-verifiable
     //    as a remote Bearer at the CLI control plane (the CLI remote-target security model).
     const resource = cliResourceFor(origin);
-    const { authorizationUrl, codeVerifier } = await startAuthorization(origin, {
+    const { authorizationUrl, codeVerifier } = await startAuthorization(authorizationServerUrl, {
       metadata,
       clientInformation,
       redirectUrl: listener.redirectUrl,
@@ -504,7 +589,7 @@ export async function runLogin(opts) {
     // sign-in at the token exchange. Servers that do not advertise it and send
     // no `iss` are unaffected — that row of the decision table is a no-op.
     const { code, iss } = await listener.waitForCode();
-    const tokens = await exchangeAuthorization(origin, {
+    const tokens = await exchangeAuthorization(authorizationServerUrl, {
       metadata,
       clientInformation,
       authorizationCode: code,
@@ -602,11 +687,16 @@ export async function resolveAccessToken(opts = {}) {
       `Login for "${profileKey}" expired and has no refresh token. Run \`cinatra login\` again.`,
     );
   }
-  const metadata = await discoverAuthorizationServerMetadata(record.origin, {
+  // Same authorization-server URL the interactive login used (cinatra-cli#203).
+  // Re-DERIVED from the stored origin rather than persisted: an instance that
+  // ever moves its auth mount then fixes both paths at once, and a profile
+  // written by an older CLI needs no migration.
+  const authorizationServerUrl = authorizationServerUrlFor(record.origin);
+  const metadata = await discoverAuthorizationServerMetadata(authorizationServerUrl, {
     protocolVersion: OAUTH_DISCOVERY_PROTOCOL_VERSION,
   });
   if (!metadata) {
-    throw new Error(`Could not discover OAuth metadata at ${record.origin} to refresh.`);
+    throw new Error(discoveryFailureMessage(record.origin, " to refresh"));
   }
   // Re-send the stored RFC 8707 resource so the refreshed token keeps the
   // `<origin>/api/cli` audience (the CLI remote-target security model). Fall back to the origin's resource
@@ -614,7 +704,7 @@ export async function resolveAccessToken(opts = {}) {
   const refreshResource = record.resource
     ? new URL(record.resource)
     : cliResourceFor(record.origin);
-  const tokens = await refreshAuthorization(record.origin, {
+  const tokens = await refreshAuthorization(authorizationServerUrl, {
     metadata,
     clientInformation: { client_id: record.clientId },
     refreshToken: record.refreshToken,

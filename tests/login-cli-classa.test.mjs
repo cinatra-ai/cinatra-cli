@@ -148,8 +148,26 @@ describe("RFC 8707 resource on interactive login", () => {
     expect(sdkMocks.discoverAuthorizationServerMetadata).toHaveBeenCalledTimes(1);
     const [discoverTarget, discoverOpts] =
       sdkMocks.discoverAuthorizationServerMetadata.mock.calls[0];
-    expect(discoverTarget).toBe("https://instance.example.com");
+    // cinatra-cli#203: the AUTHORIZATION SERVER, not the instance origin. The
+    // bare origin makes the library probe only the ROOT well-known paths, which
+    // a Cinatra instance does not serve.
+    expect(discoverTarget).toBe("https://instance.example.com/api/auth");
     expect(discoverOpts?.protocolVersion).toBe(OAUTH_DISCOVERY_PROTOCOL_VERSION);
+
+    // Every primitive that takes an `authorizationServerUrl` gets the SAME
+    // value. Inert while `metadata` is supplied (the library then uses the
+    // document's own endpoints) — but `origin` there was a latent defect: it is
+    // the fallback these primitives use when metadata is absent, and it would
+    // point at `<origin>/register`, `/authorize`, `/token`, none of which exist.
+    expect(sdkMocks.registerClient.mock.calls[0][0]).toBe(
+      "https://instance.example.com/api/auth",
+    );
+    expect(sdkMocks.startAuthorization.mock.calls[0][0]).toBe(
+      "https://instance.example.com/api/auth",
+    );
+    expect(sdkMocks.exchangeAuthorization.mock.calls[0][0]).toBe(
+      "https://instance.example.com/api/auth",
+    );
 
     expect(sdkMocks.exchangeAuthorization).toHaveBeenCalledTimes(1);
     const exchangeArgs = sdkMocks.exchangeAuthorization.mock.calls[0][1];
@@ -248,8 +266,16 @@ describe("resource on refresh", () => {
     // MCP-Protocol-Version as the interactive path. Asserted at the production
     // call site: deleting the option in `resolveAccessToken` fails here.
     expect(sdkMocks.discoverAuthorizationServerMetadata).toHaveBeenCalledTimes(1);
-    const [, discoverOpts] = sdkMocks.discoverAuthorizationServerMetadata.mock.calls[0];
+    const [discoverTarget, discoverOpts] =
+      sdkMocks.discoverAuthorizationServerMetadata.mock.calls[0];
     expect(discoverOpts?.protocolVersion).toBe(OAUTH_DISCOVERY_PROTOCOL_VERSION);
+    // ...and the SAME authorization-server URL as the interactive path
+    // (cinatra-cli#203). A refresh that discovered against the bare origin would
+    // fail exactly as login did, stranding an expired profile.
+    expect(discoverTarget).toBe("https://instance.example.com/api/auth");
+    expect(sdkMocks.refreshAuthorization.mock.calls[0][0]).toBe(
+      "https://instance.example.com/api/auth",
+    );
   });
 
   it("buildProfileRecord defaults resource to <origin>/api/cli when not supplied", () => {
