@@ -144,6 +144,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`cinatra update` / `cinatra instance refresh` no longer require Corepack.**
+  The update/reconcile dependency step and the post-extension-sync workspace
+  re-link invoked `corepack pnpm install` unconditionally, so on a machine
+  where Corepack is not enabled the update aborted at the dependency step and
+  left the instance mid-reconcile — even with a perfectly good `pnpm` on
+  `PATH`. Both steps now apply the same selection `cinatra install` has always
+  used: pnpm runs through Corepack when Corepack is present (honoring the
+  pinned pnpm) and degrades to the bare `pnpm` on `PATH` when it is not, with
+  the step's progress and failure messages naming the binary actually invoked.
+  When neither tool is available, the canonical `corepack pnpm install` is
+  still attempted so the loud failure names the command to enable. (#205)
+
 - **`cinatra login` can discover OAuth metadata against a real instance again.**
   Both the interactive sign-in and the token refresh passed the instance's bare
   ORIGIN as the authorization-server URL. Discovery builds its well-known URLs

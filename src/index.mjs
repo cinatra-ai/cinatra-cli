@@ -1561,6 +1561,21 @@ function commandExists(command, args = ["--version"]) {
   return result.status === 0;
 }
 
+// How to invoke `pnpm install` on THIS machine. Mirrors the `usePnpmDirect`
+// selection in src/install.mjs: pnpm runs through Corepack so the repo's
+// pinned pnpm is honored, and a bare `pnpm` on PATH is the accepted fallback
+// when Corepack is absent (not enabled / not on PATH). When neither tool is
+// available the canonical `corepack pnpm install` is still the command
+// attempted, so the loud failure names the command to enable — the same
+// degradation `pnpmInstall` in src/install.mjs has.
+function resolvePnpmInstallInvocation({ exists = commandExists } = {}) {
+  const usePnpmDirect = !exists("corepack", ["--version"]) && exists("pnpm", ["--version"]);
+  if (usePnpmDirect) {
+    return { command: "pnpm", args: ["install"], label: "pnpm install" };
+  }
+  return { command: "corepack", args: ["pnpm", "install"], label: "corepack pnpm install" };
+}
+
 function createTempDirectory(prefix) {
   return mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -5389,7 +5404,11 @@ function extensionDeclaresInstallableDeps(pkgDir) {
   }
 }
 
-function installAfterExtensionSync(repoRoot, syncResult, { failHard = false } = {}) {
+function installAfterExtensionSync(
+  repoRoot,
+  syncResult,
+  { failHard = false, spawn = spawnSync, exists = commandExists } = {},
+) {
   const results = syncResult && Array.isArray(syncResult.results) ? syncResult.results : [];
   if (results.length === 0) return; // no-config / nothing matched / nothing synced
   // A real clone, a force-reset, a verified prod download ("downloaded"), or a
@@ -5409,8 +5428,9 @@ function installAfterExtensionSync(repoRoot, syncResult, { failHard = false } = 
       !existsSync(path.join(r.dest, "node_modules")),
   );
   if (!materiallyChanged && !hydrationMissing) return;
-  console.log("- Linking cloned extensions into the workspace (corepack pnpm install)…");
-  const install = spawnSync("corepack", ["pnpm", "install"], {
+  const invocation = resolvePnpmInstallInvocation({ exists });
+  console.log(`- Linking cloned extensions into the workspace (${invocation.label})…`);
+  const install = spawn(invocation.command, invocation.args, {
     cwd: repoRoot,
     stdio: "inherit",
     env: process.env,
@@ -5426,7 +5446,7 @@ function installAfterExtensionSync(repoRoot, syncResult, { failHard = false } = 
     }
     console.error(
       `\n⚠ Post-extension-sync \`pnpm install\` FAILED — cloned extensions may not be linked into the workspace. ` +
-        `Re-run \`corepack pnpm install\` in ${repoRoot}, then start the app.\n`,
+        `Re-run \`${invocation.label}\` in ${repoRoot}, then start the app.\n`,
     );
     process.exitCode = 1;
     return { ok: false };
@@ -7219,11 +7239,12 @@ async function runDevRefresh(rest) {
 
   // 2. Dependencies: plain install so an intentionally-changed lockfile is honored
   //    (frozen installs are for CI, not a contributor reconcile).
-  console.log("- Dependencies: corepack pnpm install…");
+  const depsInvocation = resolvePnpmInstallInvocation();
+  console.log(`- Dependencies: ${depsInvocation.label}…`);
   runCommandOrThrow(
-    "corepack",
-    ["pnpm", "install"],
-    "Failed to install dependencies (corepack pnpm install).",
+    depsInvocation.command,
+    depsInvocation.args,
+    `Failed to install dependencies (${depsInvocation.label}).`,
     { cwd: repoRoot },
   );
 
@@ -13478,6 +13499,10 @@ export {
   TAILSCALE_SERVE_FQDN_KEY,
   buildTailscaleServeConfig,
   writeTailscaleServeConfig,
+  // update/reconcile dependency step — corepack→bare-pnpm selection (mirrors
+  // `usePnpmDirect` in src/install.mjs) + the re-link seam that consumes it.
+  resolvePnpmInstallInvocation,
+  installAfterExtensionSync,
   // cinatra-cli#41 — clone link-invariant seams (pure; injectable fs).
   linkedSetMatchesEmittedSet,
   enumerateEmittedExtensionPackages,
