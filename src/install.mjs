@@ -7,8 +7,8 @@
 // clones ONLY the repos the host declares, creates the env, brings up infra, and
 // runs setup inside the freshly-cloned target.
 //
-// DELIBERATELY self-contained: node builtins + `git`/`docker`/`corepack`
-// subprocesses + the two pre-install-safe sync modules
+// DELIBERATELY self-contained: node builtins + `git`/`docker`/`corepack`|`pnpm`|
+// `npm` subprocesses + the two pre-install-safe sync modules
 // (`cinatra-dev-extensions.mjs`, `dev-apps.mjs`). It does NOT import the heavy
 // `index.mjs` graph (pg, pacote, the MCP SDK, …) and — critically — does NOT
 // call `getRepoRoot()`: there is no checkout to anchor on when bootstrapping
@@ -21,7 +21,7 @@
 //   preflight (FIRST, before any download) → resolve target dir →
 //   clone/update host at --ref (record the resolved SHA) → create/reconcile
 //   .env.local → bring up + wait for docker infra → sync cinatra.devExtensions
-//   → `corepack pnpm install` → run `setup dev` in the target (which itself
+//   → the workspace `pnpm install` → run `setup dev` in the target (which itself
 //   clones cinatra.devApps and provisions DB/Nango/MCP/OAuth).
 //
 // Flow (prod) mirrors scripts/setup.sh's prod branch: install → acquire-prod →
@@ -784,16 +784,31 @@ export function runPreflight({ mode = "dev", targetDir = null, noInfra = false, 
     failures.push("git is not installed. Install git (https://git-scm.com/downloads) and retry.");
   }
 
-  // A package manager via Corepack. We invoke pnpm through `corepack pnpm`, so
-  // corepack is what we truly need; a bare `pnpm` on PATH is an accepted
-  // fallback.
+  // A package manager. We prefer pnpm through `corepack pnpm` (Corepack reads
+  // the checkout's `packageManager` pin itself); a bare `pnpm` on PATH is an
+  // accepted fallback. Node 25 REMOVED the bundled Corepack — and with it the
+  // `pnpm` shim Corepack provided — so "neither on PATH" is the ordinary state
+  // of a current-Node host, not a misconfiguration (cinatra-cli#207). npm ships
+  // with every Node line and can run the checkout's pinned pnpm
+  // (`npm exec -y -- pnpm@<pin> install`), so npm is the third tier and this
+  // stops being a blocking failure whenever npm is present.
   const hasCorepack = exists("corepack", ["--version"]);
   const hasPnpm = exists("pnpm", ["--version"]);
   if (!hasCorepack && !hasPnpm) {
-    failures.push(
-      "Neither Corepack nor pnpm is available. Corepack ships with Node 24 — run `corepack enable`, " +
-        "or install pnpm (`npm install -g pnpm`), then retry.",
-    );
+    if (exists("npm", ["--version"])) {
+      warnings.push(
+        "Neither Corepack nor pnpm is on PATH (Node 25 no longer bundles Corepack). Dependencies will be " +
+          "installed with the checkout's own pinned pnpm via `npm exec`. Installing pnpm " +
+          "(`npm install -g pnpm`) is still worth doing: it makes this step faster, and the checkout's own " +
+          "dev commands (`pnpm dev`) need a pnpm on PATH.",
+      );
+    } else {
+      failures.push(
+        "Neither Corepack nor pnpm is available, and npm is missing too — this host has no package " +
+          "manager at all. Install pnpm (`npm install -g pnpm`), or on a Node line that still bundles " +
+          "Corepack (24.x) run `corepack enable`, then retry.",
+      );
+    }
   }
 
   // Docker + Compose are required for dev infra (postgres/redis/nango) and for
@@ -1809,13 +1824,84 @@ function waitForNango(log, maxAttempts = 60, healthUrl = null) {
 // pnpm + setup subprocess.
 // ---------------------------------------------------------------------------
 
-function pnpmInstall({ targetDir, usePnpmDirect, log = console.log }) {
-  log("- Installing dependencies (pnpm install)…");
-  if (usePnpmDirect) {
-    runOrThrow("pnpm", ["install"], "pnpm install failed.", { cwd: targetDir });
-  } else {
-    runOrThrow("corepack", ["pnpm", "install"], "corepack pnpm install failed.", { cwd: targetDir });
+/** The checkout's own pinned pnpm as a spec `npm exec` can resolve. Corepack's
+ *  `packageManager` format is `<name>@<version>` with an optional `+<integrity>`
+ *  suffix npm does not understand; only a well-formed **pnpm** pin yields a
+ *  spec (anything else returns null and the caller keeps its prior behavior).
+ *  Duplicated from src/index.mjs on purpose — install.mjs is deliberately
+ *  self-contained (node builtins only). */
+const PNPM_PIN_RE =
+  /^pnpm@((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?)(?:\+[0-9A-Za-z.-]+)?$/;
+
+function pinnedPnpmSpec(targetDir) {
+  if (!targetDir) return null;
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(targetDir, "package.json"), "utf8"));
+    const pin = typeof pkg.packageManager === "string" ? pkg.packageManager.trim() : "";
+    const match = PNPM_PIN_RE.exec(pin);
+    return match ? `pnpm@${match[1]}` : null;
+  } catch {
+    return null;
   }
+}
+
+/** Same three-tier selection as `resolvePnpmInstallInvocation` in src/index.mjs:
+ *  Corepack (pin honored by Corepack itself) → bare `pnpm` → the checkout's
+ *  pinned pnpm through `npm exec` (the Node 25 line, where Corepack is no longer
+ *  bundled — cinatra-cli#207). Only an unreadable pin degrades to attempting the
+ *  canonical corepack command, so the failure still names what to enable. */
+function resolvePnpmInvocation({ targetDir, exists = commandExists } = {}) {
+  if (exists("corepack", ["--version"])) {
+    return { command: "corepack", args: ["pnpm", "install"], label: "corepack pnpm install" };
+  }
+  if (exists("pnpm", ["--version"])) {
+    return { command: "pnpm", args: ["install"], label: "pnpm install" };
+  }
+  const spec = pinnedPnpmSpec(targetDir);
+  if (spec && exists("npm", ["--version"])) {
+    return {
+      command: "npm",
+      args: ["exec", "-y", "--", spec, "install"],
+      label: `npm exec -y -- ${spec} install`,
+      pinned: spec,
+    };
+  }
+  return { command: "corepack", args: ["pnpm", "install"], label: "corepack pnpm install" };
+}
+
+/** Fail-fast gate: the checkout is on disk, nothing has been mutated around it
+ *  yet, and we can now answer authoritatively whether a dependency install is
+ *  possible AT ALL on this host. Preflight can only answer it approximately —
+ *  the third tier depends on the checkout's own `packageManager` pin, and there
+ *  is no checkout when preflight runs. Without this gate a Corepack-less host
+ *  cloning a checkout with no usable pin would create env state and bring up
+ *  infrastructure before dying on an install command that cannot exist. */
+export function assertWorkspaceInstallPossible({ targetDir, exists = commandExists } = {}) {
+  const invocation = resolvePnpmInvocation({ targetDir, exists });
+  // The only invocation that can be returned without being proven present is the
+  // canonical corepack degradation. Everything else was probed.
+  if (invocation.command !== "corepack" || exists("corepack", ["--version"])) return invocation;
+  throw new Error(
+    `No usable package manager for ${targetDir}: Corepack is not installed (Node 25 no longer bundles it), ` +
+      `pnpm is not on PATH, and this checkout declares no exact pnpm \`packageManager\` pin that could be run ` +
+      `through \`npm exec\`. Install pnpm (\`npm install -g pnpm\`), or add a ` +
+      `\`"packageManager": "pnpm@<version>"\` pin to the checkout, then re-run.`,
+  );
+}
+
+function pnpmInstall({ targetDir, usePnpmDirect, log = console.log }) {
+  // `usePnpmDirect` is the caller's already-probed corepack-absent/pnpm-present
+  // verdict; honored as-is so that selection is unchanged. Everything else goes
+  // through the shared tiering, which is what reaches the pinned-pnpm fallback.
+  const invocation =
+    usePnpmDirect === true
+      ? { command: "pnpm", args: ["install"], label: "pnpm install" }
+      : resolvePnpmInvocation({ targetDir });
+  // Name the binary actually invoked, like every other install site does — the
+  // fixed "pnpm install" text told an operator on the Corepack tier something
+  // that was not what ran.
+  log(`- Installing dependencies (${invocation.label})…`);
+  runOrThrow(invocation.command, invocation.args, `${invocation.label} failed.`, { cwd: targetDir });
 }
 
 /** Acquire the prod required-extension set via the PUBLISHED CLI's own bin,
@@ -5454,6 +5540,16 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   // instance. Covers every install path (default / isolated / attach) since the
   // clone above is common to all of them.
   if (opts.mode === "demo") assertTargetSupportsDemo(targetDir);
+
+  // cinatra-cli#207 — same reasoning, same place: the checkout has materialized,
+  // so the package-manager question is now answerable for real (the third tier
+  // reads the checkout's OWN `packageManager` pin, which did not exist when
+  // preflight ran). Assert it HERE — before the marker/ignore write, before the
+  // terminal co-use branch, and before any conflict resolution starts, stops or
+  // provisions infrastructure — so a host that cannot install this checkout's
+  // dependencies fails with nothing mutated. Skipped when the run installs
+  // nothing (`--no-install`), which is also the co-use skip condition.
+  if (!opts.noInstall) assertWorkspaceInstallPossible({ targetDir, exists: deps.commandExists ?? commandExists });
 
   // Locally git-ignore the per-checkout marker dir + the generated isolated
   // compose so neither dirties the working tree (keeps idempotent re-runs clean;

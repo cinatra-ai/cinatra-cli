@@ -632,9 +632,10 @@ Commands:
                     cinatra-required-extensions.lock.json: codeload tarballs
                     pinned to commit SHAs, hardened extraction, tree-hash +
                     package.json verification. No git/gh binary needed.
-                    Idempotent; fails loud on any integrity mismatch. Run
-                    \`corepack pnpm install\` afterwards to link the packages
-                    (the Dockerfile and scripts/setup.sh prod flow do this).
+                    Idempotent; fails loud on any integrity mismatch. Run the
+                    workspace \`pnpm install\` afterwards to link the packages —
+                    the command prints the exact invocation for this host (the
+                    Dockerfile and scripts/setup.sh prod flow do this).
 
   extensions verify-prod
                     READ-ONLY assertion that the prod required-extension state is
@@ -1561,17 +1562,67 @@ function commandExists(command, args = ["--version"]) {
   return result.status === 0;
 }
 
-// How to invoke `pnpm install` on THIS machine. Mirrors the `usePnpmDirect`
-// selection in src/install.mjs: pnpm runs through Corepack so the repo's
-// pinned pnpm is honored, and a bare `pnpm` on PATH is the accepted fallback
-// when Corepack is absent (not enabled / not on PATH). When neither tool is
-// available the canonical `corepack pnpm install` is still the command
-// attempted, so the loud failure names the command to enable — the same
-// degradation `pnpmInstall` in src/install.mjs has.
-function resolvePnpmInstallInvocation({ exists = commandExists } = {}) {
-  const usePnpmDirect = !exists("corepack", ["--version"]) && exists("pnpm", ["--version"]);
-  if (usePnpmDirect) {
+// An EXACT pnpm version pin, per the semver grammar (numeric identifiers carry
+// no leading zeros; a prerelease is dot-separated identifiers, never empty), plus
+// Corepack's optional `+<integrity>` suffix. Anchored, so nothing beyond a
+// version can ride along into the argv handed to `npm exec`.
+const PNPM_PIN_RE =
+  /^pnpm@((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?)(?:\+[0-9A-Za-z.-]+)?$/;
+
+// The checkout's OWN pinned pnpm, in a spec `npm exec` can resolve.
+//
+// `packageManager` is Corepack's format — `<name>@<version>` with an OPTIONAL
+// `+<integrity>` suffix (cinatra pins `pnpm@11.1.2+sha512.…`). npm has no such
+// spec, so the suffix is stripped. Deliberately conservative: only a well-formed
+// **pnpm** pin yields a spec — a yarn/npm pin, a range, a missing field or an
+// unreadable manifest returns null, and the caller keeps its previous behavior.
+function readPinnedPnpmSpec(repoRoot) {
+  if (!repoRoot) return null;
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+    const pin = typeof pkg.packageManager === "string" ? pkg.packageManager.trim() : "";
+    const match = PNPM_PIN_RE.exec(pin);
+    return match ? `pnpm@${match[1]}` : null;
+  } catch {
+    return null;
+  }
+}
+
+// How to invoke `pnpm install` on THIS machine. Mirrors the selection in
+// src/install.mjs, in strict preference order:
+//
+//   1. Corepack present  → `corepack pnpm install`. The canonical invocation:
+//      Corepack reads `packageManager` itself, so the pin is honored exactly.
+//   2. Corepack absent, bare `pnpm` on PATH → `pnpm install` (cinatra-cli#205).
+//   3. Neither → `npm exec -y -- pnpm@<pin> install`, resolving the pin from the
+//      checkout's own `packageManager` (cinatra-cli#207). **Node 25 removed the
+//      bundled Corepack**, and on that line the `pnpm` shim Corepack used to
+//      provide is gone with it — so "neither tool" is the ORDINARY state of a
+//      current-Node host, not an exotic one. npm ships with every Node line, so
+//      this tier always exists, and going through the pin keeps the install as
+//      reproducible as tier 1.
+//
+// Only when the pin cannot be read (or npm is somehow absent) does this fall
+// back to attempting the canonical `corepack pnpm install`, so the loud failure
+// still names the command to enable — the pre-existing degradation.
+//
+// `repoRoot` is what carries the pin; a caller that has no checkout in hand can
+// omit it and keeps exactly the tier-1/tier-2 behavior it had before.
+function resolvePnpmInstallInvocation({ exists = commandExists, repoRoot = null, readPin = readPinnedPnpmSpec } = {}) {
+  if (exists("corepack", ["--version"])) {
+    return { command: "corepack", args: ["pnpm", "install"], label: "corepack pnpm install" };
+  }
+  if (exists("pnpm", ["--version"])) {
     return { command: "pnpm", args: ["install"], label: "pnpm install" };
+  }
+  const spec = repoRoot ? readPin(repoRoot) : null;
+  if (spec && exists("npm", ["--version"])) {
+    return {
+      command: "npm",
+      args: ["exec", "-y", "--", spec, "install"],
+      label: `npm exec -y -- ${spec} install`,
+      pinned: spec,
+    };
   }
   return { command: "corepack", args: ["pnpm", "install"], label: "corepack pnpm install" };
 }
@@ -1782,14 +1833,56 @@ function applyNextCleanBeforeStart(repoRoot, directive) {
   );
 }
 
-function reinstallDependencies(repoRoot) {
-  const script = `rm -rf node_modules .pnpm-store && echo "  Removed node_modules/ and .pnpm-store/" && pnpm install`;
-  const result = spawnSync("sh", ["-c", script], {
+// `instance reset --full`: DESTRUCTIVE — the dependency tree is removed before
+// the install runs, so the install command must be one that actually exists on
+// this host. A hardcoded bare `pnpm install` deleted node_modules and then
+// failed on any host without pnpm on PATH — which on Node 25, where Corepack
+// (and with it Corepack's `pnpm` shim) is no longer bundled, is the ORDINARY
+// state (cinatra-cli#207). The removal is done in-process rather than through
+// `sh -c` so the two halves cannot be reordered or word-split.
+// The reset path's dependency install. This site has always invoked BARE pnpm;
+// that is preserved exactly while a pnpm is on PATH, so nothing about the
+// current Node line moves. Only when pnpm is absent does it fall through to the
+// shared selection.
+function resolveResetInstallInvocation({ repoRoot, exists = commandExists } = {}) {
+  return exists("pnpm", ["--version"])
+    ? { command: "pnpm", args: ["install"], label: "pnpm install" }
+    : resolvePnpmInstallInvocation({ repoRoot, exists });
+}
+
+// FAIL CLOSED, and fail EARLY. `instance reset --full` tears the docker stack
+// down WITH ITS VOLUMES, cleans build artifacts, and deletes node_modules —
+// all before it reinstalls. If no install command can exist on this host, the
+// reset would leave an instance with neither its data nor its dependencies. So
+// prove the installer is runnable BEFORE the first destructive step, not at the
+// install itself. Only one invocation can be returned unproven — the canonical
+// corepack degradation — so that is exactly what this refuses (cinatra-cli#207).
+function assertResetInstallPossible({ repoRoot, exists = commandExists } = {}) {
+  const invocation = resolveResetInstallInvocation({ repoRoot, exists });
+  if (invocation.command !== "corepack" || exists("corepack", ["--version"])) return invocation;
+  throw new Error(
+    `Refusing to run a full reset: nothing on this host could reinstall dependencies for ${repoRoot} ` +
+      `afterwards. Corepack is not installed (Node 25 no longer bundles it), pnpm is not on PATH, and this ` +
+      `checkout declares no exact pnpm \`packageManager\` pin to run through \`npm exec\`. Install pnpm ` +
+      `(\`npm install -g pnpm\`), or add a \`"packageManager": "pnpm@<version>"\` pin to the checkout, then ` +
+      `re-run. Nothing has been torn down.`,
+  );
+}
+
+function reinstallDependencies(repoRoot, { spawn = spawnSync, exists = commandExists, rm = rmSync } = {}) {
+  // Re-asserted here too: this function is what actually deletes the tree, so it
+  // must be safe to call on its own, not only via the guarded reset path.
+  const invocation = assertResetInstallPossible({ repoRoot, exists });
+  for (const dir of ["node_modules", ".pnpm-store"]) {
+    rm(path.join(repoRoot, dir), { recursive: true, force: true });
+  }
+  console.log("  Removed node_modules/ and .pnpm-store/");
+  const result = spawn(invocation.command, invocation.args, {
     stdio: "inherit",
     cwd: repoRoot,
   });
   if (result.status !== 0) {
-    throw new Error("Failed to reinstall dependencies.");
+    throw new Error(`Failed to reinstall dependencies (${invocation.label}).`);
   }
 }
 
@@ -5407,7 +5500,7 @@ function extensionDeclaresInstallableDeps(pkgDir) {
 function installAfterExtensionSync(
   repoRoot,
   syncResult,
-  { failHard = false, spawn = spawnSync, exists = commandExists } = {},
+  { failHard = false, spawn = spawnSync, exists = commandExists, readPin = readPinnedPnpmSpec } = {},
 ) {
   const results = syncResult && Array.isArray(syncResult.results) ? syncResult.results : [];
   if (results.length === 0) return; // no-config / nothing matched / nothing synced
@@ -5428,7 +5521,7 @@ function installAfterExtensionSync(
       !existsSync(path.join(r.dest, "node_modules")),
   );
   if (!materiallyChanged && !hydrationMissing) return;
-  const invocation = resolvePnpmInstallInvocation({ exists });
+  const invocation = resolvePnpmInstallInvocation({ exists, repoRoot, readPin });
   console.log(`- Linking cloned extensions into the workspace (${invocation.label})…`);
   const install = spawn(invocation.command, invocation.args, {
     cwd: repoRoot,
@@ -5647,11 +5740,15 @@ function ensureClonedExtensionsLinked(worktree, { log = console.log } = {}) {
     log(`  Linked ${repaired.length} extension(s): ${repaired.join(", ")}`);
   }
   if (stillMissing.length > 0) {
+    // Name a command the operator can actually run on THIS host — on a Node
+    // line without the bundled Corepack, `corepack pnpm install` is not a
+    // remediation, it is a second failure (cinatra-cli#207).
+    const relink = resolvePnpmInstallInvocation({ repoRoot: worktree });
     console.error(
       `\n⚠ ${stillMissing.length} extension(s) could not be linked into node_modules ` +
         `(${stillMissing.join(", ")}). The extension manifest will NOT be regenerated against this tree ` +
         `(regenerating would emit imports the build cannot resolve and 500 every route). ` +
-        `Re-run \`corepack pnpm install\` in ${worktree}, then re-run setup.\n`,
+        `Re-run \`${relink.label}\` in ${worktree}, then re-run setup.\n`,
     );
     process.exitCode = 1;
     return { ok: false, repaired, stillMissing };
@@ -7239,7 +7336,7 @@ async function runDevRefresh(rest) {
 
   // 2. Dependencies: plain install so an intentionally-changed lockfile is honored
   //    (frozen installs are for CI, not a contributor reconcile).
-  const depsInvocation = resolvePnpmInstallInvocation();
+  const depsInvocation = resolvePnpmInstallInvocation({ repoRoot });
   console.log(`- Dependencies: ${depsInvocation.label}…`);
   runCommandOrThrow(
     depsInvocation.command,
@@ -7835,16 +7932,22 @@ async function runSetupBranch(argv) {
   console.log(`  Schema:      ${schemaName}`);
   console.log(`  Queue:       ${queueName}`);
   console.log(`  .env.local:  ${outPath}`);
+  // Name an install command this host can actually run (cinatra-cli#207). The
+  // familiar bare `pnpm install` guidance is kept verbatim wherever pnpm exists;
+  // only a host without it is told something different.
+  const branchInstall = commandExists("pnpm", ["--version"])
+    ? { label: "pnpm install" }
+    : resolvePnpmInstallInvocation({ repoRoot: worktreePath });
   if (repairedSymlinks.length > 0) {
     console.log("");
     console.log(`Removed ${repairedSymlinks.length} cross-worktree / broken node_modules symlink(s):`);
     for (const { link, target, reason } of repairedSymlinks) {
       console.log(`  - ${link} -> ${target}  (${reason})`);
     }
-    console.log(`  Run \`pnpm install\` in ${worktreePath} before \`pnpm dev\` to re-populate them locally.`);
+    console.log(`  Run \`${branchInstall.label}\` in ${worktreePath} before \`pnpm dev\` to re-populate them locally.`);
   }
   console.log("");
-  console.log(`Next: cd ${worktreePath} && pnpm install && pnpm dev`);
+  console.log(`Next: cd ${worktreePath} && ${branchInstall.label} && pnpm dev`);
 }
 
 async function runTeardownBranch(argv) {
@@ -8737,16 +8840,20 @@ async function runSetupClone(argv) {
 
   // Auto-install deps for command-managed heavy clones. Only run when the worktree
   // was just created OR node_modules is absent — a re-run on an
-  // already-installed clone must NOT pay another slow pnpm pass. MUST use
-  // `corepack pnpm` (NOT bare pnpm) so the pnpm@11.1.2 pin is honored and the
-  // lockfile / patches are preserved.
+  // already-installed clone must NOT pay another slow pnpm pass. The pnpm@11.1.2
+  // pin MUST be honored (the lockfile / patches depend on it), which is why
+  // Corepack is still the first choice; where Corepack does not exist — Node 25
+  // unbundled it (cinatra-cli#207) — the shared resolver keeps the pin by
+  // running the pinned pnpm through `npm exec` instead of failing outright.
   let depsAutoInstalled = false;
+  let depsInvocation = null;
   if (cliOwnedWorktree) {
     const nodeModulesPath = path.join(worktreePath, "node_modules");
+    depsInvocation = resolvePnpmInstallInvocation({ repoRoot: worktreePath });
     if (worktreeJustCreated || !existsSync(nodeModulesPath)) {
       console.log("");
-      console.log(`Installing dependencies (corepack pnpm install) in ${worktreePath}…`);
-      const install = spawnSync("corepack", ["pnpm", "install"], {
+      console.log(`Installing dependencies (${depsInvocation.label}) in ${worktreePath}…`);
+      const install = spawnSync(depsInvocation.command, depsInvocation.args, {
         cwd: worktreePath,
         stdio: "inherit",
         env: process.env,
@@ -8758,7 +8865,7 @@ async function runSetupClone(argv) {
             "slot, and git worktree were all provisioned SUCCESSFULLY and are intact.",
         );
         console.error(
-          `Re-run the install manually: cd ${worktreePath} && corepack pnpm install`,
+          `Re-run the install manually: cd ${worktreePath} && ${depsInvocation.label}`,
         );
         console.error("(Do NOT re-run 'cinatra instance clone new' — that work is already done.)");
         process.exitCode = 1;
@@ -8833,9 +8940,15 @@ async function runSetupClone(argv) {
   if (cliOwnedWorktree && depsAutoInstalled) {
     console.log(`Next: cd ${worktreePath} && pnpm dev`);
   } else if (cliOwnedWorktree) {
-    console.log(`Next: cd ${worktreePath} && corepack pnpm install && pnpm dev`);
+    console.log(`Next: cd ${worktreePath} && ${depsInvocation.label} && pnpm dev`);
   } else {
-    console.log(`Next: cd ${worktreePath} && pnpm install && pnpm dev`);
+    // Not a CLI-owned worktree, so no install ran and none was resolved above.
+    // Keep the familiar bare `pnpm install` wherever pnpm exists; only a host
+    // without it is told something different (cinatra-cli#207).
+    const manualInstall = commandExists("pnpm", ["--version"])
+      ? "pnpm install"
+      : resolvePnpmInstallInvocation({ repoRoot: worktreePath }).label;
+    console.log(`Next: cd ${worktreePath} && ${manualInstall} && pnpm dev`);
   }
 }
 
@@ -12493,6 +12606,12 @@ async function runResetDev(argv) {
   if (isFull) {
     // ── Full reset: tear down everything and rebuild from scratch ──
 
+    // cinatra-cli#207 — BEFORE the first destructive step: prove this host can
+    // still reinstall the dependencies a full reset is about to delete. A reset
+    // that tears down the volumes and then cannot install is strictly worse than
+    // one that refuses to start.
+    assertResetInstallPossible({ repoRoot });
+
     console.log("Stopping Docker containers and removing volumes...");
     runCommandOrThrow("docker", ["compose", "down", "-v"], "Failed to stop Docker containers.", { cwd: repoRoot });
 
@@ -13499,10 +13618,14 @@ export {
   TAILSCALE_SERVE_FQDN_KEY,
   buildTailscaleServeConfig,
   writeTailscaleServeConfig,
-  // update/reconcile dependency step — corepack→bare-pnpm selection (mirrors
-  // `usePnpmDirect` in src/install.mjs) + the re-link seam that consumes it.
+  // Dependency-install selection shared by every workspace-install site —
+  // corepack → bare pnpm → the checkout's pinned pnpm via `npm exec`
+  // (cinatra-cli#205, #207) — plus the pin reader and the re-link seam.
   resolvePnpmInstallInvocation,
+  readPinnedPnpmSpec,
   installAfterExtensionSync,
+  reinstallDependencies,
+  assertResetInstallPossible,
   // cinatra-cli#41 — clone link-invariant seams (pure; injectable fs).
   linkedSetMatchesEmittedSet,
   enumerateEmittedExtensionPackages,
@@ -13603,8 +13726,9 @@ function buildHandlers() {
         console.log(`extensions acquire-prod: skipped (${outcome.reason}).`);
         return;
       }
+      const relink = resolvePnpmInstallInvocation({ repoRoot });
       console.log(
-        "Run `corepack pnpm install` next so the acquired extension packages are linked into the workspace.",
+        `Run \`${relink.label}\` next so the acquired extension packages are linked into the workspace.`,
       );
     },
     "extensions.submit": async (rest) => {

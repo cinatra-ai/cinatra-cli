@@ -155,7 +155,7 @@ export function applyCheckoutBootstrapDdl({
   }
   if (!checkoutResolvesTsx(repoRoot, deps)) {
     const remediation =
-      "the checkout does not resolve `tsx`. Install dependencies (corepack pnpm install) so setup can " +
+      "the checkout does not resolve `tsx`. Install the workspace dependencies so setup can " +
       "apply the checkout's schema bootstrap before the versioned migration chain.";
     if (required) {
       throw new Error(`Checkout bootstrap DDL cannot run — ${remediation}`);

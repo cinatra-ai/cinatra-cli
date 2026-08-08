@@ -144,6 +144,33 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The CLI no longer needs Corepack to exist — Node 25 unbundled it.** Node 25
+  removed Corepack from the distribution, and with it the `pnpm` shim Corepack
+  provided, so a stock Node 25 host has NEITHER `corepack` NOR `pnpm` on `PATH`.
+  Every internal workspace-install step therefore fell through to attempting a
+  `corepack pnpm install` that does not exist: `cinatra instance reset` and
+  `cinatra instance setup dev` reported a FAILED post-extension-sync workspace
+  link and skipped extension-manifest regeneration (leaving the workspace
+  unlinked), `cinatra instance clone new` failed its dependency install
+  outright, and `cinatra install` was blocked at the requirements check by a
+  remediation (`corepack enable`) that is impossible on that Node line.
+  Dependency installs now select in three tiers — Corepack when present (the
+  pin is honored by Corepack itself, unchanged), the bare `pnpm` on `PATH`
+  otherwise, and finally the checkout's OWN `packageManager` pin run through
+  `npm exec` (`npm exec -y -- pnpm@<pin> install`), which needs nothing but the
+  npm that ships with every Node line and keeps the install as reproducible as
+  the Corepack route. The clone auto-install, the post-extension-sync re-link,
+  the update/reconcile dependency step and `cinatra install` all share that
+  selection, and every remediation the CLI prints now names a command that is
+  actually runnable on the host it printed it on. Two paths additionally fail
+  CLOSED rather than mid-way: `cinatra instance reset --full` proves an install
+  command exists BEFORE it tears the stack down and deletes `node_modules` (it
+  previously removed the dependency tree and only then discovered it could not
+  reinstall it), and `cinatra install` proves it right after the checkout
+  materializes — the first moment the checkout's pin is readable — and before
+  any local-ignore write, co-use hand-off, conflict resolution or infra
+  bring-up. A host that has Corepack is completely unaffected. (#207)
+
 - **`cinatra update` / `cinatra instance refresh` no longer require Corepack.**
   The update/reconcile dependency step and the post-extension-sync workspace
   re-link invoked `corepack pnpm install` unconditionally, so on a machine
