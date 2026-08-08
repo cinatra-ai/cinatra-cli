@@ -201,6 +201,16 @@ import {
   devTunnelRuntimeSlug,
   claimDevTunnelRuntimeDir,
 } from "./dev-tunnel-identity.mjs";
+// Registry-user reconcile for `instance reset --purge-app-data` (cinatra-cli#208).
+// Builtins-only module — safe on an extension-empty checkout.
+import {
+  collectAppOwnedRegistryNamespaces,
+  createComposeRegistryTransport,
+  INSTANCE_IDENTITY_METADATA_KEY,
+  parseMetadataRow,
+  PENDING_PROVISION_METADATA_KEY,
+  purgeLocalRegistryUsers,
+} from "./purge-registry-users.mjs";
 
 const AUTH_TABLES = [
   "user",
@@ -957,6 +967,29 @@ Examples:
   cinatra update --instance      # update the instance (dev→origin/main, prod→release)
   cinatra update --ref <tag-or-sha>  # update the instance to a specific ref
   cinatra update --cli --dry-run     # show what the CLI update would run`,
+  "reset.dev": `Reset the development environment. Requires --yes. Development mode only.
+
+Options:
+  --full               Tear everything down (containers AND volumes) and rebuild
+                       from scratch. Not combinable with the app-data flags.
+  --rebuild-env        (--full) Rebuild .env.local from the running infrastructure.
+  --backup|--no-backup Create a full backup first, or skip it. Prompts if unset.
+  --file <path>        (--backup) Write the backup bundle to this path.
+  --purge-app-data     Drop the app schema too: campaigns, drafts, blog data,
+                       source data, skills, notifications and related records.
+  --keep-app-data      Keep that data. Reset only the auth tables.
+
+What --purge-app-data does to the local registry (cinatra-cli#208):
+  The app mints one registry user per instance namespace and keeps the generated
+  password in its own database. Purging the database throws that password away,
+  so the reset also removes the registry users this instance owned — otherwise
+  the next onboarding collides with its own leftovers at /setup/name. The
+  registry service restarts afterwards, because it keeps removed users in memory
+  until it does.
+  Package storage is never touched: published packages survive the reset.
+  Registry users this instance did not own stay. --keep-app-data removes none of
+  them, because the app keeps the password that matches them. --full needs no
+  reconcile at all: it removes the registry volume outright.`,
   "extensions.reconcile": `Operator-facing planner/executor for the instance's NON-REQUIRED extension
 updates — the same set the boot-seeded auto-update loop would touch, driven from
 the same read model + fail-closed gates. This command is a THIN AUTHENTICATED
@@ -4177,6 +4210,62 @@ async function resetDevelopmentData(client, schemaName, purgeAppData) {
       cascade
     `,
   );
+}
+
+// Postgres codes for "that schema does not exist" / "that table does not
+// exist". Those are the ONLY read failures that legitimately mean "nothing was
+// recorded" — on a checkout that has never been set up.
+const NOTHING_RECORDED_PG_CODES = new Set(["3F000", "42P01"]);
+
+/**
+ * Read the registry namespaces the app recorded, BEFORE the purge drops the
+ * schema that holds them (cinatra-cli#208). One query over the two metadata
+ * keys that can name a Verdaccio user this instance minted.
+ *
+ * An absent schema/table reads as "nothing recorded". ANY OTHER failure throws,
+ * on purpose: this runs before the destructive drop, so failing here costs
+ * nothing, while swallowing it would drop the schema and then report "no
+ * registry user was recorded" — destroying the only evidence of which users to
+ * clean up and lying about it in the same breath.
+ */
+async function readAppOwnedRegistryNamespaces(client, schemaName) {
+  let result;
+  try {
+    result = await client.query(
+      `select key, value from ${quoteIdentifier(schemaName)}.metadata where key = any($1::text[])`,
+      [[INSTANCE_IDENTITY_METADATA_KEY, PENDING_PROVISION_METADATA_KEY]],
+    );
+  } catch (err) {
+    if (NOTHING_RECORDED_PG_CODES.has(err?.code)) return [];
+    throw new Error(
+      `Could not read the instance registry namespaces from ${schemaName}.metadata, so the reset ` +
+        `stopped before purging anything: ${err?.message ?? err}`,
+      { cause: err },
+    );
+  }
+
+  // A row that EXISTS but is not a record is not "nothing recorded" — it may be
+  // the record of a minted registry user in a shape this code does not
+  // understand. Purging past it would strand that user with no trace of its
+  // name, so stop here instead (still before the drop). A literal JSON `null` is
+  // NOT such a case: that is how the app clears its pending-provision stash.
+  const byKey = new Map();
+  for (const row of result.rows) {
+    const parsed = parseMetadataRow(row.value);
+    if (!parsed.ok) {
+      throw new Error(
+        `The ${schemaName}.metadata row "${row.key}" is present but unreadable, so the reset ` +
+          `stopped before purging anything. It may name a registry user that the purge would ` +
+          `strand. Inspect or remove that row, then run the reset again.`,
+      );
+    }
+    byKey.set(row.key, parsed.value);
+  }
+
+  return collectAppOwnedRegistryNamespaces({
+    identity: byKey.get(INSTANCE_IDENTITY_METADATA_KEY),
+    pendingProvision: byKey.get(PENDING_PROVISION_METADATA_KEY),
+  });
 }
 
 async function resolveAppDataPurgePreference(argv) {
@@ -12675,10 +12764,32 @@ async function runResetDev(argv) {
     const client = await createClient(connectionString);
     await client.connect();
 
+    // cinatra-cli#208 — the namespaces live in the schema the purge is about to
+    // drop, so they are read FIRST or not at all.
+    let ownedRegistryNamespaces = [];
     try {
+      if (purgeAppData) {
+        ownedRegistryNamespaces = await readAppOwnedRegistryNamespaces(client, schemaName);
+      }
       await resetDevelopmentData(client, schemaName, purgeAppData);
     } finally {
       await client.end();
+    }
+
+    // cinatra-cli#208 (the un-done half of cinatra#2500) — purging the app DB
+    // throws away the registry password the app generated, so the matching
+    // Verdaccio user becomes an orphan that answers the next onboarding with a
+    // 401. Remove exactly the users this instance owned; package storage and
+    // every other user stay. `--keep-app-data` keeps the DB, hence keeps the
+    // credential, hence keeps the user.
+    if (purgeAppData) {
+      console.log("Reconciling the local registry users...");
+      await purgeLocalRegistryUsers({
+        namespaces: ownedRegistryNamespaces,
+        transport: createComposeRegistryTransport(repoRoot),
+        log: (line) => console.log(line),
+        warn: (line) => console.warn(line),
+      });
     }
 
     console.log("Flushing Redis...");
@@ -13560,6 +13671,12 @@ async function runAgentImport(argv) {
 // client + mocked token mint — without booting the app or a live DB.
 // ---------------------------------------------------------------------------
 export {
+  // cinatra-cli#208 — the reset entrypoint, exported so the wiring itself is
+  // testable: that the registry namespaces are read BEFORE the schema drop, and
+  // that the reconcile runs only for --purge-app-data. Both are invisible at the
+  // module seam, and getting either wrong silently restores the original bug.
+  runResetDev,
+  readAppOwnedRegistryNamespaces,
   // cinatra-cli#174 — execution-plane orchestration seams (injectable
   // docker/http/settings boundaries so the docker-gated E2E can drive each
   // induced failure).

@@ -144,6 +144,42 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`instance reset --purge-app-data` no longer strands the registry user it
+  just orphaned.** The app mints one Verdaccio npm user per instance namespace
+  and keeps the generated password in its own database. Purging the app data
+  threw that password away but left the `htpasswd` entry behind with the old
+  hash, so re-onboarding under the same name re-issued the adduser call with a
+  fresh password, Verdaccio answered HTTP 401, and a supposedly fresh instance
+  was blocked at `/setup/name` by its own leftovers — one more orphan per reset,
+  forever. The reset now reads the namespaces the app recorded BEFORE it drops
+  the schema that holds them (the live namespace, every namespace the instance
+  was renamed away from, and a mint whose identity write never landed) and
+  removes exactly those entries from the registry user store afterwards, then
+  restarts the registry service and waits for it to serve again — Verdaccio
+  merges `htpasswd` into an in-memory map and never forgets a user that left the
+  file, so the rewrite alone would have left the running registry answering 401
+  from the stale copy (found by running the real command against a real
+  registry, not by reading the file). The boundary is deliberately narrow:
+  package storage is never touched (only lines of `htpasswd` are rewritten,
+  atomically, through a staging file; the sibling `.verdaccio-db.json` holds the
+  package list and is left alone), registry
+  users this instance never claimed are left alone (the dev-seed publisher and
+  any throwaway e2e users — the reset has no evidence that those are orphans),
+  `--keep-app-data` removes nothing at all because the app keeps the password
+  that matches its user, and `--full` needs no reconcile because it already
+  destroys the whole registry volume. Re-running the reset is a clean no-op: the
+  second pass finds no user of its own and writes nothing. The step is
+  loud-but-non-fatal — it runs after the destructive purge, so an unreachable
+  registry, an unreadable store or a failed rewrite warns and lets the reset
+  finish instead of stranding a half-built instance. Every such warning NAMES
+  the users, because the row that recorded them is already purged and a re-run
+  would find nothing: the warning is the operator's only remaining record. The
+  namespace read itself now fails CLOSED — anything other than "the schema does
+  not exist yet" aborts the reset BEFORE the drop rather than silently reporting
+  that nothing was recorded — and after the restart the removal is verified
+  against the live store instead of assumed. `cinatra instance reset --help` now
+  documents the whole flag/purge boundary. (#208)
+
 - **The CLI no longer needs Corepack to exist — Node 25 unbundled it.** Node 25
   removed Corepack from the distribution, and with it the `pnpm` shim Corepack
   provided, so a stock Node 25 host has NEITHER `corepack` NOR `pnpm` on `PATH`.
