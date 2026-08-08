@@ -8942,7 +8942,13 @@ async function runSetupClone(argv) {
   } else if (cliOwnedWorktree) {
     console.log(`Next: cd ${worktreePath} && ${depsInvocation.label} && pnpm dev`);
   } else {
-    console.log(`Next: cd ${worktreePath} && pnpm install && pnpm dev`);
+    // Not a CLI-owned worktree, so no install ran and none was resolved above.
+    // Keep the familiar bare `pnpm install` wherever pnpm exists; only a host
+    // without it is told something different (cinatra-cli#207).
+    const manualInstall = commandExists("pnpm", ["--version"])
+      ? "pnpm install"
+      : resolvePnpmInstallInvocation({ repoRoot: worktreePath }).label;
+    console.log(`Next: cd ${worktreePath} && ${manualInstall} && pnpm dev`);
   }
 }
 

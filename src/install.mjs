@@ -1897,13 +1897,10 @@ function pnpmInstall({ targetDir, usePnpmDirect, log = console.log }) {
     usePnpmDirect === true
       ? { command: "pnpm", args: ["install"], label: "pnpm install" }
       : resolvePnpmInvocation({ targetDir });
-  log("- Installing dependencies (pnpm install)…");
-  if (invocation.pinned) {
-    log(
-      `  Corepack and pnpm are both unavailable on this host — running the checkout's pinned ` +
-        `${invocation.pinned} via \`npm exec\`.`,
-    );
-  }
+  // Name the binary actually invoked, like every other install site does — the
+  // fixed "pnpm install" text told an operator on the Corepack tier something
+  // that was not what ran.
+  log(`- Installing dependencies (${invocation.label})…`);
   runOrThrow(invocation.command, invocation.args, `${invocation.label} failed.`, { cwd: targetDir });
 }
 

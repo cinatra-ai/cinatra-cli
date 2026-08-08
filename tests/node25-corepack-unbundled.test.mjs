@@ -461,24 +461,25 @@ describe("runInstall gates the package manager before it mutates anything", () =
     expect(exclude).not.toMatch(/\.cinatra\//);
   });
 
-  it("proceeds when the checkout carries a pnpm pin the third tier can run", async () => {
-    buildOrigin(REAL_PIN);
-    const targetDir = path.join(sandbox, "out");
-
-    // `--no-install` so the run stops short of an actual dependency install; the
-    // point is that the GATE did not reject a checkout it can serve.
-    const result = await install(targetDir, ["--no-install"]);
-    expect(result.targetDir).toBe(targetDir);
-    expect(existsSync(path.join(targetDir, ".env.local"))).toBe(true);
-  });
-
-  it("does not gate a run that installs nothing", async () => {
-    buildOrigin(undefined); // unusable for tier 3 …
-    const targetDir = path.join(sandbox, "out");
-    // … but `--no-install` never reaches an install, so refusing would be wrong.
-    const result = await install(targetDir, ["--no-install"]);
-    expect(result.targetDir).toBe(targetDir);
-  });
+  // `--no-install` never reaches an install, so refusing would be wrong there —
+  // with or without a usable pin. (The pin-IS-usable case is proven end to end by
+  // the standalone gate test above; driving it through runInstall would perform a
+  // real dependency install.)
+  for (const [label, pin] of [
+    ["no pin at all", undefined],
+    ["a usable pnpm pin", REAL_PIN],
+  ]) {
+    it(`does not gate a run that installs nothing — ${label}`, async () => {
+      buildOrigin(pin);
+      const targetDir = path.join(sandbox, "out");
+      const result = await install(targetDir, ["--no-install"]);
+      expect(result.targetDir).toBe(targetDir);
+      // It got all the way past the gate and the marker write into the env step.
+      expect(existsSync(path.join(targetDir, ".env.local"))).toBe(true);
+      const exclude = readFileSync(path.join(targetDir, ".git", "info", "exclude"), "utf8");
+      expect(exclude).toMatch(/\.cinatra\//);
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
