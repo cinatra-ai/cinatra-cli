@@ -54,7 +54,7 @@ export const INSTALL_BYPRODUCT_RULES = Object.freeze([
   Object.freeze({
     kind: "exact",
     path: "pnpm-lock.yaml",
-    why: "workspace re-link — the cloned dev extensions join the pnpm workspace, so `corepack pnpm install` rewrites the lockfile",
+    why: "workspace re-link — the cloned dev extensions join the pnpm workspace, so the workspace install rewrites the lockfile",
   }),
   Object.freeze({
     kind: "prefix",
