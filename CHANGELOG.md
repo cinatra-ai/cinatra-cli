@@ -178,8 +178,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
   not exist yet" aborts the reset BEFORE the drop rather than silently reporting
   that nothing was recorded — and after the restart the removal is verified
   against the live store instead of assumed. `cinatra instance reset --help` now
-  documents the whole flag/purge boundary. (#208, the un-done half of
-  cinatra#2500)
+  documents the whole flag/purge boundary. (#208)
 
 - **The CLI no longer needs Corepack to exist — Node 25 unbundled it.** Node 25
   removed Corepack from the distribution, and with it the `pnpm` shim Corepack
