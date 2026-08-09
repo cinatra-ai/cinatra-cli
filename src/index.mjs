@@ -35,6 +35,10 @@ import {
   seedLocalRegistryExtensions,
 } from "./seed-local-registry.mjs";
 import { parseDevRefreshFlags, describeDockerDecision } from "./dev-refresh.mjs";
+import {
+  createComposeNangoDbTransport,
+  ensureNangoSecretKey,
+} from "./nango-secret-key.mjs";
 import { prodRuntimeGuidanceLines } from "./prod-runtime-guidance.mjs";
 import {
   EXECUTION_MODES,
@@ -1706,6 +1710,35 @@ function waitForNango(repoRoot, maxAttempts = 60) {
     spawnSync("sleep", ["2"]);
   }
   throw new Error(`Nango server did not become ready within ${maxAttempts * 2} seconds.`);
+}
+
+/**
+ * cinatra-cli#211 — once the local stack is up, reconcile this checkout's
+ * `NANGO_SECRET_KEY` against the environment key nango-server seeded into
+ * nango-db (the only value it authenticates; a fresh install never had one, so
+ * every Nango-backed connector save 401'd). Mints when absent, heals a malformed
+ * value, and NEVER rotates a valid one — see src/nango-secret-key.mjs.
+ *
+ * `adoptDivergent` is passed ONLY by `reset --full`, which just destroyed the
+ * nango volume — see the planner's contract.
+ *
+ * Non-fatal by contract: the reconcile never throws, and an unexpected throw is
+ * still contained here rather than failing a refresh/reset that otherwise worked.
+ */
+function reconcileNangoSecretKey(repoRoot, { adoptDivergent = false } = {}) {
+  try {
+    return ensureNangoSecretKey({
+      envPath: path.join(repoRoot, ".env.local"),
+      transport: createComposeNangoDbTransport({ cwd: repoRoot }),
+      adoptDivergent,
+    });
+  } catch (err) {
+    console.log(
+      `  ⚠ Could not reconcile NANGO_SECRET_KEY (${err instanceof Error ? err.message : err}) — ` +
+        "Nango-backed connectors may fail with HTTP 401 until it is set.",
+    );
+    return null;
+  }
 }
 
 function flushRedis(repoRoot) {
@@ -7384,6 +7417,10 @@ async function runDevRefresh(rest) {
       waitForRedis(repoRoot);
       waitForNango(repoRoot);
       console.log("  Postgres, Redis, and Nango are ready.");
+      // cinatra-cli#211: heal/mint NANGO_SECRET_KEY now that nango-db is up —
+      // this is the "next relevant command" for an instance installed before the
+      // key was provisioned at all.
+      reconcileNangoSecretKey(repoRoot);
       // cinatra-cli#128: this `up` deployed whatever the checkout now pins —
       // record the stateful-service versions in the instance's ledger
       // (best-effort; skipped when this checkout has no registered instance).
@@ -12726,6 +12763,12 @@ async function runResetDev(argv) {
     console.log("Waiting for Nango...");
     waitForNango(repoRoot);
     console.log("Nango is ready.");
+
+    // cinatra-cli#211: `--full` destroyed the nango volume, so nango-server has
+    // just seeded a BRAND NEW environment key — the value in `.env.local` (and
+    // the one `--rebuild-env` omits entirely) is now stale. Adopt the new one
+    // here, or every connector save 401s on the rebuilt stack.
+    reconcileNangoSecretKey(repoRoot, { adoptDivergent: true });
 
     console.log("Reinstalling dependencies...");
     reinstallDependencies(repoRoot);

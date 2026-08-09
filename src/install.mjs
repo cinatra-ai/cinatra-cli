@@ -50,6 +50,10 @@ import { fileURLToPath } from "node:url";
 import { syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
 import { isValidSlug } from "./clone-registry.mjs";
 import {
+  createComposeNangoDbTransport,
+  ensureNangoSecretKey,
+} from "./nango-secret-key.mjs";
+import {
   SETUP_EXIT_REGISTRY_SKEW,
   claimRegistrySkewExitCode,
   registrySkewVerdictLines,
@@ -1660,8 +1664,12 @@ function tightenEnvLocalPerms(envPath) {
   }
 }
 
-/** Replace the value of `KEY=` in-place if the key line exists, else append. */
-function upsertEnvKey(body, key, value) {
+/** Replace the value of `KEY=` in-place if the key line exists, else append.
+ *  Exported so `tests/nango-secret-key.test.mjs` can pin the deliberate copy in
+ *  `src/nango-secret-key.mjs` against it (that module stays builtins-only so
+ *  this self-contained one can import it — the copy is the cost, the parity
+ *  test is the guard). */
+export function upsertEnvKey(body, key, value) {
   const re = new RegExp(`^${key}=.*$`, "m");
   if (re.test(body)) return body.replace(re, `${key}=${value}`);
   const sep = body.endsWith("\n") || body.length === 0 ? "" : "\n";
@@ -1723,7 +1731,11 @@ export function preflightRecreate({ slug, targetDir, composeFiles = null, compos
   }
 }
 
-function bringUpInfra({ slug = null, deps = {}, targetDir, log = console.log, composeFiles = null, composeProject = null, envFile = null, nangoHealthUrl = null }) {
+/** Exported for `tests/nango-secret-key-wiring.test.mjs`, which drives the REAL
+ *  bring-up sequence (with `deps.assertRecreateSafe` stubbed and
+ *  `node:child_process` mocked) to prove the cinatra-cli#211 reconcile actually
+ *  runs, and runs AFTER Nango reports healthy. */
+export function bringUpInfra({ slug = null, deps = {}, targetDir, log = console.log, composeFiles = null, composeProject = null, envFile = null, nangoHealthUrl = null }) {
   // cinatra-cli#140: the recreate GATE runs FIRST — before a single stateful
   // container is (re)created — so a major data-format boundary halts here rather
   // than crash-looping (cinatra-ai/cinatra#1417). Every install/refresh recreate
@@ -1735,6 +1747,39 @@ function bringUpInfra({ slug = null, deps = {}, targetDir, log = console.log, co
   waitForCompose(targetDir, "postgres", ["pg_isready", "-U", "postgres"], "Postgres", log, 60, composeBase);
   waitForCompose(targetDir, "redis", ["redis-cli", "ping"], "Redis", log, 60, composeBase);
   waitForNango(log, 60, nangoHealthUrl);
+  // cinatra-cli#211: with Nango up, reconcile the instance's NANGO_SECRET_KEY
+  // against the environment key nango-server just seeded into nango-db — the
+  // ONLY value that authenticates against it. This runs HERE, after the
+  // bring-up, because the key does not exist until nango-server's first-boot
+  // migrations write it (so `ensureEnvLocal`, which runs before any container,
+  // cannot mint it), and it runs for every local bring-up — install, isolated,
+  // attach, re-converge — so an existing broken install heals on its next run.
+  // Never fatal: see the module header.
+  reconcileNangoSecretKey({ targetDir, envFile, composeBase, log, deps });
+}
+
+/** cinatra-cli#211 — the `NANGO_SECRET_KEY` reconcile as one call site.
+ *  `deps.ensureNangoSecretKey` is the test seam (same pattern as
+ *  `deps.bringUpInfra`). Non-fatal by contract: the module never throws, and an
+ *  unexpected throw is still contained here — a bring-up that otherwise
+ *  succeeded must not fail over a connector-credential convenience. */
+function reconcileNangoSecretKey({ targetDir, envFile = null, composeBase = ["compose"], log = console.log, deps = {} }) {
+  const reconcile = deps.ensureNangoSecretKey ?? ensureNangoSecretKey;
+  try {
+    return reconcile({
+      // The default (non-isolated) bring-up threads its env-file; a legacy
+      // caller that does not still keeps `.env.local` next to the checkout.
+      envPath: envFile ?? path.join(targetDir, ".env.local"),
+      transport: createComposeNangoDbTransport({ cwd: targetDir, composeArgs: composeBase }),
+      log,
+    });
+  } catch (err) {
+    log(
+      `  ⚠ Could not reconcile NANGO_SECRET_KEY (${err instanceof Error ? err.message : err}) — ` +
+        "Nango-backed connectors may fail with HTTP 401 until it is set.",
+    );
+    return null;
+  }
 }
 
 /** The leading `compose` argv that selects the recorded files + project (+ an
