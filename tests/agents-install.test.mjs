@@ -322,6 +322,134 @@ describe("pickInputSchema fallback chain", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Identity derivation — boot-path parity (cinatra-cli#212). See the module
+// note above `deriveAgentDisplayName` in src/agents-install.mjs for the exact
+// ground-truth source seam this mirrors.
+// ---------------------------------------------------------------------------
+
+describe("humanizePackageName", () => {
+  it("title-cases a scoped, hyphenated package slug", () => {
+    expect(__test.humanizePackageName("@cinatra-ai/blog-draft-writer-agent")).toBe(
+      "Blog Draft Writer Agent",
+    );
+  });
+  it("handles an unscoped name", () => {
+    expect(__test.humanizePackageName("context-selection-agent")).toBe(
+      "Context Selection Agent",
+    );
+  });
+  it("collapses underscores too", () => {
+    expect(__test.humanizePackageName("@vendor/my_agent_name")).toBe("My Agent Name");
+  });
+});
+
+describe("deriveAgentDisplayName", () => {
+  const PKG = "@cinatra-ai/blog-draft-writer-agent";
+
+  it("prefers agent.json's top-level title", () => {
+    const agent = { title: "Blog Draft Writer Agent", template: { name: "ignored" } };
+    const oas = { name: "also ignored" };
+    const pkg = { cinatra: { displayName: "also ignored" } };
+    expect(__test.deriveAgentDisplayName(agent, oas, pkg, PKG)).toBe("Blog Draft Writer Agent");
+  });
+
+  it("falls back to agent.template.name when title is absent", () => {
+    const agent = { template: { name: "Blog Draft Writer Agent" } };
+    expect(__test.deriveAgentDisplayName(agent, null, null, PKG)).toBe(
+      "Blog Draft Writer Agent",
+    );
+  });
+
+  it("falls back to cinatra/oas.json's top-level name when agent.json has neither", () => {
+    const oas = { name: "Blog Draft Writer Agent" };
+    expect(__test.deriveAgentDisplayName({}, oas, null, PKG)).toBe("Blog Draft Writer Agent");
+    expect(__test.deriveAgentDisplayName(null, oas, null, PKG)).toBe("Blog Draft Writer Agent");
+  });
+
+  // Grounded against the REAL published `@cinatra-ai/blog-draft-writer-agent`
+  // tarball (cinatra-cli#212's own repro package): its published contents are
+  // `package.json` + `cinatra/oas.json` ONLY — no `agent.json` at all — so
+  // `agent` is null and `oas.name` is the rung that actually fires in
+  // production for this exact bug.
+  it("handles the real cinatra-cli#212 repro shape: no agent.json, oas.json only", () => {
+    const oas = { name: "Blog Draft Writer Agent", component_type: "Flow" };
+    const pkg = { name: PKG, cinatra: { displayName: "Blog Draft Writer Agent" } };
+    expect(__test.deriveAgentDisplayName(null, oas, pkg, PKG)).toBe("Blog Draft Writer Agent");
+  });
+
+  it("falls back to package.json's cinatra.displayName when agent.json AND oas.name are both absent", () => {
+    const pkg = { cinatra: { displayName: "Blog Draft Writer Agent" } };
+    expect(__test.deriveAgentDisplayName(null, null, pkg, PKG)).toBe("Blog Draft Writer Agent");
+    expect(__test.deriveAgentDisplayName({}, {}, pkg, PKG)).toBe("Blog Draft Writer Agent");
+  });
+
+  it("prefers oas.name over cinatra.displayName when both are present (boot-path parity)", () => {
+    // The boot importer itself only ever reads oas.name, never
+    // cinatra.displayName — ranking the OAS higher keeps this CLI's /agents
+    // card identical to the core app's for a package where the two diverge.
+    const oas = { name: "OAS Name Wins" };
+    const pkg = { cinatra: { displayName: "Displayed Name Loses" } };
+    expect(__test.deriveAgentDisplayName({}, oas, pkg, PKG)).toBe("OAS Name Wins");
+  });
+
+  it("never falls through to the raw package name — humanizes instead (cinatra-cli#212 regression)", () => {
+    expect(__test.deriveAgentDisplayName(null, null, null, PKG)).toBe("Blog Draft Writer Agent");
+    expect(__test.deriveAgentDisplayName({}, {}, {}, PKG)).toBe("Blog Draft Writer Agent");
+    expect(__test.deriveAgentDisplayName(null, null, null, PKG)).not.toBe(PKG);
+  });
+
+  it("skips blank/whitespace-only title before falling through", () => {
+    const agent = { title: "   ", template: { name: "Real Name" } };
+    expect(__test.deriveAgentDisplayName(agent, null, null, PKG)).toBe("Real Name");
+  });
+
+  // codex round 0 (cinatra-cli#212): a candidate that literally equals the raw
+  // package name must be rejected too, not just an empty one — otherwise a
+  // degenerate manifest can reproduce the exact symptom this fix closes, and
+  // the heal-only writer would loop forever re-writing the same raw string.
+  it("skips any candidate that literally equals the raw package name", () => {
+    const agent = { title: PKG, template: { name: "Real Name" } };
+    expect(__test.deriveAgentDisplayName(agent, null, null, PKG)).toBe("Real Name");
+  });
+
+  it("falls through every raw-name candidate all the way to the humanized fallback", () => {
+    const agent = { title: PKG, template: { name: PKG } };
+    const oas = { name: PKG };
+    const pkg = { cinatra: { displayName: PKG } };
+    expect(__test.deriveAgentDisplayName(agent, oas, pkg, PKG)).toBe("Blog Draft Writer Agent");
+  });
+});
+
+describe("deriveAgentDescription", () => {
+  it("prefers agent.json's top-level description", () => {
+    const agent = { description: "top-level", template: { description: "template" } };
+    const oas = { description: "oas" };
+    const pkg = { description: "pkg" };
+    expect(__test.deriveAgentDescription(agent, oas, pkg)).toBe("top-level");
+  });
+
+  it("falls back to agent.template.description", () => {
+    const agent = { template: { description: "template desc" } };
+    expect(__test.deriveAgentDescription(agent, null, null)).toBe("template desc");
+  });
+
+  it("falls back to cinatra/oas.json's description", () => {
+    const oas = { description: "oas desc" };
+    expect(__test.deriveAgentDescription({}, oas, null)).toBe("oas desc");
+  });
+
+  it("falls back to the sibling package.json description last", () => {
+    const pkg = { description: "pkg desc" };
+    expect(__test.deriveAgentDescription({}, {}, pkg)).toBe("pkg desc");
+  });
+
+  it("returns null (never a raw fallback string) when nothing declares one", () => {
+    expect(__test.deriveAgentDescription(null, null, null)).toBeNull();
+    expect(__test.deriveAgentDescription({}, {}, {})).toBeNull();
+  });
+});
+
 describe("safeJsonParse", () => {
   it("parses valid JSON", () => {
     expect(__test.safeJsonParse('{"a":1}')).toEqual({ a: 1 });
@@ -785,6 +913,125 @@ describe.skipIf(!INTEGRATION_DB_URL)("upsert/delete agent template — LIVE sche
     );
     expect(second.templateId).toBe(first.templateId);
     expect(second.versionNumber).toBe(2);
+  });
+
+  // cinatra-cli#212 — name/description are HEAL-ONLY on conflict: only a row
+  // still carrying the raw-name/empty-description symptom gets corrected; any
+  // other existing value (an operator's UI rename, or a name a prior install
+  // already healed) survives untouched.
+  describe("heal-only name/description on conflict (cinatra-cli#212)", () => {
+    const PKG = "@cinatra-test/heal-agent";
+
+    it("heals a pre-seeded row whose name literally equals its own package_name", async () => {
+      // Simulate the pre-fix symptom directly (bypassing the writer's own
+      // INSERT derivation, which no longer produces this shape) so the heal
+      // predicate is exercised against a genuinely raw-name row.
+      await __test.upsertAgentTemplate(
+        client,
+        TEST_SCHEMA,
+        fields({ name: PKG, description: null, packageName: PKG }),
+      );
+      const seeded = await client.query(
+        `SELECT name, description FROM ${TEST_SCHEMA}.agent_templates WHERE package_name = $1`,
+        [PKG],
+      );
+      expect(seeded.rows[0].name).toBe(PKG);
+      expect(seeded.rows[0].description).toBeNull();
+
+      await __test.upsertAgentTemplate(
+        client,
+        TEST_SCHEMA,
+        fields({
+          name: "Heal Agent",
+          description: "A healed description.",
+          packageName: PKG,
+        }),
+      );
+      const healed = await client.query(
+        `SELECT name, description FROM ${TEST_SCHEMA}.agent_templates WHERE package_name = $1`,
+        [PKG],
+      );
+      expect(healed.rows[0].name).toBe("Heal Agent");
+      expect(healed.rows[0].description).toBe("A healed description.");
+    });
+
+    // codex round 0 (cinatra-cli#212): a whitespace-only description is
+    // exactly as symptomatic as NULL/'' and must heal too.
+    it("heals a pre-seeded row whose description is whitespace-only", async () => {
+      await __test.upsertAgentTemplate(
+        client,
+        TEST_SCHEMA,
+        fields({ name: "Heal Agent", description: "   ", packageName: PKG }),
+      );
+      await __test.upsertAgentTemplate(
+        client,
+        TEST_SCHEMA,
+        fields({ name: "Heal Agent", description: "A healed description.", packageName: PKG }),
+      );
+      const row = await client.query(
+        `SELECT description FROM ${TEST_SCHEMA}.agent_templates WHERE package_name = $1`,
+        [PKG],
+      );
+      expect(row.rows[0].description).toBe("A healed description.");
+    });
+
+    it("does not clobber an operator-customized name/description on re-install", async () => {
+      await __test.upsertAgentTemplate(
+        client,
+        TEST_SCHEMA,
+        fields({
+          name: "Heal Agent",
+          description: "A healed description.",
+          packageName: PKG,
+        }),
+      );
+      // Simulate an operator renaming/redescribing the row from the UI —
+      // neither value equals the heal-trigger symptom any more.
+      await client.query(
+        `UPDATE ${TEST_SCHEMA}.agent_templates SET name = $1, description = $2 WHERE package_name = $3`,
+        ["My Custom Agent Name", "My custom description.", PKG],
+      );
+
+      // A later install/upgrade re-run (e.g. a version bump) must not revert
+      // the operator's customization back to the manifest-derived values.
+      await __test.upsertAgentTemplate(
+        client,
+        TEST_SCHEMA,
+        fields({
+          name: "Heal Agent v2",
+          description: "Manifest description v2.",
+          packageName: PKG,
+          packageVersion: "0.0.2",
+        }),
+      );
+      const row = await client.query(
+        `SELECT name, description, package_version FROM ${TEST_SCHEMA}.agent_templates WHERE package_name = $1`,
+        [PKG],
+      );
+      expect(row.rows[0].name).toBe("My Custom Agent Name");
+      expect(row.rows[0].description).toBe("My custom description.");
+      // Non-identity columns still refresh normally.
+      expect(row.rows[0].package_version).toBe("0.0.2");
+    });
+
+    it("is idempotent: re-running install with identical values does not change name/description", async () => {
+      await __test.upsertAgentTemplate(
+        client,
+        TEST_SCHEMA,
+        fields({ name: "Heal Agent", description: "A healed description.", packageName: PKG }),
+      );
+      await __test.upsertAgentTemplate(
+        client,
+        TEST_SCHEMA,
+        fields({ name: "Heal Agent", description: "A healed description.", packageName: PKG }),
+      );
+      const row = await client.query(
+        `SELECT name, description FROM ${TEST_SCHEMA}.agent_templates WHERE package_name = $1`,
+        [PKG],
+      );
+      expect(row.rows[0].name).toBe("Heal Agent");
+      expect(row.rows[0].description).toBe("A healed description.");
+    });
   });
 
   it("DELETES text-id rows (42883 uuid-cast regression) atomically", async () => {

@@ -180,6 +180,120 @@ function pickInputSchema(agent, oas) {
   return compiled && typeof compiled === "object" ? compiled : {};
 }
 
+// ---------------------------------------------------------------------------
+// Identity derivation — parity with the boot importer (cinatra-cli#212)
+// ---------------------------------------------------------------------------
+//
+// GROUND TRUTH (traced in the `cinatra` monorepo, not guessed): the boot-time
+// git-file loader `ensureAgentPackageFromGitFile`
+// (cinatra/packages/agents/src/ensure-agent-package.ts) reads the agent's
+// self-declared human title straight off `cinatra/oas.json`'s top-level
+// `name` field, and its description off the OAS's top-level `description`
+// (falling back to the sibling `package.json#description` ONLY when the OAS
+// itself carries none). It hands both to `importAgentTemplateCore`
+// (cinatra/packages/agents/src/import-agent-core.ts around line 106:
+// `importedName = nameOverride?.trim() || agent.name || "Imported Agent"`),
+// which projects them onto `agent_templates.name` / `.description` — NEVER
+// the raw package identifier.
+//
+// Both Verdaccio publish routes the CLI's tarball can come from
+// (packages/agents/src/verdaccio/client.ts's `publishAgentPackageFromGitDir`
+// and packages/agents/src/verdaccio/package-files.ts's
+// `buildAgentPackageFiles`) carry that exact same OAS `name`/`description`
+// into the published `agent.json`'s top-level `title`/`description` (and its
+// legacy `template.name`/`template.description` shape), so this CLI mirrors
+// the boot importer by preferring those already-published fields first and
+// falling through to the tarball's own `cinatra/oas.json` — the canonical
+// source the boot importer reads directly — before ever resorting to a
+// humanized package slug. `agent.title`/`agent.description` is the common
+// case; `oas.name`/`oas.description` is the defense-in-depth rung for a
+// tarball whose `agent.json` is absent or under-populated — CONFIRMED against
+// the real `@cinatra-ai/blog-draft-writer-agent` tarball on a live registry
+// (the exact package cinatra-cli#212 reproduced against): its published
+// contents are `package.json` + `cinatra/oas.json` only — no `agent.json` at
+// all — so `oas.name`/`oas.description` is not a hypothetical fallback, it is
+// the rung that fires for THIS bug's own repro.
+//
+// `pkg.cinatra.displayName` — the literal field cinatra-cli#212 names, carried
+// by `carryManifestDisplayName` (cinatra#2494) into the SAME published
+// `package.json` as the cross-kind card identity
+// (packages/sdk-extensions/src/manifest.ts:320's "Self-declared card
+// identity") — sits ONE rung BELOW `oas.name` here, not above it: the boot
+// importer itself never reads `cinatra.displayName` (only `oas.name`), so
+// ranking it higher would make this CLI's `/agents` card diverge from the
+// core app's for any package where the two differ. It is included as an
+// additional defense-in-depth rung (confirmed present and equal to `oas.name`
+// on the real repro package above) for the rarer case where even the OAS
+// carries no usable `name`.
+//
+// The CLI cannot import the core TS helpers directly (no `@cinatra-ai/*`
+// dependency, same constraint noted on `registryScopedAuthOptions` above), so
+// this is a plain-JS mirror of that derivation, not a shared import.
+
+/** Trim a value to a non-empty string, else `undefined` (never `""`/whitespace). */
+function nonEmptyString(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/**
+ * Last-resort ONLY fallback: turn a scoped npm package name into a
+ * human-readable title, e.g. "@cinatra-ai/blog-draft-writer-agent" ->
+ * "Blog Draft Writer Agent". The boot path never shows the raw package
+ * identifier on an agent's `/agents` card (cinatra-cli#212), so this CLI
+ * never does either — every other derivation rung is tried first.
+ */
+function humanizePackageName(packageName) {
+  const raw = String(packageName ?? "");
+  const slug = raw.includes("/") ? raw.slice(raw.lastIndexOf("/") + 1) : raw;
+  const words = slug.split(/[-_]+/).filter(Boolean);
+  if (words.length === 0) return raw;
+  return words.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+}
+
+/**
+ * Derive the value written to `agent_templates.name` — see the module note
+ * above for the boot-path parity this mirrors. `packageName` is the CLI's own
+ * install target identifier, used only as the last-resort humanization input
+ * (never written verbatim).
+ *
+ * Every candidate rung is also rejected when it happens to literally equal
+ * `packageName` (codex round 0): a degenerate/malformed manifest could
+ * otherwise declare e.g. `title: "@cinatra-ai/foo-agent"` and reproduce
+ * exactly the raw-name symptom cinatra-cli#212 fixes — and because the writer
+ * heals `name` only when it equals `package_name`, such a row would
+ * (correctly) re-heal on every install, but would never converge on anything
+ * better than the raw string it started with. Skipping straight to the next
+ * rung (ultimately the humanized fallback) guarantees convergence.
+ */
+function deriveAgentDisplayName(agent, oas, pkg, packageName) {
+  const candidates = [
+    nonEmptyString(agent?.title),
+    nonEmptyString(agent?.template?.name),
+    nonEmptyString(oas?.name),
+    nonEmptyString(pkg?.cinatra?.displayName),
+  ];
+  for (const candidate of candidates) {
+    if (candidate !== undefined && candidate !== packageName) return candidate;
+  }
+  return humanizePackageName(packageName);
+}
+
+/**
+ * Derive the value written to `agent_templates.description` — see the module
+ * note above. Mirrors the boot path's OAS-first-then-sibling-manifest order;
+ * `null` (never `""`) when nothing declares one, matching the boot path's
+ * `agent.description ?? undefined` → SQL NULL projection.
+ */
+function deriveAgentDescription(agent, oas, pkg) {
+  return (
+    nonEmptyString(agent?.description) ??
+    nonEmptyString(agent?.template?.description) ??
+    nonEmptyString(oas?.description) ??
+    nonEmptyString(pkg?.description) ??
+    null
+  );
+}
+
 function parseArgv(argv) {
   const flags = { lockfileOnly: false, dryRun: false };
   const rest = [];
@@ -582,6 +696,15 @@ function quoteIdent(name) {
  * either index shape. On a package_name conflict only the mutable content
  * columns + updated_at are refreshed — `status`, `package_name`, `id` and
  * `created_at` are PRESERVED, matching the historical install-update contract.
+ *
+ * `name`/`description` are HEAL-ONLY on conflict (cinatra-cli#212): the SET
+ * clause only replaces them when the row still carries the exact symptom this
+ * fix closes — `name` still literally equal to its own `package_name` (the
+ * pre-fix raw-identifier write), or `description` still null/empty. Any other
+ * existing value — an operator's in-UI rename/redescription, or a name this
+ * same heal already corrected on a prior install — is PRESERVED verbatim.
+ * Idempotent and self-limiting: once healed, neither predicate matches again,
+ * so every later `agents install` of the same package leaves them untouched.
  * `version_number` is computed as MAX(version_number)+1 for the template in the
  * same statement; because the template row is locked by the upsert within the
  * transaction, a concurrent writer of the same package blocks and then sees the
@@ -628,8 +751,24 @@ export async function upsertAgentTemplate(client, schema, fields) {
          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW(),NOW()
        )
        ON CONFLICT (package_name) WHERE package_name IS NOT NULL DO UPDATE SET
-         name = EXCLUDED.name,
-         description = EXCLUDED.description,
+         name = CASE
+           -- Postgres requires the PRE-UPDATE existing row to be qualified by
+           -- the target table's own (unqualified, not schema-prefixed) name
+           -- inside a DO UPDATE SET expression; a bare column reference is
+           -- rejected as ambiguous against EXCLUDED, and the schema-qualified
+           -- templatesTable JS variable form is not a valid SQL correlation
+           -- name here.
+           WHEN agent_templates.name = agent_templates.package_name THEN EXCLUDED.name
+           ELSE agent_templates.name
+         END,
+         description = CASE
+           -- btrim (not a bare '' check, codex round 0): a legacy row could
+           -- carry a whitespace-only description from some other writer, which
+           -- is exactly as symptomatic as NULL/'' and must heal the same way.
+           WHEN agent_templates.description IS NULL OR btrim(agent_templates.description) = ''
+             THEN EXCLUDED.description
+           ELSE agent_templates.description
+         END,
          source_nl = EXCLUDED.source_nl,
          compiled_plan = EXCLUDED.compiled_plan,
          input_schema = EXCLUDED.input_schema,
@@ -739,8 +878,12 @@ async function installAgentFromPackage({ packageName, packageVersion, registryUr
     const agentDeps = cinatraMeta.agentDependencies ?? {};
     const agentType = cinatraMeta.type ?? "leaf";
     const executionMode = agent?.template?.executionMode ?? cinatraMeta.executionMode ?? "agentic";
-    const templateName = agent?.title?.trim() || agent?.template?.name || pkg.name;
-    const description = agent?.description ?? agent?.template?.description ?? null;
+    // cinatra-cli#212: derive the human display name + description the boot
+    // path shows on the `/agents` card — see the module note above
+    // `deriveAgentDisplayName` for the exact source seam this mirrors. Never
+    // the raw `pkg.name`/`packageName` scoped identifier.
+    const templateName = deriveAgentDisplayName(agent, oas, pkg, packageName);
+    const description = deriveAgentDescription(agent, oas, pkg);
     const sourceNl = agent?.template?.sourceNl ?? "";
     const compiledPlan = agent?.template?.compiledPlan ?? [];
     // When agent.json supplies a non-empty inputSchema, use it. Otherwise
@@ -1250,4 +1393,9 @@ export const __test = {
   // Exported for the live-schema uninstall round-trip test (eng#513).
   deleteAgentTemplateByPackage,
   quoteIdent,
+  // Exported for unit test coverage of the boot-path-parity identity
+  // derivation (cinatra-cli#212).
+  humanizePackageName,
+  deriveAgentDisplayName,
+  deriveAgentDescription,
 };
