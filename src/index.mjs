@@ -795,7 +795,11 @@ Usage:
   cinatra instance preview refresh [--ref <git-ref>] [--slug <slug>]
                                # CINATRA_PREVIEW_BUILD_TIMEOUT_MS overrides the image-build
                                # budget (default 5400000 = 90m; 1000 .. 21600000 = 1s .. 6h).
-                               # Env-only so it applies to \`install --mode preview\` too.
+                               # CINATRA_PREVIEW_BUILD_MEMORY_MB sets the build's V8 old-space
+                               # limit in MB (256 .. 65536; unset keeps the checkout's own).
+                               # CINATRA_PREVIEW_BUILD_TYPECHECK=1 restores the in-build tsc
+                               # (skipped by default, as the CI image build does).
+                               # Env-only so they apply to \`install --mode preview\` too.
   cinatra instance preview status [--slug <slug>]
   cinatra instance preview list
   cinatra instance execution set-mode <remote|local-dev|disabled> [--sandbox-broker-url <url>]
@@ -879,6 +883,51 @@ Commands:
                       that step starts over, so if one single step is longer
                       than the budget, retrying alone will never get past it and
                       the budget has to be raised.
+
+                      BUILD MEMORY: a build that dies OUT OF MEMORY is not a
+                      budget problem — a larger timeout only lets it die slower.
+                      Set the image build's V8 old-space limit with
+
+                        CINATRA_PREVIEW_BUILD_MEMORY_MB=<megabytes>
+
+                      accepted range 256 .. 65536. It becomes the build-arg
+                      NODE_OPTIONS=--max-old-space-size=<MB>. UNSET is the
+                      default and passes nothing, so the resolved SHA's own
+                      Dockerfile keeps its ceiling (cinatra's bakes in 4096).
+
+                      Know what this does and does not bound. It is V8's old
+                      space: decisive for "JavaScript heap out of memory", which
+                      it fixes by being RAISED. It does NOT bound Turbopack's
+                      native allocator, the container's total memory, or build
+                      concurrency. So a NATIVE "cannot allocate memory" is a
+                      different failure, and an exit-code-137 kill only says
+                      something sent SIGKILL — neither names its own cause.
+                      Check Docker/host memory pressure first; more VM RAM may
+                      help, but cinatra-cli#210 measured a native wall that
+                      survived 4 GB to 14 GB, and clearing that needs the
+                      checkout-side concurrency / bundler-fallback control that
+                      issue tracks.
+
+                      IN-BUILD TYPECHECK: preview forwards CI=true to the image
+                      build, matching how the CI image is built — it skips the
+                      checkout's redundant in-build tsc and cuts build cost.
+                      That trade is real: the checkout keeps CI empty so an
+                      ad-hoc build retains the typecheck, and a preview can be
+                      pointed at ANY resolved SHA, including one no required
+                      typecheck job has ever seen. Set
+
+                        CINATRA_PREVIEW_BUILD_TYPECHECK=1
+
+                      to put the in-build check back for such a SHA. CI is a
+                      generic signal, so this switch can affect more than the
+                      typecheck alone.
+
+                      Both are env-only (not flags), like the budget, so the same
+                      levers apply to create, refresh AND \`install --mode
+                      preview\`; both are hard errors on a malformed value. They
+                      reach the build as --build-arg, so they only bite on a SHA
+                      whose Dockerfile declares the matching ARG — the build says
+                      so out loud when it does not.
   instance preview status|list
                       Show a preview's (or all previews') resolved SHA, built
                       image tag, provenance, durable volume, and state.
