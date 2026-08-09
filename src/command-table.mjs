@@ -337,14 +337,14 @@ export const COMMAND_DESCRIPTORS = [
     path: ["instance", "preview", "create"],
     match: "command+mode+sub",
     summary:
-      "Build + boot a LOCAL non-production image at a resolved SHA (CINATRA_RUNTIME_MODE=production, provenance local-image:<sha>); health-gates on /api/health. The image build is bounded (default 90m); raise it on a slow/cold host with CINATRA_PREVIEW_BUILD_TIMEOUT_MS (ms, 1000..21600000).",
+      "Build + boot a LOCAL non-production image at a resolved SHA (CINATRA_RUNTIME_MODE=production, provenance local-image:<sha>); health-gates on /api/health. The image build is bounded (default 90m); raise it on a slow/cold host with CINATRA_PREVIEW_BUILD_TIMEOUT_MS (ms, 1000..21600000). A build reporting 'JavaScript heap out of memory' needs the other lever: CINATRA_PREVIEW_BUILD_MEMORY_MB (MB, 256..65536; unset keeps the checkout's own) sets the build's V8 old-space limit — it does not bound Turbopack's native allocator, total container memory, or build concurrency. CINATRA_PREVIEW_BUILD_TYPECHECK=1 restores the in-build tsc that the forwarded CI=true skips.",
   },
   {
     id: "preview.refresh",
     path: ["instance", "preview", "refresh"],
     match: "command+mode+sub",
     summary:
-      "Rebuild the preview at a NEW resolved SHA, reboot, reuse the durable volume, health-gate, and clean up the superseded image. Honours the same CINATRA_PREVIEW_BUILD_TIMEOUT_MS build budget as create.",
+      "Rebuild the preview at a NEW resolved SHA, reboot, reuse the durable volume, health-gate, and clean up the superseded image. Honours the same CINATRA_PREVIEW_BUILD_TIMEOUT_MS build budget, CINATRA_PREVIEW_BUILD_MEMORY_MB limit and CINATRA_PREVIEW_BUILD_TYPECHECK switch as create.",
   },
   {
     id: "preview.status",

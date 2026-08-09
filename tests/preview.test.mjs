@@ -49,10 +49,19 @@ const {
   resolveBuildTimeoutMs,
   formatBuildBudget,
   buildPreviewImage,
+  resolveBuildMemoryMb,
+  resolveBuildTypecheck,
+  buildPreviewBuildArgs,
+  dockerfileDeclaredBuildArgs,
   PREVIEW_BUILD_TIMEOUT_DEFAULT_MS,
   PREVIEW_BUILD_TIMEOUT_ENV,
   PREVIEW_BUILD_TIMEOUT_MIN_MS,
   PREVIEW_BUILD_TIMEOUT_MAX_MS,
+  PREVIEW_BUILD_MEMORY_ENV,
+  PREVIEW_BUILD_MEMORY_CHECKOUT_DEFAULT_MB,
+  PREVIEW_BUILD_MEMORY_MIN_MB,
+  PREVIEW_BUILD_MEMORY_MAX_MB,
+  PREVIEW_BUILD_TYPECHECK_ENV,
   PREVIEW_IMAGE_TAG_PREFIX,
   PREVIEW_RUNTIME_MODE,
   PREVIEW_HOST_PORT_MIN,
@@ -1103,5 +1112,332 @@ describe("preview build budget — default + bounded override (#194)", () => {
     );
     await runPreviewRefresh(["--slug", "main"], deps);
     expect(fake.buildOpts().timeoutMs).toBe(4_500_000);
+  });
+});
+
+// cinatra-cli#210 — the image build's MEMORY lever and the CI=true forward.
+//
+// The seam under test is `buildPreviewBuildArgs`: it is the single place the two
+// levers are read from the operator's environment and turned into `docker build`
+// argv. Asserting the assembled argv (not just the resolvers) is what makes the
+// #210 regression impossible to reintroduce — the whole bug was that the values
+// existed in principle and never reached the subprocess.
+describe("preview build levers — memory ceiling + CI forward (#210)", () => {
+  const withMem = (v) => ({ [PREVIEW_BUILD_MEMORY_ENV]: v });
+  const buildArgv = (fake) => fake.calls.find((c) => c[0] === "build");
+  const argFor = (argv, name) => {
+    const out = [];
+    for (let i = 0; i < argv.length - 1; i += 1) {
+      if (argv[i] === "--build-arg" && String(argv[i + 1]).startsWith(`${name}=`)) {
+        out.push(String(argv[i + 1]).slice(name.length + 1));
+      }
+    }
+    return out;
+  };
+
+  it("UNSET means unset — the resolved SHA's own Dockerfile keeps its ceiling", () => {
+    // The CLI must NOT assert its own idea of a good ceiling onto an arbitrary
+    // SHA: a checkout that deliberately chose a different value would be
+    // silently overridden, and the two would drift apart on the next change.
+    expect(resolveBuildMemoryMb({})).toBeNull();
+    expect(resolveBuildMemoryMb(withMem(""))).toBeNull();
+    expect(resolveBuildMemoryMb(withMem("   "))).toBeNull();
+    expect(resolveBuildMemoryMb({ [PREVIEW_BUILD_MEMORY_ENV]: 4096 })).toBeNull();
+    // The 4096 constant survives as DOCUMENTATION of what cinatra bakes in — it
+    // is quoted in help/error text and never passed as a build-arg.
+    expect(PREVIEW_BUILD_MEMORY_CHECKOUT_DEFAULT_MB).toBe(4096);
+    expect(buildPreviewBuildArgs({}).args.join(" ")).not.toContain("NODE_OPTIONS");
+  });
+
+  it("a valid override wins, in BOTH directions and at both ends of the range", () => {
+    // Both directions must be reachable: UP clears a "JavaScript heap out of
+    // memory", and DOWN is what an operator reaches for when V8 is competing with
+    // the native allocator for the same container memory.
+    expect(resolveBuildMemoryMb(withMem("2048"))).toBe(2048);
+    expect(resolveBuildMemoryMb(withMem("8192"))).toBe(8192);
+    expect(resolveBuildMemoryMb(withMem(" 3072 "))).toBe(3072);
+    expect(resolveBuildMemoryMb(withMem(String(PREVIEW_BUILD_MEMORY_MIN_MB)))).toBe(PREVIEW_BUILD_MEMORY_MIN_MB);
+    expect(resolveBuildMemoryMb(withMem(String(PREVIEW_BUILD_MEMORY_MAX_MB)))).toBe(PREVIEW_BUILD_MEMORY_MAX_MB);
+  });
+
+  it("a malformed or out-of-range ceiling is a HARD error — never silently ignored or clamped", () => {
+    for (const v of ["0", "-1", "4.5", "4g", "4096MB", "1e3", "Infinity", "lots", "0x1000", "+4096"]) {
+      let err;
+      try {
+        resolveBuildMemoryMb(withMem(v));
+      } catch (e) {
+        err = e;
+      }
+      expect(err, `expected ${v} to be rejected`).toBeTruthy();
+      expect(err.message).toContain(PREVIEW_BUILD_MEMORY_ENV);
+      expect(err.message).toContain(JSON.stringify(v)); // the offending value is quoted back
+      expect(err.message).toContain(String(PREVIEW_BUILD_MEMORY_MAX_MB)); // the accepted range
+    }
+    expect(() => resolveBuildMemoryMb(withMem(String(PREVIEW_BUILD_MEMORY_MIN_MB - 1)))).toThrow();
+    expect(() => resolveBuildMemoryMb(withMem(String(PREVIEW_BUILD_MEMORY_MAX_MB + 1)))).toThrow();
+  });
+
+  it("the in-build tsc is OFF by default and only the documented booleans switch it", () => {
+    expect(resolveBuildTypecheck({})).toBe(false);
+    expect(resolveBuildTypecheck({ [PREVIEW_BUILD_TYPECHECK_ENV]: "" })).toBe(false);
+    for (const v of ["1", "true", "TRUE", " yes ", "on"]) {
+      expect(resolveBuildTypecheck({ [PREVIEW_BUILD_TYPECHECK_ENV]: v })).toBe(true);
+    }
+    for (const v of ["0", "false", "no", "off"]) {
+      expect(resolveBuildTypecheck({ [PREVIEW_BUILD_TYPECHECK_ENV]: v })).toBe(false);
+    }
+    // A near-miss must not be silently read as its opposite.
+    for (const v of ["yes-please", "2", "maybe"]) {
+      expect(() => resolveBuildTypecheck({ [PREVIEW_BUILD_TYPECHECK_ENV]: v })).toThrow(
+        new RegExp(PREVIEW_BUILD_TYPECHECK_ENV),
+      );
+    }
+  });
+
+  it("assembles CI always and NODE_OPTIONS only on an explicit override", () => {
+    const { args, memoryMb, typecheck } = buildPreviewBuildArgs({});
+    expect(memoryMb).toBeNull();
+    expect(typecheck).toBe(false);
+    expect(argFor(args, "CI")).toEqual(["true"]);
+    expect(argFor(args, "NODE_OPTIONS")).toEqual([]);
+    // Explicitly PINNED, not omitted: with the typecheck switch on, CI is still
+    // passed (empty), so the build never depends on that SHA's ARG default.
+    const on = buildPreviewBuildArgs({ [PREVIEW_BUILD_TYPECHECK_ENV]: "1" });
+    expect(argFor(on.args, "CI")).toEqual([""]);
+    // The ceiling composes into NODE_OPTIONS as MB — the unit the lever documents.
+    const tuned = buildPreviewBuildArgs(withMem("1536"));
+    expect(argFor(tuned.args, "NODE_OPTIONS")).toEqual(["--max-old-space-size=1536"]);
+  });
+
+  it("the levers REACH the real `docker build` argv — the actual #210 regression", () => {
+    const fake = makeFakeDocker({});
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: "/ctx",
+      deps: { runDocker: fake.runDocker, buildControlEnv: {} },
+    });
+    const argv = buildArgv(fake);
+    expect(argFor(argv, "CI")).toEqual(["true"]); // leg 2: was absent entirely
+    expect(argFor(argv, "NODE_OPTIONS")).toEqual([]); // untuned: the SHA keeps its own
+
+    const fake2 = makeFakeDocker({});
+    buildPreviewImage({
+      tag: previewImageTag(SHA_B),
+      contextDir: "/ctx",
+      deps: { runDocker: fake2.runDocker, buildControlEnv: withMem("2048") },
+    });
+    expect(argFor(buildArgv(fake2), "NODE_OPTIONS")).toEqual(["--max-old-space-size=2048"]);
+  });
+
+  it("the build-args precede the context path and never disturb the labels or the tag", () => {
+    const fake = makeFakeDocker({});
+    const tag = previewImageTag(SHA_A);
+    buildPreviewImage({
+      tag,
+      contextDir: "/ctx",
+      provenance: previewProvenance(SHA_A),
+      sha: SHA_A,
+      deps: { runDocker: fake.runDocker, buildControlEnv: {} },
+    });
+    const argv = buildArgv(fake);
+    // docker treats the LAST positional as the context; a flag after it would be
+    // parsed as a second positional and the build would fail.
+    expect(argv[argv.length - 1]).toBe("/ctx");
+    expect(argv.slice(0, 5)).toEqual(["build", "-t", tag, "--build-arg", "CI=true"]);
+    expect(argv).toContain(`cinatra.preview.sha=${SHA_A}`);
+    expect(argv).toContain(`cinatra.preview.provenance=${previewProvenance(SHA_A)}`);
+  });
+
+  it("logs the effective ceiling and the tsc decision on EVERY build, tuned or not", () => {
+    const lines = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: "/ctx",
+      deps: { runDocker: makeFakeDocker({}).runDocker, buildControlEnv: {}, log: (m) => lines.push(m) },
+    });
+    const out = lines.join("\n");
+    // Untuned: says the checkout owns the ceiling, and still names the lever so
+    // it is discoverable BEFORE an operator needs it.
+    expect(out).toMatch(/the checkout's own Dockerfile ceiling/);
+    expect(out).toContain(PREVIEW_BUILD_MEMORY_ENV);
+    expect(out).toMatch(/tsc skipped/);
+
+    const lines2 = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: "/ctx",
+      deps: {
+        runDocker: makeFakeDocker({}).runDocker,
+        buildControlEnv: { ...withMem("2048"), [PREVIEW_BUILD_TYPECHECK_ENV]: "1" },
+        log: (m) => lines2.push(m),
+      },
+    });
+    const out2 = lines2.join("\n");
+    expect(out2).toContain("--max-old-space-size=2048");
+    expect(out2).toContain("override");
+    expect(out2).toMatch(/tsc ON/);
+  });
+
+  it("a FAILED build names the memory lever — a timeout does not (that one is a budget)", () => {
+    let err;
+    try {
+      buildPreviewImage({
+        tag: previewImageTag(SHA_A),
+        contextDir: "/ctx",
+        deps: { runDocker: makeFakeDocker({ buildFails: true }).runDocker, buildControlEnv: {} },
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err.message).toContain(PREVIEW_BUILD_MEMORY_ENV);
+    // The distinction the issue is ABOUT: an OOM is not fixed by a bigger budget.
+    expect(err.message).toMatch(/a larger build budget cannot fix it/);
+    // And the HONEST distinction inside that: the lever is V8's old space, so it
+    // must not be sold as a cure for a NATIVE allocation failure (#210 review).
+    expect(err.message).toMatch(/JavaScript heap out of memory" is the V8 old-space limit/);
+    expect(err.message).toMatch(/NATIVE "cannot allocate memory" is NOT that limit/);
+    expect(err.message).toMatch(/does not bound native allocation/);
+    // And it must not over-diagnose: exit 137 names a SIGKILL, not a cause, and
+    // "more RAM" is offered as MAY help — #210 measured a native wall that
+    // survived 4 GB to 14 GB, so promising RAM as the remedy would misdirect.
+    expect(err.message).toMatch(/only tells you something sent SIGKILL/);
+    expect(err.message).toMatch(/more VM RAM MAY help/);
+    expect(err.message).toMatch(/build-concurrency \/ bundler-fallback/);
+
+    let timedOut;
+    try {
+      buildPreviewImage({
+        tag: previewImageTag(SHA_A),
+        contextDir: "/ctx",
+        deps: { runDocker: makeFakeDocker({ buildTimesOut: true }).runDocker, buildControlEnv: {} },
+      });
+    } catch (e) {
+      timedOut = e;
+    }
+    expect(timedOut.message).not.toContain(PREVIEW_BUILD_MEMORY_ENV);
+  });
+
+  it("reads a context Dockerfile's ARG declarations, and says so when a lever is INERT", () => {
+    const ctx = path.join(tmp, "ctx-old");
+    mkdirSync(ctx, { recursive: true });
+    // A SHA whose Dockerfile predates both ARGs — docker would drop the
+    // build-args with only a warning, so the build must say it out loud.
+    writeFileSync(path.join(ctx, "Dockerfile"), "FROM node:24-alpine\nENV NODE_ENV=production\nRUN echo hi\n");
+    expect([...dockerfileDeclaredBuildArgs(ctx)]).toEqual([]);
+    const lines = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: ctx,
+      deps: { runDocker: makeFakeDocker({}).runDocker, buildControlEnv: withMem("2048"), log: (m) => lines.push(m) },
+    });
+    const out = lines.join("\n");
+    expect(out).toMatch(/ARG CI/);
+    expect(out).toMatch(/ARG NODE_OPTIONS/);
+    expect(out).toMatch(/very likely ignored by THIS build/);
+    // Only args actually PASSED are reported: untuned, NODE_OPTIONS is not sent,
+    // so warning about it would be noise on every build of an older SHA.
+    const untuned = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: ctx,
+      deps: { runDocker: makeFakeDocker({}).runDocker, buildControlEnv: {}, log: (m) => untuned.push(m) },
+    });
+    expect(untuned.join("\n")).toMatch(/ARG CI/);
+    expect(untuned.join("\n")).not.toMatch(/ARG NODE_OPTIONS/);
+
+    // A modern context declares both — no warning, and the build is unchanged.
+    const ok = path.join(tmp, "ctx-new");
+    mkdirSync(ok, { recursive: true });
+    writeFileSync(
+      path.join(ok, "Dockerfile"),
+      'FROM node:24-alpine\nARG CI=\nARG NODE_OPTIONS="--max-old-space-size=4096"\nENV NODE_OPTIONS=${NODE_OPTIONS}\nRUN echo hi\n',
+    );
+    expect([...dockerfileDeclaredBuildArgs(ok)].sort()).toEqual(["CI", "NODE_OPTIONS"]);
+    const lines2 = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: ok,
+      deps: { runDocker: makeFakeDocker({}).runDocker, buildControlEnv: {}, log: (m) => lines2.push(m) },
+    });
+    expect(lines2.join("\n")).not.toMatch(/very likely ignored by THIS build/);
+
+    // Unreadable context: "cannot tell" stays quiet rather than crying wolf, and
+    // NEVER blocks the build.
+    expect(dockerfileDeclaredBuildArgs(path.join(tmp, "nope"))).toBeNull();
+    const lines3 = [];
+    expect(() =>
+      buildPreviewImage({
+        tag: previewImageTag(SHA_A),
+        contextDir: path.join(tmp, "nope"),
+        deps: { runDocker: makeFakeDocker({}).runDocker, buildControlEnv: {}, log: (m) => lines3.push(m) },
+      }),
+    ).not.toThrow();
+    expect(lines3.join("\n")).not.toMatch(/very likely ignored by THIS build/);
+  });
+
+  it("the ARG scan tolerates docker's real syntax — lowercase and line continuations", () => {
+    // Dockerfile instructions are case-insensitive and can be continued across
+    // lines; a scan that missed either would cry wolf on a Dockerfile that is
+    // in fact fine (#210 review, finding 4).
+    const ctx = path.join(tmp, "ctx-syntax");
+    mkdirSync(ctx, { recursive: true });
+    writeFileSync(
+      path.join(ctx, "Dockerfile"),
+      "FROM node:24-alpine\narg CI=\nARG \\\n  NODE_OPTIONS=--max-old-space-size=4096\nRUN echo hi\n",
+    );
+    expect([...dockerfileDeclaredBuildArgs(ctx)].sort()).toEqual(["CI", "NODE_OPTIONS"]);
+    const lines = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: ctx,
+      deps: { runDocker: makeFakeDocker({}).runDocker, buildControlEnv: withMem("2048"), log: (m) => lines.push(m) },
+    });
+    expect(lines.join("\n")).not.toMatch(/very likely ignored by THIS build/);
+  });
+
+  it("the levers are read from the OPERATOR env, not the container env contract", async () => {
+    // Same trap #194 documents: `install --mode preview` REPLACES deps.env with a
+    // fresh object composed from the install's .env.local, so a lever read from
+    // there is silently inert on exactly that front door. Decoys in the container env.
+    const { deps, fake } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' } },
+      {
+        env: { [ENCRYPTION_KEY_ENV]: KEY_64, [PREVIEW_BUILD_MEMORY_ENV]: "999", [PREVIEW_BUILD_TYPECHECK_ENV]: "1" },
+        buildControlEnv: withMem("2048"),
+      },
+    );
+    await runPreviewCreate(["--slug", "main"], deps);
+    expect(argFor(buildArgv(fake), "NODE_OPTIONS")).toEqual(["--max-old-space-size=2048"]);
+    expect(argFor(buildArgv(fake), "CI")).toEqual(["true"]); // the container-env decoy did NOT flip it
+    // And neither lever is forwarded INTO the container.
+    const run = fake.calls.find((c) => c[0] === "run");
+    expect(run.join(" ")).not.toContain(PREVIEW_BUILD_MEMORY_ENV);
+    expect(run.join(" ")).not.toContain(PREVIEW_BUILD_TYPECHECK_ENV);
+  });
+
+  it("create FAILS FAST on a malformed ceiling — before the slug is ever claimed", async () => {
+    const { deps: bad, fake: badFake } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' } },
+      { buildControlEnv: withMem("4g") },
+    );
+    await expect(runPreviewCreate(["--slug", "other"], bad)).rejects.toThrow(new RegExp(PREVIEW_BUILD_MEMORY_ENV));
+    expect(badFake.calls.find((c) => c[0] === "build")).toBeUndefined();
+    expect(getPreview(readRegistry(registryPath).registry ?? { previews: {} }, "other")).toBeFalsy();
+  });
+
+  it("refresh FAILS FAST on a malformed ceiling — the running preview is untouched", async () => {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+    });
+    const { deps: bad, fake: badFake } = makeDeps(
+      { sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' } },
+      { buildControlEnv: { [PREVIEW_BUILD_TYPECHECK_ENV]: "yes-please" } },
+    );
+    await expect(runPreviewRefresh(["--slug", "main"], bad)).rejects.toThrow(new RegExp(PREVIEW_BUILD_TYPECHECK_ENV));
+    expect(badFake.calls.find((c) => c[0] === "build")).toBeUndefined();
+    const row = getPreview(readRegistry(registryPath).registry, "main");
+    expect(row.sha).toBe(SHA_A);
+    expect(row.state).toBe("ready");
   });
 });

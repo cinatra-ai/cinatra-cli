@@ -154,6 +154,70 @@ export const PREVIEW_BUILD_TIMEOUT_ENV = "CINATRA_PREVIEW_BUILD_TIMEOUT_MS";
 // acceptance is demonstrated without burning a full cold build.
 export const PREVIEW_BUILD_TIMEOUT_MIN_MS = 1_000; // 1s
 export const PREVIEW_BUILD_TIMEOUT_MAX_MS = 21_600_000; // 6h — the bound the lever can never remove
+// cinatra-cli#210 — the image build had exactly ONE lever (the timeout above),
+// and a build that dies out of memory is a MEMORY failure, not a time failure:
+// raising the budget cannot fix it, it only lets the build die slower. So the
+// build gets a second lever: the V8 old-space limit the `next build` node
+// process runs under, in whole MEGABYTES, assembled into the `NODE_OPTIONS`
+// build-arg (`--max-old-space-size=<MB>`).
+//
+// BE PRECISE ABOUT WHAT THIS IS, because over-selling it would send an operator
+// down the wrong path (#210 review). `--max-old-space-size` bounds V8's OLD
+// SPACE. It is NOT a total build-memory ceiling, it does NOT bound Turbopack's
+// native (Rust) allocator, and it does NOT control build concurrency. It is
+// decisive for a "JavaScript heap out of memory" failure. For a NATIVE
+// "cannot allocate memory" — which is what #210's reporter measured, and which
+// survived 4 GB → 14 GB of VM RAM — lowering this can only help to the extent
+// that V8 would otherwise have consumed memory the native allocator needed; it
+// reserves nothing for Turbopack and is not a demonstrated remedy for that wall.
+// #210's native leg needs a concurrency / bundler-fallback knob that lives in
+// the checkout, not here.
+//
+// WHY MB and not a raw NODE_OPTIONS string: a raw passthrough cannot be
+// validated (a typo could silently disable the ceiling or inject an unrelated
+// flag), and this lever exists to make ONE number controllable. A whole-MB
+// integer is bounded and fail-closed exactly like the timeout.
+//
+// UNSET MEANS UNSET (#210 review, finding 1): with no override the CLI passes NO
+// NODE_OPTIONS build-arg at all, so the resolved SHA's own Dockerfile keeps
+// ownership of its default. A preview builds an ARBITRARY SHA — pinning the
+// CLI's idea of a good ceiling onto it would silently override a checkout that
+// deliberately chose a different one, and would drift the moment the checkout's
+// value changed. The lever changes what is CONTROLLABLE, never what an untuned
+// build does.
+export const PREVIEW_BUILD_MEMORY_ENV = "CINATRA_PREVIEW_BUILD_MEMORY_MB";
+// Documentation only — the value cinatra's Dockerfile bakes in today, quoted in
+// help/error text so an operator knows what they are moving away FROM. The CLI
+// never asserts it; see "UNSET MEANS UNSET" above.
+export const PREVIEW_BUILD_MEMORY_CHECKOUT_DEFAULT_MB = 4096;
+// 256 MB floor: below this no realistic `next build` starts, so a lower value is
+// a configuration mistake, not a tuning choice. 65536 ceiling: 64 GB is past any
+// dev host this lifecycle targets, and a finite max keeps a typo (a stray extra
+// digit) from silently asking for an unsatisfiable heap.
+export const PREVIEW_BUILD_MEMORY_MIN_MB = 256;
+export const PREVIEW_BUILD_MEMORY_MAX_MB = 65_536;
+
+// cinatra-cli#210 leg 2 — the in-build `tsc`. The checkout Dockerfile declares
+// `ARG CI=` and passes it into the build RUN; `next.config` skips the redundant
+// in-build typecheck when it is truthy, which is what the CI image build does.
+// A local preview build got NO `--build-arg CI=...`, so it always ran the heavier
+// tsc + Turbopack path — the cost #210 asks to remove.
+//
+// Preview forwards `CI=true` by DEFAULT, deliberately: a preview image is the
+// LOCAL equivalent of the CI-built production image, and matching how that image
+// is built is the point of the lifecycle. But be honest about the trade the
+// checkout's own comment names — it keeps `CI` empty precisely so an ad-hoc
+// build retains the typecheck as a safety net. A preview can be pointed at ANY
+// resolved SHA, including a work-in-progress commit no required typecheck job
+// has ever seen, and for that SHA skipping the in-build tsc removes a real
+// check. `CINATRA_PREVIEW_BUILD_TYPECHECK` puts it back. Note also that `CI` is
+// a GENERIC signal: the checkout and its dependencies may key other behaviour
+// off it, so this switch is broader than "typecheck on/off" by nature.
+export const PREVIEW_BUILD_TYPECHECK_ENV = "CINATRA_PREVIEW_BUILD_TYPECHECK";
+// The build-arg NAMES the Dockerfile must declare for either lever to bite.
+export const PREVIEW_BUILD_MEMORY_ARG = "NODE_OPTIONS";
+export const PREVIEW_BUILD_CI_ARG = "CI";
+
 export const PREVIEW_HEALTH_TIMEOUT_MS = 180_000; // 3m health-gate budget (mirrors prod-boot-e2e default)
 export const PREVIEW_HEALTH_POLL_INTERVAL_MS = 3_000; // 3s (mirrors prod-boot-e2e sleep 3)
 export const DOCKER_CLI_PROBE_TIMEOUT_MS = 15_000; // 15s fast docker-CLI metadata probes
@@ -1042,6 +1106,139 @@ export function resolveBuildTimeoutMs(env = {}) {
 }
 
 /**
+ * Resolve the `next build` V8 old-space limit in whole MEGABYTES:
+ * `CINATRA_PREVIEW_BUILD_MEMORY_MB` when the operator set it, else `null` —
+ * meaning "not set", i.e. leave the resolved SHA's own Dockerfile default alone
+ * (cinatra-cli#210).
+ *
+ * FAIL-CLOSED on a bad value, for the same reason `resolveBuildTimeoutMs` is: an
+ * operator reaching for this lever is already fighting an OOM, so silently
+ * ignoring their value would strand them on the setting that just failed and
+ * look like the lever does not work, and silently clamping would conceal the
+ * mistake. An absent or ALL-WHITESPACE value means "not set"; every other
+ * non-integer input — `0`, a negative, `4.5`, `4g`, `4096MB`, `Infinity` — is a
+ * hard, actionable error.
+ */
+export function resolveBuildMemoryMb(env = {}) {
+  const raw = env?.[PREVIEW_BUILD_MEMORY_ENV];
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  const value = raw.trim();
+  const reject = (why) => {
+    throw new Error(
+      `${PREVIEW_BUILD_MEMORY_ENV}=${JSON.stringify(raw)} is invalid — ${why}. ` +
+        `Set it to a whole number of MEGABYTES between ${PREVIEW_BUILD_MEMORY_MIN_MB} and ` +
+        `${PREVIEW_BUILD_MEMORY_MAX_MB}, or unset it to leave the checkout's own Dockerfile ceiling ` +
+        `in place (cinatra's bakes in ${PREVIEW_BUILD_MEMORY_CHECKOUT_DEFAULT_MB}). ` +
+        `It becomes --max-old-space-size=<MB> for the image build's node process; the unit is MB only ` +
+        `(no "g"/"MB" suffix).`,
+    );
+  };
+  // Digits only, mirroring the timeout lever: rules out "4.5", "4e3", "4g",
+  // "4096MB", "0x1000", "+4096", "-1", "Infinity" in one predicate.
+  if (!/^\d+$/.test(value)) reject("it is not a whole number of megabytes");
+  const mb = Number(value);
+  if (!Number.isSafeInteger(mb)) reject("it is not a representable whole number");
+  if (mb < PREVIEW_BUILD_MEMORY_MIN_MB) reject(`it is below the ${PREVIEW_BUILD_MEMORY_MIN_MB} MB minimum`);
+  if (mb > PREVIEW_BUILD_MEMORY_MAX_MB) reject(`it exceeds the ${PREVIEW_BUILD_MEMORY_MAX_MB} MB maximum`);
+  return mb;
+}
+
+/**
+ * Resolve whether the image build runs the checkout's redundant IN-BUILD `tsc`
+ * (cinatra-cli#210 leg 2). Default FALSE — preview forwards `CI=true`, which is
+ * what the CI image build does and what the Dockerfile's `ARG CI=` exists for.
+ *
+ * Fail-closed on anything that is not one of the documented boolean spellings:
+ * a preview operator who writes `CINATRA_PREVIEW_BUILD_TYPECHECK=yes-please` must
+ * not be silently given the opposite of what they asked for.
+ */
+export function resolveBuildTypecheck(env = {}) {
+  const raw = env?.[PREVIEW_BUILD_TYPECHECK_ENV];
+  if (typeof raw !== "string" || raw.trim() === "") return false;
+  const v = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(v)) return true;
+  if (["0", "false", "no", "off"].includes(v)) return false;
+  throw new Error(
+    `${PREVIEW_BUILD_TYPECHECK_ENV}=${JSON.stringify(raw)} is invalid — it is not a boolean. ` +
+      `Use 1/true/yes/on to run the checkout's in-build tsc during the preview image build, ` +
+      `or 0/false/no/off (or unset) to skip it the way the CI image build does.`,
+  );
+}
+
+/**
+ * Assemble the `--build-arg` pairs the preview image build passes to
+ * `docker build` (cinatra-cli#210). This is the single env-assembly seam: both
+ * levers are resolved here, from the OPERATOR's environment, and nowhere else.
+ *
+ * Returns `{ args, memoryMb, typecheck }` — `args` is the flat argv fragment,
+ * `memoryMb` is `null` when the operator set no ceiling, and the rest is what
+ * the caller logs.
+ *
+ * `CI` is always passed EXPLICITLY, including in the typecheck-on case where it
+ * is passed empty. Passing `CI=` empty is not the same as omitting it: it pins
+ * the build to the Dockerfile's documented "no CI" behaviour instead of leaving
+ * it to whatever that SHA's ARG default happens to be. `NODE_OPTIONS` is the
+ * opposite by design: it is passed ONLY on an explicit override, so an untuned
+ * preview never overrides the resolved SHA's own ceiling.
+ */
+export function buildPreviewBuildArgs(env = {}) {
+  const memoryMb = resolveBuildMemoryMb(env);
+  const typecheck = resolveBuildTypecheck(env);
+  const args = ["--build-arg", `${PREVIEW_BUILD_CI_ARG}=${typecheck ? "" : "true"}`];
+  if (memoryMb !== null) {
+    args.push("--build-arg", `${PREVIEW_BUILD_MEMORY_ARG}=--max-old-space-size=${memoryMb}`);
+  }
+  return { memoryMb, typecheck, args };
+}
+
+/**
+ * The build-arg names a build CONTEXT's Dockerfile mentions in an `ARG`
+ * instruction, as a Set — a LEXICAL HINT, deliberately not a claim about
+ * consumption.
+ *
+ * Why it exists: `docker build --build-arg X=...` against a Dockerfile that
+ * never declares `ARG X` is only a WARNING ("one or more build-args were not
+ * consumed") — the value is silently dropped. A preview builds a RESOLVED SHA,
+ * so an operator can legitimately point it at an older commit whose Dockerfile
+ * predates one of these ARGs, and the lever would then do nothing with no signal
+ * the operator is likely to read. Scanning the context lets the build say so.
+ *
+ * KNOWN LIMITS (#210 review, finding 4) — this is why the caller only ever emits
+ * a NOTE, never a refusal, and why a MISSING declaration is the only thing it
+ * reports. A name found here may still be inert: an `ARG` before the first
+ * `FROM` is global and must be REDECLARED inside a stage to be usable there, an
+ * `ARG` in an unrelated stage does not apply to the build stage, and a name
+ * inside a heredoc is not an instruction at all. Deciding those needs a real
+ * Dockerfile parser with stage/use analysis. So: absence of a note is NOT proof
+ * the value was consumed — docker's own unconsumed-build-arg warning remains the
+ * authority. A note is the high-confidence direction (nothing named the ARG at
+ * all), which is the case worth catching; it is still phrased as "very likely",
+ * because an exotic `# escape=` directive changes what continues a line.
+ *
+ * Best-effort by construction: an unreadable or unusually-named Dockerfile
+ * yields `null`, which the caller treats as "cannot tell" and stays quiet rather
+ * than crying wolf. It never blocks a build — an old SHA must still be
+ * previewable, just honestly.
+ */
+export function dockerfileDeclaredBuildArgs(contextDir) {
+  try {
+    const text = readFileSync(path.join(contextDir, "Dockerfile"), "utf8");
+    // Join backslash line-continuations first: `ARG \\\n  NODE_OPTIONS=...` is one
+    // instruction, and splitting on raw newlines would miss it.
+    const joined = text.replace(/\\[ \t]*\r?\n/g, " ");
+    const declared = new Set();
+    // Dockerfile instructions are CASE-INSENSITIVE (`arg` is as valid as `ARG`).
+    for (const line of joined.split("\n")) {
+      const m = /^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)/i.exec(line);
+      if (m) declared.add(m[1]);
+    }
+    return declared;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Build the preview image at `tag` from `contextDir` using the checkout's OWN
  * multi-stage Dockerfile (the same one build-image.yml uses: acquire-prod +
  * OAS-seed + presence-aware manifest regen + `next build` standalone + runtime
@@ -1061,8 +1258,10 @@ export function resolveBuildTimeoutMs(env = {}) {
  */
 export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
   assertNotProductionImageTag(tag);
-  const timeoutMs = resolveBuildTimeoutMs(deps.buildControlEnv ?? process.env);
+  const buildEnv = deps.buildControlEnv ?? process.env;
+  const timeoutMs = resolveBuildTimeoutMs(buildEnv);
   const overridden = timeoutMs !== PREVIEW_BUILD_TIMEOUT_DEFAULT_MS;
+  const build = buildPreviewBuildArgs(buildEnv);
   deps.log?.(
     `  building ${tag} — budget ${formatBuildBudget(timeoutMs)}` +
       (overridden
@@ -1070,7 +1269,40 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
         : `; a slower/cold host can raise it with ${PREVIEW_BUILD_TIMEOUT_ENV} ` +
           `(up to ${formatBuildBudget(PREVIEW_BUILD_TIMEOUT_MAX_MS)}).`),
   );
-  const args = ["build", "-t", tag];
+  // cinatra-cli#210: the memory ceiling and the in-build-tsc decision are part of
+  // the build's identity, so they are ALWAYS logged — an operator reading a
+  // failed build's output must be able to see what it actually ran with, and the
+  // lever must be discoverable from a build that has not been tuned yet.
+  deps.log?.(
+    (build.memoryMb === null
+      ? `  build memory: the checkout's own Dockerfile ceiling (cinatra's bakes in ` +
+        `--max-old-space-size=${PREVIEW_BUILD_MEMORY_CHECKOUT_DEFAULT_MB}); override the V8 old-space limit ` +
+        `with ${PREVIEW_BUILD_MEMORY_ENV} (${PREVIEW_BUILD_MEMORY_MIN_MB}..${PREVIEW_BUILD_MEMORY_MAX_MB} MB) ` +
+        `if the build dies out of memory.`
+      : `  build memory: --max-old-space-size=${build.memoryMb} (MB, ${PREVIEW_BUILD_MEMORY_ENV} override).`) +
+      ` In-build tsc ${build.typecheck ? `ON (${PREVIEW_BUILD_TYPECHECK_ENV})` : `skipped (CI=true, as the CI image build does)`}.`,
+  );
+  // Warn — never block — when THIS SHA's Dockerfile does not declare an ARG a
+  // lever is being passed for: docker drops an unconsumed --build-arg with only a
+  // warning, so the lever would look set and do nothing. Only the args actually
+  // being PASSED are checked (`NODE_OPTIONS` is passed only on an override), and
+  // only a MISSING declaration is reported — see `dockerfileDeclaredBuildArgs`
+  // for why the converse is not something this scan can honestly claim.
+  const declared = dockerfileDeclaredBuildArgs(contextDir);
+  if (declared) {
+    const passed = [PREVIEW_BUILD_CI_ARG, ...(build.memoryMb === null ? [] : [PREVIEW_BUILD_MEMORY_ARG])];
+    const inert = passed.filter((n) => !declared.has(n));
+    if (inert.length > 0) {
+      deps.log?.(
+        `  NOTE: no ${inert.map((n) => `ARG ${n}`).join(" / ")} declaration found in the Dockerfile at this SHA — ` +
+          `docker drops an unconsumed --build-arg with only a warning, so ` +
+          `${inert.length === 1 ? "that value is" : "those values are"} very likely ignored by THIS build. ` +
+          `Preview a SHA whose Dockerfile declares ${inert.length === 1 ? "it" : "them"}, or add ` +
+          `${inert.map((n) => `\`ARG ${n}\``).join(" / ")} to the checkout's Dockerfile.`,
+      );
+    }
+  }
+  const args = ["build", "-t", tag, ...build.args];
   if (provenance) args.push("--label", `cinatra.preview.provenance=${provenance}`);
   if (sha) args.push("--label", `cinatra.preview.sha=${sha}`);
   args.push(contextDir);
@@ -1085,6 +1317,22 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
         (r.stderr ? `: ${r.stderr.trim()}` : ".") +
         ` The build runs the checkout's own multi-stage Dockerfile (acquire-prod, required-OAS seed, ` +
         `manifest regen, next build); fix the underlying error and retry.` +
+        // cinatra-cli#210: an out-of-memory build is the one failure the timeout
+        // lever CANNOT fix, so name the memory lever on every non-timeout
+        // failure rather than leaving the operator to re-read the help.
+        (r.timedOut
+          ? ""
+          : ` If it died out of memory, that is a MEMORY failure and a larger build budget cannot fix it. ` +
+            `"JavaScript heap out of memory" is the V8 old-space limit — raise it with ` +
+            `${PREVIEW_BUILD_MEMORY_ENV} (${PREVIEW_BUILD_MEMORY_MIN_MB}..${PREVIEW_BUILD_MEMORY_MAX_MB} MB; ` +
+            `this build used ${
+              build.memoryMb === null ? `the Dockerfile's own ceiling` : `--max-old-space-size=${build.memoryMb}`
+            }). ` +
+            `A NATIVE "cannot allocate memory" is NOT that limit, and an exit-code-137 kill only tells you ` +
+            `something sent SIGKILL — neither identifies the cause, and ${PREVIEW_BUILD_MEMORY_ENV} does not ` +
+            `bound native allocation. Check Docker/host memory pressure first; more VM RAM MAY help, but ` +
+            `cinatra-cli#210 measured a native wall that survived 4 GB to 14 GB, and clearing that needs the ` +
+            `checkout-side build-concurrency / bundler-fallback control that issue tracks.`) +
         (r.timedOut
           ? ` If the build was still ADVANCING, this is a budget problem, not a hang: re-run with a larger ` +
             `${PREVIEW_BUILD_TIMEOUT_ENV} (milliseconds, max ${PREVIEW_BUILD_TIMEOUT_MAX_MS} = ` +
@@ -1346,6 +1594,10 @@ export async function runPreviewCreate(rest, injected = {}) {
   // probe — so a typo costs nothing to recover from. `buildPreviewImage`
   // re-resolves the same value at the build itself (single source of truth).
   resolveBuildTimeoutMs(deps.buildControlEnv ?? process.env);
+  // cinatra-cli#210: the two build levers get the same fail-fast treatment, for
+  // the same reason — a typo'd ceiling must cost nothing, not surface an hour
+  // into a build (or, worse, only after the slug/port/volume state was claimed).
+  buildPreviewBuildArgs(deps.buildControlEnv ?? process.env);
   // AC9: refuse a genuine `--mode prod` checkout up front — before we even
   // resolve a SHA against or touch its `.git`. Checkout-derived, unconditional on
   // the env mode (never gated on a registry row).
@@ -1503,6 +1755,8 @@ export async function runPreviewRefresh(rest, injected = {}) {
   // registry claim and the container replacement — a typo'd override must not
   // surface only after the old preview has been put into `provisioning`.
   resolveBuildTimeoutMs(deps.buildControlEnv ?? process.env);
+  buildPreviewBuildArgs(deps.buildControlEnv ?? process.env); // cinatra-cli#210 — same fail-fast for the build levers
+
   // AC9: refuse a genuine `--mode prod` checkout up front — checkout-derived and
   // unconditional. Critically NOT gated on an existing registry row: refresh
   // requires an existing row to proceed, so gating the refusal on "a row exists"
@@ -1726,6 +1980,13 @@ export const __test = {
   PREVIEW_BUILD_TIMEOUT_ENV,
   PREVIEW_BUILD_TIMEOUT_MIN_MS,
   PREVIEW_BUILD_TIMEOUT_MAX_MS,
+  PREVIEW_BUILD_MEMORY_ENV,
+  PREVIEW_BUILD_MEMORY_CHECKOUT_DEFAULT_MB,
+  PREVIEW_BUILD_MEMORY_MIN_MB,
+  PREVIEW_BUILD_MEMORY_MAX_MB,
+  PREVIEW_BUILD_TYPECHECK_ENV,
+  PREVIEW_BUILD_MEMORY_ARG,
+  PREVIEW_BUILD_CI_ARG,
   // pure helpers
   resolveBuildTimeoutMs,
   formatBuildBudget,
@@ -1759,6 +2020,10 @@ export const __test = {
   makePreviewSlot,
   refreshPreviewSlot,
   // docker steps
+  resolveBuildMemoryMb,
+  resolveBuildTypecheck,
+  buildPreviewBuildArgs,
+  dockerfileDeclaredBuildArgs,
   buildPreviewImage,
   bootPreviewContainer,
   dockerObjectExists,
