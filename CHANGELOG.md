@@ -144,6 +144,39 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A local install now provisions `NANGO_SECRET_KEY`, so Nango-backed
+  connectors work on a fresh instance.** Nothing ever set it: the install mints
+  `NANGO_ENCRYPTION_KEY` and `CINATRA_BRIDGE_TOKEN`, but the secret key fell
+  through to whatever an operator typed at `/setup/connections` — and
+  nango-server refuses anything that is not a UUID v4 with
+  `invalid_secret_key_format` (HTTP 401), so every Google OAuth / Calendar /
+  Gmail save failed with no hint about what the field wanted. Generating a UUID
+  would not have fixed it either: `FLAG_AUTH_ENABLED=false` on the bundled
+  nango-server disables its DASHBOARD auth, not its API secret-key auth, so a
+  random key clears the format gate and then 401s again ("does not match any
+  account") because no Nango environment carries it. The key is not ours to
+  choose — nango-server seeds its own `prod`/`dev` environments into nango-db at
+  first boot. So every local bring-up now ADOPTS that value: once Nango reports
+  healthy, the reconcile reads the seeded environment key for this instance's
+  runtime mode (`production` → `prod`, else `dev` — the same selection the CLI's
+  own Nango discovery makes) and writes it into `.env.local`, where the app
+  reads it. Host and container hold one value by construction. It runs on every
+  local bring-up — `install`, an isolated instance, an attach, a re-converge,
+  `instance refresh` and `instance reset --full` — so an instance installed
+  before this fix heals on its next run: an absent key is minted, and a
+  malformed one is replaced with a message naming the 401 it was causing. A
+  VALID key is never rotated: one that already matches is left byte-identical
+  (re-running writes nothing at all), and one that diverges is reported with the
+  remedy rather than overwritten — the sole exception is `reset --full`, which
+  destroyed the nango volume itself, so the key it left behind names an
+  environment that no longer exists and is re-pointed at the rebuilt stack. A
+  hosted `NANGO_SERVER_URL` is never touched — that key belongs to the
+  operator's own Nango account — and an install pointed at one with no key set
+  now says so instead of failing silently. The step is loud-but-non-fatal: an
+  unreachable nango-db, a missing `psql` or a schema that moved warns (naming
+  the manual read) and lets the install finish. No key value is ever logged.
+  (#211)
+
 - **`instance reset --purge-app-data` no longer strands the registry user it
   just orphaned.** The app mints one Verdaccio npm user per instance namespace
   and keeps the generated password in its own database. Purging the app data
