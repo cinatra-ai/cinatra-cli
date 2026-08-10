@@ -85,8 +85,26 @@ describe("the re-link verdict names the invocation that ran (cinatra#2637)", () 
     });
     expect(res).toEqual({ ok: false, label: "pnpm install" });
     const blob = errors.mock.calls.flat().join("\n");
+    expect(blob).toContain("exit 1");
     // The re-run must be named as the thing that clears the state.
     expect(blob).toContain("cinatra instance setup dev");
+  });
+
+  it("says the command is not on PATH — never `(exit null)` — when it cannot run at all", () => {
+    // The reported host: no package manager, so spawn returns status null with
+    // an ENOENT error. "cannot run it" and "it ran and failed" want different
+    // fixes, so the message must not conflate them.
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const res = installAfterExtensionSync("/repo", syncResult, {
+      spawn: () => ({ status: null, error: Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }) }),
+      exists: () => false, // neither corepack nor pnpm nor npm
+    });
+    expect(res).toEqual({ ok: false, label: "corepack pnpm install" });
+    const blob = errors.mock.calls.flat().join("\n");
+    expect(blob).toContain("`corepack` is not on PATH");
+    expect(blob).not.toContain("exit null");
+    expect(blob).toContain("npm install -g pnpm");
   });
 });
 

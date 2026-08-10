@@ -5700,18 +5700,28 @@ function installAfterExtensionSync(
     env: process.env,
   });
   if (install.status !== 0) {
+    // cinatra#2637 — an install command that is not on PATH exits with a NULL
+    // status and an ENOENT `error`, so the old "(exit ${status})" rendered
+    // "(exit null)" for exactly the reported host: one with no usable package
+    // manager. Say which of the two it was — "cannot run it" and "it ran and
+    // failed" call for different fixes.
+    const missingCommand = install.error && install.error.code === "ENOENT";
+    const how = missingCommand
+      ? `\`${invocation.command}\` is not on PATH`
+      : `exit ${install.status ?? (install.error?.code || "unknown")}`;
     if (failHard) {
       // Prod path: a failed re-link means the bootable set is NOT linked —
       // abort (the caller runs this BEFORE any DB mutation).
       throw new Error(
-        `Post-acquisition \`pnpm install\` failed (exit ${install.status}) — the required extensions are not ` +
+        `Post-acquisition \`${invocation.label}\` failed (${how}) — the required extensions are not ` +
           `linked into the workspace. Fix the install error and re-run.`,
       );
     }
     console.error(
-      `\n⚠ Post-extension-sync \`pnpm install\` FAILED (exit ${install.status}) — cloned extensions may not be ` +
-        `linked into the workspace. Re-run \`${invocation.label}\` in ${repoRoot}, then re-run ` +
-        `\`cinatra instance setup dev\` (it repeats this step and the manifest regeneration below).\n`,
+      `\n⚠ Post-extension-sync workspace re-link FAILED (${how}) — cloned extensions may not be ` +
+        `linked into the workspace. Re-run \`${invocation.label}\` in ${repoRoot}` +
+        `${missingCommand ? " (install pnpm with `npm install -g pnpm`, or enable Corepack, so it can run)" : ""}, ` +
+        `then re-run \`cinatra instance setup dev\` (it repeats this step and the manifest regeneration below).\n`,
     );
     process.exitCode = 1;
     return { ok: false, label: invocation.label };
