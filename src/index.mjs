@@ -5709,13 +5709,41 @@ function installAfterExtensionSync(
       );
     }
     console.error(
-      `\n⚠ Post-extension-sync \`pnpm install\` FAILED — cloned extensions may not be linked into the workspace. ` +
-        `Re-run \`${invocation.label}\` in ${repoRoot}, then start the app.\n`,
+      `\n⚠ Post-extension-sync \`pnpm install\` FAILED (exit ${install.status}) — cloned extensions may not be ` +
+        `linked into the workspace. Re-run \`${invocation.label}\` in ${repoRoot}, then re-run ` +
+        `\`cinatra instance setup dev\` (it repeats this step and the manifest regeneration below).\n`,
     );
     process.exitCode = 1;
-    return { ok: false };
+    return { ok: false, label: invocation.label };
   }
-  return { ok: true };
+  return { ok: true, label: invocation.label };
+}
+
+// cinatra#2637 — is the on-disk extension tree HYDRATED, i.e. does every synced
+// extension that declares installable deps have its per-package `node_modules`?
+//
+// This is the property the workspace install exists to produce. Read separately
+// from the install command's exit status, because those two are not the same
+// thing: an install can exit non-zero for reasons that leave the extension tree
+// perfectly usable (a lifecycle script of an unrelated workspace package, a
+// post-link step, a flaky registry read after the linking pass), and — the
+// cinatra#2637 failure class — an install can be UNRUNNABLE on the host while
+// the tree is fine. Gating manifest regeneration on the exit status therefore
+// throws away a regenerable tree; gating it on THIS (plus the #41 link
+// invariant) keeps the real safety property: never emit a literal import for a
+// package the build cannot resolve.
+function unhydratedSyncedExtensions(syncResult) {
+  const results = syncResult && Array.isArray(syncResult.results) ? syncResult.results : [];
+  return results
+    .filter(
+      (r) =>
+        r &&
+        r.dest &&
+        existsSync(r.dest) &&
+        extensionDeclaresInstallableDeps(r.dest) &&
+        !existsSync(path.join(r.dest, "node_modules")),
+    )
+    .map((r) => r.dest);
 }
 
 // ---------------------------------------------------------------------------
@@ -5942,7 +5970,69 @@ function ensureClonedExtensionsLinked(worktree, { log = console.log } = {}) {
 // extension. Regenerating from a tree the sync did not reconcile (throw,
 // skip, or empty filter match) would presence-drop map entries for extensions
 // that are merely missing, not absent.
-function regenerateExtensionManifestAfterSync(repoRoot, syncResult, { failed = false } = {}) {
+//
+// cinatra#2637 — what BLOCKS the regeneration is decided here, once, as a pure
+// function of the tree's observable state, so a blocked run can NAME the blocker
+// and the exact command that clears it. The workspace install's EXIT STATUS is
+// deliberately not a blocker on its own: the properties regeneration actually
+// needs are (a) a sync that reconciled the tree, (b) the #41 link invariant, and
+// (c) — only when an install ran and failed — that the synced extensions were
+// still hydrated. An install that cannot run at all on this host (the
+// cinatra#2637 report: no `corepack` on PATH) leaves a perfectly regenerable
+// tree, and the old exit-status gate skipped it silently anyway.
+function decideManifestRegenGate({
+  syncFailed = false,
+  linkOk = true,
+  stillMissing = [],
+  installOk = true,
+  installLabel = null,
+  unhydrated = [],
+} = {}) {
+  const relink = installLabel ?? "pnpm install";
+  const rerun = "cinatra instance setup dev";
+  if (syncFailed) {
+    return {
+      blocked: true,
+      blockedBy: "the dev extension sync failed, so the tree it would regenerate against is unknown",
+      recovery: [rerun],
+      regeneratedDespiteInstallFailure: false,
+    };
+  }
+  if (!linkOk) {
+    const names = stillMissing.length > 0 ? ` (${stillMissing.join(", ")})` : "";
+    return {
+      blocked: true,
+      blockedBy:
+        `${stillMissing.length || "some"} synced extension(s) are not linked into node_modules${names} — ` +
+        `regenerating would emit imports the build cannot resolve`,
+      recovery: [relink, rerun],
+      regeneratedDespiteInstallFailure: false,
+    };
+  }
+  if (installOk === false && unhydrated.length > 0) {
+    return {
+      blocked: true,
+      blockedBy:
+        `the workspace install failed and left ${unhydrated.length} synced extension(s) without their ` +
+        `node_modules (${unhydrated.join(", ")})`,
+      recovery: [relink, rerun],
+      regeneratedDespiteInstallFailure: false,
+    };
+  }
+  return {
+    blocked: false,
+    blockedBy: null,
+    recovery: [],
+    // The decoupling, stated explicitly so the run can say so out loud.
+    regeneratedDespiteInstallFailure: installOk === false,
+  };
+}
+
+function regenerateExtensionManifestAfterSync(
+  repoRoot,
+  syncResult,
+  { failed = false, blockedBy = null, recovery = [] } = {},
+) {
   const reconciled =
     !failed &&
     syncResult &&
@@ -5950,8 +6040,28 @@ function regenerateExtensionManifestAfterSync(repoRoot, syncResult, { failed = f
     Array.isArray(syncResult.results) &&
     syncResult.results.length > 0;
   if (!reconciled) {
+    if (failed) {
+      // A REAL blocker (sync failure / unlinked / unhydrated tree). This is the
+      // state that used to scroll past as one quiet line and leave an operator
+      // with generated maps that do not describe their own checkout — name the
+      // blocker AND the exact commands that clear it (cinatra#2637).
+      const generator = path.join("scripts", "extensions", "generate-extension-manifest.mjs");
+      const steps = [...recovery, `node ${generator}`];
+      console.error(
+        `\n⚠ Extension-manifest regeneration SKIPPED — ${
+          blockedBy ?? "the extension sync did not reconcile the tree"
+        }. The committed generated maps stay as-is, so extensions this checkout cloned are NOT in them.\n` +
+          `  Recover with, in ${repoRoot}:\n` +
+          steps.map((cmd, i) => `    ${i + 1}. ${cmd}`).join("\n") +
+          `\n  A re-run of \`cinatra instance setup dev\` repeats this step — it is NOT a one-shot gate.\n`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    // Benign: nothing was reconciled to regenerate against (no `cinatra.devExtensions`
+    // configured, or the --select/--kind/--exclude filters matched nothing).
     console.log(
-      "- Skipping extension-manifest regeneration (extension sync failed, was skipped, or matched nothing) — the committed generated maps stay as-is.",
+      "- Skipping extension-manifest regeneration (the extension sync was skipped or matched nothing) — the committed generated maps stay as-is.",
     );
     return;
   }
@@ -6183,14 +6293,31 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
       // node_modules (verify + non-destructive symlink repair) before regen, and
       // gate the regen on it — see ensureClonedExtensionsLinked.
       const devLinkState = ensureClonedExtensionsLinked(repoRoot);
-      const devLinkSafe = (devInstallResult ? devInstallResult.ok !== false : true) && devLinkState.ok;
       // Presence-aware regeneration of the generated extension maps
       // (cinatra#109/#110): keeps the committed src/lib/generated/* maps matching
       // the extension set actually on disk. Gated on a successful, non-skipped,
-      // non-empty sync AND the #41 link invariant — see
-      // regenerateExtensionManifestAfterSync.
+      // non-empty sync, the #41 link invariant and — only when an install ran and
+      // FAILED — a hydrated tree. cinatra#2637: the install command's exit status
+      // is no longer a blocker by itself, so a host where the install cannot run
+      // still gets maps that describe its own checkout.
+      const devGate = decideManifestRegenGate({
+        syncFailed: extensionSyncFailed,
+        linkOk: devLinkState.ok,
+        stillMissing: devLinkState.stillMissing,
+        installOk: devInstallResult ? devInstallResult.ok !== false : true,
+        installLabel: devInstallResult?.label ?? null,
+        unhydrated: unhydratedSyncedExtensions(extensionSync),
+      });
+      if (devGate.regeneratedDespiteInstallFailure) {
+        console.log(
+          "- The workspace install failed, but every synced extension is linked and hydrated — " +
+            "regenerating the extension manifest anyway (the generated maps must describe THIS checkout).",
+        );
+      }
       regenerateExtensionManifestAfterSync(repoRoot, extensionSync, {
-        failed: extensionSyncFailed || !devLinkSafe,
+        failed: devGate.blocked,
+        blockedBy: devGate.blockedBy,
+        recovery: devGate.recovery,
       });
     }
     // cinatra#260 Step 3 — self-establishing + self-healing public MCP URL
@@ -8093,8 +8220,16 @@ async function runSetupBranch(argv) {
   // Keep THIS worktree's generated maps matching the extension set the sync
   // just put on its disk (cinatra#109/#110) — same gating as `setup dev`, plus
   // the #41 link gate.
+  const branchGate = decideManifestRegenGate({
+    syncFailed: branchExtensionSyncFailed,
+    linkOk: branchLinkState.ok,
+    stillMissing: branchLinkState.stillMissing,
+    // No install runs on this path, so there is no install verdict to read.
+  });
   regenerateExtensionManifestAfterSync(worktreePath, branchExtensionSync, {
-    failed: branchExtensionSyncFailed || !branchLinkState.ok,
+    failed: branchGate.blocked,
+    blockedBy: branchGate.blockedBy,
+    recovery: branchGate.recovery,
   });
 
   // 7. Print summary
@@ -9093,12 +9228,28 @@ async function runSetupClone(argv) {
   // (verify + non-destructive symlink repair) BEFORE regenerating, and GATE the
   // regen on it: never regenerate against a tree whose connectors aren't linked.
   const linkState = ensureClonedExtensionsLinked(worktreePath);
-  const linkSafe = (installResult ? installResult.ok !== false : true) && linkState.ok;
   // Keep THIS worktree's generated maps matching the extension set the sync
-  // just put on its disk (cinatra#109/#110) — same gating as `setup dev`, plus
-  // the #41 link gate (don't regen against an unlinked tree).
+  // just put on its disk (cinatra#109/#110) — same gating as `setup dev`: the
+  // #41 link gate, plus a hydration check only when an install ran and failed
+  // (cinatra#2637 — the install's exit status alone no longer blocks regen).
+  const cloneGate = decideManifestRegenGate({
+    syncFailed: extensionSyncFailed,
+    linkOk: linkState.ok,
+    stillMissing: linkState.stillMissing,
+    installOk: installResult ? installResult.ok !== false : true,
+    installLabel: installResult?.label ?? null,
+    unhydrated: unhydratedSyncedExtensions(extensionSync),
+  });
+  if (cloneGate.regeneratedDespiteInstallFailure) {
+    console.log(
+      "- The workspace install failed, but every synced extension is linked and hydrated — " +
+        "regenerating the extension manifest anyway (the generated maps must describe THIS worktree).",
+    );
+  }
   regenerateExtensionManifestAfterSync(worktreePath, extensionSync, {
-    failed: extensionSyncFailed || !linkSafe,
+    failed: cloneGate.blocked,
+    blockedBy: cloneGate.blockedBy,
+    recovery: cloneGate.recovery,
   });
 
   // Summary.
@@ -13835,6 +13986,12 @@ export {
   installAfterExtensionSync,
   reinstallDependencies,
   assertResetInstallPossible,
+  // cinatra#2637 — the manifest-regeneration gate: what blocks a regeneration is
+  // a pure function of the tree's state (never the install command's exit
+  // status alone), and a blocked run names the blocker + the exact recovery.
+  decideManifestRegenGate,
+  unhydratedSyncedExtensions,
+  regenerateExtensionManifestAfterSync,
   // cinatra-cli#41 — clone link-invariant seams (pure; injectable fs).
   linkedSetMatchesEmittedSet,
   enumerateEmittedExtensionPackages,
