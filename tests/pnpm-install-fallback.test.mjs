@@ -87,7 +87,9 @@ describe("installAfterExtensionSync corepack→pnpm fallback", () => {
       spawn,
       exists: present("corepack", "pnpm"),
     });
-    expect(res).toEqual({ ok: true });
+    // cinatra#2637 — the verdict carries the invocation LABEL so the caller can
+    // name the exact re-link command in its own recovery text.
+    expect(res).toEqual({ ok: true, label: "corepack pnpm install" });
     expect(calls).toHaveLength(1);
     expect(calls[0].command).toBe("corepack");
     expect(calls[0].args).toEqual(["pnpm", "install"]);
@@ -101,7 +103,7 @@ describe("installAfterExtensionSync corepack→pnpm fallback", () => {
       spawn,
       exists: present("pnpm"),
     });
-    expect(res).toEqual({ ok: true });
+    expect(res).toEqual({ ok: true, label: "pnpm install" });
     expect(calls).toHaveLength(1);
     expect(calls[0].command).toBe("pnpm");
     expect(calls[0].args).toEqual(["install"]);
@@ -115,7 +117,7 @@ describe("installAfterExtensionSync corepack→pnpm fallback", () => {
       spawn,
       exists: present("pnpm"),
     });
-    expect(res).toEqual({ ok: false });
+    expect(res).toEqual({ ok: false, label: "pnpm install" });
     expect(process.exitCode).toBe(1);
     const blob = errors.mock.calls.map((call) => call.join(" ")).join("\n");
     expect(blob).toContain("Re-run `pnpm install`");

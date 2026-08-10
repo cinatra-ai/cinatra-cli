@@ -187,7 +187,7 @@ describe("installAfterExtensionSync on a Node 25 host", () => {
 
     const res = installAfterExtensionSync(dir, syncResult, { spawn, exists: present("npm") });
 
-    expect(res).toEqual({ ok: true });
+    expect(res).toEqual({ ok: true, label: "npm exec -y -- pnpm@11.1.2 install" });
     expect(errors).not.toHaveBeenCalled();
     expect(process.exitCode).toBeUndefined();
     expect(calls).toHaveLength(1);
@@ -205,7 +205,7 @@ describe("installAfterExtensionSync on a Node 25 host", () => {
 
     const res = installAfterExtensionSync(dir, syncResult, { spawn, exists: present("npm") });
 
-    expect(res).toEqual({ ok: false });
+    expect(res).toEqual({ ok: false, label: "npm exec -y -- pnpm@11.1.2 install" });
     expect(process.exitCode).toBe(1);
     const blob = errors.mock.calls.map((call) => call.join(" ")).join("\n");
     expect(blob).toContain("Re-run `npm exec -y -- pnpm@11.1.2 install`");
