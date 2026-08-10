@@ -16,7 +16,7 @@
 //   3. an unresolvable dev-CLI key says WHICH tree was scanned and what to run.
 
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -105,6 +105,17 @@ describe("the re-link verdict names the invocation that ran (cinatra#2637)", () 
     expect(blob).toContain("`corepack` is not on PATH");
     expect(blob).not.toContain("exit null");
     expect(blob).toContain("npm install -g pnpm");
+  });
+
+  it("gives the prod (failHard) abort the same not-on-PATH guidance", () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    expect(() =>
+      installAfterExtensionSync("/repo", syncResult, {
+        failHard: true,
+        spawn: () => ({ status: null, error: Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }) }),
+        exists: () => false,
+      }),
+    ).toThrow(/`corepack` is not on PATH[\s\S]*npm install -g pnpm/);
   });
 });
 
@@ -252,6 +263,26 @@ describe("unresolvable dev-CLI key (cinatra#2637)", () => {
     makeExtension(root, "github-connector", {});
     const scan = scanDevCliExtensionTree(path.join(root, "extensions"));
     expect(scan).toEqual({ treeExists: true, packages: 2, keys: ["tailscale-api"] });
+  });
+
+  // codex round 2: this scan runs on a FAILURE path over repo-external data, so
+  // it must never be the thing that hangs or explodes.
+  it("stays bounded on a hostile tree: no symlinked dirs, no non-regular manifests, truncated keys", () => {
+    const root = makeTree();
+    const real = makeExtension(root, "tailscale-connector", {
+      devCliModules: { ["k".repeat(200)]: "./src/x.mjs" },
+    });
+    // A symlinked package dir must not be walked into…
+    symlinkSync(real, path.join(root, "extensions", "cinatra-ai", "linked-copy"), "dir");
+    // …and a package.json that is a DIRECTORY (stand-in for any non-regular
+    // file, e.g. a FIFO that would block a read forever) is skipped.
+    mkdirSync(path.join(root, "extensions", "cinatra-ai", "weird", "package.json"), {
+      recursive: true,
+    });
+    const scan = scanDevCliExtensionTree(path.join(root, "extensions"));
+    expect(scan.treeExists).toBe(true);
+    expect(scan.packages).toBe(1); // the real one only
+    expect(scan.keys).toEqual(["k".repeat(64)]);
   });
 
   it("throws the hinted message — still ERR_MODULE_NOT_FOUND + the declarer-missing marker", async () => {

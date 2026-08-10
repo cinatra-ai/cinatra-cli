@@ -15,7 +15,7 @@
 // `import()` of a missing path produced — so every caller's existing
 // graceful-degradation guard keeps working.
 
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -136,38 +136,56 @@ export function discoverDevCliModulePath(key, repoRoot) {
  *     rooted somewhere else entirely (the class where a published CLI resolved
  *     its own `node_modules` as the root and every key looked "absent").
  *
- * Bounded + total: any unreadable path degrades to "not seen", never throws.
+ * Bounded + total (codex round 2): this runs on a FAILURE path, over a tree of
+ * repo-external data, purely to write a diagnostic line — so it must not be the
+ * thing that hangs or blows up the run. It never follows a symlinked entry,
+ * never opens a non-regular file (a FIFO would block forever), refuses an
+ * oversized manifest, and stops after a fixed number of packages. Any unreadable
+ * path degrades to "not seen" and it never throws.
  *
  * @param {string} extRoot absolute `<root>/extensions`
  * @returns {{ treeExists: boolean, packages: number, keys: string[] }}
  */
-export function scanDevCliExtensionTree(extRoot) {
-  let scopes;
+const SCAN_MAX_PACKAGES = 1000;
+const SCAN_MAX_MANIFEST_BYTES = 1024 * 1024;
+const SCAN_MAX_KEY_CHARS = 64;
+
+/** Directory entries that are real directories, sorted; never symlinks. */
+function realSubdirectories(dir) {
   try {
-    scopes = readdirSync(extRoot).sort();
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+      .map((entry) => entry.name)
+      .sort();
   } catch {
-    return { treeExists: false, packages: 0, keys: [] };
+    return null;
   }
+}
+
+export function scanDevCliExtensionTree(extRoot) {
+  const scopes = realSubdirectories(extRoot);
+  if (scopes === null) return { treeExists: false, packages: 0, keys: [] };
   let packages = 0;
   const keys = new Set();
-  for (const scope of scopes) {
-    let dirs;
-    try {
-      dirs = readdirSync(path.join(extRoot, scope)).sort();
-    } catch {
-      continue;
-    }
+  outer: for (const scope of scopes) {
+    const dirs = realSubdirectories(path.join(extRoot, scope));
+    if (dirs === null) continue;
     for (const dir of dirs) {
+      if (packages >= SCAN_MAX_PACKAGES) break outer;
+      const manifest = path.join(extRoot, scope, dir, "package.json");
       let pkg;
       try {
-        pkg = JSON.parse(readFileSync(path.join(extRoot, scope, dir, "package.json"), "utf8"));
+        // Regular files only, and only ones small enough to be a manifest.
+        const stat = statSync(manifest);
+        if (!stat.isFile() || stat.size > SCAN_MAX_MANIFEST_BYTES) continue;
+        pkg = JSON.parse(readFileSync(manifest, "utf8"));
       } catch {
         continue; // not a package dir
       }
       packages += 1;
       const declared = pkg?.cinatra?.devCliModules;
       if (declared && typeof declared === "object") {
-        for (const k of Object.keys(declared)) keys.add(k);
+        for (const k of Object.keys(declared)) keys.add(String(k).slice(0, SCAN_MAX_KEY_CHARS));
       }
     }
   }

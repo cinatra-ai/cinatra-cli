@@ -5714,7 +5714,10 @@ function installAfterExtensionSync(
       // abort (the caller runs this BEFORE any DB mutation).
       throw new Error(
         `Post-acquisition \`${invocation.label}\` failed (${how}) — the required extensions are not ` +
-          `linked into the workspace. Fix the install error and re-run.`,
+          `linked into the workspace. ` +
+          (missingCommand
+            ? "Install pnpm (`npm install -g pnpm`), or enable Corepack, so that command can run, then re-run."
+            : "Fix the install error and re-run."),
       );
     }
     console.error(
