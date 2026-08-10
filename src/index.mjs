@@ -825,6 +825,7 @@ Usage:
   cinatra instance restart
   cinatra instance wordpress start|stop
   cinatra instance drupal start|stop
+  cinatra instance wayflow start|stop
   cinatra instance a2a start|stop
   cinatra instance backup create [--file <path>]
   cinatra instance backup import [--file <path>|<filename>] [--yes]
@@ -958,6 +959,13 @@ Commands:
   instance wordpress start|stop / instance drupal start|stop
                       Start or stop ONLY the named CMS dev container (single
                       compose service; preserves its named volumes).
+  instance wayflow start|stop
+                      Start or stop the shared WayFlow agent runtime container
+                      (serves every installed agent on :3010). \`start\` first
+                      regenerates docker/wayflow/.wayflow.env from .env.local so
+                      the bridge token matches the app, then builds + starts the
+                      single \`wayflow\` compose service. Agent runs fail with
+                      ECONNREFUSED until this runtime is up.
   instance a2a start|stop
                       Start or stop the A2A dev test peers on THIS checkout's
                       ISOLATED stack (the \`a2a-peers\` compose profile), and wire
@@ -4473,6 +4481,17 @@ const DOCTOR_DRUPAL = {
   mcpToolsPath: "/_mcp_tools",
   requiredModule: "cinatra",
 };
+// The shared WayFlow agent runtime (docker-compose.yml `wayflow` service,
+// default compose container name). Profile-gated, so a default dev bring-up
+// never starts it: the exact fresh-install state where every agent run dies
+// with ECONNREFUSED against :3010. `/.health` is the loader's own contract
+// (returns {"status":"ok"|"degraded","agents":<count>,...}); the compose
+// healthcheck treats BOTH ok and degraded as healthy (a single broken agent
+// must not condemn the runtime), and the doctor mirrors that.
+const DOCTOR_WAYFLOW = {
+  containerName: "cinatra-wayflow-1",
+  healthUrl: "http://localhost:3010/.health",
+};
 
 function makeAssertion(id, label, verdict, detail, remediation) {
   return { id, label, verdict, detail, remediation: remediation ?? null };
@@ -5052,6 +5071,83 @@ async function doctorAssertDrupalReadiness({ fetchImpl, dockerImpl }) {
   );
 }
 
+// WayFlow agent runtime readiness (read-only, no secret). The runtime is
+// profile-gated and NOT started by the default dev bring-up, so "container not
+// running" is the expected fresh-install state, a SKIP that names the exact
+// start command, because every agent run hard-fails (ECONNREFUSED) until the
+// operator runs it. Health is asserted via the loader's own /.health contract:
+// `ok` and `degraded` are both healthy (mirrors the compose healthcheck;
+// per-agent load failures must never condemn the runtime), anything else is a
+// FAIL with the rebuild remediation the agents preflight prescribes.
+async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl }) {
+  const id = "wayflow-readiness";
+  const label = "WayFlow agent runtime readiness (read-only)";
+  if (!doctorContainerRunning(dockerImpl, DOCTOR_WAYFLOW.containerName)) {
+    return makeAssertion(
+      id,
+      label,
+      "skip",
+      `${DOCTOR_WAYFLOW.containerName} not running; agent runs fail with ECONNREFUSED until it is`,
+      "Start the WayFlow agent runtime (`cinatra instance wayflow start`), then re-run `cinatra doctor`.",
+    );
+  }
+  // Probe /.health and parse its body. A transport error/timeout on a RUNNING
+  // container is "booting?" → SKIP, never PASS (same rule as the CMS probes).
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DOCTOR_HTTP_TIMEOUT_MS);
+  let health = null;
+  let httpStatus = null;
+  try {
+    const response = await fetchImpl(DOCTOR_WAYFLOW.healthUrl, {
+      method: "GET",
+      signal: controller.signal,
+    });
+    httpStatus = response.status;
+    if (httpStatus === 200) {
+      try {
+        health = await response.json();
+      } catch {
+        health = null; // non-JSON 200 → treated as a hard failure below
+      }
+    }
+  } catch {
+    return makeAssertion(
+      id,
+      label,
+      "skip",
+      `container up but ${DOCTOR_WAYFLOW.healthUrl} not answering; loader booting? (cold start mounts every agent, up to ~2 min)`,
+      "Wait for the loader to finish mounting agents, then re-run `cinatra doctor`.",
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+  const runtimeStatus = typeof health?.status === "string" ? health.status : null;
+  if (httpStatus !== 200 || (runtimeStatus !== "ok" && runtimeStatus !== "degraded")) {
+    return makeAssertion(
+      id,
+      label,
+      "fail",
+      `/.health unhealthy (HTTP ${httpStatus ?? "no-response"}, status=${runtimeStatus ?? "unparseable"})`,
+      "Rebuild + restart the runtime (`cinatra instance wayflow start`) and check `docker logs " +
+        `${DOCTOR_WAYFLOW.containerName}\`.`,
+    );
+  }
+  const agentCount = typeof health?.agents === "number" ? health.agents : null;
+  const agentNote = agentCount === null ? "" : `; ${agentCount} agent(s) mounted`;
+  if (runtimeStatus === "degraded") {
+    const failed = Array.isArray(health?.failed_agents) ? health.failed_agents.length : null;
+    return makeAssertion(
+      id,
+      label,
+      "pass",
+      `runtime up; /.health degraded${agentNote}` +
+        (failed === null ? "" : `; ${failed} agent(s) failed to load`) +
+        `; check \`docker logs ${DOCTOR_WAYFLOW.containerName}\` for the per-agent errors`,
+    );
+  }
+  return makeAssertion(id, label, "pass", `runtime up; /.health ok${agentNote}`);
+}
+
 // Assertion 8 — dev-app clone presence. The WP plugin + Drupal module clones must
 // exist on disk (they are gitignored; `cinatra instance setup dev` syncs them). Pure fs.
 function doctorAssertDevAppsPresence(repoRoot) {
@@ -5135,7 +5231,12 @@ async function gatherDoctorReport({
   assertions.push(await doctorAssertWordPressReadiness({ fetchImpl, dockerImpl }));
   assertions.push(await doctorAssertDrupalReadiness({ fetchImpl, dockerImpl }));
 
-  // 8 — dev-app clone presence.
+  // 8 -- WayFlow agent runtime readiness (profile-gated; a fresh dev install
+  // has it DOWN and every agent run fails with ECONNREFUSED; the skip
+  // remediation names the exact start command).
+  assertions.push(await doctorAssertWayflowReadiness({ fetchImpl, dockerImpl }));
+
+  // 9 -- dev-app clone presence.
   assertions.push(doctorAssertDevAppsPresence(repoRoot));
 
   const counts = { pass: 0, fail: 0, skip: 0 };
@@ -11289,6 +11390,147 @@ async function runDevCms(service, argv = []) {
 }
 
 // ---------------------------------------------------------------------------
+// `cinatra instance wayflow start|stop`: the shared WayFlow agent runtime.
+//
+// Parity with the CMS commands above: the `wayflow` compose service is
+// profile-gated (profiles: [wayflow, drupal, wordpress]) and the default dev
+// bring-up activates NO profile, so a fresh dev install has no runtime on
+// :3010 and every agent run dies with ECONNREFUSED. This command is the
+// first-class affordance the doctor and setup output point at.
+//
+// Two deliberate differences from `runDevCms`:
+//
+//   1. BRIDGE-TOKEN ENV FIRST. The runtime authenticates its callbacks to the
+//      app's /api/llm-bridge with CINATRA_BRIDGE_TOKEN, read from the NARROW
+//      generated file docker/wayflow/.wayflow.env (compose `env_file`,
+//      `required: false`). A start without that file crash-loops the loader
+//      ("FATAL: CINATRA_BRIDGE_TOKEN is unset or empty"). So `start` first runs
+//      the checkout's own generator (`node scripts/gen-wayflow-env.mjs
+//      --require-bridge-token`, the same call `npm run services` and the demo
+//      setup path make) and ABORTS on generator failure: a loud, actionable
+//      failure instead of a silently 403ing bridge. A checkout without the
+//      generator (older tree) warns and proceeds: compose tolerates the
+//      missing env_file and the loader still fails loud on a missing token.
+//
+//   2. `--build`. The service builds from ./docker/wayflow (no registry
+//      image), so `up` must be able to produce the image on first start, and a
+//      rebuild after a checkout update must be picked up. `--build` covers
+//      both; the docker layer cache makes a no-change rebuild cheap. This is
+//      the same build+up shape the agents preflight prescribes for a stale
+//      runtime.
+//
+// The CRITICAL SCOPING rule from `runDevCms` applies unchanged: never
+// `--profile wayflow down` (it would also tear down the always-on dev infra);
+// start scopes `up` to the single named service, stop is `rm -sf wayflow`
+// (named volumes untouched; the service has none anyway; agents are a ro
+// bind-mount of ./extensions).
+const WAYFLOW_SERVICE = "wayflow";
+const WAYFLOW_LOCAL_URL = "http://localhost:3010";
+
+function composeWayflowArgs(verb) {
+  const base = ["compose", "-f", "docker-compose.yml", "-f", "docker-compose.dev.yml"];
+  return verb === "start"
+    ? [...base, "--profile", WAYFLOW_SERVICE, "up", "-d", "--build", WAYFLOW_SERVICE]
+    : [...base, "rm", "-sf", WAYFLOW_SERVICE];
+}
+
+// Regenerate docker/wayflow/.wayflow.env from .env.local via the checkout's
+// generator. Returns true when the start may proceed (generated OK, or the
+// generator does not exist in this checkout), false when the generator exists
+// and failed; the caller must abort the start. Seams (`spawnImpl`,
+// `existsImpl`) are injectable for hermetic tests.
+function ensureWayflowBridgeEnv(
+  repoRoot,
+  { spawnImpl = spawnSync, existsImpl = existsSync } = {},
+) {
+  const generator = path.join(repoRoot, "scripts", "gen-wayflow-env.mjs");
+  if (!existsImpl(generator)) {
+    console.warn(
+      "scripts/gen-wayflow-env.mjs not found in this checkout; starting wayflow without " +
+        "regenerating docker/wayflow/.wayflow.env. If agent replies stay empty, the bridge " +
+        "token is missing; update the checkout and re-run `cinatra instance wayflow start`.",
+    );
+    return true;
+  }
+  console.log(
+    "Provisioning the WayFlow bridge-token env (docker/wayflow/.wayflow.env) from .env.local ...",
+  );
+  const result = spawnImpl(process.execPath, [generator, "--require-bridge-token"], {
+    cwd: repoRoot,
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  const status = result.error ? 1 : (result.status ?? 1);
+  if (status !== 0) {
+    console.error(
+      `gen-wayflow-env.mjs failed (exit ${status}).` +
+        (result.error ? ` ${result.error.message}` : "") +
+        " The wayflow start was NOT attempted: without CINATRA_BRIDGE_TOKEN the runtime " +
+        "crash-loops. Fix .env.local (run `cinatra install` / `pnpm services` once), then retry.",
+    );
+    return false;
+  }
+  return true;
+}
+
+// `argv` is the legacy rest (argv.slice(2)); its first token is the start|stop verb.
+async function runDevWayflow(argv = []) {
+  rejectTailscaleAuthkeyFlag(argv);
+  const verb = String(argv[0] ?? "").trim();
+  if (verb !== "start" && verb !== "stop") {
+    throw new Error(
+      `Unknown 'cinatra instance wayflow' sub-command "${argv[0] ?? ""}". ` +
+        `Expected: cinatra instance wayflow <start|stop>.`,
+    );
+  }
+  // The verb is the ONLY accepted argument (same contract as the CMS commands):
+  // a malformed `instance wayflow start oops` / `--foo` fails fast rather than
+  // silently performing a container action.
+  const extra = argv.slice(1).filter((tok) => String(tok ?? "").trim() !== "");
+  if (extra.length > 0) {
+    throw new Error(
+      `Unexpected argument(s) for 'cinatra instance wayflow ${verb}': ${extra.join(" ")}. ` +
+        `Expected: cinatra instance wayflow <start|stop>.`,
+    );
+  }
+  if (!isComposeAvailable()) {
+    throw new Error(
+      "`docker compose` is not available on PATH. Install Docker + the compose plugin, then retry.",
+    );
+  }
+  const repoRoot = getRepoRoot();
+  if (verb === "start" && !ensureWayflowBridgeEnv(repoRoot)) {
+    process.exitCode = 1;
+    return;
+  }
+  const args = composeWayflowArgs(verb);
+  const shownCmd = `docker ${args.join(" ")}`;
+  console.log(
+    verb === "start"
+      ? `Starting the WayFlow agent runtime (${shownCmd}) ...`
+      : `Stopping the WayFlow agent runtime (${shownCmd}) ...`,
+  );
+  const result = spawnSync("docker", args, {
+    cwd: repoRoot,
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  const status = result.error ? 1 : (result.status ?? 1);
+  if (status !== 0) {
+    process.exitCode = status || 1;
+    console.error(
+      `\`${shownCmd}\` failed (exit ${status}).` + (result.error ? ` ${result.error.message}` : ""),
+    );
+    return;
+  }
+  console.log(
+    verb === "start"
+      ? `WayFlow agent runtime started (${WAYFLOW_LOCAL_URL}; the loader mounts every ` +
+          `installed agent, allow up to ~2 min on cold start). Re-run \`cinatra doctor\` to verify readiness.`
+      : `WayFlow agent runtime stopped (container removed). Agent runs will fail with ` +
+          `ECONNREFUSED until it is started again (\`cinatra instance wayflow start\`).`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // `cinatra logs [--app] [--service <name>] [--follow|-f]` (cinatra#12).
 //
 // Surfaces the two log sources an operator otherwise has to hunt for by hand:
@@ -13930,9 +14172,14 @@ export {
   deriveConfiguredPublicMcpUrl,
   doctorAssertLlmMcpAccess,
   doctorAssertDevAppsPresence,
+  doctorAssertWayflowReadiness,
   printDoctorReport,
   printDoctorAssertion,
   DOCTOR_CMS_WRITE_TOOLS,
+  // `instance wayflow start|stop` seams (pure / injectable): the compose
+  // invocation shape and the bridge-token env-generation gate.
+  composeWayflowArgs,
+  ensureWayflowBridgeEnv,
   // cinatra-cli#105 — HEAD-stamped `.next` auto-clean (pure seams).
   cleanNextBuildCache,
   readNextBuildStamp,
@@ -14253,6 +14500,9 @@ function buildHandlers() {
     },
     "dev.drupal": async (rest) => {
       await runDevCms("drupal", rest);
+    },
+    "dev.wayflow": async (rest) => {
+      await runDevWayflow(rest);
     },
     "dev.a2a": async (rest) => {
       // cinatra-cli#113: isolated-aware A2A dev-peer start/stop. Anchored on the

@@ -426,6 +426,12 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode",
         },
         {
+          "command": "instance wayflow",
+          "hidden": false,
+          "id": "dev.wayflow",
+          "match": "command+mode",
+        },
+        {
           "command": "instance a2a",
           "hidden": false,
           "id": "dev.a2a",
@@ -585,6 +591,9 @@ describe("command table — routing (longest-match)", () => {
     [["instance", "wordpress"], "dev.wordpress"],
     [["instance", "wordpress", "start"], "dev.wordpress"],
     [["instance", "drupal", "stop"], "dev.drupal"],
+    [["instance", "wayflow"], "dev.wayflow"],
+    [["instance", "wayflow", "start"], "dev.wayflow"],
+    [["instance", "wayflow", "stop"], "dev.wayflow"],
     [["instance", "a2a"], "dev.a2a"],
     [["instance", "a2a", "start"], "dev.a2a"],
     [["instance", "reset"], "reset.dev"],
