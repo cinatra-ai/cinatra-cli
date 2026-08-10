@@ -10,10 +10,9 @@
 //   1. the install invocation is CHOSEN, never assumed (three-tier selection,
 //      cinatra-cli#205/#207) and the chosen label travels with the verdict, so
 //      the recovery text names the command that actually ran;
-//   2. the regeneration gate blocks on the TREE's state (sync reconciled, #41
-//      link invariant, and — only when an install ran and failed — hydration),
-//      never on the install command's exit status alone; a blocked regeneration
-//      is LOUD and names the exact recovery, and a re-run repeats the step;
+//   2. a BLOCKED regeneration (failed sync / #41 link violation / failed
+//      re-link) is loud: it names the blocker and the ordered recovery
+//      commands — resolved for THIS host — and says a re-run repeats the step;
 //   3. an unresolvable dev-CLI key says WHICH tree was scanned and what to run.
 
 import { describe, it, expect, afterEach, vi } from "vitest";
@@ -22,7 +21,6 @@ import os from "node:os";
 import path from "node:path";
 import {
   decideManifestRegenGate,
-  unhydratedSyncedExtensions,
   regenerateExtensionManifestAfterSync,
   installAfterExtensionSync,
 } from "../src/index.mjs";
@@ -96,17 +94,18 @@ describe("the re-link verdict names the invocation that ran (cinatra#2637)", () 
 // 2. The regeneration gate.
 // ---------------------------------------------------------------------------
 describe("decideManifestRegenGate", () => {
-  it("does NOT block on a failed install when the tree is linked and hydrated (the cinatra#2637 fix)", () => {
+  it("blocks a FAILED re-link — the synced extensions' own dependencies are unproven", () => {
+    // codex round 1 (adopted): a present `node_modules` does not prove the
+    // dependency graph resolves, so a non-zero install stays a blocker. What
+    // changes is that the block is now attributable and recoverable.
     const gate = decideManifestRegenGate({
-      syncFailed: false,
       linkOk: true,
-      installOk: false, // e.g. the install command does not exist on this host
+      installOk: false,
       installLabel: "pnpm install",
-      unhydrated: [],
     });
-    expect(gate.blocked).toBe(false);
-    // …and the run is expected to SAY it regenerated anyway.
-    expect(gate.regeneratedDespiteInstallFailure).toBe(true);
+    expect(gate.blocked).toBe(true);
+    expect(gate.blockedBy).toContain("re-link failed");
+    expect(gate.recovery).toEqual(["pnpm install", "cinatra instance setup dev"]);
   });
 
   it("blocks when the #41 link invariant is violated, naming the packages and the recovery", () => {
@@ -121,51 +120,50 @@ describe("decideManifestRegenGate", () => {
     expect(gate.recovery).toEqual(["pnpm install", "cinatra instance setup dev"]);
   });
 
-  it("blocks when a FAILED install left synced extensions without node_modules", () => {
-    const gate = decideManifestRegenGate({
-      linkOk: true,
-      installOk: false,
-      installLabel: "npm exec -y -- pnpm@11.1.2 install",
-      unhydrated: ["/repo/extensions/cinatra-ai/tailscale-connector"],
-    });
-    expect(gate.blocked).toBe(true);
-    expect(gate.blockedBy).toContain("tailscale-connector");
-    expect(gate.recovery[0]).toBe("npm exec -y -- pnpm@11.1.2 install");
-  });
-
-  it("does not treat unhydrated extensions as a blocker when no install ran (branch-isolation path)", () => {
-    const gate = decideManifestRegenGate({
-      linkOk: true,
-      installOk: true, // no install verdict on that path
-      unhydrated: ["/repo/extensions/cinatra-ai/tailscale-connector"],
-    });
-    expect(gate.blocked).toBe(false);
-    expect(gate.regeneratedDespiteInstallFailure).toBe(false);
-  });
-
   it("blocks a failed SYNC — the tree it would regenerate against is unknown", () => {
     const gate = decideManifestRegenGate({ syncFailed: true });
     expect(gate.blocked).toBe(true);
     expect(gate.recovery).toEqual(["cinatra instance setup dev"]);
   });
-});
 
-describe("unhydratedSyncedExtensions", () => {
-  it("lists only synced extensions that declare deps and have no node_modules", () => {
-    const root = makeTree();
-    const dry = makeExtension(root, "tailscale-connector", { deps: true, hydrated: false });
-    const wet = makeExtension(root, "github-connector", { deps: true, hydrated: true });
-    const depless = makeExtension(root, "text-artifact", { deps: false, hydrated: false });
-    const gone = path.join(root, "extensions", "cinatra-ai", "not-cloned");
-    const syncResult = {
-      results: [{ dest: dry }, { dest: wet }, { dest: depless }, { dest: gone }],
-    };
-    expect(unhydratedSyncedExtensions(syncResult)).toEqual([dry]);
+  it("does not block a reconciled, linked, installed tree", () => {
+    expect(decideManifestRegenGate({ linkOk: true, installOk: true })).toEqual({
+      blocked: false,
+      blockedBy: null,
+      recovery: [],
+    });
   });
 
-  it("is empty for a sync that produced nothing", () => {
-    expect(unhydratedSyncedExtensions(undefined)).toEqual([]);
-    expect(unhydratedSyncedExtensions({ skipped: true })).toEqual([]);
+  // cinatra#2637 — the recovery command must be one THIS host can run: naming
+  // `corepack pnpm install` on a Corepack-less host is what left the reporter
+  // with no way forward.
+  it("resolves the re-link label for the host when no install ran, lazily", () => {
+    let probes = 0;
+    const resolveInstallLabel = () => {
+      probes += 1;
+      return "npm exec -y -- pnpm@11.1.2 install";
+    };
+    const clean = decideManifestRegenGate({ linkOk: true, installOk: true, resolveInstallLabel });
+    expect(clean.blocked).toBe(false);
+    expect(probes).toBe(0); // never probed on the happy path
+
+    const blocked = decideManifestRegenGate({
+      linkOk: false,
+      stillMissing: ["@cinatra-ai/tailscale-connector"],
+      resolveInstallLabel,
+    });
+    expect(blocked.recovery[0]).toBe("npm exec -y -- pnpm@11.1.2 install");
+    expect(probes).toBe(1);
+  });
+
+  it("degrades to `pnpm install` when the host probe itself throws", () => {
+    const gate = decideManifestRegenGate({
+      linkOk: false,
+      resolveInstallLabel: () => {
+        throw new Error("probe exploded");
+      },
+    });
+    expect(gate.recovery).toEqual(["pnpm install", "cinatra instance setup dev"]);
   });
 });
 
