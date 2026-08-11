@@ -2353,9 +2353,16 @@ export async function runPreviewStart(rest, injected = {}) {
         throw new Error(
           `preview "${slug}" is still degraded (terminal state: ${probe.state}` +
             (probe.status ? `, http ${probe.status}` : "") + `). ` +
-            (probe.state === "crashed"
-              ? `The container stopped running while it was being probed; nothing here removed it. `
-              : `The container was left running and untouched. `) +
+            // `containerRunning` deliberately treats an unanswered liveness probe
+            // as "keep polling", so a non-crashed outcome does NOT prove the
+            // container is up. Read the state once more and say what it says.
+            ((s) =>
+              s === "running"
+                ? `The container was left running and untouched. `
+                : s === "unknown"
+                  ? `Nothing here touched the container; docker did not answer a state probe, so whether it is ` +
+                    `still up is UNKNOWN. `
+                  : `Nothing here touched the container, and it is now ${s}. `)(containerState(name, deps)) +
             `\`cinatra instance preview start --slug ${slug} --recreate\` re-materializes it with freshly ` +
             `composed environment (no build), which is the fix when the configuration is what changed.`,
         );
@@ -2450,13 +2457,25 @@ export async function runPreviewStart(rest, injected = {}) {
       // DOWN when the container is in fact back would be the same over-claim the
       // absent/unknown split exists to prevent.
       const state = containerState(name, deps);
-      return { outcome: state === "running" ? "restored" : state === "unknown" ? "unconfirmed" : "failed", parked: null };
+      // Four distinguishable outcomes, because three of them are true in
+      // different ways: it is back and running; it is back under its own name
+      // but NOT running (started, then exited); its state could not be read; or
+      // it never came back at all.
+      if (state === "running") return { outcome: "restored", parked: null };
+      if (state === "unknown") return { outcome: "unconfirmed", parked: null };
+      if (state === "stopped") return { outcome: "restored-not-running", parked: null };
+      return { outcome: "failed", parked: null };
     };
     /** The tail of a failure message: what the restore actually achieved. */
     const restoreNote = (r) => {
       if (r.outcome === "none") return `There was no previous container to restore. `;
       if (r.outcome === "restored") {
         return `The PREVIOUS container was restored and restarted — this run left the preview as it found it. `;
+      }
+      if (r.outcome === "restored-not-running") {
+        return `The previous container was put back as ${name} but is NOT running — it started and then ` +
+          `exited. It was not removed: \`docker logs ${name}\` has its output, and ` +
+          `\`cinatra instance preview start --slug ${slug}\` retries it. `;
       }
       if (r.outcome === "unconfirmed") {
         return `The previous container was renamed back and started, but docker did not answer the ` +
@@ -2482,7 +2501,7 @@ export async function runPreviewStart(rest, injected = {}) {
       });
     } catch (err) {
       const r = restore();
-      await release(r.outcome === "failed" ? "degraded" : row.state);
+      await release(r.outcome === "failed" || r.outcome === "restored-not-running" ? "degraded" : row.state);
       throw new Error(`${err?.message ?? err}\n  ${restoreNote(r).trim()}`);
     }
     deps.log(
@@ -2496,7 +2515,7 @@ export async function runPreviewStart(rest, injected = {}) {
     if (result.state !== "healthy") {
       const diag = dumpContainerLogs(container, deps);
       const r = restore();
-      await release(r.outcome === "failed" ? "degraded" : row.state);
+      await release(r.outcome === "failed" || r.outcome === "restored-not-running" ? "degraded" : row.state);
       throw new Error(
         `preview "${slug}" did not reach healthy after re-materializing (terminal state: ${result.state}` +
           (result.status ? `, http ${result.status}` : "") + `). ` +

@@ -138,6 +138,15 @@ function makeFakeDocker(state) {
     if (verb === "container" && sub === "inspect") {
       // cinatra-cli#220: PRESENCE and LIVENESS are different questions — a
       // stopped container still inspects successfully.
+      state.inspects = (state.inspects ?? 0) + 1;
+      // `livenessUnansweredAfter: n` answers the first n probes and goes silent
+      // after that — the shape a daemon saturated mid-operation actually has.
+      if (Number.isInteger(state.livenessUnansweredAfter) && state.inspects > state.livenessUnansweredAfter) {
+        return { status: null, stdout: "", stderr: "", timedOut: true, error: new Error("ETIMEDOUT") };
+      }
+      // `restoreExits`: the parked container is renamed back and started, but
+      // has exited by the time it is probed.
+      if (state.restoreExits && (state.restored ?? false)) return { status: 0, stdout: "false\n", stderr: "" };
       if (state.containerAbsent) return { status: 1, stdout: "", stderr: "No such object" };
       const running = Boolean(state.containerRunning);
       if (state.containerPresentStopped && !running) return { status: 0, stdout: "false\n", stderr: "" };
@@ -176,6 +185,7 @@ function makeFakeDocker(state) {
     }
     if (verb === "start") {
       if (state.containerAbsent) return { status: 1, stdout: "", stderr: "No such container" };
+      state.restored = true;
       state.containerRunning = true;
       state.started = [...(state.started ?? []), args[args.length - 1]];
       return { status: 0, stdout: "", stderr: "" };
@@ -2104,6 +2114,49 @@ describe("preview start — the re-materialize image check is the STAMPED one (c
     });
     await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(
       /Could not determine whether the image .* is present/,
+    );
+  });
+});
+
+describe("preview — the restore/degraded messages say only what was OBSERVED (cinatra-cli#220)", () => {
+  function seedReady(state) {
+    const slot = makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" });
+    writeRegistry(registryPath, { version: 1, previews: { main: state ? { ...slot, state } : slot } });
+  }
+  const OWNED = () => ({
+    containers: [
+      { id: "own-redis", name: "cinatra-redis-1", service: "redis", project: "cinatra", workingDir: tmp, ports: [["127.0.0.1", 6379, 6379]] },
+    ],
+  });
+
+  it("a restored container that started and then EXITED is not reported as removed", async () => {
+    seedReady();
+    // The re-materialized container never becomes healthy; the parked one is
+    // renamed back and started, but is present-and-stopped when probed.
+    const state = {
+      containerRunning: true,
+      health: { status: 503, body: '{"status":"degraded"}' },
+      images: new Set([previewImageTag(SHA_A)]),
+      compose: OWNED(),
+      restoreExits: true,
+    };
+    const { deps } = makeDeps(state, { env: { [ENCRYPTION_KEY_ENV]: KEY_64, REDIS_URL: "redis://127.0.0.1:6379" } });
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(
+      /was put back as cinatra-preview-main but is NOT running[\s\S]*docker logs/,
+    );
+    expect(getPreview(readRegistry(registryPath).registry, "main").state).toBe("degraded");
+  });
+
+  it("the degraded re-probe never claims 'left running' on an unread state", async () => {
+    seedReady("degraded");
+    const { deps } = makeDeps({
+      containerRunning: true,
+      health: { status: 503, body: '{"status":"degraded"}' },
+      compose: OWNED(),
+      livenessUnansweredAfter: 1,
+    });
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(
+      /docker did not answer a state probe, so whether it is still up is UNKNOWN/,
     );
   });
 });
