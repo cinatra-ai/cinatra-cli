@@ -109,6 +109,7 @@ describe("cinatra <subcommand> --help across matcher shapes", () => {
     [["instance", "restart", "--help"], "cinatra instance restart"], // command+mode, stop+start — must NOT run on --help
     [["instance", "wordpress", "start", "--help"], "cinatra instance wordpress"], // command+mode, spawns docker compose — must NOT run on --help
     [["instance", "drupal", "stop", "--help"], "cinatra instance drupal"], // command+mode, spawns docker compose — must NOT run on --help
+    [["instance", "wayflow", "start", "--help"], "cinatra instance wayflow"], // command+mode, spawns env-gen + docker compose; must NOT run on --help
     [["instance", "backup", "import", "--help"], "cinatra instance backup import"], // command+mode+sub, destructive
     [["instance", "reset", "--help"], "cinatra instance reset"], // command+mode, destructive
     [["mcp", "llm-access", "setup", "--help"], "cinatra mcp llm-access setup"], // command+mode+sub

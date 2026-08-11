@@ -505,6 +505,13 @@ export const COMMAND_DESCRIPTORS = [
     summary: "Manage the Drupal CMS dev container (start|stop) via the compose `drupal` profile.",
   },
   {
+    id: "dev.wayflow",
+    path: ["instance", "wayflow"],
+    match: "command+mode",
+    summary:
+      "Manage the shared WayFlow agent runtime dev container (start|stop) via the compose `wayflow` profile; start regenerates the bridge-token env first.",
+  },
+  {
     id: "dev.a2a",
     path: ["instance", "a2a"],
     match: "command+mode",
