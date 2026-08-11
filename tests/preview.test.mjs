@@ -144,8 +144,15 @@ function makeFakeDocker(state) {
       return { status: running ? 0 : 1, stdout: running ? "true\n" : "false\n", stderr: "" };
     }
     // `docker volume inspect <name>` — existence (default: does NOT exist).
+    // The stderr matters: cinatra-cli#220 only lets a probe that SAID "no such
+    // volume" license the abort path to delete it.
     if (verb === "volume" && sub === "inspect") {
-      return { status: state.volumeExists ? 0 : 1, stdout: "", stderr: "" };
+      if (state.volumeProbeUnanswered) {
+        return { status: null, stdout: "", stderr: "", timedOut: true, error: new Error("ETIMEDOUT") };
+      }
+      return state.volumeExists
+        ? { status: 0, stdout: "[]", stderr: "" }
+        : { status: 1, stdout: "", stderr: `Error response from daemon: get ${args[args.length - 1]}: no such volume` };
     }
     // `docker image inspect <ref>` — default: does NOT exist. cinatra-cli#220
     // models the LOCAL image set so the build-skip is assertable, INCLUDING the
@@ -2030,5 +2037,73 @@ describe("preview lifecycle — soundness of the reuse + park/restore paths (cin
     seedReady();
     await runPreviewStop(["--slug", "main"], deps);
     expect(getPreview(readRegistry(registryPath).registry, "main").state).toBe("ready");
+  });
+});
+
+describe("preview — a durable volume is never destroyed on an unanswered probe (cinatra-cli#220)", () => {
+  it("an unanswered `volume inspect` reads as PRE-EXISTING, so abort keeps it", async () => {
+    const state = {
+      sha: SHA_A,
+      health: { status: 503, body: '{"status":"degraded"}' },
+      volumeProbeUnanswered: true,
+      compose: { containers: [] },
+    };
+    const { deps } = makeDeps(state);
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/did not reach healthy/);
+    // Unrecoverable if wrong: the volume holds the preview's encrypted data.
+    expect(state.removedVolumes ?? []).not.toContain("cinatra-preview-data-main");
+  });
+
+  it("volumeAbsence separates docker's \"no such volume\" from a silent probe", () => {
+    const absent = { runDocker: () => ({ status: 1, stdout: "", stderr: "Error: No such volume: v" }) };
+    const present = { runDocker: () => ({ status: 0, stdout: "[]", stderr: "" }) };
+    const quiet = { runDocker: () => ({ status: null, stdout: "", stderr: "", timedOut: true, error: new Error("ETIMEDOUT") }) };
+    expect(P.volumeAbsence({ ref: "v", deps: absent })).toBe("absent");
+    expect(P.volumeAbsence({ ref: "v", deps: present })).toBe("present");
+    expect(P.volumeAbsence({ ref: "v", deps: quiet })).toBe("unknown");
+  });
+});
+
+describe("preview start — the re-materialize image check is the STAMPED one (cinatra-cli#220)", () => {
+  function seedReady() {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+    });
+  }
+  const OWNED = () => ({
+    containers: [
+      { id: "own-redis", name: "cinatra-redis-1", service: "redis", project: "cinatra", workingDir: tmp, ports: [["127.0.0.1", 6379, 6379]] },
+    ],
+  });
+
+  it("refuses to boot a tag that was not built from this preview's SHA", async () => {
+    seedReady();
+    const { deps, fake } = makeDeps({
+      containerRunning: true,
+      health: { status: 200, body: '{"status":"ok"}' },
+      images: new Set([previewImageTag(SHA_A)]),
+      imageLabelSha: SHA_B,
+      compose: OWNED(),
+    });
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(
+      /was NOT built from this preview's SHA[\s\S]*--rebuild/,
+    );
+    // The healthy container was never touched.
+    expect(fake.calls.some((c) => c[0] === "rename" || c[0] === "run")).toBe(false);
+    expect(getPreview(readRegistry(registryPath).registry, "main").state).toBe("ready");
+  });
+
+  it("refuses on an UNANSWERED image probe instead of claiming the image is gone", async () => {
+    seedReady();
+    const { deps } = makeDeps({
+      containerAbsent: true,
+      images: new Set([previewImageTag(SHA_A)]),
+      imageProbeUnanswered: true,
+      compose: OWNED(),
+    });
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(
+      /Could not determine whether the image .* is present/,
+    );
   });
 });
