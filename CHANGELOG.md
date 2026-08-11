@@ -6,6 +6,30 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`cinatra instance preview stop | start`, and a refresh that stops rebuilding
+  what it already has.** Every way to change a preview container used to go
+  through a full `docker build`: there was no verb to stop, start or
+  re-materialize one, and `refresh` rebuilt unconditionally — even when the
+  image for the target SHA was already present locally. Re-pointing a preview at
+  changed configuration therefore cost a full multi-stage build, although the
+  only thing that needed to change was the container's environment (the durable
+  volume, container name and host port are all stable across a refresh). On a
+  memory-constrained host that build is not merely slow but impossible, so a
+  host that could not build could not reconfigure either. Now `create` and
+  `refresh` reuse an image that is already present for the target SHA
+  (`--rebuild` / `--force-build` forces one), `stop` stops a preview's container
+  while keeping its volume, host port, image and registry row, and `start`
+  starts a stopped container in place — or re-materializes an absent one from
+  the recorded image with freshly composed environment and no build at all.
+  `start --recreate` does that for a running container, which is how a
+  re-banded instance's stale container environment is corrected without a
+  build; the container it replaces is parked and restored if the new one fails
+  its health gate. `status` now reports the container's actual state (running,
+  stopped or absent) alongside the registry row's, and says which verb closes
+  the gap.
+
 ### Fixed
 
 - **A preview no longer wires itself to another instance's services, and it can

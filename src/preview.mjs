@@ -1450,8 +1450,17 @@ export function containerState(name, deps) {
   const r = deps.runDocker(["container", "inspect", "-f", "{{.State.Running}}", name], {
     timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS,
   });
-  if (r.status !== 0) return "absent";
-  return (r.stdout ?? "").trim() === "true" ? "running" : "stopped";
+  if (r.status === 0) return (r.stdout ?? "").trim() === "true" ? "running" : "stopped";
+  // A NON-ZERO exit is not proof of absence. Docker says a missing container in
+  // so many words ("No such object/container"); a probe that TIMED OUT or hit a
+  // busy/erroring daemon says nothing at all — and this was observed for real:
+  // right after an aborted image build the daemon was slow enough that the probe
+  // timed out, and reporting "absent" then would have (a) told the operator their
+  // running preview was gone and (b) let `start` re-materialize ON TOP of a live
+  // container. An unobserved fact is "unknown", never a claim.
+  const said = `${r.stderr ?? ""}`;
+  if (!r.timedOut && !r.error && /no such (object|container|image)/i.test(said)) return "absent";
+  return "unknown";
 }
 
 /**
@@ -1501,11 +1510,13 @@ export function ensurePreviewImage({ tag, sha, checkoutDir, rebuild = false, pro
  * prod-boot-e2e's `docker inspect -f '{{.State.Running}}'` liveness signal.
  */
 export function containerRunning(name, deps) {
-  const r = deps.runDocker(["container", "inspect", "-f", "{{.State.Running}}", name], {
-    timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS,
-  });
-  if (r.status !== 0) return false; // absent/removed
-  return (r.stdout ?? "").trim() === "true";
+  // A liveness probe that cannot be answered must NOT read as "crashed": the
+  // health gate treats a false here as TERMINAL and tears the boot down, so a
+  // momentarily unresponsive daemon would kill a perfectly healthy container.
+  // "unknown" keeps polling; the gate's bounded budget still fails loudly
+  // (cinatra-cli#220 — observed on a host whose daemon was saturated by a build).
+  const state = containerState(name, deps);
+  return state === "running" || state === "unknown";
 }
 
 /**
@@ -2097,6 +2108,12 @@ export async function runPreviewStop(rest, injected = {}) {
   }
   const name = previewContainerName(slug);
   const before = containerState(name, deps);
+  if (before === "unknown") {
+    throw new Error(
+      `Could not determine the state of ${name} — docker did not answer the probe (it neither reported ` +
+        `the container nor said it does not exist). Nothing was changed. Check the docker daemon and retry.`,
+    );
+  }
   if (before === "absent") {
     deps.log(`preview "${slug}": no container ${name} to stop (image ${row.imageTag} is still recorded).`);
     return { slug, container: "absent", changed: false };
@@ -2176,6 +2193,22 @@ export async function runPreviewStart(rest, injected = {}) {
   const tag = row.imageTag;
   const hostPort = row.hostPort;
   const present = containerState(name, deps);
+  if (present === "unknown") {
+    await withRegistryLock(deps.registryPath, () => {
+      const reg = requireUsableRegistry(deps.registryPath);
+      const cur = getPreview(reg, slug);
+      if (cur && cur.state === "provisioning") {
+        const next = cloneRegistry(reg);
+        next.previews[slug] = { ...cur, state: row.state };
+        writeRegistry(deps.registryPath, next);
+      }
+    });
+    throw new Error(
+      `Could not determine the state of ${name} — docker did not answer the probe. Nothing was changed. ` +
+        `Re-materializing on an UNKNOWN state could replace a container that is in fact still serving, ` +
+        `so this stops instead. Check the docker daemon and retry.`,
+    );
+  }
 
   // Restore the row on ANY failure — `start` never leaves a claim behind.
   const release = async (state) => {
@@ -2350,7 +2383,9 @@ export function runPreviewStatus(rest, injected = {}) {
       `preview ${r.slug}: state=${r.state} container=${container} sha=${r.sha} tag=${r.imageTag} ` +
         `provenance=${r.provenance} volume=${r.volumeName} port=${r.hostPort ?? "-"} ref=${r.ref}`,
     );
-    if (r.state === "ready" && container !== "running") {
+    if (r.state === "ready" && container === "unknown") {
+      deps.log(`  the container's state could NOT be read (docker did not answer) — this is not a claim that it is gone.`);
+    } else if (r.state === "ready" && container !== "running") {
       deps.log(
         container === "stopped"
           ? `  the row is ready but its container is STOPPED — \`cinatra instance preview start --slug ${r.slug}\` serves it again.`

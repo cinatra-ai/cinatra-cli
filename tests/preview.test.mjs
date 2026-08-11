@@ -824,8 +824,49 @@ describe("preview — container liveness uses .State.Running, not mere existence
     expect(P.containerRunning("x", stopped)).toBe(false);
     const running = { runDocker: () => ({ status: 0, stdout: "true\n", stderr: "" }) };
     expect(P.containerRunning("x", running)).toBe(true);
-    const absent = { runDocker: () => ({ status: 1, stdout: "", stderr: "" }) };
+    // cinatra-cli#220: docker NAMES a missing container; that is absence.
+    const absent = { runDocker: () => ({ status: 1, stdout: "", stderr: "Error: No such object: x" }) };
     expect(P.containerRunning("x", absent)).toBe(false);
+    expect(P.containerState("x", absent)).toBe("absent");
+  });
+
+  it("cinatra-cli#220: an UNANSWERED probe is `unknown` — never reported as absence", () => {
+    // Observed for real: right after an aborted image build the daemon was slow
+    // enough that this probe timed out. Reading that as "absent" told the
+    // operator their RUNNING preview was gone, and would let `start` replace a
+    // live container.
+    const timedOut = { runDocker: () => ({ status: null, stdout: "", stderr: "", timedOut: true, error: new Error("ETIMEDOUT") }) };
+    expect(P.containerState("x", timedOut)).toBe("unknown");
+    // For the health gate, unknown means KEEP POLLING, not "crashed" — a
+    // momentarily unresponsive daemon must not tear down a healthy boot.
+    expect(P.containerRunning("x", timedOut)).toBe(true);
+    const daemonError = { runDocker: () => ({ status: 1, stdout: "", stderr: "Cannot connect to the Docker daemon" }) };
+    expect(P.containerState("x", daemonError)).toBe("unknown");
+  });
+
+  it("cinatra-cli#220: stop and start REFUSE on an unknown container state", async () => {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+    });
+    const unanswered = (extra = {}) => ({
+      registryPath,
+      checkoutDir: tmp,
+      env: { [ENCRYPTION_KEY_ENV]: KEY_64 },
+      log: () => {},
+      logError: () => {},
+      runDocker: (args) =>
+        args[0] === "container"
+          ? { status: null, stdout: "", stderr: "", timedOut: true, error: new Error("ETIMEDOUT") }
+          : { status: 0, stdout: "", stderr: "" },
+      ...extra,
+    });
+    await expect(runPreviewStop(["--slug", "main"], unanswered())).rejects.toThrow(/Could not determine the state/);
+    await expect(runPreviewStart(["--slug", "main"], unanswered())).rejects.toThrow(
+      /Could not determine the state[\s\S]*still serving/,
+    );
+    // The row is left exactly as found.
+    expect(getPreview(readRegistry(registryPath).registry, "main").state).toBe("ready");
   });
 });
 
