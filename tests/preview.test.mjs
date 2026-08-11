@@ -13,6 +13,8 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { answerComposeOwnership } from "./helpers/fake-compose-ownership.mjs";
+
 import { __test as P } from "../src/preview.mjs";
 
 const {
@@ -31,6 +33,7 @@ const {
   rewriteLoopbackUrlForContainer,
   CONTAINER_HOST_GATEWAY,
   CONTAINER_REWRITE_ENV_KEYS,
+  containerDialedLoopbackEndpoints,
   PASSTHROUGH_ENV_KEYS,
   classifyHealthResponse,
   pollHealthGate,
@@ -103,6 +106,11 @@ function makeFakeDocker(state) {
   const runDocker = (args, callOpts = {}) => {
     calls.push(args);
     opts.push(callOpts);
+    // cinatra-cli#219 — the compose-metadata probes the endpoint-ownership gate
+    // runs. Unmodelled by default (reported UNAVAILABLE, never an ownership
+    // claim), so a case about something else is unaffected by the gate.
+    const ownership = answerComposeOwnership(args, state);
+    if (ownership) return ownership;
     const [verb, sub] = args;
     // `docker build ...` — success unless state.buildFails / state.buildTimesOut.
     if (verb === "build") {
@@ -1439,5 +1447,156 @@ describe("preview build levers — memory ceiling + CI forward (#210)", () => {
     const row = getPreview(readRegistry(registryPath).registry, "main");
     expect(row.sha).toBe(SHA_A);
     expect(row.state).toBe("ready");
+  });
+});
+
+// --------------------------------------------------------------------------
+// cinatra-cli#219 — the Nango wiring, and the ownership gate on every
+// container-dialed loopback endpoint
+// --------------------------------------------------------------------------
+
+describe("preview — Nango address + credential forwarding (cinatra-cli#219)", () => {
+  it("AC3: both keys are in the passthrough set; the ADDRESS is container-rewritten", () => {
+    expect(PASSTHROUGH_ENV_KEYS).toContain("NANGO_SERVER_URL");
+    expect(PASSTHROUGH_ENV_KEYS).toContain("NANGO_SECRET_KEY");
+    expect(CONTAINER_REWRITE_ENV_KEYS).toContain("NANGO_SERVER_URL");
+    // The CREDENTIAL is not an address — it is never rewritten.
+    expect(CONTAINER_REWRITE_ENV_KEYS).not.toContain("NANGO_SECRET_KEY");
+    const args = buildPreviewRunEnvArgs({
+      encryptionKey: KEY_64,
+      env: {
+        [ENCRYPTION_KEY_ENV]: KEY_64,
+        NANGO_SERVER_URL: "http://localhost:3003",
+        NANGO_SECRET_KEY: "nango-env-key",
+        NANGO_ENCRYPTION_KEY: "bmFuZ28=",
+      },
+    });
+    const joined = args.join(" ");
+    expect(joined).toContain(`NANGO_SERVER_URL=http://${CONTAINER_HOST_GATEWAY}:3003`);
+    expect(joined).toContain("NANGO_SECRET_KEY=nango-env-key");
+    expect(joined).toContain("NANGO_ENCRYPTION_KEY=bmFuZ28=");
+  });
+
+  it("forwards nothing when the host has no Nango wiring (unchanged for that case)", () => {
+    const joined = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env: { [ENCRYPTION_KEY_ENV]: KEY_64 } }).join(" ");
+    expect(joined).not.toContain("NANGO_SERVER_URL");
+    expect(joined).not.toContain("NANGO_SECRET_KEY");
+  });
+
+  it("a HOSTED Nango is forwarded verbatim (never rewritten, never ownership-checked)", () => {
+    const joined = buildPreviewRunEnvArgs({
+      encryptionKey: KEY_64,
+      env: { [ENCRYPTION_KEY_ENV]: KEY_64, NANGO_SERVER_URL: "https://api.nango.example" },
+    }).join(" ");
+    expect(joined).toContain("NANGO_SERVER_URL=https://api.nango.example");
+    expect(containerDialedLoopbackEndpoints({ NANGO_SERVER_URL: "https://api.nango.example" })).toEqual([]);
+  });
+});
+
+// These NET-NEW Postgres fixtures are assembled from parts so they cannot LOOK
+// like a credential to the secret-scan gate (as the install-preview suites
+// already do).
+const pgUrl = (cred, hostPort, db) => ["postgresql:/", `${cred}@${hostPort}`, db].join("/");
+const DB_CRED = ["u", "p"].join(":");
+
+describe("preview — container-dialed endpoint ownership (cinatra-cli#219)", () => {
+  const OURS = () => tmp; // the deps' checkoutDir
+  const THEIRS = "/tmp/a-different-stack";
+
+  /** Our stack publishes 6379/5434; a FOREIGN project holds 3003 (the #219 repro). */
+  function reproWorld() {
+    return {
+      containers: [
+        { id: "own-redis", name: "cinatra-redis-1", service: "redis", project: "cinatra", workingDir: OURS(), ports: [["127.0.0.1", 6379, 6379]] },
+        { id: "own-pg", name: "cinatra-postgres-1", service: "postgres", project: "cinatra", workingDir: OURS(), ports: [["127.0.0.1", 5434, 5432]] },
+        { id: "own-nango", name: "cinatra-nango-server-1", service: "nango-server", project: "cinatra", workingDir: OURS(), ports: [] },
+        { id: "their-nango", name: "other-nango-server-1", service: "nango-server", project: "other-stack", workingDir: THEIRS, ports: [["0.0.0.0", 3003, 3003]] },
+      ],
+    };
+  }
+
+  const envWith = (extra) => ({ [ENCRYPTION_KEY_ENV]: KEY_64, ...extra });
+
+  it("AC1: create REFUSES before any build when a foreign stack holds the port", async () => {
+    const { deps, fake } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' }, compose: reproWorld() },
+      { env: envWith({ REDIS_URL: "redis://127.0.0.1:6379", NANGO_SERVER_URL: "http://localhost:3003" }) },
+    );
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(
+      /Refusing to compose this preview[\s\S]*NANGO_SERVER_URL[\s\S]*other-nango-server-1/,
+    );
+    // Nothing was built and nothing was booted.
+    expect(fake.calls.find((c) => c[0] === "build")).toBeUndefined();
+    expect(fake.calls.find((c) => c[0] === "run")).toBeUndefined();
+    // The claim was released — the slug is free again.
+    expect(getPreview(readRegistry(registryPath).registry ?? { previews: {} }, "main")).toBeFalsy();
+  });
+
+  it("AC4: an owned stack composes exactly as before (no new failure mode)", async () => {
+    const { deps, fake } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' }, compose: reproWorld() },
+      { env: envWith({ REDIS_URL: "redis://127.0.0.1:6379", SUPABASE_DB_URL: pgUrl(DB_CRED, "127.0.0.1:5434", "cinatra") }) },
+    );
+    const out = await runPreviewCreate(["--slug", "main"], deps);
+    expect(out.state).toBe("healthy");
+    const run = fake.calls.find((c) => c[0] === "run").join(" ");
+    expect(run).toContain(`REDIS_URL=redis://${CONTAINER_HOST_GATEWAY}:6379`);
+  });
+
+  it("AC4: a hosted/external endpoint is never flagged", async () => {
+    const { deps } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' }, compose: { containers: [] } },
+      { env: envWith({ SUPABASE_DB_URL: pgUrl(DB_CRED, "db.example.test:5432", "cinatra"), REDIS_URL: "rediss://cache.example.test:6380" }) },
+    );
+    const out = await runPreviewCreate(["--slug", "main"], deps);
+    expect(out.state).toBe("healthy");
+  });
+
+  it("AC2: a running container that publishes NO host port is reported, not absorbed", async () => {
+    const world = { containers: reproWorld().containers.filter((c) => c.id === "own-nango") };
+    const { deps } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' }, compose: world },
+      { env: envWith({ NANGO_SERVER_URL: "http://127.0.0.1:3003" }) },
+    );
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(
+      /cinatra-nango-server-1[\s\S]*publishes NO host port while RUNNING/,
+    );
+  });
+
+  it("refresh REFUSES before the running preview is touched", async () => {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+    });
+    const { deps, fake } = makeDeps(
+      { sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' }, compose: reproWorld() },
+      { env: envWith({ NANGO_SERVER_URL: "http://localhost:3003" }) },
+    );
+    await expect(runPreviewRefresh(["--slug", "main"], deps)).rejects.toThrow(/Refusing to compose this preview/);
+    expect(fake.calls.find((c) => c[0] === "build")).toBeUndefined();
+    expect(fake.calls.find((c) => c[0] === "rm")).toBeUndefined();
+    const row = getPreview(readRegistry(registryPath).registry, "main");
+    expect(row.sha).toBe(SHA_A);
+    expect(row.state).toBe("ready");
+  });
+
+  it("the mode lever fails fast on a typo — before the slug is claimed", async () => {
+    const { deps, fake } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' }, compose: reproWorld() },
+      { env: envWith({ REDIS_URL: "redis://127.0.0.1:6379", CINATRA_PREVIEW_ENDPOINT_OWNERSHIP: "yes" }) },
+    );
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/CINATRA_PREVIEW_ENDPOINT_OWNERSHIP.*invalid/s);
+    expect(fake.calls.find((c) => c[0] === "build")).toBeUndefined();
+    expect(getPreview(readRegistry(registryPath).registry ?? { previews: {} }, "main")).toBeFalsy();
+  });
+
+  it("warn mode proceeds with the finding printed (AC1's loud degradation)", async () => {
+    const { deps, logs } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' }, compose: reproWorld() },
+      { env: envWith({ NANGO_SERVER_URL: "http://localhost:3003", CINATRA_PREVIEW_ENDPOINT_OWNERSHIP: "warn" }) },
+    );
+    const out = await runPreviewCreate(["--slug", "main"], deps);
+    expect(out.state).toBe("healthy");
+    expect(logs.join("\n")).toMatch(/WARNING[\s\S]*NANGO_SERVER_URL[\s\S]*other-nango-server-1/);
   });
 });

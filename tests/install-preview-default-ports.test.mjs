@@ -19,6 +19,8 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { answerComposeOwnership } from "./helpers/fake-compose-ownership.mjs";
+
 import { __test as F } from "../src/install-preview.mjs";
 import { __test as P } from "../src/preview.mjs";
 import { deriveEffectiveInstanceEndpoints } from "../src/instance-endpoints.mjs";
@@ -94,6 +96,8 @@ function makeFakeDocker(state) {
   const calls = [];
   const runDocker = (args) => {
     calls.push(args);
+    const ownership = answerComposeOwnership(args, state); // cinatra-cli#219
+    if (ownership) return ownership;
     const [verb, sub] = args;
     if (verb === "build") return { status: 0, stdout: "", stderr: "" };
     if (verb === "run" && sub === "-d") {
@@ -338,6 +342,9 @@ describe("preview refresh — the continuation invents nothing (#197 AC6)", () =
           REDIS_URL: "redis://127.0.0.1:6479",
           SUPABASE_DB_URL: "x",
           CINATRA_AGENT_REGISTRY_URL: "http://127.0.0.1:4973",
+          // cinatra-cli#219 joined the container-dialed class, and the isolated
+          // path writes it down like the rest.
+          NANGO_SERVER_URL: "http://127.0.0.1:3103",
         },
       }),
     ).toEqual([]);

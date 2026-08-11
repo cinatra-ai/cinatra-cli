@@ -14,6 +14,8 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { answerComposeOwnership } from "./helpers/fake-compose-ownership.mjs";
+
 import { __test as F } from "../src/install-preview.mjs";
 import { __test as P } from "../src/preview.mjs";
 import {
@@ -82,6 +84,10 @@ const DEV_ENV_LOCAL = [
   "NEXT_PUBLIC_BETTER_AUTH_URL=http://localhost:3000",
   "NEXT_PUBLIC_APP_URL=http://localhost:3000",
   "NANGO_ENCRYPTION_KEY=bmFuZ28=",
+  // cinatra-cli#219: the install writes the connection service's address
+  // (`.env.example`) and, since cinatra-cli#214, its seeded secret key.
+  "NANGO_SERVER_URL=http://localhost:3003",
+  "NANGO_SECRET_KEY=nango-env-key",
   "CINATRA_BRIDGE_TOKEN=bridgetoken",
   "",
 ].join("\n");
@@ -114,6 +120,8 @@ function makeFakeDocker(state) {
   const calls = [];
   const runDocker = (args) => {
     calls.push(args);
+    const ownership = answerComposeOwnership(args, state); // cinatra-cli#219
+    if (ownership) return ownership;
     const [verb, sub] = args;
     if (verb === "build") return { status: 0, stdout: "", stderr: "" };
     if (verb === "run" && sub === "-d") {
@@ -456,6 +464,11 @@ describe("preview front door — end to end over the EXISTING create path (AC1, 
     expect(argv).toContain(`BETTER_AUTH_URL=http://localhost:${out.hostPort}`);
     // AC3: install-sourced secrets reached the container.
     expect(argv).toContain("BETTER_AUTH_SECRET=devsecret");
+    // cinatra-cli#219: the connection service's ADDRESS is container-rewritten
+    // and its CREDENTIAL rides along — the composition carries the pair, so a
+    // connector save inside the preview reaches THIS instance's own Nango.
+    expect(argv).toContain(`NANGO_SERVER_URL=http://${CONTAINER_HOST_GATEWAY}:3003`);
+    expect(argv).toContain("NANGO_SECRET_KEY=nango-env-key");
     // AC4: the provisioned key reached the container.
     expect(argv).toMatch(new RegExp(`${ENCRYPTION_KEY_ENV}=[0-9a-f]{64}`));
   });

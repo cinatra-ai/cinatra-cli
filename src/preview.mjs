@@ -77,6 +77,11 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+// cinatra-cli#219 — the endpoint-ownership proof. Node-builtins-only and
+// dependency-free in the other direction (it never imports this module), so
+// there is no cycle and the light CLI core stays importable.
+import { assertEndpointOwnership, resolveEndpointOwnershipMode } from "./preview-endpoint-ownership.mjs";
+
 // --- constants -------------------------------------------------------------
 
 const REGISTRY_VERSION = 1;
@@ -249,6 +254,21 @@ export const PASSTHROUGH_ENV_KEYS = [
   "NEXT_PUBLIC_SITE_URL",
   "REDIS_URL",
   "NANGO_ENCRYPTION_KEY",
+  // cinatra-cli#219: the connection service's ADDRESS and its CREDENTIAL. Only
+  // `NANGO_ENCRYPTION_KEY` used to be forwarded, so a preview container could
+  // neither reach nor authenticate to Nango: saving a provider key reported
+  // partial success (the key validates directly against the provider, then the
+  // connection-service copy fails and the remote state cannot be confirmed) and
+  // connector flows were non-functional regardless of whether Nango ran.
+  //
+  // They are forwarded TOGETHER — an address without the credential still
+  // cannot authenticate — and, being a locally-managed endpoint, the address is
+  // subject to the SAME rewrite + ownership verification as every other
+  // container-dialed key. cinatra-cli#214 made the INSTALL adopt the
+  // nango-seeded secret key so connector saves stop 401'ing on the host; that
+  // fix lives in the instance env and only reaches a container through here.
+  "NANGO_SERVER_URL",
+  "NANGO_SECRET_KEY",
   "OPENAI_API_KEY",
   "CINATRA_BRIDGE_TOKEN",
   // cinatra-cli#190: the agent-registry (Verdaccio) client URLs. Without them
@@ -309,6 +329,10 @@ export const CONTAINER_REWRITE_ENV_KEYS = [
   // there is exactly one mechanism (and one `--add-host` mapping) for all of it.
   "SUPABASE_DB_URL",
   "REDIS_URL",
+  // cinatra-cli#219: the connection service the SERVER-side connector save
+  // dials. `NANGO_SECRET_KEY` is its credential, not an address, so it is
+  // forwarded verbatim and never rewritten.
+  "NANGO_SERVER_URL",
 ];
 
 // --- slug / name / tag -----------------------------------------------------
@@ -548,6 +572,58 @@ export function rewriteLoopbackUrlForContainer(value, gatewayHost = CONTAINER_HO
     return rewritten.slice(0, -1);
   }
   return rewritten;
+}
+
+/**
+ * The container-dialed endpoints this composition would REWRITE — the exact set
+ * cinatra-cli#219's ownership verification applies to.
+ *
+ * A key qualifies only when BOTH hold: it is container-dialed
+ * (`CONTAINER_REWRITE_ENV_KEYS` — the rewrite is what makes it a host-gateway
+ * address) AND its value is a host-LOOPBACK URL, i.e. an endpoint this project
+ * is supposed to own. An external or hosted endpoint (a managed database, the
+ * hosted registry) parses to a non-loopback host, is never rewritten, and is
+ * therefore never verified — it legitimately belongs to no Compose project
+ * (#219 AC4).
+ *
+ * Returns `{ key, value }` pairs. The values are credential-bearing; the caller
+ * uses them only to derive a port.
+ */
+export function containerDialedLoopbackEndpoints(env = {}) {
+  const entries = [];
+  for (const key of CONTAINER_REWRITE_ENV_KEYS) {
+    const value = env?.[key];
+    if (typeof value !== "string" || value.length === 0) continue;
+    let parsed;
+    try {
+      parsed = new URL(value);
+    } catch {
+      continue; // not a URL — the rewrite leaves it alone, so nothing to verify
+    }
+    if (!isHostLoopbackHostname(parsed.hostname)) continue;
+    entries.push({ key, value });
+  }
+  return entries;
+}
+
+/**
+ * cinatra-cli#219 — the ownership gate as ONE call site for both orchestrations.
+ *
+ * Runs on the RESOLVED runtime env (the values the container will really boot
+ * with), and is invoked in `create`/`refresh` BEFORE the image build and — in
+ * refresh — before the healthy old container is replaced, so a refusal costs
+ * nothing and never destroys a working preview.
+ */
+function assertContainerDialedEndpointsOwned({ env, checkoutDir, deps }) {
+  const entries = containerDialedLoopbackEndpoints(env);
+  if (entries.length === 0) return null;
+  return assertEndpointOwnership({
+    entries,
+    checkoutDir,
+    deps,
+    env: deps.ownershipControlEnv ?? deps.env ?? process.env,
+    gatewayHost: CONTAINER_HOST_GATEWAY,
+  });
 }
 
 // --- runtime env for `docker run` (AC2 + the NEVERs) -----------------------
@@ -1598,6 +1674,10 @@ export async function runPreviewCreate(rest, injected = {}) {
   // the same reason — a typo'd ceiling must cost nothing, not surface an hour
   // into a build (or, worse, only after the slug/port/volume state was claimed).
   buildPreviewBuildArgs(deps.buildControlEnv ?? process.env);
+  // cinatra-cli#219: the endpoint-ownership mode lever gets the SAME fail-fast
+  // treatment — a typo'd value must be rejected before any state is claimed,
+  // never silently downgrade the gate.
+  resolveEndpointOwnershipMode(deps.ownershipControlEnv ?? deps.env ?? process.env);
   // AC9: refuse a genuine `--mode prod` checkout up front — before we even
   // resolve a SHA against or touch its `.git`. Checkout-derived, unconditional on
   // the env mode (never gated on a registry row).
@@ -1682,6 +1762,11 @@ export async function runPreviewCreate(rest, injected = {}) {
     // releases the claim and cleans up.
     const runtimeEnv = resolveRuntimeEnv({ deps, env, hostPort });
     const bootKey = assertEncryptionKey(runtimeEnv);
+    // cinatra-cli#219: prove every container-dialed loopback endpoint belongs to
+    // THIS instance before anything is built or booted. Run on the RESOLVED env
+    // (what the container really boots with) rather than the pre-hook one, and
+    // ahead of the build so a refusal costs nothing to recover from.
+    assertContainerDialedEndpointsOwned({ env: runtimeEnv, checkoutDir, deps });
 
     const ctx = deps.prepareContext({ sha, checkoutDir });
     try {
@@ -1756,6 +1841,7 @@ export async function runPreviewRefresh(rest, injected = {}) {
   // surface only after the old preview has been put into `provisioning`.
   resolveBuildTimeoutMs(deps.buildControlEnv ?? process.env);
   buildPreviewBuildArgs(deps.buildControlEnv ?? process.env); // cinatra-cli#210 — same fail-fast for the build levers
+  resolveEndpointOwnershipMode(deps.ownershipControlEnv ?? deps.env ?? process.env); // cinatra-cli#219
 
   // AC9: refuse a genuine `--mode prod` checkout up front — checkout-derived and
   // unconditional. Critically NOT gated on an existing registry row: refresh
@@ -1847,6 +1933,11 @@ export async function runPreviewRefresh(rest, injected = {}) {
     // `ready` and the running container is untouched.
     const runtimeEnv = resolveRuntimeEnv({ deps, env, hostPort });
     const bootKey = assertEncryptionKey(runtimeEnv);
+    // cinatra-cli#219, same seam and the same ordering reason as create: a
+    // foreign endpoint must be refused BEFORE the build and — critically —
+    // before the healthy old container is torn down, so `replaced` stays false
+    // and abort restores the row to `ready` with the running preview untouched.
+    assertContainerDialedEndpointsOwned({ env: runtimeEnv, checkoutDir, deps });
     // Build the NEW image FIRST (a build failure leaves the running preview
     // untouched — we only replace the container after a successful build).
     const ctx = deps.prepareContext({ sha: newSha, checkoutDir });
@@ -1991,6 +2082,7 @@ export const __test = {
   resolveBuildTimeoutMs,
   formatBuildBudget,
   rewriteLoopbackUrlForContainer,
+  containerDialedLoopbackEndpoints,
   isValidSlug,
   isImmutableSha,
   previewImageTag,
