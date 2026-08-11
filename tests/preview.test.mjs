@@ -148,10 +148,18 @@ function makeFakeDocker(state) {
       return { status: state.volumeExists ? 0 : 1, stdout: "", stderr: "" };
     }
     // `docker image inspect <ref>` — default: does NOT exist. cinatra-cli#220
-    // models the LOCAL image set so the build-skip is assertable.
+    // models the LOCAL image set so the build-skip is assertable, INCLUDING the
+    // `cinatra.preview.sha` stamp the reuse decision reads (a docker tag is
+    // mutable, so the tag alone is not proof).
     if (verb === "image" && sub === "inspect") {
-      const present = state.images instanceof Set && state.images.has(args[args.length - 1]);
-      return { status: present ? 0 : 1, stdout: "", stderr: "" };
+      const ref = args[args.length - 1];
+      const present = state.images instanceof Set && state.images.has(ref);
+      if (state.imageProbeUnanswered) {
+        return { status: null, stdout: "", stderr: "", timedOut: true, error: new Error("ETIMEDOUT") };
+      }
+      if (!present) return { status: 1, stdout: "", stderr: `Error: No such image: ${ref}` };
+      const stamped = state.imageLabelSha ?? ref.split("local-")[1] ?? "";
+      return { status: 0, stdout: `${stamped}\n`, stderr: "" };
     }
     // `docker stop|start|rename <name>` — cinatra-cli#220's lifecycle verbs.
     if (verb === "stop") {
@@ -167,7 +175,11 @@ function makeFakeDocker(state) {
     }
     if (verb === "rename") {
       state.renames = [...(state.renames ?? []), args.slice(1)];
-      return { status: state.renameFails ? 1 : 0, stdout: "", stderr: state.renameFails ? "rename boom" : "" };
+      // `renameFailsAfter: n` lets a test fail the n-th rename (the RESTORE) while
+      // letting the park succeed.
+      const n = state.renames.length;
+      const fails = state.renameFails || (Number.isInteger(state.renameFailsAfter) && n > state.renameFailsAfter);
+      return { status: fails ? 1 : 0, stdout: "", stderr: fails ? "rename boom" : "" };
     }
     // `docker rm -f <name>` — container gone.
     if (verb === "rm") {
@@ -1901,5 +1913,122 @@ describe("preview stop / start (cinatra-cli#220 AC3, AC4, AC5, AC6)", () => {
     const { deps: upDeps, logs: upLogs } = makeDeps({ containerRunning: true });
     expect(runPreviewStatus(["--slug", "main"], upDeps)[0].container).toBe("running");
     expect(upLogs.join("\n")).not.toMatch(/row is ready but/);
+  });
+});
+
+// --------------------------------------------------------------------------
+// cinatra-cli#220 — the round-1 review findings, as tests
+// --------------------------------------------------------------------------
+
+describe("preview lifecycle — soundness of the reuse + park/restore paths (cinatra-cli#220)", () => {
+  const OWNED = () => ({
+    containers: [
+      { id: "own-redis", name: "cinatra-redis-1", service: "redis", project: "cinatra", workingDir: tmp, ports: [["127.0.0.1", 6379, 6379]] },
+    ],
+  });
+  function seedReady({ sha = SHA_A, hostPort = 3400, state } = {}) {
+    const slot = makePreviewSlot({ slug: "main", ref: "main", sha, hostPort, now: () => "T0" });
+    writeRegistry(registryPath, { version: 1, previews: { main: state ? { ...slot, state } : slot } });
+  }
+
+  it("a tag that was NOT built from this SHA is rebuilt, never trusted", async () => {
+    seedReady(); // row at SHA_A
+    const { deps, fake, logs } = makeDeps({
+      sha: SHA_B,
+      health: { status: 200, body: '{"status":"ok"}' },
+      images: new Set([previewImageTag(SHA_B)]),
+      imageLabelSha: "not-the-sha-you-are-looking-for",
+      compose: OWNED(),
+    });
+    await runPreviewRefresh(["--slug", "main"], deps);
+    expect(fake.calls.find((c) => c[0] === "build")).toBeTruthy();
+    expect(logs.join("\n")).toMatch(/was NOT built from this SHA/);
+  });
+
+  it("an UNANSWERED image probe builds rather than assuming either way", async () => {
+    seedReady();
+    const { deps, fake, logs } = makeDeps({
+      sha: SHA_B,
+      health: { status: 200, body: '{"status":"ok"}' },
+      images: new Set([previewImageTag(SHA_B)]),
+      imageProbeUnanswered: true,
+      compose: OWNED(),
+    });
+    await runPreviewRefresh(["--slug", "main"], deps);
+    expect(fake.calls.find((c) => c[0] === "build")).toBeTruthy();
+    expect(logs.join("\n")).toMatch(/could not read whether .* is present/);
+  });
+
+  it("a failed create never deletes an image it only REUSED", async () => {
+    const { deps, fake } = makeDeps({
+      sha: SHA_A,
+      health: { status: 503, body: '{"status":"degraded"}' },
+      images: new Set([previewImageTag(SHA_A)]),
+      compose: OWNED(),
+    });
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/did not reach healthy/);
+    expect(fake.calls.some((c) => c[0] === "build")).toBe(false);
+    // The cached artifact survives — the next attempt must not be forced back
+    // through a build this host may not be able to run.
+    expect(fake.calls.some((c) => c[0] === "image" && c[1] === "rm")).toBe(false);
+  });
+
+  it("the parked name cannot collide with another preview's container", () => {
+    // A slug is [a-z0-9][a-z0-9-]* — so `foo--superseded` IS a valid slug, and a
+    // `-` suffix would make parking `foo` target THAT preview's container.
+    expect(P.SUPERSEDED_CONTAINER_SUFFIX).toBe(".superseded");
+    expect(P.isValidSlug("foo--superseded")).toBe(true);
+    expect(P.isValidSlug("foo.superseded")).toBe(false);
+    const parked = `${P.previewContainerName("foo")}${P.SUPERSEDED_CONTAINER_SUFFIX}`;
+    // No valid slug can produce that container name.
+    expect(parked).toBe("cinatra-preview-foo.superseded");
+    expect(P.previewContainerName("foo--superseded")).not.toBe(parked);
+  });
+
+  it("a restore that FAILS says so, and the row is degraded rather than falsely ready", async () => {
+    seedReady();
+    const state = {
+      containerRunning: true,
+      health: { status: 503, body: '{"status":"degraded"}' },
+      images: new Set([previewImageTag(SHA_A)]),
+      compose: OWNED(),
+      renameFailsAfter: 1,
+    };
+    const { deps } = makeDeps(state, { env: { [ENCRYPTION_KEY_ENV]: KEY_64, REDIS_URL: "redis://127.0.0.1:6379" } });
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(
+      /could NOT be brought back[\s\S]*preview is DOWN/,
+    );
+    expect(getPreview(readRegistry(registryPath).registry, "main").state).toBe("degraded");
+  });
+
+  it("start on a DEGRADED row only clears it when health actually passes", async () => {
+    seedReady({ state: "degraded" });
+    // Still unhealthy: the row stays degraded and the container is untouched.
+    const sick = makeDeps({ containerRunning: true, health: { status: 503, body: '{"status":"degraded"}' }, compose: OWNED() });
+    await expect(runPreviewStart(["--slug", "main"], sick.deps)).rejects.toThrow(/is still degraded[\s\S]*--recreate/);
+    expect(getPreview(readRegistry(registryPath).registry, "main").state).toBe("degraded");
+    expect(sick.fake.calls.some((c) => c[0] === "rm" || c[0] === "run")).toBe(false);
+    // Healthy again: promoted, still without touching the container.
+    seedReady({ state: "degraded" });
+    const well = makeDeps({ containerRunning: true, health: { status: 200, body: '{"status":"ok"}' }, compose: OWNED() });
+    const out = await runPreviewStart(["--slug", "main"], well.deps);
+    expect(out.changed).toBe(false);
+    expect(getPreview(readRegistry(registryPath).registry, "main").state).toBe("ready");
+  });
+
+  it("stop CLAIMS the row under the lock and releases it unchanged", async () => {
+    seedReady();
+    const { deps } = makeDeps({ containerRunning: true });
+    // A row already claimed by another operation is refused, not raced.
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: {
+        main: { ...makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }), state: "provisioning" },
+      },
+    });
+    await expect(runPreviewStop(["--slug", "main"], deps)).rejects.toThrow(/already in-flight/);
+    seedReady();
+    await runPreviewStop(["--slug", "main"], deps);
+    expect(getPreview(readRegistry(registryPath).registry, "main").state).toBe("ready");
   });
 });

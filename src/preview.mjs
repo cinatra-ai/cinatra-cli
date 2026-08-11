@@ -232,8 +232,14 @@ export const DOCKER_CLI_PROBE_TIMEOUT_MS = 15_000; // 15s fast docker-CLI metada
 export const PREVIEW_STOP_TIMEOUT_MS = 60_000;
 // Where an existing container is PARKED while a re-materialization is health-
 // gated, so a failure can put it back instead of leaving nothing running
-// (cinatra-cli#220 AC6). Never a name `previewContainerName` can produce.
-export const SUPERSEDED_CONTAINER_SUFFIX = "--superseded";
+// (cinatra-cli#220 AC6).
+//
+// The DOT is load-bearing: a slug is `[a-z0-9][a-z0-9-]*` (`isValidSlug`), so no
+// valid slug can contain one and `cinatra-preview-<slug>.superseded` can never
+// collide with the canonical container of some OTHER preview. A `-` suffix could:
+// `foo--superseded` is itself a valid slug, and parking `foo` would then target a
+// real preview's container. Docker accepts `.` in a container name.
+export const SUPERSEDED_CONTAINER_SUFFIX = ".superseded";
 
 // Preview containers publish their app port (container 3000) to a host port in a
 // DEDICATED pool, disjoint from every port the install/clone systems hand out:
@@ -1438,6 +1444,35 @@ export function dockerObjectExists({ kind, ref, deps }) {
 }
 
 /**
+ * What is known about a preview image tag: "present" (and stamped for THIS sha),
+ * "absent" (docker said so), "unknown" (the probe was not answered), or
+ * "mismatch" (a tag of that name exists but was NOT built from this sha).
+ *
+ * The label check matters because a docker tag is MUTABLE: `cinatra-preview:
+ * local-<sha>` existing is not by itself proof that it holds the artifact for
+ * that sha. `buildPreviewImage` stamps `cinatra.preview.sha` on everything it
+ * builds, so an image that cannot show that stamp is not one this lifecycle
+ * built and is rebuilt rather than trusted — reusing it would replace a healthy
+ * container with a stranger's image and only discover it at the health gate.
+ *
+ * "unknown" is kept distinct from "absent" for the same reason it is for
+ * containers: a timed-out or erroring probe observed nothing (cinatra-cli#220).
+ */
+export function previewImagePresence({ tag, sha, deps }) {
+  const r = deps.runDocker(["image", "inspect", "-f", "{{index .Config.Labels \"cinatra.preview.sha\"}}", tag], {
+    timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS,
+  });
+  if (r.status === 0) {
+    const stamped = (r.stdout ?? "").trim();
+    if (!sha) return { state: "present", sha: stamped };
+    return stamped === sha ? { state: "present", sha: stamped } : { state: "mismatch", sha: stamped };
+  }
+  const said = `${r.stderr ?? ""}`;
+  if (!r.timedOut && !r.error && /no such (image|object)/i.test(said)) return { state: "absent" };
+  return { state: "unknown" };
+}
+
+/**
  * The three states a preview's container can be in, as a fact about docker
  * rather than about the registry row (cinatra-cli#220 AC5): "running" (up and
  * serving), "stopped" (present, holds its durable volume + published port
@@ -1483,12 +1518,29 @@ export function containerState(name, deps) {
  * @returns {{ built: boolean, tag: string }}
  */
 export function ensurePreviewImage({ tag, sha, checkoutDir, rebuild = false, provenance, deps }) {
-  if (!rebuild && dockerObjectExists({ kind: "image", ref: tag, deps })) {
-    deps.log?.(
-      `  reusing the image already present for this SHA: ${tag} — no docker build ` +
-        `(pass --rebuild to force one).`,
-    );
-    return { built: false, tag };
+  if (!rebuild) {
+    const present = previewImagePresence({ tag, sha, deps });
+    if (present.state === "present") {
+      deps.log?.(
+        `  reusing the image already present for this SHA: ${tag} — no docker build ` +
+          `(pass --rebuild to force one).`,
+      );
+      return { built: false, tag };
+    }
+    // Anything short of a POSITIVE identification builds. Say which it was, so a
+    // build nobody asked for is never a mystery — on a host where the build is
+    // the expensive/impossible step, that reason is the whole story.
+    if (present.state === "mismatch") {
+      deps.log?.(
+        `  the image tagged ${tag} was NOT built from this SHA ` +
+          `(cinatra.preview.sha=${present.sha || "<unstamped>"}), so it is rebuilt rather than trusted.`,
+      );
+    } else if (present.state === "unknown") {
+      deps.log?.(
+        `  could not read whether ${tag} is present (docker did not answer the probe) — ` +
+          `building rather than assuming either way.`,
+      );
+    }
   }
   const ctx = deps.prepareContext({ sha, checkoutDir });
   try {
@@ -1817,9 +1869,17 @@ export async function runPreviewCreate(rest, injected = {}) {
   // claim, then re-throw. Image removal is SHA-global-safe (only removes the tag
   // when no OTHER slug references it); the volume is removed only if this create
   // created it.
+  // cinatra-cli#220: an image this invocation REUSED is not this invocation's to
+  // delete. Dropping a cached artifact because a boot failed for an unrelated
+  // (configuration) reason would force the next attempt back through the build
+  // this change exists to avoid — and on a constrained host that build may be
+  // impossible (#210).
+  let imageBuiltHere = false;
   const abort = async (err) => {
     removeContainer(previewContainerName(slug), deps);
-    await removeImageIfUnreferenced(tag, { registryPath: deps.registryPath, keepSlug: slug, deps });
+    if (imageBuiltHere) {
+      await removeImageIfUnreferenced(tag, { registryPath: deps.registryPath, keepSlug: slug, deps });
+    }
     if (!volumePreexisted) {
       deps.runDocker(["volume", "rm", "-f", volumeName], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
     }
@@ -1852,7 +1912,7 @@ export async function runPreviewCreate(rest, injected = {}) {
     assertContainerDialedEndpointsOwned({ env: runtimeEnv, checkoutDir, deps });
 
     // cinatra-cli#220: an image already present for this SHA is reused.
-    ensurePreviewImage({ tag, sha, checkoutDir, rebuild, provenance, deps });
+    imageBuiltHere = ensurePreviewImage({ tag, sha, checkoutDir, rebuild, provenance, deps }).built;
 
     const container = bootPreviewContainer({
       slug,
@@ -1976,9 +2036,10 @@ export async function runPreviewRefresh(rest, injected = {}) {
   // `degraded`. Either way the durable volume is NEVER dropped (AC4) and the new
   // image is removed SHA-global-safe (only if no other slug references it).
   let replaced = false;
+  let imageBuiltHere = false; // cinatra-cli#220 — see create's abort
   const abort = async (err) => {
     if (replaced) removeContainer(previewContainerName(slug), deps);
-    if (newTag !== oldTag) {
+    if (newTag !== oldTag && imageBuiltHere) {
       await removeImageIfUnreferenced(newTag, { registryPath: deps.registryPath, keepSlug: slug, deps });
     }
     await withRegistryLock(deps.registryPath, () => {
@@ -2019,7 +2080,7 @@ export async function runPreviewRefresh(rest, injected = {}) {
     // cinatra-cli#220 AC1: when that image is ALREADY here, no build runs at all
     // — which is what makes re-pointing a preview at changed configuration cheap
     // enough to be possible on a host that cannot build (#210).
-    ensurePreviewImage({ tag: newTag, sha: newSha, checkoutDir, rebuild, provenance, deps });
+    imageBuiltHere = ensurePreviewImage({ tag: newTag, sha: newSha, checkoutDir, rebuild, provenance, deps }).built;
 
     // Replace the running container (AC4: the replaced container is removed —
     // no orphan accumulation), REUSING the durable volume (never dropped).
@@ -2094,43 +2155,74 @@ export async function runPreviewStop(rest, injected = {}) {
   const deps = { ...defaultDeps(), ...injected };
   const checkoutDir = deps.checkoutDir ?? process.cwd();
   const slug = deriveSlug({ rest, checkoutDir });
-  const reg = requireUsableRegistry(deps.registryPath);
-  const row = getPreview(reg, slug);
-  if (!row) {
-    throw new Error(
-      `No preview exists for slug "${slug}". Run \`cinatra instance preview list\` to see the registered previews.`,
-    );
-  }
-  if (row.state === "provisioning") {
-    throw new Error(
-      `An operation is already in-flight for preview "${slug}" (state=provisioning). Wait for it to finish.`,
-    );
-  }
+
+  // CLAIM the row under the lock, exactly like every other mutating verb. A bare
+  // read would race a concurrent refresh: refresh replaces the container and
+  // health-gates it, and a `stop` that decided on the PRE-replacement reading
+  // would stop the new container mid-gate and degrade that refresh.
+  let row;
+  await withRegistryLock(deps.registryPath, () => {
+    const reg = requireUsableRegistry(deps.registryPath);
+    const existing = getPreview(reg, slug);
+    if (!existing) {
+      throw new Error(
+        `No preview exists for slug "${slug}". Run \`cinatra instance preview list\` to see the registered previews.`,
+      );
+    }
+    if (existing.state === "provisioning") {
+      throw new Error(
+        `An operation is already in-flight for preview "${slug}" (state=provisioning). Wait for it to finish.`,
+      );
+    }
+    row = existing;
+    const next = cloneRegistry(reg);
+    next.previews[slug] = { ...existing, state: "provisioning" };
+    writeRegistry(deps.registryPath, next);
+  });
+
+  const release = async (state) => {
+    await withRegistryLock(deps.registryPath, () => {
+      const reg = requireUsableRegistry(deps.registryPath);
+      const cur = getPreview(reg, slug);
+      if (cur && cur.state === "provisioning") {
+        const next = cloneRegistry(reg);
+        next.previews[slug] = { ...cur, state };
+        writeRegistry(deps.registryPath, next);
+      }
+    });
+  };
+
   const name = previewContainerName(slug);
-  const before = containerState(name, deps);
-  if (before === "unknown") {
-    throw new Error(
-      `Could not determine the state of ${name} — docker did not answer the probe (it neither reported ` +
-        `the container nor said it does not exist). Nothing was changed. Check the docker daemon and retry.`,
+  try {
+    const before = containerState(name, deps);
+    if (before === "unknown") {
+      throw new Error(
+        `Could not determine the state of ${name} — docker did not answer the probe (it neither reported ` +
+          `the container nor said it does not exist). Nothing was changed. Check the docker daemon and retry.`,
+      );
+    }
+    if (before === "absent") {
+      deps.log(`preview "${slug}": no container ${name} to stop (image ${row.imageTag} is still recorded).`);
+      return { slug, container: "absent", changed: false };
+    }
+    if (before === "stopped") {
+      deps.log(`preview "${slug}": ${name} is already stopped.`);
+      return { slug, container: "stopped", changed: false };
+    }
+    const r = deps.runDocker(["stop", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+    if (r.error || r.status !== 0) {
+      throw new Error(`docker stop of preview ${name} failed` + (r.stderr ? `: ${r.stderr.trim()}` : "."));
+    }
+    deps.log(
+      `preview "${slug}" stopped: ${name} is down; the durable volume ${row.volumeName} and host port ` +
+        `${row.hostPort ?? "-"} are kept. \`cinatra instance preview start --slug ${slug}\` brings it back.`,
     );
+    return { slug, container: "stopped", changed: true };
+  } finally {
+    // `stop` never changes what the row RECORDS — the container's state is
+    // docker's fact, which `status` reads live (AC5).
+    await release(row.state);
   }
-  if (before === "absent") {
-    deps.log(`preview "${slug}": no container ${name} to stop (image ${row.imageTag} is still recorded).`);
-    return { slug, container: "absent", changed: false };
-  }
-  if (before === "stopped") {
-    deps.log(`preview "${slug}": ${name} is already stopped.`);
-    return { slug, container: "stopped", changed: false };
-  }
-  const r = deps.runDocker(["stop", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
-  if (r.error || r.status !== 0) {
-    throw new Error(`docker stop of preview ${name} failed` + (r.stderr ? `: ${r.stderr.trim()}` : "."));
-  }
-  deps.log(
-    `preview "${slug}" stopped: ${name} is down; the durable volume ${row.volumeName} and host port ` +
-      `${row.hostPort ?? "-"} are kept. \`cinatra instance preview start --slug ${slug}\` brings it back.`,
-  );
-  return { slug, container: "stopped", changed: true };
 }
 
 /**
@@ -2225,8 +2317,31 @@ export async function runPreviewStart(rest, injected = {}) {
 
   try {
     if (present === "running" && !recreate) {
-      deps.log(`preview "${slug}" is already running: ${tag} on http://localhost:${hostPort}`);
-      await release(row.state === "degraded" ? "ready" : row.state);
+      if (row.state !== "degraded") {
+        deps.log(`preview "${slug}" is already running: ${tag} on http://localhost:${hostPort}`);
+        await release(row.state);
+        return { slug, container: "running", changed: false, rematerialized: false, hostPort };
+      }
+      // A DEGRADED row means the last run's health gate did not pass. "docker
+      // says it is running" is not the same fact and must never clear it — the
+      // container that failed the gate is typically still running. Re-probe, and
+      // only a real healthy answer promotes the row.
+      deps.log(`preview "${slug}" is running but its row is degraded; re-probing http://localhost:${hostPort}/api/health ...`);
+      const probe = await pollHealthGate({
+        url: `http://localhost:${hostPort}/api/health`,
+        deps: { ...deps, isRunning: () => containerRunning(name, deps) },
+      });
+      if (probe.state !== "healthy") {
+        await release("degraded");
+        throw new Error(
+          `preview "${slug}" is still degraded (terminal state: ${probe.state}` +
+            (probe.status ? `, http ${probe.status}` : "") + `). The container was left running and untouched. ` +
+            `\`cinatra instance preview start --slug ${slug} --recreate\` re-materializes it with freshly ` +
+            `composed environment (no build), which is the fix when the configuration is what changed.`,
+        );
+      }
+      await release("ready");
+      deps.log(`preview "${slug}" is healthy again: ${tag} on http://localhost:${hostPort}`);
       return { slug, container: "running", changed: false, rematerialized: false, hostPort };
     }
 
@@ -2287,12 +2402,28 @@ export async function runPreviewStart(rest, injected = {}) {
       deps.runDocker(["stop", parked], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
     }
 
+    // Put the parked container back. Every step is CHECKED: a restore that
+    // silently failed would leave the canonical container absent while the
+    // message claimed it was back, and the row would say `ready`.
     const restore = () => {
-      if (!parked) return;
+      if (!parked) return { restored: false, parked: null };
       removeContainer(name, deps);
-      deps.runDocker(["rename", parked, name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
-      deps.runDocker(["start", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+      const back = deps.runDocker(["rename", parked, name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+      if (back.error || back.status !== 0) return { restored: false, parked };
+      const up = deps.runDocker(["start", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+      if (up.error || up.status !== 0) return { restored: false, parked: name };
+      return { restored: containerState(name, deps) === "running", parked: null };
     };
+    /** The tail of a failure message: what the restore actually achieved. */
+    const restoreNote = (r) =>
+      !parked
+        ? `There was no previous container to restore. `
+        : r.restored
+          ? `The PREVIOUS container was restored and restarted — this run left the preview as it found it. `
+          : `The previous container could NOT be brought back and is left ` +
+            `${r.parked ? `as ${r.parked}` : `removed`}; the preview is DOWN. ` +
+            `\`cinatra instance preview start --slug ${slug} --recreate\` re-materializes it from ${tag} ` +
+            `(no build)${r.parked ? `; remove ${r.parked} once you no longer need it` : ""}. `;
 
     let container;
     try {
@@ -2306,9 +2437,9 @@ export async function runPreviewStart(rest, injected = {}) {
         deps: { ...deps, env: runtimeEnv },
       });
     } catch (err) {
-      restore();
-      await release(row.state);
-      throw err;
+      const r = restore();
+      await release(r.restored || !parked ? row.state : "degraded");
+      throw new Error(`${err?.message ?? err}\n  ${restoreNote(r).trim()}`);
     }
     deps.log(
       `  re-materialized ${container} from the image already present (${tag}) — no build; ` +
@@ -2320,14 +2451,12 @@ export async function runPreviewStart(rest, injected = {}) {
     });
     if (result.state !== "healthy") {
       const diag = dumpContainerLogs(container, deps);
-      restore();
-      await release(parked ? row.state : "degraded");
+      const r = restore();
+      await release(r.restored ? row.state : "degraded");
       throw new Error(
         `preview "${slug}" did not reach healthy after re-materializing (terminal state: ${result.state}` +
           (result.status ? `, http ${result.status}` : "") + `). ` +
-          (parked
-            ? `The PREVIOUS container was restored and restarted — this run left the preview as it found it. `
-            : `There was no previous container to restore. `) +
+          restoreNote(r) +
           `The durable volume ${row.volumeName} was never touched.` +
           `\n--- container logs (tail) ---\n${diag.slice(-4000)}`,
       );
@@ -2478,6 +2607,7 @@ export const __test = {
   buildPreviewImage,
   bootPreviewContainer,
   dockerObjectExists,
+  previewImagePresence,
   ensurePreviewImage,
   containerRunning,
   containerState,
