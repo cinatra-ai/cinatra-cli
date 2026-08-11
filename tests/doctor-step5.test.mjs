@@ -27,6 +27,7 @@ import {
   deriveConfiguredPublicMcpUrl,
   doctorAssertLlmMcpAccess,
   doctorAssertDevAppsPresence,
+  effectiveComposeProjectName,
   DOCTOR_CMS_WRITE_TOOLS,
   LLM_MCP_SETTINGS_KEY,
   MCP_SETTINGS_KEY,
@@ -96,10 +97,25 @@ function throwingFetch() {
   };
 }
 
-// A docker runner stub keyed by the first meaningful arg.
-function makeDocker({ running = [], plugins = [], modules = [] } = {}) {
+// A docker runner stub keyed by the first meaningful arg. `composeRunning`
+// answers the label-scoped lookups (com.docker.compose.project + .service)
+// the wayflow assertion uses; `running` answers the fixed-name lookups of the
+// CMS assertions.
+function makeDocker({ running = [], plugins = [], modules = [], composeRunning = [] } = {}) {
   return function dockerImpl(args) {
     if (args[0] === "ps") {
+      const labelFilters = args
+        .filter((a) => typeof a === "string" && a.startsWith("label=com.docker.compose."))
+        .map((a) => a.replace("label=", "").split("="));
+      if (labelFilters.length > 0) {
+        const want = Object.fromEntries(labelFilters);
+        const hit = composeRunning.find(
+          (c) =>
+            (!want["com.docker.compose.project"] || c.project === want["com.docker.compose.project"]) &&
+            (!want["com.docker.compose.service"] || c.service === want["com.docker.compose.service"]),
+        );
+        return { status: 0, stdout: hit ? hit.name : "" };
+      }
       const filter = args.find((a) => a.startsWith("name=^/"));
       const name = filter ? filter.replace("name=^/", "").replaceAll("$", "") : "";
       return { status: 0, stdout: running.includes(name) ? name : "" };
@@ -847,6 +863,13 @@ describe("runDoctorCore — gather → remediate → fresh re-gather → gate", 
 // The SKIP on a down container MUST name the exact start command.
 // =========================================================================
 describe("gatherDoctorReport: wayflow-readiness", () => {
+  // The assertion scopes its lookup by the EFFECTIVE compose project (env or
+  // checkout basename), mirroring the -p-less start invocation. Tests derive
+  // the same project the assertion will (repoRoot: process.cwd()).
+  const PROJECT = effectiveComposeProjectName(process.cwd());
+  const WAYFLOW_UP = makeDocker({
+    composeRunning: [{ project: PROJECT, service: "wayflow", name: `${PROJECT}-wayflow-1` }],
+  });
   function baseStore() {
     return { [LLM_KEY]: provisionedLlm(), [MCP_KEY]: publicUrlRow() };
   }
@@ -876,7 +899,7 @@ describe("gatherDoctorReport: wayflow-readiness", () => {
         throw new Error("ECONNREFUSED");
       },
     });
-    const dockerImpl = makeDocker({ running: ["cinatra-wayflow-1"] });
+    const dockerImpl = WAYFLOW_UP;
     const report = await reportWith({ fetchImpl, dockerImpl });
     const a = byId(report, "wayflow-readiness");
     expect(a.verdict).toBe("pass");
@@ -892,7 +915,7 @@ describe("gatherDoctorReport: wayflow-readiness", () => {
         throw new Error("ECONNREFUSED");
       },
     });
-    const dockerImpl = makeDocker({ running: ["cinatra-wayflow-1"] });
+    const dockerImpl = WAYFLOW_UP;
     const report = await reportWith({ fetchImpl, dockerImpl });
     const a = byId(report, "wayflow-readiness");
     expect(a.verdict).toBe("pass");
@@ -901,7 +924,7 @@ describe("gatherDoctorReport: wayflow-readiness", () => {
   });
 
   it("container up but /.health not answering (loader booting) → SKIP, never PASS", async () => {
-    const dockerImpl = makeDocker({ running: ["cinatra-wayflow-1"] });
+    const dockerImpl = WAYFLOW_UP;
     const report = await reportWith({ fetchImpl: throwingFetch(), dockerImpl });
     const a = byId(report, "wayflow-readiness");
     expect(a.verdict).toBe("skip");
@@ -915,10 +938,21 @@ describe("gatherDoctorReport: wayflow-readiness", () => {
         throw new Error("ECONNREFUSED");
       },
     });
-    const dockerImpl = makeDocker({ running: ["cinatra-wayflow-1"] });
+    const dockerImpl = WAYFLOW_UP;
     const report = await reportWith({ fetchImpl, dockerImpl });
     const a = byId(report, "wayflow-readiness");
     expect(a.verdict).toBe("fail");
+    expect(a.remediation).toContain("cinatra instance wayflow start");
+  });
+
+  it("a wayflow container under a DIFFERENT compose project is not ours → SKIP with the start command", async () => {
+    const dockerImpl = makeDocker({
+      composeRunning: [{ project: "someone-elses-stack", service: "wayflow", name: "someone-elses-stack-wayflow-1" }],
+    });
+    const report = await reportWith({ fetchImpl: throwingFetch(), dockerImpl });
+    const a = byId(report, "wayflow-readiness");
+    expect(a.verdict).toBe("skip");
+    expect(a.detail).toContain(`compose project "${PROJECT}"`);
     expect(a.remediation).toContain("cinatra instance wayflow start");
   });
 
@@ -929,7 +963,7 @@ describe("gatherDoctorReport: wayflow-readiness", () => {
         throw new Error("ECONNREFUSED");
       },
     });
-    const dockerImpl = makeDocker({ running: ["cinatra-wayflow-1"] });
+    const dockerImpl = WAYFLOW_UP;
     const report = await reportWith({ fetchImpl, dockerImpl });
     expect(byId(report, "wayflow-readiness").verdict).toBe("fail");
   });

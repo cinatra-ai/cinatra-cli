@@ -16,7 +16,11 @@ import path from "node:path";
 
 import { describe, it, expect } from "vitest";
 
-import { composeWayflowArgs, ensureWayflowBridgeEnv } from "../src/index.mjs";
+import {
+  composeWayflowArgs,
+  ensureWayflowBridgeEnv,
+  effectiveComposeProjectName,
+} from "../src/index.mjs";
 
 describe("composeWayflowArgs", () => {
   it("start: profile-enabled, scoped to the single wayflow service, with --build", () => {
@@ -99,5 +103,28 @@ describe("ensureWayflowBridgeEnv", () => {
     });
     expect(ok).toBe(true);
     expect(spawned).toBe(false);
+  });
+});
+
+describe("effectiveComposeProjectName", () => {
+  it("an explicit COMPOSE_PROJECT_NAME wins over the checkout basename", () => {
+    expect(
+      effectiveComposeProjectName("/home/dev/cinatra", { COMPOSE_PROJECT_NAME: "my-stack" }),
+    ).toBe("my-stack");
+  });
+
+  it("falls back to the checkout directory basename when the env var is absent or blank", () => {
+    expect(effectiveComposeProjectName("/home/dev/cinatra", {})).toBe("cinatra");
+    expect(effectiveComposeProjectName("/home/dev/cinatra", { COMPOSE_PROJECT_NAME: "   " })).toBe(
+      "cinatra",
+    );
+  });
+
+  it("normalizes like Compose: lowercase, invalid chars dropped, leading separators trimmed", () => {
+    expect(effectiveComposeProjectName("/home/dev/My Repo.Fork", {})).toBe("myrepofork");
+    expect(effectiveComposeProjectName("/home/dev/_hidden-repo", {})).toBe("hidden-repo");
+    expect(
+      effectiveComposeProjectName("/ignored", { COMPOSE_PROJECT_NAME: "Cinatra Fix#42" }),
+    ).toBe("cinatrafix42");
   });
 });

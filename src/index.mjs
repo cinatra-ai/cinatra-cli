@@ -4481,17 +4481,35 @@ const DOCTOR_DRUPAL = {
   mcpToolsPath: "/_mcp_tools",
   requiredModule: "cinatra",
 };
-// The shared WayFlow agent runtime (docker-compose.yml `wayflow` service,
-// default compose container name). Profile-gated, so a default dev bring-up
-// never starts it: the exact fresh-install state where every agent run dies
-// with ECONNREFUSED against :3010. `/.health` is the loader's own contract
-// (returns {"status":"ok"|"degraded","agents":<count>,...}); the compose
-// healthcheck treats BOTH ok and degraded as healthy (a single broken agent
-// must not condemn the runtime), and the doctor mirrors that.
+// The shared WayFlow agent runtime (docker-compose.yml `wayflow` service).
+// Profile-gated, so a default dev bring-up never starts it: the exact
+// fresh-install state where every agent run dies with ECONNREFUSED against
+// :3010. `/.health` is the loader's own contract (returns
+// {"status":"ok"|"degraded","agents":<count>,...}); the compose healthcheck
+// treats BOTH ok and degraded as healthy (a single broken agent must not
+// condemn the runtime), and the doctor mirrors that.
+//
+// The container is resolved by Compose LABELS (project + service), NOT a fixed
+// `cinatra-wayflow-1` name: `runDevWayflow` starts Compose without `-p`, so the
+// effective project comes from COMPOSE_PROJECT_NAME or the checkout directory
+// basename — under a custom project name a fixed-name lookup reported a RUNNING
+// runtime as down and printed a useless start hint.
 const DOCTOR_WAYFLOW = {
-  containerName: "cinatra-wayflow-1",
+  service: "wayflow",
   healthUrl: "http://localhost:3010/.health",
 };
+
+// Resolve the effective Compose project name the way `docker compose` itself
+// does when no `-p` is passed (the wayflow start path passes none): an explicit
+// COMPOSE_PROJECT_NAME wins, else the checkout directory's basename, normalized
+// per Compose's rules (lowercased, chars outside [a-z0-9_-] dropped, leading
+// separators trimmed so the name starts alphanumeric).
+function effectiveComposeProjectName(repoRoot, env = process.env) {
+  const explicit =
+    typeof env.COMPOSE_PROJECT_NAME === "string" ? env.COMPOSE_PROJECT_NAME.trim() : "";
+  const raw = explicit || path.basename(repoRoot ?? "");
+  return raw.toLowerCase().replace(/[^a-z0-9_-]/g, "").replace(/^[_-]+/, "");
+}
 
 function makeAssertion(id, label, verdict, detail, remediation) {
   return { id, label, verdict, detail, remediation: remediation ?? null };
@@ -5079,15 +5097,29 @@ async function doctorAssertDrupalReadiness({ fetchImpl, dockerImpl }) {
 // `ok` and `degraded` are both healthy (mirrors the compose healthcheck;
 // per-agent load failures must never condemn the runtime), anything else is a
 // FAIL with the rebuild remediation the agents preflight prescribes.
-async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl }) {
+async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot }) {
   const id = "wayflow-readiness";
   const label = "WayFlow agent runtime readiness (read-only)";
-  if (!doctorContainerRunning(dockerImpl, DOCTOR_WAYFLOW.containerName)) {
+  // Label-scoped lookup (project + service), mirroring how the start path's
+  // `-p`-less compose invocation names its containers. A fixed
+  // `cinatra-wayflow-1` would miss any custom COMPOSE_PROJECT_NAME.
+  const project = effectiveComposeProjectName(repoRoot);
+  const ps = doctorDockerRun(dockerImpl, [
+    "ps",
+    "--filter",
+    `label=com.docker.compose.project=${project}`,
+    "--filter",
+    `label=com.docker.compose.service=${DOCTOR_WAYFLOW.service}`,
+    "--format",
+    "{{.Names}}",
+  ]);
+  const runningContainer = ps.ok ? (ps.stdout.trim().split("\n")[0] ?? "").trim() : "";
+  if (runningContainer === "") {
     return makeAssertion(
       id,
       label,
       "skip",
-      `${DOCTOR_WAYFLOW.containerName} not running; agent runs fail with ECONNREFUSED until it is`,
+      `no running ${DOCTOR_WAYFLOW.service} container in compose project "${project}"; agent runs fail with ECONNREFUSED until it is started`,
       "Start the WayFlow agent runtime (`cinatra instance wayflow start`), then re-run `cinatra doctor`.",
     );
   }
@@ -5129,7 +5161,7 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl }) {
       "fail",
       `/.health unhealthy (HTTP ${httpStatus ?? "no-response"}, status=${runtimeStatus ?? "unparseable"})`,
       "Rebuild + restart the runtime (`cinatra instance wayflow start`) and check `docker logs " +
-        `${DOCTOR_WAYFLOW.containerName}\`.`,
+        `${runningContainer}\`.`,
     );
   }
   const agentCount = typeof health?.agents === "number" ? health.agents : null;
@@ -5142,7 +5174,7 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl }) {
       "pass",
       `runtime up; /.health degraded${agentNote}` +
         (failed === null ? "" : `; ${failed} agent(s) failed to load`) +
-        `; check \`docker logs ${DOCTOR_WAYFLOW.containerName}\` for the per-agent errors`,
+        `; check \`docker logs ${runningContainer}\` for the per-agent errors`,
     );
   }
   return makeAssertion(id, label, "pass", `runtime up; /.health ok${agentNote}`);
@@ -5233,8 +5265,9 @@ async function gatherDoctorReport({
 
   // 8 -- WayFlow agent runtime readiness (profile-gated; a fresh dev install
   // has it DOWN and every agent run fails with ECONNREFUSED; the skip
-  // remediation names the exact start command).
-  assertions.push(await doctorAssertWayflowReadiness({ fetchImpl, dockerImpl }));
+  // remediation names the exact start command). repoRoot feeds the compose
+  // project-name resolution the container lookup is scoped by.
+  assertions.push(await doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot }));
 
   // 9 -- dev-app clone presence.
   assertions.push(doctorAssertDevAppsPresence(repoRoot));
@@ -14177,9 +14210,11 @@ export {
   printDoctorAssertion,
   DOCTOR_CMS_WRITE_TOOLS,
   // `instance wayflow start|stop` seams (pure / injectable): the compose
-  // invocation shape and the bridge-token env-generation gate.
+  // invocation shape, the bridge-token env-generation gate, and the compose
+  // project-name resolution the doctor's label-scoped container lookup uses.
   composeWayflowArgs,
   ensureWayflowBridgeEnv,
+  effectiveComposeProjectName,
   // cinatra-cli#105 — HEAD-stamped `.next` auto-clean (pure seams).
   cleanNextBuildCache,
   readNextBuildStamp,
