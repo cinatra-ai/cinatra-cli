@@ -927,6 +927,59 @@ export async function runInstallPreviewRefresh(rest = [], injected = {}) {
   });
 }
 
+/**
+ * `cinatra instance preview start`, able to CONTINUE a preview the front door
+ * created (cinatra-cli#220, the same continuation contract as `refresh`).
+ *
+ * This is the verb the stale-endpoint case actually needs: re-banding an
+ * instance's infra rewrites `.env.local`, and the preview keeps the PREVIOUS
+ * band's addresses baked into its container env until something replaces the
+ * container. `start --recreate` replaces it with FRESHLY COMPOSED environment
+ * and no build — so the composition has to be the same one `refresh` performs,
+ * or the re-materialized container would boot on ambient shell state instead of
+ * the install's.
+ *
+ * Identical rules to the refresh continuation, deliberately: the composed values
+ * are only a BASE that the ambient environment overrides, the persisted boot key
+ * is used only when `CINATRA_ENCRYPTION_KEY` is unset, a checkout with no
+ * `.env.local` composes nothing (and is handed straight through), and a
+ * continuation INVENTS NOTHING — no effective-endpoint synthesis, because start
+ * cannot see the infra plan those values would only be valid for.
+ */
+export async function runInstallPreviewStart(rest = [], injected = {}) {
+  const { runPreviewStart } = await import("./preview.mjs");
+  const deps = { ...defaultDeps(), ...injected };
+  const checkoutDir = deps.checkoutDir ?? process.cwd();
+  const ambientEnv = deps.env ?? process.env;
+  const slug = deriveSlug({ rest, checkoutDir });
+
+  const secretsFile = deps.previewSecretsPath ?? previewSecretsPath();
+  const storedKey =
+    typeof ambientEnv[ENCRYPTION_KEY_ENV] === "string" && ambientEnv[ENCRYPTION_KEY_ENV].trim().length > 0
+      ? null
+      : lookupPreviewEncryptionKey({ slug, filePath: secretsFile });
+
+  const plan = makePreviewComposition({
+    targetDir: checkoutDir,
+    slug,
+    encryptionKey: storedKey,
+    baseEnv: ambientEnv,
+    continuation: true,
+    deps,
+  });
+
+  if (!plan.composes && !storedKey) {
+    return runPreviewStart(rest, { ...injected, checkoutDir });
+  }
+
+  return runPreviewStart(rest, {
+    ...injected,
+    checkoutDir,
+    env: plan.preEnv,
+    composeRuntimeEnv: plan.composeRuntimeEnv,
+  });
+}
+
 // --- test surface ----------------------------------------------------------
 
 export const __test = {

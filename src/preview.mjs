@@ -226,6 +226,14 @@ export const PREVIEW_BUILD_CI_ARG = "CI";
 export const PREVIEW_HEALTH_TIMEOUT_MS = 180_000; // 3m health-gate budget (mirrors prod-boot-e2e default)
 export const PREVIEW_HEALTH_POLL_INTERVAL_MS = 3_000; // 3s (mirrors prod-boot-e2e sleep 3)
 export const DOCKER_CLI_PROBE_TIMEOUT_MS = 15_000; // 15s fast docker-CLI metadata probes
+// `docker stop`/`start` are not metadata probes: stop sends SIGTERM and waits
+// out the container's own grace period (10s by default) before SIGKILL, so the
+// metadata budget would abort a perfectly normal shutdown (cinatra-cli#220).
+export const PREVIEW_STOP_TIMEOUT_MS = 60_000;
+// Where an existing container is PARKED while a re-materialization is health-
+// gated, so a failure can put it back instead of leaving nothing running
+// (cinatra-cli#220 AC6). Never a name `previewContainerName` can produce.
+export const SUPERSEDED_CONTAINER_SUFFIX = "--superseded";
 
 // Preview containers publish their app port (container 3000) to a host port in a
 // DEDICATED pool, disjoint from every port the install/clone systems hand out:
@@ -1430,6 +1438,63 @@ export function dockerObjectExists({ kind, ref, deps }) {
 }
 
 /**
+ * The three states a preview's container can be in, as a fact about docker
+ * rather than about the registry row (cinatra-cli#220 AC5): "running" (up and
+ * serving), "stopped" (present, holds its durable volume + published port
+ * mapping, currently down) and "absent" (nothing to start).
+ *
+ * `docker container inspect` succeeds for a STOPPED container, so presence and
+ * liveness are two different questions and both are asked here.
+ */
+export function containerState(name, deps) {
+  const r = deps.runDocker(["container", "inspect", "-f", "{{.State.Running}}", name], {
+    timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS,
+  });
+  if (r.status !== 0) return "absent";
+  return (r.stdout ?? "").trim() === "true" ? "running" : "stopped";
+}
+
+/**
+ * cinatra-cli#220 AC1/AC2 — build the image ONLY when it is not already here.
+ *
+ * `cinatra-preview:local-<sha>` is content-addressed by construction: the tag
+ * names the SHA it was built from, so an existing tag IS the artifact for that
+ * SHA and rebuilding it produces the same thing at the cost of a full
+ * multi-stage build. That cost is not merely time: on a memory-constrained host
+ * the build can be IMPOSSIBLE (cinatra-cli#210), and making a build a hard
+ * dependency of a configuration change means a host that cannot build cannot
+ * reconfigure.
+ *
+ * The mechanism this needs already existed — `dockerObjectExists` supports
+ * image inspection and was only ever called for a volume. This is its caller.
+ *
+ * `rebuild` (the `--rebuild` / `--force-build` escape hatch) forces the build
+ * back on, for a deliberately dirty rebuild of a tag whose SHA is unchanged.
+ *
+ * @returns {{ built: boolean, tag: string }}
+ */
+export function ensurePreviewImage({ tag, sha, checkoutDir, rebuild = false, provenance, deps }) {
+  if (!rebuild && dockerObjectExists({ kind: "image", ref: tag, deps })) {
+    deps.log?.(
+      `  reusing the image already present for this SHA: ${tag} — no docker build ` +
+        `(pass --rebuild to force one).`,
+    );
+    return { built: false, tag };
+  }
+  const ctx = deps.prepareContext({ sha, checkoutDir });
+  try {
+    buildPreviewImage({ tag, contextDir: ctx.contextDir, deps, provenance, sha });
+  } finally {
+    try {
+      ctx.cleanup?.();
+    } catch {
+      /* best-effort */
+    }
+  }
+  return { built: true, tag };
+}
+
+/**
  * True iff a container is actually RUNNING (not merely present). `docker
  * container inspect <name>` succeeds even for a STOPPED/exited container, so a
  * bare existence check would misclassify a crash as a timeout. Mirrors
@@ -1567,6 +1632,11 @@ function readOption(rest, flag) {
   return undefined;
 }
 
+/** True iff any of `flags` appears as a bare switch in `rest`. */
+export function readFlag(rest, ...flags) {
+  return rest.some((a) => flags.includes(a));
+}
+
 /**
  * Derive the preview slug: explicit `--slug`, else the checkout's current git
  * branch sanitized, else "main".
@@ -1686,6 +1756,8 @@ export async function runPreviewCreate(rest, injected = {}) {
   const slug = deriveSlug({ rest, checkoutDir });
   const ref = readOption(rest, "--ref") ?? "main";
   const explicitPort = readOption(rest, "--port");
+  // cinatra-cli#220: force a build even when this SHA's image is already here.
+  const rebuild = readFlag(rest, "--rebuild", "--force-build");
 
   const sha = deps.resolveSha(ref, checkoutDir);
   const tag = previewImageTag(sha);
@@ -1768,16 +1840,8 @@ export async function runPreviewCreate(rest, injected = {}) {
     // ahead of the build so a refusal costs nothing to recover from.
     assertContainerDialedEndpointsOwned({ env: runtimeEnv, checkoutDir, deps });
 
-    const ctx = deps.prepareContext({ sha, checkoutDir });
-    try {
-      buildPreviewImage({ tag, contextDir: ctx.contextDir, deps, provenance, sha });
-    } finally {
-      try {
-        ctx.cleanup?.();
-      } catch {
-        /* best-effort */
-      }
-    }
+    // cinatra-cli#220: an image already present for this SHA is reused.
+    ensurePreviewImage({ tag, sha, checkoutDir, rebuild, provenance, deps });
 
     const container = bootPreviewContainer({
       slug,
@@ -1851,6 +1915,7 @@ export async function runPreviewRefresh(rest, injected = {}) {
 
   const slug = deriveSlug({ rest, checkoutDir });
   const ref = readOption(rest, "--ref") ?? "main";
+  const rebuild = readFlag(rest, "--rebuild", "--force-build"); // cinatra-cli#220
   const newSha = deps.resolveSha(ref, checkoutDir);
   const newTag = previewImageTag(newSha);
   const provenance = previewProvenance(newSha);
@@ -1938,18 +2003,12 @@ export async function runPreviewRefresh(rest, injected = {}) {
     // before the healthy old container is torn down, so `replaced` stays false
     // and abort restores the row to `ready` with the running preview untouched.
     assertContainerDialedEndpointsOwned({ env: runtimeEnv, checkoutDir, deps });
-    // Build the NEW image FIRST (a build failure leaves the running preview
-    // untouched — we only replace the container after a successful build).
-    const ctx = deps.prepareContext({ sha: newSha, checkoutDir });
-    try {
-      buildPreviewImage({ tag: newTag, contextDir: ctx.contextDir, deps, provenance, sha: newSha });
-    } finally {
-      try {
-        ctx.cleanup?.();
-      } catch {
-        /* best-effort */
-      }
-    }
+    // Acquire the NEW image FIRST (a build failure leaves the running preview
+    // untouched — we only replace the container after the image is in hand).
+    // cinatra-cli#220 AC1: when that image is ALREADY here, no build runs at all
+    // — which is what makes re-pointing a preview at changed configuration cheap
+    // enough to be possible on a host that cannot build (#210).
+    ensurePreviewImage({ tag: newTag, sha: newSha, checkoutDir, rebuild, provenance, deps });
 
     // Replace the running container (AC4: the replaced container is removed —
     // no orphan accumulation), REUSING the durable volume (never dropped).
@@ -2007,6 +2066,253 @@ export async function runPreviewRefresh(rest, injected = {}) {
 }
 
 /**
+ * `cinatra instance preview stop` (cinatra-cli#220 AC4).
+ *
+ * Stops the preview's container and NOTHING else: the durable volume, the
+ * recorded host port, the image tag and the registry row are all untouched, so
+ * `start` brings the SAME preview back. Reaching past the CLI to `docker stop`
+ * was previously the only way to do this.
+ *
+ * The registry `state` deliberately does not change. It records what the
+ * LIFECYCLE knows about the row (ready / provisioning / degraded); whether the
+ * container is up is a fact about docker, which `status` now reads live (AC5).
+ * Encoding "stopped" in the row would be a second, immediately-stale copy of a
+ * truth docker already owns.
+ */
+export async function runPreviewStop(rest, injected = {}) {
+  const deps = { ...defaultDeps(), ...injected };
+  const checkoutDir = deps.checkoutDir ?? process.cwd();
+  const slug = deriveSlug({ rest, checkoutDir });
+  const reg = requireUsableRegistry(deps.registryPath);
+  const row = getPreview(reg, slug);
+  if (!row) {
+    throw new Error(
+      `No preview exists for slug "${slug}". Run \`cinatra instance preview list\` to see the registered previews.`,
+    );
+  }
+  if (row.state === "provisioning") {
+    throw new Error(
+      `An operation is already in-flight for preview "${slug}" (state=provisioning). Wait for it to finish.`,
+    );
+  }
+  const name = previewContainerName(slug);
+  const before = containerState(name, deps);
+  if (before === "absent") {
+    deps.log(`preview "${slug}": no container ${name} to stop (image ${row.imageTag} is still recorded).`);
+    return { slug, container: "absent", changed: false };
+  }
+  if (before === "stopped") {
+    deps.log(`preview "${slug}": ${name} is already stopped.`);
+    return { slug, container: "stopped", changed: false };
+  }
+  const r = deps.runDocker(["stop", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+  if (r.error || r.status !== 0) {
+    throw new Error(`docker stop of preview ${name} failed` + (r.stderr ? `: ${r.stderr.trim()}` : "."));
+  }
+  deps.log(
+    `preview "${slug}" stopped: ${name} is down; the durable volume ${row.volumeName} and host port ` +
+      `${row.hostPort ?? "-"} are kept. \`cinatra instance preview start --slug ${slug}\` brings it back.`,
+  );
+  return { slug, container: "stopped", changed: true };
+}
+
+/**
+ * `cinatra instance preview start` (cinatra-cli#220 AC3 + AC4).
+ *
+ * Three cases, one verb:
+ *   - the container is RUNNING  → nothing to do (idempotent).
+ *   - the container is STOPPED  → `docker start` it and health-gate. The
+ *     container is not destroyed at any point, so this is the NARROWEST failure
+ *     window of any path in this lifecycle.
+ *   - the container is ABSENT   → RE-MATERIALIZE it from the image the row
+ *     already records, with FRESHLY COMPOSED environment and no build.
+ *
+ * `--recreate` forces the re-materialization even when a container exists —
+ * this is the answer to AC3's stale-endpoint case: re-banding an instance's
+ * infra rewrites `.env.local`, and the running preview keeps the previous
+ * band's addresses baked into its container env until something replaces the
+ * container. Before this verb the only remedy was `refresh`, i.e. a full image
+ * build for a change that never touched the image.
+ *
+ * AC6 (the failure window): a re-materialize must not widen the window a
+ * refresh already has, and a cheap one is the opportunity to narrow it. So the
+ * existing container is not destroyed to make room — it is RENAMED aside and
+ * stopped, the new one is health-gated, and only then is the old one dropped. A
+ * failed re-materialize RESTORES the old container instead of leaving the row
+ * degraded with nothing running.
+ */
+export async function runPreviewStart(rest, injected = {}) {
+  const deps = { ...defaultDeps(), ...injected };
+  const checkoutDir = deps.checkoutDir ?? process.cwd();
+  const env = deps.env ?? process.env;
+  const slug = deriveSlug({ rest, checkoutDir });
+  const recreate = readFlag(rest, "--recreate", "--re-materialize");
+
+  // The same fail-fast gates the other mutating verbs apply, in the same order.
+  assertMaterializeNotDisabled(env);
+  resolveEndpointOwnershipMode(deps.ownershipControlEnv ?? deps.env ?? process.env);
+  assertPreviewCheckoutAllowed({ envMode: readCheckoutEnvMode(checkoutDir) });
+
+  let row;
+  await withRegistryLock(deps.registryPath, () => {
+    const reg = requireUsableRegistry(deps.registryPath);
+    const existing = getPreview(reg, slug);
+    if (!existing) {
+      throw new Error(
+        `No preview exists for slug "${slug}" to start. Run ` +
+          `\`cinatra instance preview create --slug ${slug} --ref <ref>\` first.`,
+      );
+    }
+    if (existing.state === "provisioning") {
+      throw new Error(`An operation is already in-flight for preview "${slug}" (state=provisioning). Wait for it to finish.`);
+    }
+    row = existing;
+    const next = cloneRegistry(reg);
+    next.previews[slug] = { ...existing, state: "provisioning" };
+    writeRegistry(deps.registryPath, next);
+  });
+
+  const name = previewContainerName(slug);
+  const tag = row.imageTag;
+  const hostPort = row.hostPort;
+  const present = containerState(name, deps);
+
+  // Restore the row on ANY failure — `start` never leaves a claim behind.
+  const release = async (state) => {
+    await withRegistryLock(deps.registryPath, () => {
+      const reg = requireUsableRegistry(deps.registryPath);
+      const cur = getPreview(reg, slug);
+      if (cur && cur.state === "provisioning") {
+        const next = cloneRegistry(reg);
+        next.previews[slug] = { ...cur, state };
+        writeRegistry(deps.registryPath, next);
+      }
+    });
+  };
+
+  try {
+    if (present === "running" && !recreate) {
+      deps.log(`preview "${slug}" is already running: ${tag} on http://localhost:${hostPort}`);
+      await release(row.state === "degraded" ? "ready" : row.state);
+      return { slug, container: "running", changed: false, rematerialized: false, hostPort };
+    }
+
+    if (present === "stopped" && !recreate) {
+      const r = deps.runDocker(["start", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+      if (r.error || r.status !== 0) {
+        throw new Error(`docker start of preview ${name} failed` + (r.stderr ? `: ${r.stderr.trim()}` : "."));
+      }
+      deps.log(`  started ${name}; health-gating http://localhost:${hostPort}/api/health ...`);
+      const result = await pollHealthGate({
+        url: `http://localhost:${hostPort}/api/health`,
+        deps: { ...deps, isRunning: () => containerRunning(name, deps) },
+      });
+      if (result.state !== "healthy") {
+        const diag = dumpContainerLogs(name, deps);
+        await release("degraded");
+        throw new Error(
+          `preview "${slug}" started but did not reach healthy (terminal state: ${result.state}` +
+            (result.status ? `, http ${result.status}` : "") + `). The container was NOT destroyed and its ` +
+            `durable volume is intact.\n--- container logs (tail) ---\n${diag.slice(-4000)}`,
+        );
+      }
+      await release("ready");
+      deps.log(`preview "${slug}" is healthy: ${tag} (sha ${row.sha}) on http://localhost:${hostPort}`);
+      return { slug, container: "running", changed: true, rematerialized: false, hostPort };
+    }
+
+    // RE-MATERIALIZE: the container is absent, or `--recreate` was asked for.
+    if (!dockerObjectExists({ kind: "image", ref: tag, deps })) {
+      await release(row.state);
+      throw new Error(
+        `Cannot re-materialize preview "${slug}": its recorded image ${tag} is not present locally. ` +
+          `Rebuild it with \`cinatra instance preview refresh --slug ${slug} --ref ${row.ref}\` ` +
+          `(that path builds; this one deliberately never does).`,
+      );
+    }
+    const runtimeEnv = resolveRuntimeEnv({ deps, env, hostPort });
+    const bootKey = assertEncryptionKey(runtimeEnv);
+    // cinatra-cli#219: a re-materialization boots a container that DIALS these
+    // endpoints, so it is gated exactly like create and refresh.
+    assertContainerDialedEndpointsOwned({ env: runtimeEnv, checkoutDir, deps });
+
+    // AC6: keep the old container ASIDE (renamed + stopped) rather than
+    // destroying it, so a failed re-materialize can put it back.
+    let parked = null;
+    if (present !== "absent") {
+      parked = `${name}${SUPERSEDED_CONTAINER_SUFFIX}`;
+      removeContainer(parked, deps); // clear any debris from an earlier attempt
+      const rename = deps.runDocker(["rename", name, parked], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+      if (rename.error || rename.status !== 0) {
+        await release(row.state);
+        throw new Error(
+          `Could not set the existing preview container aside (docker rename ${name})` +
+            (rename.stderr ? `: ${rename.stderr.trim()}` : ".") + ` Nothing was changed.`,
+        );
+      }
+      // It still holds the published host port until it is stopped.
+      deps.runDocker(["stop", parked], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+    }
+
+    const restore = () => {
+      if (!parked) return;
+      removeContainer(name, deps);
+      deps.runDocker(["rename", parked, name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+      deps.runDocker(["start", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+    };
+
+    let container;
+    try {
+      container = bootPreviewContainer({
+        slug,
+        tag,
+        hostPort,
+        encryptionKey: bootKey,
+        provenance: row.provenance,
+        sha: row.sha,
+        deps: { ...deps, env: runtimeEnv },
+      });
+    } catch (err) {
+      restore();
+      await release(row.state);
+      throw err;
+    }
+    deps.log(
+      `  re-materialized ${container} from the image already present (${tag}) — no build; ` +
+        `health-gating http://localhost:${hostPort}/api/health ...`,
+    );
+    const result = await pollHealthGate({
+      url: `http://localhost:${hostPort}/api/health`,
+      deps: { ...deps, isRunning: () => containerRunning(container, deps) },
+    });
+    if (result.state !== "healthy") {
+      const diag = dumpContainerLogs(container, deps);
+      restore();
+      await release(parked ? row.state : "degraded");
+      throw new Error(
+        `preview "${slug}" did not reach healthy after re-materializing (terminal state: ${result.state}` +
+          (result.status ? `, http ${result.status}` : "") + `). ` +
+          (parked
+            ? `The PREVIOUS container was restored and restarted — this run left the preview as it found it. `
+            : `There was no previous container to restore. `) +
+          `The durable volume ${row.volumeName} was never touched.` +
+          `\n--- container logs (tail) ---\n${diag.slice(-4000)}`,
+      );
+    }
+    if (parked) removeContainer(parked, deps);
+    await release("ready");
+    deps.log(
+      `preview "${slug}" re-materialized and healthy: ${tag} (sha ${row.sha}) on http://localhost:${hostPort} ` +
+        `— container env recomposed, image untouched.`,
+    );
+    return { slug, container: "running", changed: true, rematerialized: true, hostPort };
+  } catch (err) {
+    await release(row.state);
+    throw err;
+  }
+}
+
+/**
  * `cinatra instance preview status` / `list` (AC3): surface the resolved SHA,
  * built image tag, durable volume, provenance, and state per preview.
  */
@@ -2031,16 +2337,32 @@ export function runPreviewStatus(rest, injected = {}) {
     deps.log(wantSlug ? `No preview registered for slug "${wantSlug}".` : "No previews registered.");
     return rows;
   }
+  // cinatra-cli#220 AC5: report what the CONTAINER is actually doing, not only
+  // what the row says. "state=ready" answered the question "did the lifecycle
+  // finish successfully", which a stopped (or manually removed) container does
+  // not contradict — so the two facts are reported side by side, and the row is
+  // never rewritten from a read.
+  const out = [];
   for (const r of rows) {
+    const container = containerState(previewContainerName(r.slug), deps);
+    out.push({ ...r, container });
     deps.log(
-      `preview ${r.slug}: state=${r.state} sha=${r.sha} tag=${r.imageTag} ` +
+      `preview ${r.slug}: state=${r.state} container=${container} sha=${r.sha} tag=${r.imageTag} ` +
         `provenance=${r.provenance} volume=${r.volumeName} port=${r.hostPort ?? "-"} ref=${r.ref}`,
     );
+    if (r.state === "ready" && container !== "running") {
+      deps.log(
+        container === "stopped"
+          ? `  the row is ready but its container is STOPPED — \`cinatra instance preview start --slug ${r.slug}\` serves it again.`
+          : `  the row is ready but NO container exists — \`cinatra instance preview start --slug ${r.slug}\` ` +
+            `re-materializes it from ${r.imageTag} without a build.`,
+      );
+    }
     if (Array.isArray(r.history) && r.history.length > 1) {
       deps.log(`  history: ${r.history.map((h) => h.sha.slice(0, 12)).join(" -> ")}`);
     }
   }
-  return rows;
+  return out;
 }
 
 export function runPreviewList(rest, injected = {}) {
@@ -2078,6 +2400,8 @@ export const __test = {
   PREVIEW_BUILD_TYPECHECK_ENV,
   PREVIEW_BUILD_MEMORY_ARG,
   PREVIEW_BUILD_CI_ARG,
+  PREVIEW_STOP_TIMEOUT_MS,
+  SUPERSEDED_CONTAINER_SUFFIX,
   // pure helpers
   resolveBuildTimeoutMs,
   formatBuildBudget,
@@ -2119,7 +2443,9 @@ export const __test = {
   buildPreviewImage,
   bootPreviewContainer,
   dockerObjectExists,
+  ensurePreviewImage,
   containerRunning,
+  containerState,
   removeContainer,
   removeImage,
   removeImageIfUnreferenced,
@@ -2128,7 +2454,10 @@ export const __test = {
   // orchestration
   runPreviewCreate,
   runPreviewRefresh,
+  runPreviewStop,
+  runPreviewStart,
   runPreviewStatus,
   runPreviewList,
+  readFlag,
   defaultDeps,
 };

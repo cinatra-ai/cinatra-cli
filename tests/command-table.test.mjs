@@ -288,6 +288,18 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode+sub",
         },
         {
+          "command": "instance preview stop",
+          "hidden": false,
+          "id": "preview.stop",
+          "match": "command+mode+sub",
+        },
+        {
+          "command": "instance preview start",
+          "hidden": false,
+          "id": "preview.start",
+          "match": "command+mode+sub",
+        },
+        {
           "command": "instance preview status",
           "hidden": false,
           "id": "preview.status",

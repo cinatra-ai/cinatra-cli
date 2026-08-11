@@ -48,6 +48,8 @@ const {
   refreshPreviewSlot,
   runPreviewCreate,
   runPreviewRefresh,
+  runPreviewStart,
+  runPreviewStop,
   runPreviewStatus,
   resolveBuildTimeoutMs,
   formatBuildBudget,
@@ -128,21 +130,44 @@ function makeFakeDocker(state) {
     // `docker run -d ...` — records the run; container becomes "running".
     if (verb === "run" && sub === "-d") {
       state.containerRunning = true;
+      state.containerAbsent = false; // it exists now (cinatra-cli#220)
       return { status: 0, stdout: "deadbeef\n", stderr: "" };
     }
     // `docker container inspect -f {{.State.Running}} <name>` — liveness via the
     // running state (a bare inspect would succeed for a STOPPED container).
     if (verb === "container" && sub === "inspect") {
+      // cinatra-cli#220: PRESENCE and LIVENESS are different questions — a
+      // stopped container still inspects successfully.
+      if (state.containerAbsent) return { status: 1, stdout: "", stderr: "No such object" };
       const running = Boolean(state.containerRunning);
+      if (state.containerPresentStopped && !running) return { status: 0, stdout: "false\n", stderr: "" };
       return { status: running ? 0 : 1, stdout: running ? "true\n" : "false\n", stderr: "" };
     }
     // `docker volume inspect <name>` — existence (default: does NOT exist).
     if (verb === "volume" && sub === "inspect") {
       return { status: state.volumeExists ? 0 : 1, stdout: "", stderr: "" };
     }
-    // `docker image inspect <ref>` — default: does NOT exist.
+    // `docker image inspect <ref>` — default: does NOT exist. cinatra-cli#220
+    // models the LOCAL image set so the build-skip is assertable.
     if (verb === "image" && sub === "inspect") {
-      return { status: 1, stdout: "", stderr: "" };
+      const present = state.images instanceof Set && state.images.has(args[args.length - 1]);
+      return { status: present ? 0 : 1, stdout: "", stderr: "" };
+    }
+    // `docker stop|start|rename <name>` — cinatra-cli#220's lifecycle verbs.
+    if (verb === "stop") {
+      state.containerRunning = false;
+      state.stopped = [...(state.stopped ?? []), args[args.length - 1]];
+      return { status: 0, stdout: "", stderr: "" };
+    }
+    if (verb === "start") {
+      if (state.containerAbsent) return { status: 1, stdout: "", stderr: "No such container" };
+      state.containerRunning = true;
+      state.started = [...(state.started ?? []), args[args.length - 1]];
+      return { status: 0, stdout: "", stderr: "" };
+    }
+    if (verb === "rename") {
+      state.renames = [...(state.renames ?? []), args.slice(1)];
+      return { status: state.renameFails ? 1 : 0, stdout: "", stderr: state.renameFails ? "rename boom" : "" };
     }
     // `docker rm -f <name>` — container gone.
     if (verb === "rm") {
@@ -1598,5 +1623,242 @@ describe("preview — container-dialed endpoint ownership (cinatra-cli#219)", ()
     const out = await runPreviewCreate(["--slug", "main"], deps);
     expect(out.state).toBe("healthy");
     expect(logs.join("\n")).toMatch(/WARNING[\s\S]*NANGO_SERVER_URL[\s\S]*other-nango-server-1/);
+  });
+});
+
+// --------------------------------------------------------------------------
+// cinatra-cli#220 — the lifecycle: reuse a present image, and the ordinary
+// container operations (stop / start / re-materialize)
+// --------------------------------------------------------------------------
+
+describe("preview — an image already present for the SHA is reused (cinatra-cli#220)", () => {
+  const OWNED = () => ({
+    containers: [
+      { id: "own-redis", name: "cinatra-redis-1", service: "redis", project: "cinatra", workingDir: tmp, ports: [["127.0.0.1", 6379, 6379]] },
+    ],
+  });
+
+  function seedReady(sha = SHA_A, hostPort = 3400) {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha, hostPort, now: () => "T0" }) },
+    });
+  }
+
+  it("AC1: refresh to a SHA whose image is present does NOT invoke docker build", async () => {
+    seedReady(SHA_A);
+    const state = {
+      sha: SHA_B,
+      health: { status: 200, body: '{"status":"ok"}' },
+      images: new Set([previewImageTag(SHA_B)]),
+      compose: OWNED(),
+    };
+    const { deps, fake, logs } = makeDeps(state);
+    const out = await runPreviewRefresh(["--ref", "main", "--slug", "main"], deps);
+    expect(out.sha).toBe(SHA_B);
+    expect(fake.calls.find((c) => c[0] === "build")).toBeUndefined();
+    // …and the container really runs that image.
+    expect(fake.calls.find((c) => c[0] === "run").join(" ")).toContain(previewImageTag(SHA_B));
+    expect(logs.join("\n")).toMatch(/reusing the image already present for this SHA/);
+  });
+
+  it("AC2: --rebuild (and --force-build) force the build back on", async () => {
+    for (const flag of ["--rebuild", "--force-build"]) {
+      seedReady(SHA_A);
+      const state = {
+        sha: SHA_B,
+        health: { status: 200, body: '{"status":"ok"}' },
+        images: new Set([previewImageTag(SHA_B)]),
+        compose: OWNED(),
+      };
+      const { deps, fake } = makeDeps(state);
+      await runPreviewRefresh(["--ref", "main", "--slug", "main", flag], deps);
+      expect(fake.calls.find((c) => c[0] === "build")).toBeTruthy();
+    }
+  });
+
+  it("still builds when the image is NOT present (unchanged for the ordinary case)", async () => {
+    seedReady(SHA_A);
+    const { deps, fake } = makeDeps({ sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' }, compose: OWNED() });
+    await runPreviewRefresh(["--ref", "main", "--slug", "main"], deps);
+    expect(fake.calls.find((c) => c[0] === "build")).toBeTruthy();
+  });
+
+  it("create reuses a present image too (two previews at one SHA build it once)", async () => {
+    const { deps, fake } = makeDeps({
+      sha: SHA_A,
+      health: { status: 200, body: '{"status":"ok"}' },
+      images: new Set([previewImageTag(SHA_A)]),
+      compose: OWNED(),
+    });
+    await runPreviewCreate(["--slug", "main"], deps);
+    expect(fake.calls.find((c) => c[0] === "build")).toBeUndefined();
+  });
+});
+
+describe("preview stop / start (cinatra-cli#220 AC3, AC4, AC5, AC6)", () => {
+  const OWNED = () => ({
+    containers: [
+      { id: "own-redis", name: "cinatra-redis-1", service: "redis", project: "cinatra", workingDir: tmp, ports: [["127.0.0.1", 6379, 6379]] },
+    ],
+  });
+
+  function seedReady({ sha = SHA_A, hostPort = 3400 } = {}) {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha, hostPort, now: () => "T0" }) },
+    });
+  }
+
+  it("AC4: stop stops the container and keeps volume, port and row", async () => {
+    seedReady();
+    const { deps, fake } = makeDeps({ containerRunning: true });
+    const out = await runPreviewStop(["--slug", "main"], deps);
+    expect(out.container).toBe("stopped");
+    expect(fake.calls.find((c) => c[0] === "stop")).toEqual(["stop", "cinatra-preview-main"]);
+    // NEVER a volume/image removal, and the row is untouched.
+    expect(fake.calls.some((c) => c[0] === "volume" && c[1] === "rm")).toBe(false);
+    expect(fake.calls.some((c) => c[0] === "rm")).toBe(false);
+    const row = getPreview(readRegistry(registryPath).registry, "main");
+    expect(row.hostPort).toBe(3400);
+    expect(row.volumeName).toBe("cinatra-preview-data-main");
+    expect(row.state).toBe("ready");
+  });
+
+  it("stop is idempotent and refuses an unknown slug", async () => {
+    seedReady();
+    const { deps: stoppedDeps, fake } = makeDeps({ containerRunning: false, containerPresentStopped: true });
+    const out = await runPreviewStop(["--slug", "main"], stoppedDeps);
+    expect(out.changed).toBe(false);
+    expect(fake.calls.some((c) => c[0] === "stop")).toBe(false);
+    const { deps: other } = makeDeps({ containerRunning: true });
+    await expect(runPreviewStop(["--slug", "nope"], other)).rejects.toThrow(/No preview exists for slug "nope"/);
+  });
+
+  it("AC4: start brings a STOPPED container back WITHOUT destroying it", async () => {
+    seedReady();
+    const state = { containerRunning: false, containerPresentStopped: true, health: { status: 200, body: '{"status":"ok"}' }, compose: OWNED() };
+    const { deps, fake } = makeDeps(state);
+    const out = await runPreviewStart(["--slug", "main"], deps);
+    expect(out).toMatchObject({ container: "running", rematerialized: false });
+    expect(fake.calls.find((c) => c[0] === "start")).toEqual(["start", "cinatra-preview-main"]);
+    // No build, no run, no removal — the container was never destroyed.
+    expect(fake.calls.some((c) => c[0] === "build")).toBe(false);
+    expect(fake.calls.some((c) => c[0] === "run")).toBe(false);
+    expect(fake.calls.some((c) => c[0] === "rm")).toBe(false);
+  });
+
+  it("start on an already-running preview is a no-op", async () => {
+    seedReady();
+    const { deps, fake } = makeDeps({ containerRunning: true, health: { status: 200, body: '{"status":"ok"}' }, compose: OWNED() });
+    const out = await runPreviewStart(["--slug", "main"], deps);
+    expect(out.changed).toBe(false);
+    expect(fake.calls.some((c) => c[0] === "run" || c[0] === "build" || c[0] === "start")).toBe(false);
+  });
+
+  it("AC3: start RE-MATERIALIZES an absent container from the recorded image — no build", async () => {
+    seedReady();
+    const state = {
+      containerAbsent: true,
+      health: { status: 200, body: '{"status":"ok"}' },
+      images: new Set([previewImageTag(SHA_A)]),
+      compose: OWNED(),
+    };
+    const { deps, fake, logs } = makeDeps(state, {
+      env: { [ENCRYPTION_KEY_ENV]: KEY_64, REDIS_URL: "redis://127.0.0.1:6379" },
+    });
+    const out = await runPreviewStart(["--slug", "main"], deps);
+    expect(out.rematerialized).toBe(true);
+    expect(fake.calls.some((c) => c[0] === "build")).toBe(false);
+    const run = fake.calls.find((c) => c[0] === "run").join(" ");
+    // Same image, same durable volume, same host port — and FRESH env.
+    expect(run).toContain(previewImageTag(SHA_A));
+    expect(run).toContain(`cinatra-preview-data-main:${EXTENSION_DATA_ROOT_IN_CONTAINER}`);
+    expect(run).toContain("-p 3400:3000");
+    expect(run).toContain(`REDIS_URL=redis://${CONTAINER_HOST_GATEWAY}:6379`);
+    expect(logs.join("\n")).toMatch(/re-materialized .* from the image already present/);
+  });
+
+  it("AC3: --recreate re-materializes a RUNNING container with newly composed env", async () => {
+    seedReady();
+    const state = {
+      containerRunning: true,
+      health: { status: 200, body: '{"status":"ok"}' },
+      images: new Set([previewImageTag(SHA_A)]),
+      compose: OWNED(),
+    };
+    const { deps, fake } = makeDeps(state, {
+      env: { [ENCRYPTION_KEY_ENV]: KEY_64, REDIS_URL: "redis://127.0.0.1:6379" },
+    });
+    const out = await runPreviewStart(["--slug", "main", "--recreate"], deps);
+    expect(out.rematerialized).toBe(true);
+    expect(fake.calls.some((c) => c[0] === "build")).toBe(false);
+    // AC6: the OLD container was PARKED (renamed + stopped), not destroyed, and
+    // only dropped once the new one was healthy.
+    expect(state.renames[0]).toEqual(["cinatra-preview-main", `cinatra-preview-main${P.SUPERSEDED_CONTAINER_SUFFIX}`]);
+    expect(state.removedContainers).toContain(`cinatra-preview-main${P.SUPERSEDED_CONTAINER_SUFFIX}`);
+  });
+
+  it("AC6: a re-materialization that fails its health gate RESTORES the previous container", async () => {
+    seedReady();
+    const state = {
+      containerRunning: true,
+      health: { status: 503, body: '{"status":"degraded"}' },
+      images: new Set([previewImageTag(SHA_A)]),
+      compose: OWNED(),
+    };
+    const { deps } = makeDeps(state, { env: { [ENCRYPTION_KEY_ENV]: KEY_64, REDIS_URL: "redis://127.0.0.1:6379" } });
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(
+      /PREVIOUS container was restored and restarted/,
+    );
+    // Renamed aside, then renamed BACK and started again.
+    expect(state.renames[1]).toEqual([`cinatra-preview-main${P.SUPERSEDED_CONTAINER_SUFFIX}`, "cinatra-preview-main"]);
+    expect(state.started).toContain("cinatra-preview-main");
+    // The row is NOT left degraded — the preview is as it was found.
+    expect(getPreview(readRegistry(registryPath).registry, "main").state).toBe("ready");
+  });
+
+  it("start refuses (and never builds) when the recorded image is gone", async () => {
+    seedReady();
+    const { deps, fake } = makeDeps({ containerAbsent: true, compose: OWNED() });
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(
+      /recorded image .* is not present locally[\s\S]*refresh/,
+    );
+    expect(fake.calls.some((c) => c[0] === "build")).toBe(false);
+    expect(getPreview(readRegistry(registryPath).registry, "main").state).toBe("ready");
+  });
+
+  it("cinatra-cli#219 still applies to the re-materialize path", async () => {
+    seedReady();
+    const state = {
+      containerAbsent: true,
+      health: { status: 200, body: '{"status":"ok"}' },
+      images: new Set([previewImageTag(SHA_A)]),
+      compose: {
+        containers: [
+          { id: "theirs", name: "other-redis-1", service: "redis", project: "other", workingDir: "/tmp/elsewhere", ports: [["0.0.0.0", 6379, 6379]] },
+        ],
+      },
+    };
+    const { deps, fake } = makeDeps(state, { env: { [ENCRYPTION_KEY_ENV]: KEY_64, REDIS_URL: "redis://127.0.0.1:6379" } });
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(/Refusing to compose this preview/);
+    expect(fake.calls.some((c) => c[0] === "run")).toBe(false);
+  });
+
+  it("AC5: status reports the CONTAINER's actual state, not only the row's", async () => {
+    seedReady();
+    const { deps: stoppedDeps, logs: stoppedLogs } = makeDeps({ containerRunning: false, containerPresentStopped: true });
+    const rows = runPreviewStatus(["--slug", "main"], stoppedDeps);
+    expect(rows[0].container).toBe("stopped");
+    expect(stoppedLogs.join("\n")).toMatch(/state=ready container=stopped/);
+    expect(stoppedLogs.join("\n")).toMatch(/row is ready but its container is STOPPED/);
+
+    const { deps: absentDeps, logs: absentLogs } = makeDeps({ containerAbsent: true });
+    expect(runPreviewStatus(["--slug", "main"], absentDeps)[0].container).toBe("absent");
+    expect(absentLogs.join("\n")).toMatch(/re-materializes it from cinatra-preview:local-/);
+
+    const { deps: upDeps, logs: upLogs } = makeDeps({ containerRunning: true });
+    expect(runPreviewStatus(["--slug", "main"], upDeps)[0].container).toBe("running");
+    expect(upLogs.join("\n")).not.toMatch(/row is ready but/);
   });
 });
