@@ -6,6 +6,31 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A preview no longer wires itself to another instance's services, and it can
+  finally reach its own connection service.** The preview composition decided
+  where this instance's services live by string manipulation: it swapped a
+  loopback hostname for the container's host gateway and trusted the result,
+  with nothing confirming that `host.docker.internal:<port>` was *this*
+  instance's service rather than a different stack's that happened to hold the
+  same host port. When it was not, the preview read and wrote the other stack's
+  data and reported healthy throughout, because the app reached *a* working
+  service. Every container-dialed loopback endpoint is now VERIFIED before the
+  composition trusts it, using the same proof the install path's port-conflict
+  gate already relies on — a live container whose Compose project is rooted at
+  this checkout. A mismatch is refused with the holder named (container, Compose
+  project and its directory), a service that is running but publishes no host
+  port is reported rather than papered over by whatever else answers on that
+  port, and endpoints that are legitimately external or hosted are never
+  flagged. `CINATRA_PREVIEW_ENDPOINT_OWNERSHIP=warn` prints the same finding and
+  proceeds, for infrastructure that deliberately is not a Compose service of the
+  checkout. Together with it, `NANGO_SERVER_URL` and `NANGO_SECRET_KEY` are now
+  forwarded into the container (the address container-rewritten like its
+  siblings, the credential verbatim): a preview could previously neither reach
+  nor authenticate to its connection service, so saving a provider key reported
+  partial success and connector flows were non-functional.
+
 ### Added
 
 - **`cinatra install --mode preview` — a front door over the preview lifecycle.**
