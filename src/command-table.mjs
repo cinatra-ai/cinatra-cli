@@ -337,20 +337,35 @@ export const COMMAND_DESCRIPTORS = [
     path: ["instance", "preview", "create"],
     match: "command+mode+sub",
     summary:
-      "Build + boot a LOCAL non-production image at a resolved SHA (CINATRA_RUNTIME_MODE=production, provenance local-image:<sha>); health-gates on /api/health. Before building, every container-dialed loopback endpoint (database, Redis, Nango, the agent registry) is VERIFIED to belong to this instance — a host port held by another stack is refused with the holder named, never silently composed; CINATRA_PREVIEW_ENDPOINT_OWNERSHIP=warn downgrades that refusal to a printed finding. The image build is bounded (default 90m); raise it on a slow/cold host with CINATRA_PREVIEW_BUILD_TIMEOUT_MS (ms, 1000..21600000). A build reporting 'JavaScript heap out of memory' needs the other lever: CINATRA_PREVIEW_BUILD_MEMORY_MB (MB, 256..65536; unset keeps the checkout's own) sets the build's V8 old-space limit — it does not bound Turbopack's native allocator, total container memory, or build concurrency. CINATRA_PREVIEW_BUILD_TYPECHECK=1 restores the in-build tsc that the forwarded CI=true skips.",
+      "Build + boot a LOCAL non-production image at a resolved SHA (CINATRA_RUNTIME_MODE=production, provenance local-image:<sha>); health-gates on /api/health. An image already present for that SHA is reused instead of rebuilt (--rebuild / --force-build forces a build). Before building, every container-dialed loopback endpoint (database, Redis, Nango, the agent registry) is VERIFIED to belong to this instance — a host port held by another stack is refused with the holder named, never silently composed; CINATRA_PREVIEW_ENDPOINT_OWNERSHIP=warn downgrades that refusal to a printed finding. The image build is bounded (default 90m); raise it on a slow/cold host with CINATRA_PREVIEW_BUILD_TIMEOUT_MS (ms, 1000..21600000). A build reporting 'JavaScript heap out of memory' needs the other lever: CINATRA_PREVIEW_BUILD_MEMORY_MB (MB, 256..65536; unset keeps the checkout's own) sets the build's V8 old-space limit — it does not bound Turbopack's native allocator, total container memory, or build concurrency. CINATRA_PREVIEW_BUILD_TYPECHECK=1 restores the in-build tsc that the forwarded CI=true skips.",
   },
   {
     id: "preview.refresh",
     path: ["instance", "preview", "refresh"],
     match: "command+mode+sub",
     summary:
-      "Rebuild the preview at a NEW resolved SHA, reboot, reuse the durable volume, health-gate, and clean up the superseded image. Applies the same container-dialed endpoint-ownership verification as create — and applies it before the running preview is touched, so a refusal leaves it serving. Honours the same CINATRA_PREVIEW_BUILD_TIMEOUT_MS build budget, CINATRA_PREVIEW_BUILD_MEMORY_MB limit and CINATRA_PREVIEW_BUILD_TYPECHECK switch as create.",
+      "Rebuild the preview at a NEW resolved SHA, reboot, reuse the durable volume, health-gate, and clean up the superseded image. The build is SKIPPED when the image for the target SHA is already present locally (--rebuild / --force-build forces it). Applies the same container-dialed endpoint-ownership verification as create — and applies it before the running preview is touched, so a refusal leaves it serving. Honours the same CINATRA_PREVIEW_BUILD_TIMEOUT_MS build budget, CINATRA_PREVIEW_BUILD_MEMORY_MB limit and CINATRA_PREVIEW_BUILD_TYPECHECK switch as create.",
+  },
+  {
+    id: "preview.stop",
+    path: ["instance", "preview", "stop"],
+    match: "command+mode+sub",
+    summary:
+      "Stop a registered preview's container. The durable volume, the recorded host port, the image and the registry row are all kept — `start` brings the same preview back.",
+  },
+  {
+    id: "preview.start",
+    path: ["instance", "preview", "start"],
+    match: "command+mode+sub",
+    summary:
+      "Start a registered preview and health-gate it. A stopped container is started in place; an absent one is RE-MATERIALIZED from the image the row already records — with freshly composed environment and no build, which is how a re-banded instance's stale container env is fixed on a host that cannot build. --recreate forces that re-materialization even when a container is running; the container it replaces is parked and restored if the new one fails its health gate.",
   },
   {
     id: "preview.status",
     path: ["instance", "preview", "status"],
     match: "command+mode+sub",
-    summary: "Show a preview's resolved SHA, built image tag, provenance, durable volume, and state.",
+    summary:
+      "Show a preview's resolved SHA, built image tag, provenance, durable volume, registry state, and the CONTAINER's actual state (running | stopped | absent).",
   },
   {
     id: "preview.list",

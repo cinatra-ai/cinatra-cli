@@ -523,7 +523,7 @@ Commands:
                                       stays CINATRA_RUNTIME_MODE=development —
                                       production semantics live only inside the
                                       container — and the created preview is managed by
-                                      \`instance preview refresh|status|list\`, not by
+                                      \`instance preview refresh|start|stop|status|list\`, not by
                                       re-running install (a rerun reconciles the
                                       checkout, reports the existing preview, and points
                                       ref drift at \`refresh\`).
@@ -791,8 +791,15 @@ Usage:
   cinatra instance clone slug-for-worktree --worktree-path <path>
   cinatra instance clone prune [--worktree-path <path>] [--slug <slug>] --yes
   cinatra instance clone list
-  cinatra instance preview create [--ref <git-ref>] [--slug <slug>] [--port <port>]
-  cinatra instance preview refresh [--ref <git-ref>] [--slug <slug>]
+  cinatra instance preview create [--ref <git-ref>] [--slug <slug>] [--port <port>] [--rebuild]
+  cinatra instance preview refresh [--ref <git-ref>] [--slug <slug>] [--rebuild]
+                               # The build is SKIPPED when the image for the target SHA is
+                               # already present locally; --rebuild (--force-build) forces it.
+  cinatra instance preview stop [--slug <slug>]
+  cinatra instance preview start [--slug <slug>] [--recreate]
+                               # start re-materializes an ABSENT container from the recorded
+                               # image with freshly composed env and NO build; --recreate does
+                               # that for a running one (the stale-endpoint fix after a re-band).
                                # CINATRA_PREVIEW_BUILD_TIMEOUT_MS overrides the image-build
                                # budget (default 5400000 = 90m; 1000 .. 21600000 = 1s .. 6h).
                                # CINATRA_PREVIEW_BUILD_MEMORY_MB sets the build's V8 old-space
@@ -14463,6 +14470,20 @@ function buildHandlers() {
     "preview.refresh": async (rest) => {
       const { runInstallPreviewRefresh } = await import("./install-preview.mjs");
       await runInstallPreviewRefresh(rest, { checkoutDir: getRepoRoot() });
+    },
+    // cinatra-cli#220: the ordinary container operations the lifecycle lacked.
+    // `stop` needs no composed environment (it only stops what is already
+    // running), so it goes straight to the lifecycle; `start` may RE-MATERIALIZE
+    // the container with freshly composed env, so it routes through the same
+    // front-door continuation `refresh` uses — that is the whole point of the
+    // verb for a preview whose instance was re-banded.
+    "preview.stop": async (rest) => {
+      const { runPreviewStop } = await import("./preview.mjs");
+      await runPreviewStop(rest, { checkoutDir: getRepoRoot() });
+    },
+    "preview.start": async (rest) => {
+      const { runInstallPreviewStart } = await import("./install-preview.mjs");
+      await runInstallPreviewStart(rest, { checkoutDir: getRepoRoot() });
     },
     "preview.status": async (rest) => {
       const { runPreviewStatus } = await import("./preview.mjs");
