@@ -169,9 +169,14 @@ export function readRequiredExtensionsLock(lockPath) {
 // `cinatra.extensions`. An EMPTY array must never vacuously select the new
 // schema.
 //
-// This discrimination is TRANSITIONAL: it is removed in the CLI release AFTER
-// the cutover has landed, when `cinatra.systemExtensions` is the only shape in
-// the wild.
+// This discrimination is TRANSITIONAL — cinatra#2331 step 0, verbatim: "The
+// transitional discrimination is removed in the CLI release after the
+// cutover." It comes out once `cinatra.systemExtensions` is the only shape in
+// the wild; that removal deletes this block, `isRangedSpec`/`isRangedSpecSet`,
+// the legacy branch of `readDeclaredExtensionSpecs`, and BOTH declaration
+// suites — tests/prod-extension-declaration-schema.test.mjs (in-process) and
+// tests/prod-extension-declaration-schema-e2e.test.mjs (real command) — as one
+// change.
 // --------------------------------------------------------------------------
 
 /** Which declaration a read resolved to. */

@@ -280,7 +280,10 @@ export async function verifyProdRequiredExtensions({
   // the legacy `cinatra.extensions`) — see prod-extension-acquisition.mjs. Both
   // the name set and the pinned RANGE per name (for the version-satisfaction
   // cross-check) come from that single resolution, so the two can never
-  // disagree about which declaration won.
+  // disagree about which declaration won. That discrimination is TRANSITIONAL
+  // — cinatra#2331 step 0, verbatim: "The transitional discrimination is
+  // removed in the CLI release after the cutover." When it goes, this read
+  // collapses to the single post-cutover declaration.
   const rootManifestPath = path.join(repoRoot, "package.json");
   const declaration = existsSync(rootManifestPath)
     ? readDeclaredExtensionSpecs(rootManifestPath)
