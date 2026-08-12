@@ -15,6 +15,10 @@
 // (which declaration won, with what ranges) and — for the two shapes that
 // decide prod behaviour — through the REAL `verifyProdRequiredExtensions` code
 // path over a REAL temp filesystem, proving the pin check still fires.
+//
+// The same matrix is asserted one level out, through the actual `bin/cinatra.mjs`
+// as a child process (dispatch wiring, checkout resolution, exit codes, `--json`
+// envelope), in prod-extension-declaration-schema-e2e.test.mjs.
 
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
