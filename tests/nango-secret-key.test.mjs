@@ -23,6 +23,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   NANGO_DB_COMPOSE_SERVICE,
   NANGO_SECRET_KEY_VAR,
+  counterpartNangoEnvironmentName,
   createComposeNangoDbTransport,
   ensureNangoSecretKey,
   isBundledNangoTarget,
@@ -40,6 +41,9 @@ import { parseEnvBody, upsertEnvKey } from "../src/install.mjs";
 // one for a value already sitting in .env.local.
 const SEEDED = "3f7a1c2e-9b4d-4a61-8c2f-0d5e6a7b8c9d";
 const OTHER = "11111111-2222-4333-8444-555555555555";
+// The counterpart environment's seeded key: a DIFFERENT environment of the SAME
+// bundled nango-db, so it authenticates just as well as SEEDED.
+const SEEDED_COUNTERPART = "8c1d2e3f-4a5b-4c6d-9e7f-0a1b2c3d4e5f";
 
 /** A transport that answers a scripted list of psql results, recording the SQL. */
 function fakeTransport(script) {
@@ -141,12 +145,47 @@ describe("planNangoSecretKey — the lifecycle, as a pure decision", () => {
     });
   });
 
-  it("NEVER rotates a valid key that diverges; it reports it", () => {
+  // The divergence branch, split by what is KNOWN about the other environment.
+  it("keeps a valid key that is the OTHER seeded environment's; it authenticates", () => {
+    expect(
+      planNangoSecretKey({
+        current: SEEDED_COUNTERPART,
+        seeded: SEEDED,
+        alternates: [SEEDED_COUNTERPART],
+        alternatesComplete: true,
+      }),
+    ).toMatchObject({ action: "keep", reason: "matches-other-environment", writes: false });
+  });
+
+  it("adopts over a STALE key that matches no environment of this nango-db", () => {
+    expect(
+      planNangoSecretKey({
+        current: OTHER,
+        seeded: SEEDED,
+        alternates: [SEEDED_COUNTERPART],
+        alternatesComplete: true,
+      }),
+    ).toMatchObject({ action: "adopt-stale", writes: true });
+  });
+
+  it("NEVER rotates on partial information: an unread counterpart falls back to reporting", () => {
     expect(planNangoSecretKey({ current: OTHER, seeded: SEEDED })).toMatchObject({
       action: "keep",
       reason: "diverges-from-bundled",
       writes: false,
     });
+    expect(
+      planNangoSecretKey({ current: OTHER, seeded: SEEDED, alternates: [], alternatesComplete: false }),
+    ).toMatchObject({ action: "keep", reason: "diverges-from-bundled", writes: false });
+    // A garbage counterpart read is not a counterpart: it can never make a key stale.
+    expect(
+      planNangoSecretKey({ current: OTHER, seeded: SEEDED, alternates: ["ERROR"], alternatesComplete: false }),
+    ).toMatchObject({ action: "keep", reason: "diverges-from-bundled" });
+  });
+
+  it("names the two seeded environments as each other's counterpart", () => {
+    expect(counterpartNangoEnvironmentName("dev")).toBe("prod");
+    expect(counterpartNangoEnvironmentName("prod")).toBe("dev");
   });
 
   it("re-adopts a divergent key only for a caller that destroyed the environment", () => {
@@ -305,15 +344,62 @@ describe("ensureNangoSecretKey — against a real .env.local", () => {
     expect(message).toContain("UUID v4");
   });
 
-  it("never rotates a valid key that diverges — it reports the 401 and the remedy", () => {
+  // The three divergence outcomes, end to end.
+  it("keeps a key that belongs to the OTHER seeded environment of the same Nango", () => {
+    writeEnv(["CINATRA_RUNTIME_MODE=development", `${NANGO_SECRET_KEY_VAR}=${SEEDED_COUNTERPART}`]);
+    // First read: the preferred (`dev`) environment. Second: the counterpart.
+    const result = ensureNangoSecretKey({
+      envPath,
+      transport: fakeTransport([ok(SEEDED), ok(SEEDED_COUNTERPART)]),
+      log,
+      sleep: () => {},
+    });
+
+    expect(result).toMatchObject({ action: "keep", reason: "matches-other-environment", changed: false });
+    expect(readEnv()[NANGO_SECRET_KEY_VAR]).toBe(SEEDED_COUNTERPART);
+    // It authenticates, so nothing is reported.
+    expect(logged.join("\n")).toBe("");
+  });
+
+  it("adopts over a STALE key from a previous nango-db, and says what happened", () => {
+    writeEnv(["CINATRA_RUNTIME_MODE=development", `${NANGO_SECRET_KEY_VAR}=${OTHER}`, "OPENAI_API_KEY=sk-keep-me"]);
+    const result = ensureNangoSecretKey({
+      envPath,
+      transport: fakeTransport([ok(SEEDED), ok(SEEDED_COUNTERPART)]),
+      log,
+      sleep: () => {},
+    });
+
+    expect(result).toMatchObject({ action: "adopt-stale", changed: true });
+    const env = readEnv();
+    expect(env[NANGO_SECRET_KEY_VAR]).toBe(SEEDED);
+    // Every other line survives.
+    expect(env.OPENAI_API_KEY).toBe("sk-keep-me");
+    const message = logged.join("\n");
+    expect(message).toContain("401");
+    expect(message).toContain("NO environment");
+    // The key value is never echoed.
+    expect(message).not.toContain(SEEDED);
+    expect(message).not.toContain(OTHER);
+  });
+
+  it("reports instead of rotating when the counterpart environment cannot be read", () => {
     writeEnv(["CINATRA_RUNTIME_MODE=development", `${NANGO_SECRET_KEY_VAR}=${OTHER}`]);
-    const result = ensureNangoSecretKey({ envPath, transport: fakeTransport([ok(SEEDED)]), log, sleep: () => {} });
+    // The preferred environment answers; every counterpart query fails.
+    const transport = {
+      queries: [],
+      query: (sql) => {
+        transport.queries.push(sql);
+        return transport.queries.length === 1 ? ok(SEEDED) : boom;
+      },
+    };
+    const result = ensureNangoSecretKey({ envPath, transport, log, sleep: () => {} });
 
     expect(result).toMatchObject({ action: "keep", reason: "diverges-from-bundled", changed: false });
     expect(readEnv()[NANGO_SECRET_KEY_VAR]).toBe(OTHER);
     const message = logged.join("\n");
     expect(message).toContain("401");
-    expect(message).toContain("re-run");
+    expect(message).toContain("Re-run");
   });
 
   it("re-adopts after a --full reset destroyed the environment the old key named", () => {
