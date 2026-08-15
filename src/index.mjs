@@ -40,6 +40,26 @@ import {
   ensureNangoSecretKey,
 } from "./nango-secret-key.mjs";
 import { prodRuntimeGuidanceLines } from "./prod-runtime-guidance.mjs";
+// Aliased so the many function-local `const { defaultInstanceRegistryPath, … } =
+// await import(…)` destructurings elsewhere in this file keep their own names.
+import {
+  defaultInstanceRegistryPath as instanceRegistryDefaultPath,
+  findInstanceByInstallDir as instanceRowByInstallDir,
+  readInstanceRegistry as readInstanceRegistryFile,
+} from "./instance-registry.mjs";
+// cinatra#2654: the WayFlow agent runtime is part of every install-owned local
+// stack. The lifecycle command and the doctor assertion both address the
+// install's RECORDED compose project through this module, never the checkout
+// basename.
+import {
+  WAYFLOW_PROFILE,
+  WAYFLOW_RUNTIME_EXTERNAL,
+  WAYFLOW_RUNTIME_KEY,
+  WAYFLOW_RUNTIME_OFF,
+  normalizeWayflowRuntimeMode,
+  resolveRecordedComposeContext,
+} from "./wayflow-runtime.mjs";
+
 import {
   EXECUTION_MODES,
   DEFAULT_EXECUTION_MODE,
@@ -454,7 +474,7 @@ function printHelp() {
 Usage:
   cinatra install [dev|prod|demo] [--dir <path>] [--ref <main|tag|sha>]
                   [--mode dev|prod|demo] [--repo-url <url>] [--yes] [--force] [--reset-env]
-                  [--skip-dev-apps] [--no-infra] [--no-install] [--no-setup]
+                  [--skip-dev-apps] [--no-infra] [--no-install] [--no-setup] [--no-wayflow]
                   [--on-conflict fail|prompt|isolated|stop-existing|attach|external|co-use]
                   [--infra new|external|share] [--instance <slug>] [--app-port <n>]
                   [--port-offset auto|<n>] [--db-url <url>] [--redis-url <url>]
@@ -542,6 +562,10 @@ Commands:
                     --no-infra        Do not start docker infra (point at external Postgres/Redis/Nango).
                     --no-install      Clone + env only; skip pnpm install and setup.
                     --no-setup        Clone + install only; skip running setup.
+                    --no-wayflow      Do not start the WayFlow agent runtime. An install that
+                                      owns a local stack starts it by default, so agents work
+                                      out of the box; pass this for a deliberately lean install
+                                      (agent runs then fail until you start it by hand).
                     When an EXISTING instance already holds the ports, install
                     offers + executes an isolation option (prompts on a TTY):
                     --on-conflict=isolated  Second FULL stack on remapped ports + own app port.
@@ -4513,6 +4537,23 @@ const DOCTOR_WAYFLOW = {
   healthUrl: "http://localhost:3010/.health",
 };
 
+// cinatra#2654 — probe the endpoint THIS instance publishes. An isolated
+// instance remaps the WayFlow host port and re-points WAYFLOW_BASE_URL in its
+// own `.env.local`, so a hardcoded :3010 would probe the DEFAULT instance's
+// runtime and report another stack's health as this one's. Falls back to the
+// default endpoint when the variable is absent or unparseable.
+function wayflowHealthUrlFromEnv(env = {}) {
+  const raw = typeof env.WAYFLOW_BASE_URL === "string" ? env.WAYFLOW_BASE_URL.trim() : "";
+  if (!raw) return DOCTOR_WAYFLOW.healthUrl;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return DOCTOR_WAYFLOW.healthUrl;
+    return `${parsed.protocol}//${parsed.host}/.health`;
+  } catch {
+    return DOCTOR_WAYFLOW.healthUrl;
+  }
+}
+
 // Resolve the effective Compose project name the way `docker compose` itself
 // does when no `-p` is passed (the wayflow start path passes none): an explicit
 // COMPOSE_PROJECT_NAME wins, else the checkout directory's basename, normalized
@@ -5103,21 +5144,36 @@ async function doctorAssertDrupalReadiness({ fetchImpl, dockerImpl }) {
   );
 }
 
-// WayFlow agent runtime readiness (read-only, no secret). The runtime is
-// profile-gated and NOT started by the default dev bring-up, so "container not
-// running" is the expected fresh-install state, a SKIP that names the exact
-// start command, because every agent run hard-fails (ECONNREFUSED) until the
-// operator runs it. Health is asserted via the loader's own /.health contract:
-// `ok` and `degraded` are both healthy (mirrors the compose healthcheck;
-// per-agent load failures must never condemn the runtime), anything else is a
-// FAIL with the rebuild remediation the agents preflight prescribes.
-async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot }) {
+// WayFlow agent runtime readiness (read-only, no secret).
+//
+// cinatra#2654 changed the VERDICT semantics. An install that owns a local
+// compose stack now starts the runtime by default, so an absent container is no
+// longer the expected fresh-install state — it is a FAILURE, because every agent
+// run hard-fails with ECONNREFUSED. The install records its own decision in
+// `.env.local` (CINATRA_WAYFLOW_RUNTIME), which is what separates the two
+// legitimate non-failing cases from the broken one:
+//   * `off`      — the operator installed lean with `--no-wayflow`: SKIP, stated
+//                  as the intentional opt-out it is.
+//   * `external` — the install owns no local stack (external infra, co-use,
+//                  --no-infra): SKIP, stated as "not owned by this install".
+//   * otherwise  — a runtime was promised. Absent ⇒ FAIL.
+// An install predating the key reads as "promised", which is truthful: its agent
+// runs do fail.
+//
+// Health is asserted via the loader's own /.health contract: `ok` and `degraded`
+// are both healthy (mirrors the compose healthcheck; per-agent load failures
+// must never condemn the runtime), anything else is a FAIL with the rebuild
+// remediation the agents preflight prescribes. `degraded` passing is exactly why
+// a real agent run stays the end-to-end gate.
+async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, env = {} }) {
   const id = "wayflow-readiness";
   const label = "WayFlow agent runtime readiness (read-only)";
-  // Label-scoped lookup (project + service), mirroring how the start path's
-  // `-p`-less compose invocation names its containers. A fixed
-  // `cinatra-wayflow-1` would miss any custom COMPOSE_PROJECT_NAME.
-  const project = effectiveComposeProjectName(repoRoot);
+  const runtimeMode = normalizeWayflowRuntimeMode(env[WAYFLOW_RUNTIME_KEY]);
+  // Label-scoped lookup (project + service) against the install's RECORDED
+  // compose project, not the checkout basename — a default install records an
+  // explicit instance-scoped project and an isolated one records its own.
+  const { project } = wayflowComposeContext(repoRoot);
+  const healthUrl = wayflowHealthUrlFromEnv(env);
   const ps = doctorDockerRun(dockerImpl, [
     "ps",
     "--filter",
@@ -5129,12 +5185,31 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot })
   ]);
   const runningContainer = ps.ok ? (ps.stdout.trim().split("\n")[0] ?? "").trim() : "";
   if (runningContainer === "") {
+    if (runtimeMode === WAYFLOW_RUNTIME_OFF) {
+      return makeAssertion(
+        id,
+        label,
+        "skip",
+        "no runtime by design — this instance was installed with `--no-wayflow` (intentional opt-out); agent runs fail with ECONNREFUSED",
+        "Start it when you want agents (`cinatra instance wayflow start`), or re-install without `--no-wayflow`.",
+      );
+    }
+    if (runtimeMode === WAYFLOW_RUNTIME_EXTERNAL) {
+      return makeAssertion(
+        id,
+        label,
+        "skip",
+        "this install owns no local compose stack (external infra / co-use), so it neither owns nor started a local WayFlow runtime",
+        `Point WAYFLOW_BASE_URL at the runtime you operate and verify it answers ${healthUrl}.`,
+      );
+    }
     return makeAssertion(
       id,
       label,
-      "skip",
-      `no running ${DOCTOR_WAYFLOW.service} container in compose project "${project}"; agent runs fail with ECONNREFUSED until it is started`,
-      "Start the WayFlow agent runtime (`cinatra instance wayflow start`), then re-run `cinatra doctor`.",
+      "fail",
+      `no running ${DOCTOR_WAYFLOW.service} container in compose project "${project}"; every agent run fails with ECONNREFUSED`,
+      "Start the WayFlow agent runtime (`cinatra instance wayflow start`), or re-run `cinatra install` to reconcile this instance. " +
+        "If this instance is meant to be lean, re-install with `--no-wayflow` so the opt-out is recorded.",
     );
   }
   // Probe /.health and parse its body. A transport error/timeout on a RUNNING
@@ -5144,7 +5219,7 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot })
   let health = null;
   let httpStatus = null;
   try {
-    const response = await fetchImpl(DOCTOR_WAYFLOW.healthUrl, {
+    const response = await fetchImpl(healthUrl, {
       method: "GET",
       signal: controller.signal,
     });
@@ -5161,7 +5236,7 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot })
       id,
       label,
       "skip",
-      `container up but ${DOCTOR_WAYFLOW.healthUrl} not answering; loader booting? (cold start mounts every agent, up to ~2 min)`,
+      `container up but ${healthUrl} not answering; loader booting? (cold start mounts every agent, up to ~2 min)`,
       "Wait for the loader to finish mounting agents, then re-run `cinatra doctor`.",
     );
   } finally {
@@ -5277,11 +5352,12 @@ async function gatherDoctorReport({
   assertions.push(await doctorAssertWordPressReadiness({ fetchImpl, dockerImpl }));
   assertions.push(await doctorAssertDrupalReadiness({ fetchImpl, dockerImpl }));
 
-  // 8 -- WayFlow agent runtime readiness (profile-gated; a fresh dev install
-  // has it DOWN and every agent run fails with ECONNREFUSED; the skip
-  // remediation names the exact start command). repoRoot feeds the compose
-  // project-name resolution the container lookup is scoped by.
-  assertions.push(await doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot }));
+  // 8 -- WayFlow agent runtime readiness. cinatra#2654: an install-owned local
+  // stack starts it by default, so an absent runtime is a FAILURE unless the
+  // instance recorded an intentional opt-out or owns no local stack. repoRoot
+  // feeds the RECORDED compose-project resolution the container lookup is scoped
+  // by; env carries that recorded decision plus this instance's endpoint.
+  assertions.push(await doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, env }));
 
   // 9 -- dev-app clone presence.
   assertions.push(doctorAssertDevAppsPresence(repoRoot));
@@ -11579,10 +11655,55 @@ async function runDevCms(service, argv = []) {
 const WAYFLOW_SERVICE = "wayflow";
 const WAYFLOW_LOCAL_URL = "http://localhost:3010";
 
-function composeWayflowArgs(verb) {
-  const base = ["compose", "-f", "docker-compose.yml", "-f", "docker-compose.dev.yml"];
+// cinatra#2654 — the compose project + files THIS checkout's recorded install
+// actually uses. A `-p`-less invocation makes Docker derive the project from the
+// directory BASENAME, but a default install now records an explicit
+// instance-scoped project and an isolated install records its own generated
+// compose file. Addressing the basename therefore forks a SECOND, empty project:
+// `wayflow start` would build a container the app never reaches, and the doctor
+// would report "no container" for a runtime that is up. Falling back to the
+// basename keeps a checkout with no recorded install working exactly as before.
+function wayflowComposeContext(repoRoot, deps = {}) {
+  const readRegistry =
+    deps.readRegistry ??
+    (() => {
+      const { registry } = readInstanceRegistrySafe();
+      return registry;
+    });
+  const findByInstallDir = deps.findByInstallDir ?? findInstanceRowByInstallDir;
+  return resolveRecordedComposeContext({
+    repoRoot,
+    fallbackProject: effectiveComposeProjectName(repoRoot),
+    readRegistry,
+    findByInstallDir,
+  });
+}
+
+// Thin sync wrappers over the registry module. Best-effort by contract: a
+// missing or malformed registry must never break a lifecycle command.
+function readInstanceRegistrySafe() {
+  try {
+    return readInstanceRegistryFile(instanceRegistryDefaultPath());
+  } catch {
+    return { registry: null };
+  }
+}
+
+function findInstanceRowByInstallDir(registry, installDir) {
+  try {
+    return instanceRowByInstallDir(registry, installDir);
+  } catch {
+    return null;
+  }
+}
+
+function composeWayflowArgs(verb, { project = null, composeFiles = null } = {}) {
+  const files = composeFiles && composeFiles.length
+    ? composeFiles
+    : ["docker-compose.yml", "docker-compose.dev.yml"];
+  const base = ["compose", ...(project ? ["-p", project] : []), ...files.flatMap((f) => ["-f", f])];
   return verb === "start"
-    ? [...base, "--profile", WAYFLOW_SERVICE, "up", "-d", "--build", WAYFLOW_SERVICE]
+    ? [...base, "--profile", WAYFLOW_PROFILE, "up", "-d", "--build", WAYFLOW_SERVICE]
     : [...base, "rm", "-sf", WAYFLOW_SERVICE];
 }
 
@@ -11654,7 +11775,8 @@ async function runDevWayflow(argv = []) {
     process.exitCode = 1;
     return;
   }
-  const args = composeWayflowArgs(verb);
+  const { project, composeFiles } = wayflowComposeContext(repoRoot);
+  const args = composeWayflowArgs(verb, { project, composeFiles });
   const shownCmd = `docker ${args.join(" ")}`;
   console.log(
     verb === "start"
@@ -14335,6 +14457,8 @@ export {
   composeWayflowArgs,
   ensureWayflowBridgeEnv,
   effectiveComposeProjectName,
+  wayflowComposeContext,
+  wayflowHealthUrlFromEnv,
   // cinatra-cli#105 — HEAD-stamped `.next` auto-clean (pure seams).
   cleanNextBuildCache,
   readNextBuildStamp,

@@ -858,14 +858,16 @@ describe("runDoctorCore — gather → remediate → fresh re-gather → gate", 
 });
 
 // =========================================================================
-// WayFlow agent runtime readiness: the profile-gated runtime a fresh dev
-// install never starts (agent runs then die with ECONNREFUSED on :3010).
-// The SKIP on a down container MUST name the exact start command.
+// WayFlow agent runtime readiness. cinatra#2654: an install that owns a local
+// compose stack starts the runtime by DEFAULT, so an absent container is a
+// FAILURE, not the expected fresh-install state. The two legitimate non-failing
+// cases are read from the install's own recorded decision in .env.local:
+// `off` (deliberate --no-wayflow) and `external` (owns no local stack).
 // =========================================================================
 describe("gatherDoctorReport: wayflow-readiness", () => {
-  // The assertion scopes its lookup by the EFFECTIVE compose project (env or
-  // checkout basename), mirroring the -p-less start invocation. Tests derive
-  // the same project the assertion will (repoRoot: process.cwd()).
+  // With no recorded install row for this dir, the assertion falls back to the
+  // EFFECTIVE compose project (env or checkout basename). Tests derive the same
+  // one the assertion will (repoRoot: process.cwd()).
   const PROJECT = effectiveComposeProjectName(process.cwd());
   const WAYFLOW_UP = makeDocker({
     composeRunning: [{ project: PROJECT, service: "wayflow", name: `${PROJECT}-wayflow-1` }],
@@ -884,12 +886,53 @@ describe("gatherDoctorReport: wayflow-readiness", () => {
     });
   }
 
-  it("container down (fresh install) → SKIP with the exact start command", async () => {
+  it("container down on an install that promised one → FAIL with the exact start command", async () => {
     const report = await reportWith({ fetchImpl: throwingFetch(), dockerImpl: NO_DOCKER });
     const a = byId(report, "wayflow-readiness");
-    expect(a.verdict).toBe("skip");
+    expect(a.verdict).toBe("fail");
     expect(a.detail).toMatch(/ECONNREFUSED/);
     expect(a.remediation).toContain("cinatra instance wayflow start");
+  });
+
+  it("container down after a recorded --no-wayflow opt-out → SKIP that names the opt-out", async () => {
+    const report = await gatherDoctorReport({
+      client: createMetadataClient(baseStore()),
+      schemaName: SCHEMA,
+      env: { ...ENV, CINATRA_WAYFLOW_RUNTIME: "off" },
+      repoRoot: process.cwd(),
+      fetchImpl: throwingFetch(),
+      dockerImpl: NO_DOCKER,
+    });
+    const a = byId(report, "wayflow-readiness");
+    expect(a.verdict).toBe("skip");
+    expect(a.detail).toContain("--no-wayflow");
+    expect(a.detail).toContain("intentional opt-out");
+  });
+
+  it("container down on an install that owns no local stack → SKIP that says so explicitly", async () => {
+    const report = await gatherDoctorReport({
+      client: createMetadataClient(baseStore()),
+      schemaName: SCHEMA,
+      env: { ...ENV, CINATRA_WAYFLOW_RUNTIME: "external" },
+      repoRoot: process.cwd(),
+      fetchImpl: throwingFetch(),
+      dockerImpl: NO_DOCKER,
+    });
+    const a = byId(report, "wayflow-readiness");
+    expect(a.verdict).toBe("skip");
+    expect(a.detail).toContain("owns no local compose stack");
+  });
+
+  it("an unrecognised recorded value reads as promised (default-on) → FAIL", async () => {
+    const report = await gatherDoctorReport({
+      client: createMetadataClient(baseStore()),
+      schemaName: SCHEMA,
+      env: { ...ENV, CINATRA_WAYFLOW_RUNTIME: "banana" },
+      repoRoot: process.cwd(),
+      fetchImpl: throwingFetch(),
+      dockerImpl: NO_DOCKER,
+    });
+    expect(byId(report, "wayflow-readiness").verdict).toBe("fail");
   });
 
   it("container up + /.health ok → PASS with the mounted agent count", async () => {
@@ -945,15 +988,33 @@ describe("gatherDoctorReport: wayflow-readiness", () => {
     expect(a.remediation).toContain("cinatra instance wayflow start");
   });
 
-  it("a wayflow container under a DIFFERENT compose project is not ours → SKIP with the start command", async () => {
+  it("a wayflow container under a DIFFERENT compose project is not ours → FAIL naming our project", async () => {
     const dockerImpl = makeDocker({
       composeRunning: [{ project: "someone-elses-stack", service: "wayflow", name: "someone-elses-stack-wayflow-1" }],
     });
     const report = await reportWith({ fetchImpl: throwingFetch(), dockerImpl });
     const a = byId(report, "wayflow-readiness");
-    expect(a.verdict).toBe("skip");
+    expect(a.verdict).toBe("fail");
     expect(a.detail).toContain(`compose project "${PROJECT}"`);
     expect(a.remediation).toContain("cinatra instance wayflow start");
+  });
+
+  it("the health probe follows this instance's WAYFLOW_BASE_URL, not a hardcoded :3010", async () => {
+    const seen = [];
+    const fetchImpl = async (url) => {
+      seen.push(String(url));
+      return jsonResponse(200, { status: "ok", agents: 1 });
+    };
+    const report = await gatherDoctorReport({
+      client: createMetadataClient(baseStore()),
+      schemaName: SCHEMA,
+      env: { ...ENV, WAYFLOW_BASE_URL: "http://localhost:13010" },
+      repoRoot: process.cwd(),
+      fetchImpl,
+      dockerImpl: WAYFLOW_UP,
+    });
+    expect(byId(report, "wayflow-readiness").verdict).toBe("pass");
+    expect(seen).toContain("http://localhost:13010/.health");
   });
 
   it("container up + 200 but an unknown status value → FAIL (only ok|degraded are healthy)", async () => {
