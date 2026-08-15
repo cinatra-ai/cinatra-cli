@@ -205,6 +205,13 @@ import {
   devTunnelRuntimeSlug,
   claimDevTunnelRuntimeDir,
 } from "./dev-tunnel-identity.mjs";
+// Auto-declaration of the reserved main identity for a canonical install. Pure
+// decision module (no filesystem, no extensions tree) — see the module header
+// for the five gates and why each one keeps the fail-closed protection intact.
+import {
+  DEV_MAIN_DECLARATION_VAR,
+  planDevMainDeclaration,
+} from "./dev-main-declaration.mjs";
 // Registry-user reconcile for `instance reset --purge-app-data` (cinatra-cli#208).
 // Builtins-only module — safe on an extension-empty checkout.
 import {
@@ -6445,6 +6452,31 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
         recovery: devGate.recovery,
       });
     }
+    // A canonical single-instance main install declares its own database
+    // endpoint as the reserved main tunnel identity. Sequenced HERE — after the
+    // extension-tree materialization, before the public-MCP self-establish step
+    // — for two reasons: the endpoint parser lives in that tree, and the step
+    // below reads the declaration, so the auto-derived Funnel URL lands on the
+    // FIRST install rather than the second. Clones and schema-isolated
+    // worktrees are skipped, so the fail-closed multi-instance protection
+    // stands. Soft-fail: it never aborts setup.
+    if (mode === "dev") {
+      try {
+        await ensureDevMainDeclaration({
+          repoRoot,
+          env,
+          dbUrl: connectionString,
+          schemaName,
+        });
+      } catch (err) {
+        console.warn(
+          `⚠ Could not declare this instance as the dev main tunnel identity ` +
+            `(continuing; the Funnel URL field still accepts a pasted URL): ${
+              err && err.message ? err.message : err
+            }`,
+        );
+      }
+    }
     // cinatra#260 Step 3 — self-establishing + self-healing public MCP URL
     // (dev only). Runs AFTER the extension-tree materialization above so the
     // tailscale-hostname declarer is present (cinatra#1919).
@@ -10104,6 +10136,86 @@ function loadTailscaleApiModule() {
 }
 function loadTailscaleHostnameModule() {
   return loadDevCliModule("tailscale-hostname", getRepoRoot());
+}
+
+// ---------------------------------------------------------------------------
+// Auto-declare the reserved main tunnel identity for a canonical install.
+//
+// The I/O half of `src/dev-main-declaration.mjs` (which owns the decision and
+// documents every gate). It runs inside `runSetup("dev")`, so BOTH entry points
+// the operator can reach — `cinatra install` (which hands setup off to the
+// target checkout's own binary) and `cinatra instance setup dev` — get it from
+// one place.
+//
+// The endpoint fingerprint comes from the connector's `parseDatabaseEndpoint`,
+// loaded out of the extensions tree, so the declared value is produced by the
+// SAME parser the classifier compares it against. Re-implementing that shape
+// here would be a silent drift surface between two repos.
+//
+// SOFT by contract, exactly like the public-MCP self-establish step beside it:
+// an absent declarer, an unreadable env file or a failed write become one
+// warning line and setup continues. A missing auto-declaration costs an
+// auto-derived Funnel URL; it never costs an install.
+//
+// @returns {Promise<{ declared: boolean, code: string, value: string | null }>}
+async function ensureDevMainDeclaration({ repoRoot, env, dbUrl, schemaName, deps = {} }) {
+  const envPath = path.join(repoRoot, ".env.local");
+  const result = (code, value = null) => ({ declared: value !== null, code, value });
+
+  // Non-pure boundaries, injectable for hermetic tests.
+  const loadHostnameModule = deps.loadTailscaleHostnameModule ?? loadTailscaleHostnameModule;
+  const readBody = deps.readEnvBody ?? ((p) => readFileSync(p, "utf8"));
+  const writeBody = deps.writeEnvBody ?? ((p, body) => writeFileSync(p, body, { mode: 0o600 }));
+  const log = deps.log ?? console.log;
+
+  // Answer the two cheapest gates BEFORE touching the extensions tree, so an
+  // already-declared or non-development instance reports the REAL reason it was
+  // skipped instead of whatever the declarer lookup happens to say.
+  if (String(env?.[DEV_MAIN_DECLARATION_VAR] ?? "").trim() !== "") {
+    return result("already-declared");
+  }
+  if (readConfiguredRuntimeMode(env) !== "development") {
+    return result("not-development");
+  }
+
+  let parseDatabaseEndpoint = null;
+  try {
+    const helperModule = await loadHostnameModule();
+    parseDatabaseEndpoint = helperModule?.parseDatabaseEndpoint ?? null;
+  } catch (err) {
+    // An extension-empty checkout is a legitimate state, not a defect — the
+    // same graceful degradation every other reader of this declarer applies.
+    if (err?.cinatraDevCliDeclarerMissing !== true) throw err;
+    return result("declarer-unresolvable");
+  }
+  if (typeof parseDatabaseEndpoint !== "function") {
+    return result("declarer-outdated");
+  }
+
+  const plan = planDevMainDeclaration({
+    runtimeMode: readConfiguredRuntimeMode(env),
+    endpoint: parseDatabaseEndpoint(dbUrl),
+    schema: schemaName,
+    existingDeclaration: env?.[DEV_MAIN_DECLARATION_VAR],
+  });
+  if (!plan.declare) return result(plan.code);
+
+  if (!existsSync(envPath)) return result("no-env-file");
+  const body = readBody(envPath);
+  writeBody(envPath, applyEnvUpsertsToBody(body, [{ key: plan.key, value: plan.value }]));
+
+  // Make the declaration visible to the REST of this same run. The public-MCP
+  // self-establish step below reads it off `env`, so without this the first
+  // install would still finish with no auto-derived URL and the operator would
+  // have to run setup twice for a value this run already computed.
+  if (env && typeof env === "object") env[plan.key] = plan.value;
+
+  log(
+    `  Declared this instance as the dev main tunnel identity ` +
+      `(${plan.key}=${plan.value} in .env.local), so its Funnel URL can be ` +
+      `derived automatically.`,
+  );
+  return result(plan.code, plan.value);
 }
 
 // ---------------------------------------------------------------------------
@@ -14201,6 +14313,7 @@ export {
   ensureDecryptableJwks,
   ensureMcpSettings,
   ensureDevPublicMcpUrl,
+  ensureDevMainDeclaration,
   probeTokenMint,
   deleteLatestJwksRow,
   resolveLocalOrigin,
