@@ -36,18 +36,25 @@
 // under a pin bump, wedges auth in a way the operator cannot diagnose. Adopting
 // reads a value nango itself wrote and can never disagree with it.)
 //
-// LIFECYCLE — mint, heal, and NEVER rotate:
+// LIFECYCLE: mint, heal, adopt a stale key, and never rotate a working one:
 //   - ABSENT  → adopt the seeded key ("mint" from the operator's point of view).
 //   - MALFORMED (not a UUID v4) → heal: that value cannot authenticate under any
 //     circumstance, it is the exact `invalid_secret_key_format` 401 in the issue,
 //     and there is nothing to preserve. The replacement is announced.
-//   - A VALID (UUID v4) EXISTING KEY IS NEVER OVERWRITTEN. Not when it matches
-//     the bundled environment (nothing to do), and not when it DIVERGES from it
-//     either: a well-formed key is a deliberate operator value (a hosted Nango
-//     environment key, a second stack, a hand-copied dev key), and silently
-//     rotating credentials out from under an operator is the failure class the
-//     sibling `CINATRA_ENCRYPTION_KEY` guard exists to prevent. Divergence is
-//     REPORTED with the remedy instead — loudly, because it 401s the same way.
+//   - A VALID (UUID v4) KEY THAT AUTHENTICATES IS NEVER OVERWRITTEN. Not when it
+//     matches the environment this instance prefers (nothing to do), and not
+//     when it is the OTHER environment nango-server seeded either: both keys
+//     authenticate against the same bundled server, so holding the other one is
+//     a deliberate operator value, and silently rotating credentials out from
+//     under an operator is the failure class the sibling
+//     `CINATRA_ENCRYPTION_KEY` guard exists to prevent.
+//   - STALE (a valid UUID v4 that matches NO environment of this nango-db) →
+//     adopt. The hosted target is already excluded, so such a key can never
+//     authenticate against the only Nango in play: it is the same guaranteed
+//     401 as a malformed key, with nothing to preserve, and
+//     it is exactly what a fresh install or a nango-db wipe leaves behind when
+//     `.env.local` survives. Only ever decided after EVERY environment was read;
+//     a failed counterpart read falls back to reporting, never to rotating.
 //   Re-running any bring-up is therefore a no-op once the key is right: the file
 //   is not rewritten, so `.env.local` keeps its mtime and its bytes.
 //
@@ -138,6 +145,15 @@ export function isUuidV4(value) {
  */
 export function nangoEnvironmentNameForRuntimeMode(runtimeMode) {
   return String(runtimeMode ?? "").trim().toLowerCase() === "production" ? "prod" : "dev";
+}
+
+/** Every environment nango-server seeds into a fresh nango-db. */
+export const NANGO_ENVIRONMENT_NAMES = ["prod", "dev"];
+
+/** The other seeded environment. EITHER key authenticates against the same
+ *  bundled server, so "which one" is a preference, while "neither" is a fault. */
+export function counterpartNangoEnvironmentName(environmentName) {
+  return environmentName === "prod" ? "dev" : "prod";
 }
 
 /** Hosts that can only mean "the Nango this install just brought up". */
@@ -284,29 +300,52 @@ export function readSeededNangoSecretKey({
  * The DECISION, as a pure function of the two values — the whole lifecycle in
  * one testable place.
  *
- *   mint                  – nothing set, adopt the seeded key
- *   heal                  – set but not a UUID v4 (it can only ever 401), replace
- *   keep/matches-bundled  – already the bundled environment key: no write
- *   keep/diverges         – a VALID key that is not the bundled one: never
- *                           overwritten, reported
- *   keep/unverified       – a valid key, and the seed could not be read: no write
- *   readopt               – a valid key that diverges, on a caller that JUST
- *                           destroyed and re-seeded the Nango environment
- *   absent-unresolved     – nothing set and no seed to adopt
- *   malformed-unresolved  – broken key and no seed to heal it with
+ *   mint                    – nothing set, adopt the seeded key
+ *   heal                    – set but not a UUID v4 (it can only ever 401), replace
+ *   keep/matches-bundled    – already the bundled environment key: no write
+ *   keep/matches-other-env  – a VALID key that is the OTHER seeded environment's:
+ *                             it authenticates, so it is a deliberate operator
+ *                             choice and is kept silently
+ *   keep/diverges           – a VALID key that DIFFERS from the preferred
+ *                             environment's key and could not be checked
+ *                             against the other one: never overwritten on
+ *                             partial information, reported
+ *   keep/unverified         – a valid key, and the seed could not be read: no write
+ *   adopt-stale             – a VALID key that matches NO environment this
+ *                             nango-db seeded, with every environment read: it
+ *                             can never authenticate, so it is replaced
+ *   readopt                 – a valid key that diverges, on a caller that JUST
+ *                             destroyed and re-seeded the Nango environment
+ *   absent-unresolved       – nothing set and no seed to adopt
+ *   malformed-unresolved    – broken key and no seed to heal it with
  *
- * `adoptDivergent` is the ONE narrow exception to "never rotate a valid key",
- * and only `cinatra instance reset --full` passes it: that command runs
- * `docker compose down -v`, which DESTROYS the nango volume, so nango-server
- * re-seeds a brand-new environment key and the value still sitting in
- * `.env.local` refers to an environment that no longer exists anywhere. Keeping
- * it there would not be preservation, it would be a guaranteed 401. Every other
- * caller leaves a well-formed key alone.
+ * WHY `adopt-stale` EXISTS (and why it does NOT weaken the
+ * never-rotate rule): the rule protects a key the operator MEANT to set. The
+ * hosted target is already excluded above, so the only Nango in play is the
+ * bundled one, and a key that matches NEITHER of its seeded environments cannot
+ * authenticate against it under any circumstance. It is exactly the same class
+ * as a malformed key, which this module has always healed: a guaranteed 401 with
+ * nothing to preserve. That is the state a fresh install or a nango-db wipe
+ * leaves behind when `.env.local` survives, and reporting it (the old behaviour)
+ * left the operator to hand-edit the file. The key is replaced ONLY when every
+ * environment was actually read; a failed counterpart read falls back to
+ * reporting, because a rotation must never rest on partial information.
+ *
+ * `adoptDivergent` remains the exception for a caller that KNOWS the environment
+ * is gone: only `cinatra instance reset --full` passes it. That command runs
+ * `docker compose down -v`, which DESTROYS the nango volume, so it may re-adopt
+ * without waiting to prove the old key matches nothing.
  *
  * A seeded value that is NOT itself a UUID v4 is refused (treated as no seed):
  * a garbage read must never become the host's key.
  */
-export function planNangoSecretKey({ current, seeded, adoptDivergent = false } = {}) {
+export function planNangoSecretKey({
+  current,
+  seeded,
+  alternates = [],
+  alternatesComplete = false,
+  adoptDivergent = false,
+} = {}) {
   const cur = String(current ?? "").trim();
   const seed = String(seeded ?? "").trim();
   const adoptable = seed !== "" && isUuidV4(seed);
@@ -315,8 +354,15 @@ export function planNangoSecretKey({ current, seeded, adoptDivergent = false } =
   if (!isUuidV4(cur)) return { action: adoptable ? "heal" : "malformed-unresolved", writes: adoptable };
   if (!adoptable) return { action: "keep", reason: "unverified", writes: false };
   if (seed === cur) return { action: "keep", reason: "matches-bundled", writes: false };
-  return adoptDivergent
-    ? { action: "readopt", writes: true }
+  if (adoptDivergent) return { action: "readopt", writes: true };
+
+  const otherSeeded = (Array.isArray(alternates) ? alternates : [])
+    .map((value) => String(value ?? "").trim())
+    .filter((value) => value !== "" && isUuidV4(value));
+  if (otherSeeded.includes(cur)) return { action: "keep", reason: "matches-other-environment", writes: false };
+
+  return alternatesComplete
+    ? { action: "adopt-stale", writes: true }
     : { action: "keep", reason: "diverges-from-bundled", writes: false };
 }
 
@@ -449,16 +495,47 @@ export function ensureNangoSecretKey({
     sleep,
   });
 
-  let plan = planNangoSecretKey({ current, seeded: seeded.secretKey, adoptDivergent });
+  // A well-formed key that is not the PREFERRED environment's is not yet a
+  // fault: the other seeded environment authenticates just as well, and an
+  // operator (or the app repo's own `npm run services` reconcile, which prefers
+  // `prod`) may deliberately hold that one. So before treating a divergence as
+  // stale, read the counterpart environment and find out whether the key matches
+  // ANY environment this nango-db seeded. One attempt is enough: by the time the
+  // preferred environment answered, every environment is seeded (one migration
+  // writes them all).
+  let alternates = [];
+  let alternatesComplete = false;
+  const currentDiverges =
+    !adoptDivergent && seeded.ok && isUuidV4(current) && String(current).trim() !== seeded.secretKey;
+  if (currentDiverges) {
+    const counterpart = readSeededNangoSecretKey({
+      transport,
+      environmentName: counterpartNangoEnvironmentName(environmentName),
+      attempts: 1,
+      sleep,
+    });
+    alternatesComplete = counterpart.ok && isUuidV4(counterpart.secretKey);
+    if (counterpart.ok) alternates = [counterpart.secretKey];
+  }
+
+  let plan = planNangoSecretKey({
+    current,
+    seeded: seeded.secretKey,
+    alternates,
+    alternatesComplete,
+    adoptDivergent,
+  });
 
   if (plan.action === "keep") {
     if (plan.reason === "diverges-from-bundled") {
       log(
         `  ⚠ ${NANGO_SECRET_KEY_VAR} in .env.local is a well-formed key, but it is NOT this instance's ` +
-          `bundled Nango \`${environmentName}\` environment key — Nango answers HTTP 401 ` +
-          '("does not match any account") for every connector save. Left untouched (this installer never ' +
-          `rotates a valid key). To adopt the bundled key, delete the ${NANGO_SECRET_KEY_VAR} line from ` +
-          ".env.local and re-run this command.",
+          `bundled Nango \`${environmentName}\` environment key, and the other seeded environment could ` +
+          `not be read from ${NANGO_DB_COMPOSE_SERVICE} to tell whether it matches THAT one. If it matches ` +
+          'neither, Nango answers HTTP 401 ("does not match any account") for every connector save. Left ' +
+          "untouched (this installer never rotates a valid key on partial information). Re-run this command " +
+          `once the stack is up, or delete the ${NANGO_SECRET_KEY_VAR} line from .env.local to adopt the ` +
+          "bundled key.",
       );
     }
     return result("keep", { reason: plan.reason, environmentName });
@@ -483,7 +560,7 @@ export function ensureNangoSecretKey({
     return result("malformed-unresolved", { environmentName });
   }
 
-  // mint / heal / readopt — the only paths that write.
+  // mint / heal / adopt-stale / readopt — the only paths that write.
   //
   // RE-READ FIRST. The seed poll above can take tens of seconds, and applying the
   // plan to the snapshot taken before it would silently discard anything written
@@ -521,6 +598,8 @@ export function ensureNangoSecretKey({
     const livePlan = planNangoSecretKey({
       current: liveValues[NANGO_SECRET_KEY_VAR] ?? "",
       seeded: seeded.secretKey,
+      alternates,
+      alternatesComplete,
       adoptDivergent,
     });
     if (!livePlan.writes) {
@@ -570,6 +649,14 @@ export function ensureNangoSecretKey({
       `  ⚠ ${NANGO_SECRET_KEY_VAR} in .env.local was not a UUID v4 — Nango rejects that with ` +
         "`invalid_secret_key_format` (HTTP 401), which is why Nango-backed connectors could not save. " +
         `Replaced it with this instance's bundled Nango \`${environmentName}\` environment key.`,
+    );
+  } else if (plan.action === "adopt-stale") {
+    log(
+      `  ⚠ ${NANGO_SECRET_KEY_VAR} in .env.local was a well-formed key that matched NO environment of this ` +
+        'instance\'s Nango: a key from a previous nango-db, which answers HTTP 401 ("does not match any ' +
+        'account") on every connector save. That is what a fresh install or a nango-db wipe leaves behind ' +
+        `when .env.local survives. Replaced it with this instance's bundled Nango \`${environmentName}\` ` +
+        "environment key.",
     );
   } else if (plan.action === "readopt") {
     log(
