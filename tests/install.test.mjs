@@ -379,13 +379,44 @@ describe("ensureEnvLocal — prod secrets (cinatra-cli#143)", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("dev install does NOT mint the prod-only keys (they stay prod-gated)", () => {
+  it("dev install keeps CINATRA_ENCRYPTION_KEY prod-gated but mints the WayFlow secrets (cinatra#2654)", () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "cinatra-devsecrets-"));
     writeFileSync(path.join(dir, ".env.example"), "BETTER_AUTH_SECRET=\nCINATRA_RUNTIME_MODE=development\n");
     ensureEnvLocal({ targetDir: dir, mode: "dev", log: () => {} });
     const body = readLocal(dir);
     expect(body).not.toMatch(/^CINATRA_ENCRYPTION_KEY=/m);
-    expect(body).not.toMatch(/^CINATRA_CONTEXT_ATTEST_KEY=/m);
+    // A dev install now STARTS the WayFlow runtime, so both secrets it needs
+    // must exist before the stack comes up.
+    expect(body).toMatch(/^CINATRA_CONTEXT_ATTEST_KEY=[0-9a-f]{64}$/m);
+    expect(body).toMatch(/^CINATRA_BRIDGE_TOKEN=[0-9a-f]{64}$/m);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("demo install mints the WayFlow secrets too (its stack starts the runtime)", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "cinatra-demosecrets-"));
+    writeFileSync(path.join(dir, ".env.example"), "BETTER_AUTH_SECRET=\nCINATRA_RUNTIME_MODE=development\n");
+    ensureEnvLocal({ targetDir: dir, mode: "demo", log: () => {} });
+    const body = readLocal(dir);
+    expect(body).toMatch(/^CINATRA_CONTEXT_ATTEST_KEY=[0-9a-f]{64}$/m);
+    expect(body).toMatch(/^CINATRA_BRIDGE_TOKEN=[0-9a-f]{64}$/m);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("preserve path heals a dev .env.local written before the WayFlow secrets existed", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "cinatra-devheal-"));
+    writeFileSync(path.join(dir, ".env.example"), "BETTER_AUTH_SECRET=\nCINATRA_RUNTIME_MODE=development\n");
+    writeFileSync(
+      path.join(dir, ".env.local"),
+      "BETTER_AUTH_SECRET=abc\nCINATRA_RUNTIME_MODE=development\n",
+    );
+    const r = ensureEnvLocal({ targetDir: dir, mode: "dev", log: () => {} });
+    expect(r.created).toBe(false);
+    const body = readLocal(dir);
+    expect(body).toMatch(/^CINATRA_CONTEXT_ATTEST_KEY=[0-9a-f]{64}$/m);
+    expect(body).toMatch(/^CINATRA_BRIDGE_TOKEN=[0-9a-f]{64}$/m);
+    // An existing value is never rotated on a second reconcile.
+    ensureEnvLocal({ targetDir: dir, mode: "dev", log: () => {} });
+    expect(readLocal(dir)).toBe(body);
     rmSync(dir, { recursive: true, force: true });
   });
 

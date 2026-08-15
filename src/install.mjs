@@ -151,6 +151,20 @@ import {
 // ESM over node builtins (importable from the light CLI core), and only the pure
 // validator is used here — the lifecycle itself stays lazy-imported below.
 import { resolveBuildTimeoutMs } from "./preview.mjs";
+// cinatra#2654: the WayFlow agent runtime starts with every install-owned local
+// stack. The decision, the operator-facing status text, and the two pre-`up`
+// steps (bridge-token env, image build) live in their own builtins-only module
+// so they stay hermetically testable.
+import {
+  WAYFLOW_PROFILE,
+  WAYFLOW_RUNTIME_KEY,
+  buildWayflowImage,
+  generateWayflowEnv,
+  resolveWayflowRuntimeMode,
+  waitForWayflowHealth,
+  wayflowBuildFailureMessage,
+  wayflowStatusLines,
+} from "./wayflow-runtime.mjs";
 import {
   deriveCoUseSlug,
   coUseDbName,
@@ -682,6 +696,11 @@ export function parseInstallArgs(argv = []) {
     skipDevApps: argv.includes("--skip-dev-apps"),
     noSetup: argv.includes("--no-setup"),
     noInfra,
+    // cinatra#2654: every install-owned local stack starts the WayFlow agent
+    // runtime. `--no-wayflow` is the opt-out, for a deliberately lean install.
+    // It changes NOTHING on a path that owns no local stack (external, co-use,
+    // --no-infra) — those never started a runtime to begin with, and say so.
+    wayflow: !argv.includes("--no-wayflow"),
     // --no-install ⇒ clone + env only; pnpm install + setup both skipped
     // (setup needs the installed deps, so skipping install implies skipping setup).
     noInstall: argv.includes("--no-install"),
@@ -1480,13 +1499,14 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
     // it ensures the key is present; downgrading demo → dev/prod clears it.
     const original = readFileSync(envPath, "utf8");
     const { body: reconciled, changed: profileChanged } = reconcileInstallProfile(original, profile);
-    // cinatra-cli#143: for --mode prod, ALSO self-heal the prod-only secrets in
-    // an existing file — mint CINATRA_ENCRYPTION_KEY / CINATRA_CONTEXT_ATTEST_KEY
-    // when MISSING, carry a valid existing value forward untouched, and THROW on
-    // a malformed encryption key (rotating it would orphan encrypted data). The
-    // source values come from the existing file itself, so a valid key never
-    // changes. No-op for dev/demo.
-    const { body: withSecrets, changed: secretsChanged, minted } = ensureProdSecrets({
+    // cinatra-cli#143 + cinatra#2654: self-heal the instance secrets in an
+    // existing file — mint CINATRA_CONTEXT_ATTEST_KEY / CINATRA_BRIDGE_TOKEN
+    // (every mode, both feed the WayFlow runtime this install now starts) and
+    // CINATRA_ENCRYPTION_KEY (prod only) when MISSING, carry a valid existing
+    // value forward untouched, and THROW on a malformed encryption key
+    // (rotating it would orphan encrypted data). The source values come from
+    // the existing file itself, so a valid key never changes.
+    const { body: withSecrets, changed: secretsChanged, minted } = ensureInstanceSecrets({
       body: reconciled,
       mode,
       envPath,
@@ -1500,7 +1520,7 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
           ? ` set CINATRA_INSTALL_PROFILE=${profile} (${mode}).`
           : ` cleared CINATRA_INSTALL_PROFILE (${mode}).`
         : "";
-      const mintNote = minted.length ? ` minted missing prod secret(s): ${minted.join(", ")}.` : "";
+      const mintNote = minted.length ? ` minted missing instance secret(s): ${minted.join(", ")}.` : "";
       log(`  .env.local already exists (${normalized ?? "mode unset"}) —${profileNote}${mintNote}`.trimEnd());
       return { created: false, envPath };
     }
@@ -1529,20 +1549,19 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
   //  - CINATRA_BRIDGE_TOKEN (shared secret) — the wayflow → /api/llm-bridge
   //    callback returns 403 (content-edit "(no response)") when it is empty.
   const nangoEncryptionKey = randomBytes(32).toString("base64");
-  const bridgeToken = randomBytes(32).toString("hex");
   let body = readFileSync(envPath, "utf8");
   body = upsertEnvKey(body, "BETTER_AUTH_SECRET", secret);
   body = upsertEnvKey(body, "NANGO_ENCRYPTION_KEY", nangoEncryptionKey);
-  body = upsertEnvKey(body, "CINATRA_BRIDGE_TOKEN", bridgeToken);
   body = upsertEnvKey(body, "CINATRA_RUNTIME_MODE", wantMode);
   // cinatra-cli#122: stamp the demo install profile so `pnpm dev` seeds the demo
   // fixtures. dev/prod carry no profile line (default fixtures-off, cinatra#1237).
   if (profile) body = upsertEnvKey(body, "CINATRA_INSTALL_PROFILE", profile);
-  // cinatra-cli#143: for --mode prod, add CINATRA_ENCRYPTION_KEY (app prod-boot
-  // hard requirement) + the distinct WayFlow CINATRA_CONTEXT_ATTEST_KEY —
-  // preserving valid prior values across a --reset-env regen (throws on a
-  // malformed prior encryption key). No-op for dev/demo.
-  const { body: withProdSecrets, minted: prodMinted, preserved: prodPreserved } = ensureProdSecrets({
+  // cinatra-cli#143 + cinatra#2654: add CINATRA_CONTEXT_ATTEST_KEY and
+  // CINATRA_BRIDGE_TOKEN (every mode — the WayFlow runtime this install starts
+  // needs both) plus CINATRA_ENCRYPTION_KEY for prod (app prod-boot hard
+  // requirement) — preserving valid prior values across a --reset-env regen
+  // (throws on a malformed prior encryption key).
+  const { body: withProdSecrets, minted: prodMinted, preserved: prodPreserved } = ensureInstanceSecrets({
     body,
     mode,
     envPath,
@@ -1556,12 +1575,12 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
   // mode, so chmod explicitly (best-effort on platforms without chmod semantics).
   tightenEnvLocalPerms(envPath);
   const prodSecretNote = prodMinted.length
-    ? ` Prod secrets minted: ${prodMinted.join(", ")}${prodPreserved.length ? `; preserved: ${prodPreserved.join(", ")}` : ""}.`
+    ? ` Instance secrets minted: ${prodMinted.join(", ")}${prodPreserved.length ? `; preserved: ${prodPreserved.join(", ")}` : ""}.`
     : prodPreserved.length
-      ? ` Prod secrets preserved: ${prodPreserved.join(", ")}.`
+      ? ` Instance secrets preserved: ${prodPreserved.join(", ")}.`
       : "";
   log(
-    `  .env.local created from .env.example with fresh BETTER_AUTH_SECRET, NANGO_ENCRYPTION_KEY, CINATRA_BRIDGE_TOKEN, and CINATRA_RUNTIME_MODE=${wantMode}${profile ? `, CINATRA_INSTALL_PROFILE=${profile}` : ""}.${prodSecretNote}`,
+    `  .env.local created from .env.example with fresh BETTER_AUTH_SECRET, NANGO_ENCRYPTION_KEY, and CINATRA_RUNTIME_MODE=${wantMode}${profile ? `, CINATRA_INSTALL_PROFILE=${profile}` : ""}.${prodSecretNote}`,
   );
   return { created: true, envPath };
 }
@@ -1613,32 +1632,39 @@ function assertPriorEncryptionKeyDecodable({ mode, sourceValues = {}, envPath })
   }
 }
 
-function ensureProdSecrets({ body, mode, envPath, sourceValues = {} }) {
-  if (RUNTIME_MODE[mode] !== "production") {
-    return { body, changed: false, minted: [], preserved: [] };
-  }
+function ensureInstanceSecrets({ body, mode, envPath, sourceValues = {} }) {
+  const isProd = RUNTIME_MODE[mode] === "production";
   // A malformed prior encryption key aborts (never rotate). On the preserve path
   // this throws before any write; the fresh/reset path calls the same guard
-  // BEFORE copyFileSync so the existing file is never destroyed first.
+  // BEFORE copyFileSync so the existing file is never destroyed first. No-op
+  // for dev/demo (the key is prod-only).
   assertPriorEncryptionKeyDecodable({ mode, sourceValues, envPath });
   let next = body;
   const minted = [];
   const preserved = [];
 
-  // HARD: CINATRA_ENCRYPTION_KEY — a present value is already validated (hex-64
-  // OR base64 32-byte, matching the app); carry it forward, else mint.
-  const ENC = PROD_ENCRYPTION_KEY;
-  const encExisting = String(sourceValues[ENC] ?? "").trim();
-  if (encExisting) {
-    next = upsertEnvKey(next, ENC, encExisting);
-    preserved.push(ENC);
-  } else {
-    next = upsertEnvKey(next, ENC, randomBytes(32).toString("hex"));
-    minted.push(ENC);
+  // HARD, PROD ONLY: CINATRA_ENCRYPTION_KEY — a present value is already
+  // validated (hex-64 OR base64 32-byte, matching the app); carry it forward,
+  // else mint. Dev/demo boot without it (the app auto-generates in development).
+  if (isProd) {
+    const ENC = PROD_ENCRYPTION_KEY;
+    const encExisting = String(sourceValues[ENC] ?? "").trim();
+    if (encExisting) {
+      next = upsertEnvKey(next, ENC, encExisting);
+      preserved.push(ENC);
+    } else {
+      next = upsertEnvKey(next, ENC, randomBytes(32).toString("hex"));
+      minted.push(ENC);
+    }
   }
 
-  // SOFT: CINATRA_CONTEXT_ATTEST_KEY — preserve any present value, mint if
-  // missing. No malformed-throw (soft WayFlow contract; the gate warns instead).
+  // EVERY MODE: CINATRA_CONTEXT_ATTEST_KEY — the WayFlow runtime signs its
+  // context callbacks with it, and gen-wayflow-env.mjs hands it to the
+  // container. cinatra#2654: dev and demo now START that runtime by default, so
+  // minting this only for prod left every fresh dev/demo install running a
+  // degraded runtime (the app fails CLOSED on the composed-child path). Preserve
+  // any present value, mint when missing; never a malformed-throw (soft
+  // contract — the gate warns instead).
   const ATTEST = ATTEST_KEY.name;
   const attestExisting = String(sourceValues[ATTEST] ?? "").trim();
   if (attestExisting) {
@@ -1647,6 +1673,21 @@ function ensureProdSecrets({ body, mode, envPath, sourceValues = {} }) {
   } else {
     next = upsertEnvKey(next, ATTEST, randomBytes(32).toString("hex"));
     minted.push(ATTEST);
+  }
+
+  // EVERY MODE: CINATRA_BRIDGE_TOKEN — the shared secret the runtime presents on
+  // every /api/llm-bridge callback. The fresh path mints it below; heal it here
+  // so an EXISTING .env.local written before the token existed (or with the line
+  // still commented out) does not send gen-wayflow-env.mjs --require-bridge-token
+  // into a hard failure right before the stack comes up.
+  const BRIDGE = "CINATRA_BRIDGE_TOKEN";
+  const bridgeExisting = String(sourceValues[BRIDGE] ?? "").trim();
+  if (bridgeExisting) {
+    next = upsertEnvKey(next, BRIDGE, bridgeExisting);
+    preserved.push(BRIDGE);
+  } else {
+    next = upsertEnvKey(next, BRIDGE, randomBytes(32).toString("hex"));
+    minted.push(BRIDGE);
   }
 
   return { body: next, changed: next !== body, minted, preserved };
@@ -1661,6 +1702,30 @@ function tightenEnvLocalPerms(envPath) {
     if (existsSync(envPath)) chmodSync(envPath, 0o600);
   } catch {
     /* best-effort on platforms without chmod semantics */
+  }
+}
+
+/** cinatra#2654 — record what THIS install decided about the WayFlow agent
+ *  runtime into `.env.local`, so `cinatra doctor` can tell a deliberate opt-out
+ *  (or an install that owns no local stack) apart from a runtime that should be
+ *  up and is not. Without the record, doctor has to guess, and a lean install
+ *  would read as broken forever. Best-effort: a missing `.env.local` (dry-run,
+ *  --no-install on a fresh dir) is a no-op, and a write failure never fails an
+ *  otherwise-complete install. */
+export function recordWayflowRuntimeMode({ targetDir, mode, log = console.log }) {
+  const envPath = path.join(targetDir, ".env.local");
+  try {
+    if (!existsSync(envPath)) return { recorded: false, mode };
+    const body = readFileSync(envPath, "utf8");
+    const next = upsertEnvKey(body, WAYFLOW_RUNTIME_KEY, mode);
+    if (next !== body) {
+      writeFileSync(envPath, next, { mode: 0o600 });
+      tightenEnvLocalPerms(envPath);
+    }
+    return { recorded: true, mode };
+  } catch (err) {
+    log(`  ⚠ Could not record ${WAYFLOW_RUNTIME_KEY} in .env.local (${err instanceof Error ? err.message : err}).`);
+    return { recorded: false, mode };
   }
 }
 
@@ -1735,14 +1800,50 @@ export function preflightRecreate({ slug, targetDir, composeFiles = null, compos
  *  bring-up sequence (with `deps.assertRecreateSafe` stubbed and
  *  `node:child_process` mocked) to prove the cinatra-cli#211 reconcile actually
  *  runs, and runs AFTER Nango reports healthy. */
-export function bringUpInfra({ slug = null, deps = {}, targetDir, log = console.log, composeFiles = null, composeProject = null, envFile = null, nangoHealthUrl = null }) {
+export function bringUpInfra({ slug = null, deps = {}, targetDir, log = console.log, composeFiles = null, composeProject = null, envFile = null, nangoHealthUrl = null, wayflow = true }) {
   // cinatra-cli#140: the recreate GATE runs FIRST — before a single stateful
   // container is (re)created — so a major data-format boundary halts here rather
-  // than crash-looping (cinatra-ai/cinatra#1417). Every install/refresh recreate
+  // than crash-looping (cinatra#1417). Every install/refresh recreate
   // routes through this one seam, and a blocking verdict aborts the bring-up.
   preflightRecreate({ slug, targetDir, composeFiles, composeProject, envFile, log, deps });
-  log("- Starting infrastructure (Postgres + Redis + Nango)…");
-  composeUpOrThrow(targetDir, { composeFiles, composeProject, envFile });
+  // cinatra#2654: WayFlow is part of the stack an install-owned bring-up starts.
+  // EVERY local bring-up (default, isolated, attach, re-converge) routes through
+  // this one seam, so arming it here is what makes the default uniform instead
+  // of five call sites that can drift. Two steps must precede the `up`:
+  //   1. the narrow bridge-token env file — without CINATRA_BRIDGE_TOKEN the
+  //      runtime crash-loops, so a generator failure ABORTS rather than starting
+  //      a container that cannot authenticate its callbacks; and
+  //   2. the image build — the service has no registry image, so a broken build
+  //      must fail the install by name instead of surfacing as a generic `up`
+  //      error after the other containers already started.
+  // `--no-wayflow` skips both and says so; nothing else about the bring-up
+  // changes, which is what keeps the opt-out cheap and the retry idempotent.
+  const wayflowProfiles = wayflow ? [WAYFLOW_PROFILE] : [];
+  if (wayflow) {
+    const generated = (deps.generateWayflowEnv ?? generateWayflowEnv)({ targetDir, log });
+    if (!generated.ok) {
+      throw new Error(
+        `Refusing to start the WayFlow agent runtime — ${generated.reason}. ` +
+          "Without CINATRA_BRIDGE_TOKEN the runtime crash-loops and every agent run fails. " +
+          "Fix .env.local (re-run `cinatra install --reset-env` to mint the secrets), " +
+          "or re-run with `--no-wayflow` to install without the agent runtime.",
+      );
+    }
+    const built = (deps.buildWayflowImage ?? buildWayflowImage)({
+      targetDir,
+      composeArgs: composeArgsFor({ composeFiles, composeProject, envFile, profiles: wayflowProfiles }),
+      log,
+    });
+    if (!built.ok) throw new Error(wayflowBuildFailureMessage(built));
+  } else {
+    log("- WayFlow agent runtime: skipped (--no-wayflow). Agent runs will fail until it is started.");
+  }
+  log(
+    wayflow
+      ? "- Starting infrastructure (Postgres + Redis + Nango + the WayFlow agent runtime)…"
+      : "- Starting infrastructure (Postgres + Redis + Nango)…",
+  );
+  composeUpOrThrow(targetDir, { composeFiles, composeProject, envFile, profiles: wayflowProfiles });
   const composeBase = composeArgsFor({ composeFiles, composeProject, envFile });
   waitForCompose(targetDir, "postgres", ["pg_isready", "-U", "postgres"], "Postgres", log, 60, composeBase);
   waitForCompose(targetDir, "redis", ["redis-cli", "ping"], "Redis", log, 60, composeBase);
@@ -1756,6 +1857,23 @@ export function bringUpInfra({ slug = null, deps = {}, targetDir, log = console.
   // attach, re-converge — so an existing broken install heals on its next run.
   // Never fatal: see the module header.
   reconcileNangoSecretKey({ targetDir, envFile, composeBase, log, deps });
+  // cinatra#2654: the runtime is up, but the loader mounts every installed agent
+  // on a cold start — the compose healthcheck allows it ~2 minutes. Wait for the
+  // container's own health state so a completed install really is agent-ready.
+  // NON-FATAL: a still-mounting loader is "re-run doctor in a minute", not a
+  // failed install. Only the BUILD (above) can fail the install.
+  if (wayflow) {
+    const health = (deps.waitForWayflowHealth ?? waitForWayflowHealth)({ project: composeProject });
+    if (health.healthy) {
+      log("  WayFlow agent runtime is healthy.");
+    } else if (composeProject) {
+      log(
+        `  ⚠ The WayFlow agent runtime is not healthy yet${health.state ? ` (${health.state})` : ""}. ` +
+          "A cold start mounts every installed agent. Re-run `cinatra doctor` in a minute; " +
+          "if it stays down, check the container logs.",
+      );
+    }
+  }
 }
 
 /** cinatra-cli#211 — the `NANGO_SECRET_KEY` reconcile as one call site.
@@ -1792,15 +1910,21 @@ function reconcileNangoSecretKey({ targetDir, envFile = null, composeBase = ["co
  *  threads it too (cinatra-cli#144 — the base compose interpolates no-default
  *  secrets like `${NANGO_ENCRYPTION_KEY}`, so without it they resolve BLANK); a
  *  null envFile keeps compose's normal `.env` discovery. */
-function composeArgsFor({ composeFiles = null, composeProject = null, envFile = null } = {}) {
+function composeArgsFor({ composeFiles = null, composeProject = null, envFile = null, profiles = [] } = {}) {
   const files = composeFiles && composeFiles.length
     ? composeFiles
     : ["docker-compose.yml", "docker-compose.dev.yml"];
   const fileArgs = files.flatMap((f) => ["-f", f]);
   const projectArgs = composeProject ? ["-p", composeProject] : [];
   const envArgs = envFile ? ["--env-file", envFile] : [];
-  // `--env-file`/`-p`/`-f` are all top-level compose flags (before the subcommand).
-  return ["compose", ...envArgs, ...projectArgs, ...fileArgs];
+  // cinatra#2654: `--profile` activates a profile-gated service. Passed ONLY by
+  // the calls that must see WayFlow (its build + the `up`), never folded into
+  // the shared base — `exec`/`config` keep addressing exactly the default set,
+  // so the recreate gate and the version ledger read what they read today.
+  const profileArgs = profiles.flatMap((p) => ["--profile", p]);
+  // `--env-file`/`-p`/`-f`/`--profile` are all top-level compose flags (before
+  // the subcommand).
+  return ["compose", ...envArgs, ...projectArgs, ...profileArgs, ...fileArgs];
 }
 
 /** Run `docker compose up -d` and, on failure, surface the REAL stderr instead
@@ -1808,8 +1932,8 @@ function composeArgsFor({ composeFiles = null, composeProject = null, envFile = 
  *  collision now reads e.g. "Bind for 0.0.0.0:4873 failed: port is already
  *  allocated" rather than misattributing it to the daemon. stderr is streamed
  *  to the user (pipe) AND captured so it can be folded into the thrown error. */
-function composeUpOrThrow(targetDir, { composeFiles = null, composeProject = null, envFile = null } = {}) {
-  const args = [...composeArgsFor({ composeFiles, composeProject, envFile }), "up", "-d"];
+function composeUpOrThrow(targetDir, { composeFiles = null, composeProject = null, envFile = null, profiles = [] } = {}) {
+  const args = [...composeArgsFor({ composeFiles, composeProject, envFile, profiles }), "up", "-d"];
   const result = spawnSync("docker", args, {
     cwd: targetDir,
     env: process.env,
@@ -3007,6 +3131,7 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
         composeProject: slot.composeProject,
         envFile: existsSync(envFile) ? envFile : null,
         nangoHealthUrl: nangoHealthUrlForPorts(slot.ports),
+        wayflow: opts.wayflow !== false,
       });
       // cinatra-cli#128: record the deployed stateful-service versions in the
       // instance's ledger (best-effort — a re-up is an install-shaped event too).
@@ -3055,6 +3180,7 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       envFile: existsSync(envFile) ? envFile : null,
       // The isolated Nango publishes on a remapped port; health-probe it there.
       nangoHealthUrl: nangoHealthUrlForPorts(persisted.ports),
+      wayflow: opts.wayflow !== false,
     });
     // Mark ready ONLY after health.
     await withAllocLock(lockPath, async () => {
@@ -4561,6 +4687,7 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     composeProject: row.composeProject,
     envFile: existsSync(reconvEnvFile) ? reconvEnvFile : null,
     nangoHealthUrl: nangoHealthUrlForPorts(effectivePorts),
+    wayflow: opts.wayflow !== false,
   });
   // cinatra-cli#128: a re-converge re-ups whatever the moved checkout now pins —
   // record it (best-effort).
@@ -4907,7 +5034,7 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
       // row's slug, else the dir-derived slug (an unrecorded checkout still has a
       // deterministic slug; the gate then reads a missing/empty ledger and falls
       // to the live probe/marker rather than throwing on a null key).
-      startInfra({ slug: row?.slug ?? deriveInstanceSlug(targetDir), deps, targetDir, log, composeFiles, composeProject, envFile: attachEnvFile, nangoHealthUrl: nangoHealthUrlForPorts(row?.ports) });
+      startInfra({ slug: row?.slug ?? deriveInstanceSlug(targetDir), deps, targetDir, log, composeFiles, composeProject, envFile: attachEnvFile, nangoHealthUrl: nangoHealthUrlForPorts(row?.ports), wayflow: opts.wayflow !== false });
       broughtUp = true;
       // cinatra-cli#128: an attach re-up deploys whatever the moved checkout
       // now pins — record it (best-effort).
@@ -5778,10 +5905,16 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   // --no-infra, record) — so it is TERMINAL: return here, never falling through
   // to the default env/infra/install/setup steps (which would double-run setup).
   if (infraPlan === "co-use") {
+    // cinatra#2654: co-use owns no stack of its own, so it neither owns nor
+    // starts a local WayFlow runtime. Record and state that explicitly instead
+    // of implying the default-on behaviour of an install-owned stack.
+    const couseWayflowMode = resolveWayflowRuntimeMode({ infraPlan, wayflow: opts.wayflow });
+    recordWayflowRuntimeMode({ targetDir, mode: couseWayflowMode, log });
     log("");
     log("✓ Cinatra co-use install complete.");
     log(`  Directory:     ${targetDir}`);
     log(`  Instance:      ${resolution?.instance?.slug} (co-use — shares the donor's infra)`);
+    for (const line of wayflowStatusLines(couseWayflowMode)) log(line);
     // cinatra-cli#188: co-use is a TERMINAL tail, so `--mode preview` must compose
     // HERE too — otherwise an interactively-picked co-use would report a preview
     // composition, provision only the checkout, and never create or hand off a
@@ -5853,6 +5986,15 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     await executeExternalEnv({ targetDir, opts, conflictResolution, log });
   }
 
+  // 5c2. cinatra#2654 — record the WayFlow runtime decision for this install.
+  //      `local` for an install-owned local stack (the default), `off` for the
+  //      deliberate `--no-wayflow` opt-out, `external` when this install owns no
+  //      local stack at all. The record is what lets `cinatra doctor` report an
+  //      absent runtime as a FAILURE on the paths that promised one, and as an
+  //      explicit, non-failing statement on the paths that never did.
+  const wayflowRuntimeMode = resolveWayflowRuntimeMode({ infraPlan, wayflow: opts.wayflow });
+  recordWayflowRuntimeMode({ targetDir, mode: wayflowRuntimeMode, log });
+
   // 5d + 6. cinatra-cli#35 — resolve the EXPLICIT default Compose project name +
   //     OWNERSHIP PREFLIGHT, THEN bring the default stack up — all UNDER ONE
   //     HELD ALLOC LOCK. Historically the default `up` passed no `-p`, so Docker
@@ -5904,6 +6046,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
         log,
         composeProject: resolved,
         envFile: defaultEnvFile,
+        wayflow: opts.wayflow !== false,
       });
       return resolved;
     });
@@ -5915,6 +6058,9 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   //    - "external": no local infra to start.
   if (infraPlan === "external") {
     log("- Skipping local infrastructure startup (external infra). Ensure Postgres/Redis/Nango are reachable before setup.");
+    // cinatra#2654: say it, rather than leaving an absent runtime to be
+    // discovered by the first failing agent run.
+    log("- WayFlow agent runtime: not owned by this install (external infra) — no local runtime was started.");
   } else if (infraPlan === "isolated") {
     log(`- Isolated instance "${resolution?.instance?.slug}" infra is up (project ${resolution?.instance?.composeProject}).`);
   } else if (infraPlan === "attach") {
@@ -6076,6 +6222,10 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     // Never overwrite a non-zero this install already set for a real failure.
     process.exitCode = claimRegistrySkewExitCode(process.exitCode);
   }
+
+  // cinatra#2654: state the agent-runtime outcome in the summary — started,
+  // deliberately opted out, or not owned by this install.
+  for (const line of wayflowStatusLines(wayflowRuntimeMode)) log(line);
 
   log("");
   log("  Next:");

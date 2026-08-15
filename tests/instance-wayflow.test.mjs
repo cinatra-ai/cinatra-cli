@@ -20,6 +20,8 @@ import {
   composeWayflowArgs,
   ensureWayflowBridgeEnv,
   effectiveComposeProjectName,
+  wayflowComposeContext,
+  wayflowHealthUrlFromEnv,
 } from "../src/index.mjs";
 
 describe("composeWayflowArgs", () => {
@@ -53,6 +55,78 @@ describe("composeWayflowArgs", () => {
     ]);
     expect(args).not.toContain("down");
     expect(args).not.toContain("--profile");
+  });
+});
+
+// cinatra#2654 — the command must address the install's RECORDED compose
+// project. A `-p`-less invocation makes Docker derive the project from the
+// checkout BASENAME; a default install now records an explicit instance-scoped
+// project and an isolated install records its own generated compose file, so the
+// basename forks a SECOND, empty project — `start` would build a container the
+// app never reaches, and `stop` would find nothing to remove.
+describe("composeWayflowArgs — recorded project + compose files", () => {
+  it("start pins -p to the recorded project and uses the recorded files", () => {
+    const args = composeWayflowArgs("start", {
+      project: "cinatra_demo",
+      composeFiles: ["docker-compose.yml", "docker-compose.dev.yml", "docker-compose.isolated.yml"],
+    });
+    expect(args.slice(0, 3)).toEqual(["compose", "-p", "cinatra_demo"]);
+    expect(args).toContain("docker-compose.isolated.yml");
+    // -p is a TOP-LEVEL flag: before the subcommand, or compose rejects it.
+    expect(args.indexOf("-p")).toBeLessThan(args.indexOf("up"));
+  });
+
+  it("stop pins the same project, and still never uses `down` or the bare profile", () => {
+    const args = composeWayflowArgs("stop", { project: "cinatra_demo" });
+    expect(args.slice(0, 3)).toEqual(["compose", "-p", "cinatra_demo"]);
+    expect(args.slice(-3)).toEqual(["rm", "-sf", "wayflow"]);
+    expect(args).not.toContain("down");
+    expect(args).not.toContain("--profile");
+  });
+});
+
+describe("wayflowComposeContext", () => {
+  const ROW = {
+    slug: "demo",
+    installDir: "/home/dev/cinatra",
+    composeProject: "cinatra_demo",
+    composeFiles: ["docker-compose.yml", "docker-compose.isolated.yml"],
+  };
+
+  it("prefers the recorded install row over the checkout basename", () => {
+    const ctx = wayflowComposeContext("/home/dev/cinatra", {
+      readRegistry: () => ({ instances: { demo: ROW } }),
+      findByInstallDir: () => ROW,
+    });
+    expect(ctx.project).toBe("cinatra_demo");
+    expect(ctx.composeFiles).toEqual(ROW.composeFiles);
+  });
+
+  it("falls back to the basename-derived project for a checkout with no recorded install", () => {
+    const ctx = wayflowComposeContext("/tmp/my-checkout", {
+      readRegistry: () => ({ instances: {} }),
+      findByInstallDir: () => null,
+    });
+    expect(ctx.project).toBe(effectiveComposeProjectName("/tmp/my-checkout"));
+    expect(ctx.source).toBe("fallback");
+  });
+});
+
+describe("wayflowHealthUrlFromEnv", () => {
+  it("follows this instance's WAYFLOW_BASE_URL (an isolated stack remaps the port)", () => {
+    expect(wayflowHealthUrlFromEnv({ WAYFLOW_BASE_URL: "http://localhost:13010" })).toBe(
+      "http://localhost:13010/.health",
+    );
+    expect(wayflowHealthUrlFromEnv({ WAYFLOW_BASE_URL: "https://wayflow.example.test/agents" })).toBe(
+      "https://wayflow.example.test/.health",
+    );
+  });
+
+  it("falls back to the default endpoint when the variable is absent or unusable", () => {
+    expect(wayflowHealthUrlFromEnv({})).toBe("http://localhost:3010/.health");
+    expect(wayflowHealthUrlFromEnv({ WAYFLOW_BASE_URL: "   " })).toBe("http://localhost:3010/.health");
+    expect(wayflowHealthUrlFromEnv({ WAYFLOW_BASE_URL: "not a url" })).toBe("http://localhost:3010/.health");
+    expect(wayflowHealthUrlFromEnv({ WAYFLOW_BASE_URL: "ftp://host/x" })).toBe("http://localhost:3010/.health");
   });
 });
 
