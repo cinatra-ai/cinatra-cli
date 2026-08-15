@@ -402,6 +402,25 @@ describe("ensureNangoSecretKey — against a real .env.local", () => {
     expect(message).toContain("Re-run");
   });
 
+  it("reports instead of rotating when the counterpart query transport-succeeds with a malformed value", () => {
+    writeEnv(["CINATRA_RUNTIME_MODE=development", `${NANGO_SECRET_KEY_VAR}=${OTHER}`]);
+    // The preferred environment answers cleanly. The counterpart query also
+    // answers status 0, but the row it returns is not a UUID v4 (a garbage
+    // read, not a real counterpart) — this must NOT enable adopt-stale.
+    const result = ensureNangoSecretKey({
+      envPath,
+      transport: fakeTransport([ok(SEEDED), ok("ERROR")]),
+      log,
+      sleep: () => {},
+    });
+
+    expect(result).toMatchObject({ action: "keep", reason: "diverges-from-bundled", changed: false });
+    expect(readEnv()[NANGO_SECRET_KEY_VAR]).toBe(OTHER);
+    const message = logged.join("\n");
+    expect(message).toContain("401");
+    expect(message).toContain("Re-run");
+  });
+
   it("re-adopts after a --full reset destroyed the environment the old key named", () => {
     writeEnv(["CINATRA_RUNTIME_MODE=development", `${NANGO_SECRET_KEY_VAR}=${OTHER}`]);
     const result = ensureNangoSecretKey({

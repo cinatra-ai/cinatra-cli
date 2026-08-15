@@ -306,9 +306,10 @@ export function readSeededNangoSecretKey({
  *   keep/matches-other-env  – a VALID key that is the OTHER seeded environment's:
  *                             it authenticates, so it is a deliberate operator
  *                             choice and is kept silently
- *   keep/diverges           – a VALID key that matches the preferred environment
- *                             and could not be checked against the other one:
- *                             never overwritten on partial information, reported
+ *   keep/diverges           – a VALID key that DIFFERS from the preferred
+ *                             environment's key and could not be checked
+ *                             against the other one: never overwritten on
+ *                             partial information, reported
  *   keep/unverified         – a valid key, and the seed could not be read: no write
  *   adopt-stale             – a VALID key that matches NO environment this
  *                             nango-db seeded, with every environment read: it
@@ -513,7 +514,7 @@ export function ensureNangoSecretKey({
       attempts: 1,
       sleep,
     });
-    alternatesComplete = counterpart.ok;
+    alternatesComplete = counterpart.ok && isUuidV4(counterpart.secretKey);
     if (counterpart.ok) alternates = [counterpart.secretKey];
   }
 
