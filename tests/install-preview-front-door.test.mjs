@@ -919,6 +919,39 @@ describe("install --mode preview — terminal-tail safety", () => {
       restore();
     }
   });
+
+  // The same argument covers every `--build-arg` lever: they are read from the
+  // same operator environment and reach the same build, so a typo in any of them
+  // must cost nothing, not a full dev install.
+  it("rejects a malformed BUILD-ARG lever at ARG-PARSE time, before the install runs", () => {
+    const cases = [
+      ["CINATRA_PREVIEW_BUILD_MEMORY_MB", ["4g", "0", "-1", "4096MB"], "8192"],
+      ["CINATRA_PREVIEW_BUILD_TYPECHECK", ["yes-please", "2", "maybe"], "1"],
+      ["CINATRA_PREVIEW_BUILD_CPUS", ["auto", "0", "1.5", "4 cores"], "3"],
+      ["CINATRA_PREVIEW_BUILD_BUNDLER", ["turbo", "rspack", "webpack5"], "webpack"],
+    ];
+    for (const [KEY, bad, good] of cases) {
+      const original = process.env[KEY];
+      try {
+        for (const value of bad) {
+          process.env[KEY] = value;
+          expect(() => parseInstallArgs(["--mode", "preview"]), `expected ${KEY}=${value} to be rejected`).toThrow(
+            new RegExp(KEY),
+          );
+          // Meaningless for a plain dev/prod/demo install, so it must NOT break
+          // an operator who simply exports it in their shell profile.
+          expect(() => parseInstallArgs(["--mode", "dev"])).not.toThrow();
+        }
+        process.env[KEY] = good;
+        expect(() => parseInstallArgs(["--mode", "preview"])).not.toThrow();
+        delete process.env[KEY];
+        expect(() => parseInstallArgs(["--mode", "preview"])).not.toThrow();
+      } finally {
+        if (original === undefined) delete process.env[KEY];
+        else process.env[KEY] = original;
+      }
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

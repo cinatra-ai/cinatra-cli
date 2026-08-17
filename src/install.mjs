@@ -150,7 +150,7 @@ import {
 // cinatra-cli#194: the preview image-build budget lever. `preview.mjs` is plain
 // ESM over node builtins (importable from the light CLI core), and only the pure
 // validator is used here — the lifecycle itself stays lazy-imported below.
-import { resolveBuildTimeoutMs } from "./preview.mjs";
+import { resolveBuildTimeoutMs, buildPreviewBuildArgs } from "./preview.mjs";
 // cinatra#2654: the WayFlow agent runtime starts with every install-owned local
 // stack. The decision, the operator-facing status text, and the two pre-`up`
 // steps (bridge-token env, image build) live in their own builtins-only module
@@ -668,15 +668,20 @@ export function parseInstallArgs(argv = []) {
     );
   }
 
-  // cinatra-cli#194: validate the preview build-budget override HERE, in the
-  // same "before any side effect" position as the refusal above. The front door
-  // is a COMPOSITION — the whole dev install runs before the preview lifecycle
-  // is reached — so validating only at the preview stage would let a typo'd
-  // budget cost an operator a full install before surfacing. Preview-only: the
-  // variable has no meaning for a plain dev/prod/demo install, and rejecting it
-  // there would break an operator who simply exports it in their shell profile.
+  // cinatra-cli#194: validate the preview build levers HERE, in the same
+  // "before any side effect" position as the refusal above. The front door is a
+  // COMPOSITION: the whole dev install runs before the preview lifecycle is
+  // reached. Validating only at the preview stage would let a typo cost an
+  // operator a full install before surfacing. That argument covers the build
+  // budget and every `--build-arg` lever equally: the memory ceiling, the
+  // typecheck switch, the build worker count and the bundler are all read from
+  // the same operator environment and all reach the same build. Preview-only:
+  // these variables have no meaning for a plain dev/prod/demo install, and
+  // rejecting them there would break an operator who simply exports one in
+  // their shell profile.
   if (surfaceMode === PREVIEW_SURFACE_MODE_VALUE) {
     resolveBuildTimeoutMs(process.env);
+    buildPreviewBuildArgs(process.env);
   }
 
   return {
