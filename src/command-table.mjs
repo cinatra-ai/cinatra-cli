@@ -344,7 +344,7 @@ export const COMMAND_DESCRIPTORS = [
     path: ["instance", "preview", "refresh"],
     match: "command+mode+sub",
     summary:
-      "Rebuild the preview at a NEW resolved SHA, reboot, reuse the durable volume, health-gate, and clean up the superseded image. The build is SKIPPED when the image for the target SHA is already present locally (--rebuild / --force-build forces it). Applies the same container-dialed endpoint-ownership verification as create — and applies it before the running preview is touched, so a refusal leaves it serving. Honours the same CINATRA_PREVIEW_BUILD_TIMEOUT_MS build budget, CINATRA_PREVIEW_BUILD_MEMORY_MB limit, CINATRA_PREVIEW_BUILD_CPUS worker bound, CINATRA_PREVIEW_BUILD_BUNDLER selection and CINATRA_PREVIEW_BUILD_TYPECHECK switch as create.",
+      "Rebuild the preview at a NEW resolved SHA, reboot, reuse the durable volume, health-gate, and clean up the superseded image. The build is SKIPPED when the image for the target SHA is already present locally (--rebuild / --force-build forces it). Applies the same container-dialed endpoint-ownership verification as create — and applies it before the running preview is touched, so a refusal leaves it serving. Honours the same CINATRA_PREVIEW_BUILD_TIMEOUT_MS build budget, CINATRA_PREVIEW_BUILD_MEMORY_MB limit, CINATRA_PREVIEW_BUILD_CPUS build-CPU count, CINATRA_PREVIEW_BUILD_BUNDLER selection and CINATRA_PREVIEW_BUILD_TYPECHECK switch as create.",
   },
   {
     id: "preview.stop",

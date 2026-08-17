@@ -1580,12 +1580,12 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
               ? `This build already ran on webpack (${PREVIEW_BUILD_BUNDLER_ENV}), which fails on the V8 heap ` +
                 `rather than on native memory, so ${PREVIEW_BUILD_MEMORY_ENV} is the ceiling that applies here ` +
                 `and the bundler lever has nothing left to give. `
-              : `${
-                  build.bundler === "turbopack"
-                    ? `This build pinned turbopack (${PREVIEW_BUILD_BUNDLER_ENV}), and on that path`
-                    : `On the DEFAULT (Turbopack) path`
-                } a native death is the expected one: switch with ${PREVIEW_BUILD_BUNDLER_ENV}=webpack, whose ` +
-                `V8-heap ceiling ${PREVIEW_BUILD_MEMORY_ENV} can actually move. `) +
+              : (build.bundler === "turbopack"
+                  ? `This build pinned turbopack (${PREVIEW_BUILD_BUNDLER_ENV}), and on that path a native `
+                  : `This build pinned no bundler, so it ran whatever this SHA defaults to. If that is ` +
+                    `Turbopack, a native `) +
+                `death is the expected one and ${PREVIEW_BUILD_MEMORY_ENV} cannot move it: pin webpack with ` +
+                `${PREVIEW_BUILD_BUNDLER_ENV}=webpack, whose V8-heap ceiling it can. `) +
             `Neither removes the checkout's documented builder-memory floor.`) +
         (r.timedOut
           ? ` If the build was still ADVANCING, this is a budget problem, not a hang: re-run with a larger ` +

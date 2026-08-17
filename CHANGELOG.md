@@ -33,9 +33,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
   both are logged as part of the build's identity; and a commit whose Dockerfile
   predates the args still builds, with a warning that the values are very likely
   ignored. A failed build now names the lever that fits the death it died: on
-  the default bundler path a native out-of-memory kill points at the worker
-  count and the bundler, not only at the V8 old-space ceiling that cannot move
-  it. Neither lever removes the builder-memory floor the checkout documents.
+  the default bundler path a native out-of-memory kill points at the CPU count
+  and the bundler, not only at the V8 old-space ceiling that cannot move it. Neither lever removes the builder-memory floor the checkout documents.
 
 - **`cinatra instance preview stop | start`, and a refresh that stops rebuilding
   what it already has.** Every way to change a preview container used to go

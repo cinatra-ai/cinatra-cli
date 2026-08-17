@@ -1591,7 +1591,7 @@ describe("preview build levers: worker fan-out + bundler selection", () => {
 
   it("UNSET means unset: the resolved SHA keeps its own fan-out and bundler", () => {
     // A preview builds an ARBITRARY SHA. Asserting the CLI's idea of a good
-    // worker count or bundler onto it would silently override a checkout that
+    // CPU count or bundler onto it would silently override a checkout that
     // chose otherwise, and the two would drift on the next change.
     expect(resolveBuildCpus({})).toBeNull();
     expect(resolveBuildCpus(withCpus(""))).toBeNull();
@@ -1769,7 +1769,8 @@ describe("preview build levers: worker fan-out + bundler selection", () => {
     // binding constraint, and the build fails again the same way.
     expect(err.message).toContain(PREVIEW_BUILD_CPUS_ENV);
     expect(err.message).toContain(PREVIEW_BUILD_BUNDLER_ENV);
-    expect(err.message).toMatch(/DEFAULT \(Turbopack\) path a native death is the expected one/);
+    expect(err.message).toMatch(/pinned no bundler, so it ran whatever this SHA defaults to/);
+    expect(err.message).toMatch(/If that is Turbopack, a native death is the expected one/);
     expect(err.message).toMatch(/os\.cpus\(\)\.length/); // WHY a docker --cpus cap does not help
     expect(err.message).toMatch(/docker --cpus cap does NOT do/);
     // Honest about the bound: neither lever is sold as removing the floor.
@@ -1798,13 +1799,14 @@ describe("preview build levers: worker fan-out + bundler selection", () => {
     expect(onWebpack.message).toMatch(/this build used 3/); // the fan-out is a lever on both paths
     expect(onWebpack.message).toMatch(/already ran on webpack/);
     expect(onWebpack.message).toMatch(new RegExp(`${PREVIEW_BUILD_MEMORY_ENV} is the ceiling that applies here`));
-    expect(onWebpack.message).not.toMatch(/switch with/);
-    expect(onWebpack.message).not.toMatch(/DEFAULT \(Turbopack\) path/);
+    expect(onWebpack.message).not.toMatch(/pin webpack with/);
+    expect(onWebpack.message).not.toMatch(/If that is Turbopack/);
 
     const onTurbopack = failWith(withBundler("turbopack"));
     expect(onTurbopack.message).toMatch(/pinned turbopack/);
-    expect(onTurbopack.message).toMatch(new RegExp(`switch with ${PREVIEW_BUILD_BUNDLER_ENV}=webpack`));
-    expect(onTurbopack.message).not.toMatch(/DEFAULT \(Turbopack\) path/);
+    expect(onTurbopack.message).toMatch(new RegExp(`pin webpack with ${PREVIEW_BUILD_BUNDLER_ENV}=webpack`));
+    // The unset wording must not leak into a build that DID pin a bundler.
+    expect(onTurbopack.message).not.toMatch(/whatever this SHA defaults to/);
 
     // A TIMEOUT is a budget failure, not a memory one, so it must not be
     // answered with memory levers.
