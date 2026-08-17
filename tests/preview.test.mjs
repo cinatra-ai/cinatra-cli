@@ -1778,22 +1778,33 @@ describe("preview build levers: worker fan-out + bundler selection", () => {
     // to set something they already set.
     expect(err.message).toMatch(/this build used the checkout's own default fan-out/);
 
-    const tuned = (() => {
+    const failWith = (buildControlEnv) => {
       try {
         buildPreviewImage({
           tag: previewImageTag(SHA_A),
           contextDir: "/ctx",
-          deps: {
-            runDocker: makeFakeDocker({ buildFails: true }).runDocker,
-            buildControlEnv: { ...withCpus("3"), ...withBundler("webpack") },
-          },
+          deps: { runDocker: makeFakeDocker({ buildFails: true }).runDocker, buildControlEnv },
         });
       } catch (e) {
         return e;
       }
-    })();
-    expect(tuned.message).toMatch(/this build used 3/);
-    expect(tuned.message).toMatch(/this build used webpack/);
+      throw new Error("expected the build to fail");
+    };
+
+    // The advice FITS the bundler this build actually ran. Telling an operator
+    // who already pinned webpack to switch bundler is not actionable, and it
+    // hides that on webpack the V8 ceiling IS the applicable lever.
+    const onWebpack = failWith({ ...withCpus("3"), ...withBundler("webpack") });
+    expect(onWebpack.message).toMatch(/this build used 3/); // the fan-out is a lever on both paths
+    expect(onWebpack.message).toMatch(/already ran on webpack/);
+    expect(onWebpack.message).toMatch(new RegExp(`${PREVIEW_BUILD_MEMORY_ENV} is the ceiling that applies here`));
+    expect(onWebpack.message).not.toMatch(/switch with/);
+    expect(onWebpack.message).not.toMatch(/DEFAULT \(Turbopack\) path/);
+
+    const onTurbopack = failWith(withBundler("turbopack"));
+    expect(onTurbopack.message).toMatch(/pinned turbopack/);
+    expect(onTurbopack.message).toMatch(new RegExp(`switch with ${PREVIEW_BUILD_BUNDLER_ENV}=webpack`));
+    expect(onTurbopack.message).not.toMatch(/DEFAULT \(Turbopack\) path/);
 
     // A TIMEOUT is a budget failure, not a memory one, so it must not be
     // answered with memory levers.

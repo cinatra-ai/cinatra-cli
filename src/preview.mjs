@@ -1564,16 +1564,26 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
             `A NATIVE "cannot allocate memory" is NOT that limit, and an exit-code-137 kill only tells you ` +
             `something sent SIGKILL — neither identifies the cause, and ${PREVIEW_BUILD_MEMORY_ENV} does not ` +
             `bound native allocation. Check Docker/host memory pressure first; more VM RAM MAY help, but ` +
-            `a native wall has been measured that survived 4 GB to 14 GB. On the DEFAULT (Turbopack) path a ` +
-            `native death is the expected one, and the build-concurrency / bundler-fallback levers are what ` +
-            `address it: bound the page-data worker fan-out with ${PREVIEW_BUILD_CPUS_ENV} ` +
-            `(${PREVIEW_BUILD_CPUS_MIN}..${PREVIEW_BUILD_CPUS_MAX}; this build used ${
+            `a native wall has been measured that survived 4 GB to 14 GB. The build-concurrency / ` +
+            `bundler-fallback levers are what address it. Bound the page-data worker fan-out with ` +
+            `${PREVIEW_BUILD_CPUS_ENV} (${PREVIEW_BUILD_CPUS_MIN}..${PREVIEW_BUILD_CPUS_MAX}; this build used ${
               build.cpus === null ? `the checkout's own default fan-out` : `${build.cpus}`
             }), which a docker --cpus cap does NOT do because the build sizes its workers from ` +
-            `os.cpus().length. Or switch bundler with ` +
-            `${PREVIEW_BUILD_BUNDLER_ENV}=${PREVIEW_BUILD_BUNDLERS.join("|")} (this build used ${
-              build.bundler === null ? `the checkout's own default` : build.bundler
-            }), because webpack fails on the V8 heap that ${PREVIEW_BUILD_MEMORY_ENV} can actually move. ` +
+            `os.cpus().length. ` +
+            // Name the bundler advice that fits the bundler this build actually
+            // ran. Telling an operator who already pinned webpack to "switch
+            // bundler" is not actionable, and it hides the fact that on webpack
+            // the V8 ceiling IS the applicable lever.
+            (build.bundler === "webpack"
+              ? `This build already ran on webpack (${PREVIEW_BUILD_BUNDLER_ENV}), which fails on the V8 heap ` +
+                `rather than on native memory, so ${PREVIEW_BUILD_MEMORY_ENV} is the ceiling that applies here ` +
+                `and the bundler lever has nothing left to give. `
+              : `${
+                  build.bundler === "turbopack"
+                    ? `This build pinned turbopack (${PREVIEW_BUILD_BUNDLER_ENV}), and on that path`
+                    : `On the DEFAULT (Turbopack) path`
+                } a native death is the expected one: switch with ${PREVIEW_BUILD_BUNDLER_ENV}=webpack, whose ` +
+                `V8-heap ceiling ${PREVIEW_BUILD_MEMORY_ENV} can actually move. `) +
             `Neither removes the checkout's documented builder-memory floor.`) +
         (r.timedOut
           ? ` If the build was still ADVANCING, this is a budget problem, not a hang: re-run with a larger ` +
