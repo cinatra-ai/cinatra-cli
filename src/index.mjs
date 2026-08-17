@@ -837,10 +837,10 @@ Usage:
                                # limit in MB (256 .. 65536; unset keeps the checkout's own).
                                # CINATRA_PREVIEW_BUILD_TYPECHECK=1 restores the in-build tsc
                                # (skipped by default, as the CI image build does).
-                               # CINATRA_PREVIEW_BUILD_CPUS bounds the build's worker fan-out
-                               # (1 .. 256). A MANY-CORE builder needs it, because the build
-                               # sizes its workers from os.cpus().length and a docker --cpus
-                               # cap does not change that.
+                               # CINATRA_PREVIEW_BUILD_CPUS sets the CPU count the build plans
+                               # from, bounding its worker fan-out (1 .. 256). A MANY-CORE
+                               # builder needs it: the build otherwise takes that count from
+                               # os.cpus().length, which a docker --cpus cap does not change.
                                # CINATRA_PREVIEW_BUILD_BUNDLER=turbopack|webpack picks the
                                # bundler; webpack fails on the V8 heap the MEMORY_MB lever moves,
                                # the default fails on native memory it does not.
@@ -952,14 +952,15 @@ Commands:
                       help, but a native wall has been measured that survived
                       4 GB to 14 GB. The two levers below are what address it.
 
-                      BUILD WORKERS: the build fans page-data collection out to
-                      one worker process per core and sizes that from
-                      os.cpus().length, which a docker --cpus or --cpuset-cpus
-                      cap does NOT change. So a many-core builder keeps a wide
-                      fan-out however narrow its CPU quota is, and each worker is
-                      a whole extra node process with its own heap. Bound it with
+                      BUILD CPUS: the build fans page-data collection out to one
+                      worker process fewer than the CPU count it plans from, and
+                      it takes that count from os.cpus().length, which a docker
+                      --cpus or --cpuset-cpus cap does NOT change. So a many-core
+                      builder keeps a wide fan-out however narrow its CPU quota
+                      is, and each worker is a whole extra node process with its
+                      own heap. Bound the count with
 
-                        CINATRA_PREVIEW_BUILD_CPUS=<workers>
+                        CINATRA_PREVIEW_BUILD_CPUS=<cpus>
 
                       accepted range 1 .. 256. It becomes the build-arg
                       CINATRA_BUILD_CPUS=<n>. UNSET passes nothing, so the

@@ -1607,14 +1607,14 @@ describe("preview build levers: worker fan-out + bundler selection", () => {
     expect(args.join(" ")).not.toContain(PREVIEW_BUILD_BUNDLER_ARG);
   });
 
-  it("a valid worker count wins, at both ends of the accepted band", () => {
+  it("a valid CPU count wins, at both ends of the accepted band", () => {
     expect(resolveBuildCpus(withCpus("3"))).toBe(3);
     expect(resolveBuildCpus(withCpus(" 4 "))).toBe(4);
     expect(resolveBuildCpus(withCpus(String(PREVIEW_BUILD_CPUS_MIN)))).toBe(PREVIEW_BUILD_CPUS_MIN);
     expect(resolveBuildCpus(withCpus(String(PREVIEW_BUILD_CPUS_MAX)))).toBe(PREVIEW_BUILD_CPUS_MAX);
   });
 
-  it("a malformed or out-of-range worker count is a HARD error, never ignored or clamped", () => {
+  it("a malformed or out-of-range CPU count is a HARD error, never ignored or clamped", () => {
     for (const v of ["0", "-1", "1.5", "4 cores", "1e1", "Infinity", "auto", "0x4", "+4"]) {
       let err;
       try {
@@ -1734,7 +1734,7 @@ describe("preview build levers: worker fan-out + bundler selection", () => {
     const out = lines.join("\n");
     // Untuned: says the checkout owns both, and still names the levers so they
     // are discoverable BEFORE an operator needs them.
-    expect(out).toMatch(/build workers: the checkout's own default fan-out/);
+    expect(out).toMatch(/build CPUs: the checkout's own default fan-out/);
     expect(out).toContain(PREVIEW_BUILD_CPUS_ENV);
     expect(out).toContain(PREVIEW_BUILD_BUNDLER_ENV);
 
@@ -1749,7 +1749,7 @@ describe("preview build levers: worker fan-out + bundler selection", () => {
       },
     });
     const out2 = lines2.join("\n");
-    expect(out2).toMatch(/build workers: 3/);
+    expect(out2).toMatch(/build CPUs: 3/);
     expect(out2).toMatch(/Bundler: webpack/);
   });
 

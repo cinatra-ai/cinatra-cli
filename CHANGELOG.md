@@ -17,10 +17,11 @@ project adheres to [Semantic Versioning](https://semver.org/).
   were to keep adding memory to the Docker VM, to reconfigure the whole machine
   down to fewer cores, or to bypass the CLI with a hand-run `docker build`. Two
   environment levers now reach the build. `CINATRA_PREVIEW_BUILD_CPUS` (1 .. 256)
-  bounds the build's worker fan-out, which matters because the build sizes that
-  fan-out from `os.cpus().length`, a number a Docker `--cpus` or `--cpuset-cpus`
-  cap does not change. So a many-core builder keeps starting one page-data
-  worker process per core however narrow its CPU quota is.
+  sets the CPU count the build plans from, and so bounds its page-data worker
+  fan-out, which is one process fewer than that count. It matters because the
+  build otherwise takes the number from `os.cpus().length`, which a Docker
+  `--cpus` or `--cpuset-cpus` cap does not change. So a many-core builder keeps
+  a wide fan-out however narrow its CPU quota is.
   `CINATRA_PREVIEW_BUILD_BUNDLER=turbopack|webpack` picks the bundler, which
   decides whether the existing memory ceiling is a lever at all: the default
   bundler dies on native memory, which `--max-old-space-size` does not bound,

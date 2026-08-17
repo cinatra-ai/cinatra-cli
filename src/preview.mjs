@@ -235,8 +235,8 @@ export const PREVIEW_BUILD_TYPECHECK_ENV = "CINATRA_PREVIEW_BUILD_TYPECHECK";
 //     `--cpuset-cpus` cap does NOT change what that call reports, so a
 //     many-core builder keeps the wide fan-out however narrow its CPU quota is.
 //     Each worker is a whole extra node process with its own heap. Bounding the
-//     count is therefore a real memory lever, and it is the one that a 16 GiB
-//     builder needed before it completed.
+//     CPU count is therefore a real memory lever (it bounds the fan-out with
+//     it), and it is the one that a 16 GiB builder needed before it completed.
 //   - Turbopack (the default) dies on NATIVE memory, which `--max-old-space-size`
 //     does not bound at all. Webpack dies on the V8 heap, which it does. So the
 //     bundler choice decides whether the memory ceiling is a lever or a placebo.
@@ -249,16 +249,16 @@ export const PREVIEW_BUILD_TYPECHECK_ENV = "CINATRA_PREVIEW_BUILD_TYPECHECK";
 // UNSET MEANS UNSET, exactly as the memory ceiling is: with no override the CLI
 // passes no build-arg at all, so the resolved SHA's own Dockerfile default (an
 // empty ARG, i.e. today's build) stands. A preview builds an ARBITRARY SHA, and
-// pinning the CLI's idea of a good worker count or bundler onto it would
+// pinning the CLI's idea of a good CPU count or bundler onto it would
 // silently override a checkout that chose otherwise.
 //
 // The operator-facing names carry the `CINATRA_PREVIEW_BUILD_` prefix the other
 // three levers established, so all four read as one family and none of them can
 // be confused with the checkout's own build-time variable of a similar name.
 export const PREVIEW_BUILD_CPUS_ENV = "CINATRA_PREVIEW_BUILD_CPUS";
-// The band the checkout's own knob accepts: one worker at the floor, and a
-// ceiling well past any real builder. The CLI validates the same band so a value
-// the checkout would reject is caught before the build starts, not an hour in.
+// The band the checkout's own knob accepts: one CPU at the floor, and a ceiling
+// well past any real builder. The CLI validates the same band so a value the
+// checkout would reject is caught before the build starts, not an hour in.
 export const PREVIEW_BUILD_CPUS_MIN = 1;
 export const PREVIEW_BUILD_CPUS_MAX = 256;
 export const PREVIEW_BUILD_BUNDLER_ENV = "CINATRA_PREVIEW_BUILD_BUNDLER";
@@ -1305,15 +1305,17 @@ export function resolveBuildTypecheck(env = {}) {
 }
 
 /**
- * Resolve the image build's WORKER COUNT, or `null` when the operator set
- * nothing. The count is how many worker processes `next build` fans page-data
- * collection out to.
+ * Resolve the CPU COUNT the image build plans from, or `null` when the operator
+ * set nothing. It is a COUNT OF CPUS, not directly a count of workers: the build
+ * derives its page-data worker fan-out from this number (one fewer), which is
+ * why bounding it bounds the fan-out.
  *
- * This is the lever a many-core builder needs. `next build` sizes its worker
- * fan-out from `os.cpus().length`, which a docker `--cpus` or `--cpuset-cpus`
- * cap does not change, so the fan-out stays wide however narrow the CPU quota
- * is. Each worker is a whole extra node process with its own heap, so the count
- * is a memory decision, not only a speed one.
+ * This is the lever a many-core builder needs. `next build` takes that number
+ * from `os.cpus().length` unless it is told otherwise, and a docker `--cpus` or
+ * `--cpuset-cpus` cap does not change what that call reports, so the fan-out
+ * stays wide however narrow the CPU quota is. Each worker is a whole extra node
+ * process with its own heap, so the count is a memory decision, not only a speed
+ * one.
  *
  * FAIL-CLOSED on a bad value, for the same reason the memory ceiling is: an
  * operator reaching for this is already fighting a build that died, and silently
@@ -1326,19 +1328,19 @@ export function resolveBuildCpus(env = {}) {
   const reject = (why) => {
     throw new Error(
       `${PREVIEW_BUILD_CPUS_ENV}=${JSON.stringify(raw)} is invalid: ${why}. ` +
-        `Set it to a whole number of BUILD WORKERS between ${PREVIEW_BUILD_CPUS_MIN} and ` +
+        `Set it to a whole number of BUILD CPUS between ${PREVIEW_BUILD_CPUS_MIN} and ` +
         `${PREVIEW_BUILD_CPUS_MAX}, or unset it to leave the checkout's own default fan-out in place. ` +
         `It becomes --build-arg ${PREVIEW_BUILD_CPUS_ARG}=<n> for the image build; the unit is a COUNT ` +
-        `of workers (no "cores"/"%" suffix).`,
+        `of CPUS, which the build turns into one fewer page-data worker (no "cores"/"%" suffix).`,
     );
   };
   // Digits only, mirroring the other numeric levers: rules out "4.5", "4e0",
   // "4 cores", "0x4", "+4", "-1", "Infinity" in one predicate.
-  if (!/^\d+$/.test(value)) reject("it is not a whole number of build workers");
+  if (!/^\d+$/.test(value)) reject("it is not a whole number of build CPUs");
   const cpus = Number(value);
   if (!Number.isSafeInteger(cpus)) reject("it is not a representable whole number");
-  if (cpus < PREVIEW_BUILD_CPUS_MIN) reject(`it is below the ${PREVIEW_BUILD_CPUS_MIN} worker minimum`);
-  if (cpus > PREVIEW_BUILD_CPUS_MAX) reject(`it exceeds the ${PREVIEW_BUILD_CPUS_MAX} worker maximum`);
+  if (cpus < PREVIEW_BUILD_CPUS_MIN) reject(`it is below the ${PREVIEW_BUILD_CPUS_MIN} CPU minimum`);
+  if (cpus > PREVIEW_BUILD_CPUS_MAX) reject(`it exceeds the ${PREVIEW_BUILD_CPUS_MAX} CPU maximum`);
   return cpus;
 }
 
@@ -1497,9 +1499,9 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
   // build has not failed yet must be able to discover the levers without going
   // back to the help.
   deps.log?.(
-    `  build workers: ` +
+    `  build CPUs: ` +
       (build.cpus === null
-        ? `the checkout's own default fan-out (${PREVIEW_BUILD_CPUS_ENV} bounds it, ` +
+        ? `the checkout's own default fan-out (${PREVIEW_BUILD_CPUS_ENV} sets the count, ` +
           `${PREVIEW_BUILD_CPUS_MIN}..${PREVIEW_BUILD_CPUS_MAX}).`
         : `${build.cpus} (${PREVIEW_BUILD_CPUS_ENV} override).`) +
       ` Bundler: ` +
@@ -1979,7 +1981,7 @@ export async function runPreviewCreate(rest, injected = {}) {
   // re-resolves the same value at the build itself (single source of truth).
   resolveBuildTimeoutMs(deps.buildControlEnv ?? process.env);
   // cinatra-cli#210: every build-arg lever gets the same fail-fast treatment,
-  // for the same reason: a typo'd ceiling, worker count or bundler must cost
+  // for the same reason: a typo'd ceiling, CPU count or bundler must cost
   // nothing, not surface an hour into a build (or, worse, only after the
   // slug/port/volume state was claimed).
   buildPreviewBuildArgs(deps.buildControlEnv ?? process.env);
