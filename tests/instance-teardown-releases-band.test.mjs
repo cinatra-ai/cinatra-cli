@@ -12,7 +12,7 @@
 // `teardownInstance` against a temp registry + alloc lock, with `docker compose
 // down` injected. No Docker, no services, no network.
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -35,9 +35,11 @@ import {
   writeInstanceRegistry,
 } from "../src/instance-registry.mjs";
 import {
+  allocateAppPort,
   allocateBandOffset,
   describeInstanceReservations,
   reservedPorts,
+  withAllocLock,
   BAND_OFFSET_MAX,
 } from "../src/instance-alloc.mjs";
 import { ISOLATED_COMPOSE_FILENAME } from "../src/install-isolation.mjs";
@@ -796,5 +798,243 @@ describe("cinatra-cli#232 — `cinatra install --down` wiring", () => {
       }),
     ).rejects.toThrow(/NOTHING was released/);
     expect(rowFor(registryPath, "row1")).not.toBeNull();
+  });
+});
+
+// =========================================================================
+// Review gap 1 — the registry WRITE is the commit point of the release. The
+// containers are already down by the time it runs, so if it fails the row must
+// come through USABLE: still recorded, still holding its WHOLE reservation, and
+// releasable by a retry. The one state that must never exist is half-released —
+// a row missing while its ports stay reserved, or vice versa.
+describe("cinatra-cli#232 — a failed registry WRITE leaves the row usable, never half-released", () => {
+  /** Registry and alloc lock in SEPARATE dirs, so the registry dir can be made
+   *  read-only without also breaking the lock the teardown must still take. */
+  function splitPaths() {
+    const regDir = mkTmp("cli232-regw-");
+    const lockDir = mkTmp("cli232-lockw-");
+    return { regDir, registryPath: path.join(regDir, "instances.json"), allocLockPath: path.join(lockDir, "alloc") };
+  }
+  const tempLitter = (dir) => readdirSync(dir).filter((f) => f.startsWith(".instances.") && f.endsWith(".tmp"));
+
+  it("keeps the row and the WHOLE reservation when the release write fails, and a retry completes it", async () => {
+    const { regDir, registryPath, allocLockPath } = splitPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    const inst = installIsolated({ registryPath, slug: "row1", appPort: 3300 });
+    const before = readFileSync(registryPath, "utf8");
+    const down = recordingDown();
+    const deps = { instanceRegistryPath: registryPath, allocLockPath, runComposeDown: down.fn };
+
+    // Make the registry dir unwritable → the atomic write throws. (The `down`
+    // has ALREADY succeeded at this point; that is exactly the window.)
+    chmodSync(regDir, 0o500);
+    let threw = null;
+    try {
+      await teardownInstance({ slug: "row1", log: () => {}, deps });
+    } catch (e) {
+      threw = e;
+    } finally {
+      chmodSync(regDir, 0o700);
+    }
+
+    expect(threw, "a failed release write must surface, never be swallowed").not.toBeNull();
+    expect(down.calls).toHaveLength(1); // the containers really did go down
+
+    // The row survived UNTOUCHED — same bytes, same state, same reservation.
+    expect(readFileSync(registryPath, "utf8")).toBe(before);
+    const row = rowFor(registryPath, "row1");
+    expect(row).not.toBeNull();
+    expect(row.state).toBe("ready");
+    // Not half-released: EVERY port it held is still reserved, none leaked out.
+    const reserved = reservedPorts({ instanceRegistry: readInstanceRegistry(registryPath).registry });
+    for (const p of [...Object.values(inst.ports).flat(), 3300]) expect(reserved.has(p)).toBe(true);
+    // …so its band is still held against a competing allocation.
+    expect(tryAllocateOffset(registryPath, 3301).offset).toBe(20000);
+
+    // No orphaned temp file from the failed attempt.
+    expect(tempLitter(regDir)).toEqual([]);
+
+    // And the row is USABLE: a retry (write now permitted) finishes the release.
+    const retry = await teardownInstance({ slug: "row1", log: () => {}, deps });
+    expect(retry.released).toBe(true);
+    expect(rowFor(registryPath, "row1")).toBeNull();
+    expect(tryAllocateOffset(registryPath, 3300).offset).toBe(10000);
+  });
+
+  it("the temp+rename writer orphans no temp file when the rename (the commit point) fails", () => {
+    const dir = mkTmp("cli232-rename-");
+    // A DIRECTORY where the registry file goes: writeFileSync(tmp) succeeds,
+    // renameSync(tmp, filePath) fails — the commit point, temp already on disk.
+    const registryPath = path.join(dir, "instances.json");
+    mkdirSync(registryPath, { recursive: true });
+
+    expect(() => writeInstanceRegistry(registryPath, { version: 1, instances: {} })).toThrow();
+    expect(tempLitter(dir), "a failed rename must not leave its temp behind").toEqual([]);
+  });
+});
+
+// =========================================================================
+// Review gap 2 — `--dir` addressing is resolved OUTSIDE the alloc lock (the
+// registry read that maps a directory to a slug), but the release happens
+// INSIDE it. Between those two points another process can re-point that slug at
+// a different checkout. The `expectInstallDir` guard exists for exactly that
+// window, and this drives the REAL `--down` path through REAL lock contention —
+// no hand-passed wrong argument.
+describe("cinatra-cli#232 — --dir cannot release a row whose directory moved under the lock", () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /** Take the alloc lock and hold it until `release()` is called. Resolves once
+   *  the lock is genuinely held, so the contender provably queues behind it. */
+  async function holdAllocLock(allocLockPath) {
+    let release;
+    let acquired;
+    const held = new Promise((r) => (release = r));
+    const isAcquired = new Promise((r) => (acquired = r));
+    const done = withAllocLock(allocLockPath, async () => {
+      acquired();
+      await held;
+    });
+    await isAcquired;
+    return { release, done };
+  }
+
+  it("refuses when the row is re-pointed at another checkout while the teardown waits for the lock", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    const inst = installIsolated({ registryPath, slug: "row1", appPort: 3300 });
+    const movedDir = mkTmp("cli232-moved-");
+    const down = recordingDown();
+
+    // Contention is real: we hold the alloc lock first.
+    const lock = await holdAllocLock(allocLockPath);
+
+    // The operator's command, addressing the row BY DIRECTORY. It resolves the
+    // dir → slug now (outside the lock), then blocks acquiring the lock.
+    const teardown = runInstall(["--down", "--dir", inst.targetDir, "--yes"], {
+      log: () => {},
+      deps: { instanceRegistryPath: registryPath, allocLockPath, runComposeDown: down.fn },
+    });
+    await sleep(150); // it has resolved its target and is now queued on the lock
+
+    // The race: while WE hold the lock, "row1" comes to mean a different
+    // checkout (a concurrent release + reinstall of the same slug elsewhere).
+    const reg = requireUsableInstanceRegistry(registryPath);
+    reg.instances.row1.installDir = movedDir;
+    writeInstanceRegistry(registryPath, reg);
+    lock.release();
+    await lock.done;
+
+    // The teardown now gets the lock, re-reads, and sees the row it resolved is
+    // not the row it found. It must refuse rather than tear down the new one.
+    await expect(teardown).rejects.toThrow(/no longer points at/);
+    expect(down.calls, "a moved row must never be `down`ed").toHaveLength(0);
+    const row = rowFor(registryPath, "row1");
+    expect(row).not.toBeNull();
+    expect(path.resolve(row.installDir)).toBe(path.resolve(movedDir)); // the NEW row, intact
+    expect(tryAllocateOffset(registryPath, 3301).offset).toBe(20000); // still reserved
+  });
+
+  it("positive control: the same --dir flow DOES release when the row stays put", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    const inst = installIsolated({ registryPath, slug: "row1", appPort: 3300 });
+    const down = recordingDown();
+
+    const lock = await holdAllocLock(allocLockPath);
+    const teardown = runInstall(["--down", "--dir", inst.targetDir, "--yes"], {
+      log: () => {},
+      deps: { instanceRegistryPath: registryPath, allocLockPath, runComposeDown: down.fn },
+    });
+    await sleep(150);
+    lock.release(); // nothing changed under the lock this time
+    await lock.done;
+
+    expect(await teardown).toMatchObject({ down: true, released: true, slug: "row1" });
+    expect(down.calls).toHaveLength(1);
+    expect(rowFor(registryPath, "row1")).toBeNull();
+    expect(tryAllocateOffset(registryPath, 3300).offset).toBe(10000);
+  });
+});
+
+// =========================================================================
+// Review gap 4 — the lost-update guarantee. temp+rename prevents a TORN write,
+// not a lost one: two allocations that both read the empty registry both pick
+// offset 10000, and the second rename erases the first row. `withAllocLock` is
+// what prevents it, so the contenders here do read→allocate→write INSIDE the
+// lock exactly as production does (executeIsolatedInstall's reserve step), and
+// a no-lock control proves the race is real rather than assumed.
+describe("cinatra-cli#232 — two concurrent allocations cannot collide or lose a write", () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /** One contender: the production read→allocate→write sequence. `readDelay`
+   *  widens the read→write window so an unserialised run really does interleave. */
+  async function contend({ registryPath, allocLockPath, slug, readDelay, useLock = true }) {
+    const body = async () => {
+      const registry = requireUsableInstanceRegistry(registryPath);
+      const appPort = allocateAppPort({ instanceRegistry: registry });
+      const { offset, remapped } = allocateBandOffset({ band: BASE_BAND, instanceRegistry: registry, extraReserved: appPort });
+      await sleep(readDelay); // the window a lost update lives in
+      const next = allocateInstance(registry, slug, {
+        mode: "dev",
+        installDir: path.join(os.tmpdir(), `cli232-${slug}`),
+        composeProject: `cinatra_${slug}`,
+        composeFiles: [ISOLATED_COMPOSE_FILENAME],
+        ports: portsMapFor(remapped),
+        appPort,
+        offset,
+        repoUrl: "https://github.com/cinatra-ai/cinatra.git",
+        ref: "main",
+        infraMode: "new",
+        state: "provisioning",
+      }).registry;
+      writeInstanceRegistry(registryPath, next);
+      return { slug, offset, appPort };
+    };
+    return useLock ? withAllocLock(allocLockPath, body) : body();
+  }
+
+  it("serialises two real contenders: distinct bands, distinct app ports, neither write lost", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+
+    // Launched together, with overlapping read→write windows.
+    const [a, b] = await Promise.all([
+      contend({ registryPath, allocLockPath, slug: "conc-a", readDelay: 120 }),
+      contend({ registryPath, allocLockPath, slug: "conc-b", readDelay: 20 }),
+    ]);
+
+    // Neither picked what the other holds.
+    expect(a.offset).not.toBe(b.offset);
+    expect(a.appPort).not.toBe(b.appPort);
+    expect([a.offset, b.offset].sort((x, y) => x - y)).toEqual([10000, 20000]);
+
+    // Neither registry update was lost — BOTH rows survive in the final file.
+    const final = readInstanceRegistry(registryPath).registry;
+    expect(Object.keys(final.instances).sort()).toEqual(["conc-a", "conc-b"]);
+    for (const r of [a, b]) {
+      expect(final.instances[r.slug].offset).toBe(r.offset);
+      expect(final.instances[r.slug].appPort).toBe(r.appPort);
+    }
+
+    // And the two reservations are genuinely disjoint (no shared host port).
+    const portsOf = (slug) => [...Object.values(final.instances[slug].ports).flat(), final.instances[slug].appPort];
+    const overlap = portsOf("conc-a").filter((p) => portsOf("conc-b").includes(p));
+    expect(overlap).toEqual([]);
+  });
+
+  it("control: WITHOUT the lock the same two contenders collide and lose a write", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+
+    const [a, b] = await Promise.all([
+      contend({ registryPath, allocLockPath, slug: "race-a", readDelay: 120, useLock: false }),
+      contend({ registryPath, allocLockPath, slug: "race-b", readDelay: 20, useLock: false }),
+    ]);
+
+    // Both read the same empty registry → both picked the SAME band and port…
+    expect(a.offset).toBe(b.offset);
+    expect(a.appPort).toBe(b.appPort);
+    // …and the later rename erased the earlier row. This is what the lock buys.
+    expect(Object.keys(readInstanceRegistry(registryPath).registry.instances)).toEqual(["race-a"]);
   });
 });
