@@ -226,6 +226,32 @@ export function waitForWayflowHealth({
 }
 
 /**
+ * Unwrap whatever a registry finder hands back into the flat instance slot.
+ *
+ * cinatra-cli#230: `findInstanceByInstallDir` returns the `{ slug, slot }`
+ * ENVELOPE, not the row. Reading `.composeProject` straight off the envelope
+ * yields `undefined`, so the resolution below silently degraded to the
+ * basename WHILE REPORTING `source: "registry"` — a healthy isolated runtime
+ * recorded as `cinatra_x2654_row1` was diagnosed against `row1-dev`. The
+ * envelope is the production shape, so accept both here rather than trust
+ * every call site to unwrap; a shape mismatch must never resolve silently.
+ *
+ * @returns {{ slot: object, slug: string|null }|null}
+ */
+function unwrapRegistryRow(row) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+  const isEnvelope = row.slot && typeof row.slot === "object" && !Array.isArray(row.slot);
+  const slot = isEnvelope ? row.slot : row;
+  const slug =
+    typeof slot.slug === "string" && slot.slug.trim() !== ""
+      ? slot.slug.trim()
+      : typeof row.slug === "string" && row.slug.trim() !== ""
+        ? row.slug.trim()
+        : null;
+  return { slot, slug };
+}
+
+/**
  * Resolve the compose project + files a checkout's RECORDED install actually
  * uses, so a lifecycle command never assumes the checkout basename. A default
  * install now records an explicit instance-scoped project, and an isolated
@@ -237,7 +263,13 @@ export function waitForWayflowHealth({
  * tests and free of a hard import cycle. Falls back to the caller-supplied
  * `fallbackProject` and the base compose pair when nothing is recorded.
  *
- * @returns {{ project: string, composeFiles: string[], source: "registry"|"fallback" }}
+ * `source` describes where the returned PROJECT came from, and nothing else:
+ * it is `"registry"` only when the recorded row actually supplied the name.
+ * A found-but-unusable row reports `"fallback"`, because that is what the
+ * caller is about to address. `slug` names the instance when one was found,
+ * so a caller can say WHICH install it is talking about (cinatra-cli#230).
+ *
+ * @returns {{ project: string, composeFiles: string[], source: "registry"|"fallback", slug: string|null }}
  */
 export function resolveRecordedComposeContext({
   repoRoot,
@@ -250,6 +282,7 @@ export function resolveRecordedComposeContext({
     project: fallbackProject,
     composeFiles: baseComposeFiles,
     source: "fallback",
+    slug: null,
   };
   if (typeof readRegistry !== "function" || typeof findByInstallDir !== "function") return fallback;
   let row = null;
@@ -258,12 +291,19 @@ export function resolveRecordedComposeContext({
   } catch {
     return fallback; // a missing/malformed registry never breaks a lifecycle command
   }
-  if (!row) return fallback;
-  const project =
-    typeof row.composeProject === "string" && row.composeProject.trim() !== ""
-      ? row.composeProject.trim()
-      : fallbackProject;
+  const found = unwrapRegistryRow(row);
+  if (!found) return fallback;
+  const { slot, slug } = found;
+  const recordedProject =
+    typeof slot.composeProject === "string" && slot.composeProject.trim() !== ""
+      ? slot.composeProject.trim()
+      : null;
   const composeFiles =
-    Array.isArray(row.composeFiles) && row.composeFiles.length > 0 ? row.composeFiles : baseComposeFiles;
-  return { project, composeFiles, source: "registry" };
+    Array.isArray(slot.composeFiles) && slot.composeFiles.length > 0 ? slot.composeFiles : baseComposeFiles;
+  if (recordedProject === null) {
+    // The row exists but records no project. Say "fallback" — claiming
+    // "registry" here is exactly the lie that hid cinatra-cli#230.
+    return { project: fallbackProject, composeFiles, source: "fallback", slug };
+  }
+  return { project: recordedProject, composeFiles, source: "registry", slug };
 }

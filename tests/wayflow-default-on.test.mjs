@@ -432,6 +432,8 @@ describe("resolveRecordedComposeContext — never the checkout basename by accid
       project: "cinatra",
       composeFiles: ["docker-compose.yml", "docker-compose.dev.yml"],
       source: "fallback",
+      // cinatra-cli#230: no row found, so there is no instance to name.
+      slug: null,
     });
   });
 

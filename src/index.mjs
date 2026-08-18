@@ -5172,7 +5172,14 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
   // Label-scoped lookup (project + service) against the install's RECORDED
   // compose project, not the checkout basename — a default install records an
   // explicit instance-scoped project and an isolated one records its own.
-  const { project } = wayflowComposeContext(repoRoot);
+  // cinatra-cli#230: the verdict names WHERE the project came from, so a wrong
+  // project is diagnosable from the doctor line alone instead of needing a
+  // registry dump to tell a real "no container" from a mis-addressed one.
+  const { project, source: projectSource, slug: instanceSlug } = wayflowComposeContext(repoRoot);
+  const projectNote =
+    projectSource === "registry"
+      ? `compose project "${project}" (recorded in the instance registry${instanceSlug ? ` for instance "${instanceSlug}"` : ""})`
+      : `compose project "${project}" (derived from the checkout directory name — no instance registry record for this checkout)`;
   const healthUrl = wayflowHealthUrlFromEnv(env);
   const ps = doctorDockerRun(dockerImpl, [
     "ps",
@@ -5207,7 +5214,7 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
       id,
       label,
       "fail",
-      `no running ${DOCTOR_WAYFLOW.service} container in compose project "${project}"; every agent run fails with ECONNREFUSED`,
+      `no running ${DOCTOR_WAYFLOW.service} container in ${projectNote}; every agent run fails with ECONNREFUSED`,
       "Start the WayFlow agent runtime (`cinatra instance wayflow start`), or re-run `cinatra install` to reconcile this instance. " +
         "If this instance is meant to be lean, re-install with `--no-wayflow` so the opt-out is recorded.",
     );
@@ -11689,9 +11696,19 @@ function readInstanceRegistrySafe() {
   }
 }
 
+// cinatra-cli#230 — `findInstanceByInstallDir` returns the `{ slug, slot }`
+// ENVELOPE, not the instance row. #227 wired this adapter straight into
+// `resolveRecordedComposeContext`, which reads `.composeProject` off the value
+// it receives: on the envelope that is `undefined`, so EVERY recorded install
+// fell back to the checkout basename while the resolution still reported
+// itself as registry-sourced. Unwrap to the flat slot here, keeping the slug
+// on it so callers can name the instance they resolved.
 function findInstanceRowByInstallDir(registry, installDir) {
   try {
-    return instanceRowByInstallDir(registry, installDir);
+    const hit = instanceRowByInstallDir(registry, installDir);
+    if (!hit || typeof hit !== "object") return null;
+    const slot = hit.slot && typeof hit.slot === "object" ? hit.slot : hit;
+    return { ...slot, slug: slot.slug ?? hit.slug ?? null };
   } catch {
     return null;
   }
