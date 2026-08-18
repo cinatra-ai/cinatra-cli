@@ -355,6 +355,148 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
     expect(forced.released).toBe(true);
   });
 
+  // ── The review BLOCKER: the stale-row safety must not fail OPEN ──────────
+  // The reclaim gate is a refusal-unless---force guarantee: release the row only
+  // after PROVING no container of the project survives. If an inspection ERROR is
+  // folded into "zero containers", the guarantee evaporates in exactly the case it
+  // exists for — Docker cannot answer, so containers may well be live holding
+  // those ports, and we would reclaim the row AND skip the `down`.
+  //
+  // Both directions are pinned: "inspected: zero containers" still releases;
+  // "could not inspect" refuses.
+
+  /** A stale row (checkout removed) ready for the reclaim path. */
+  function staleRow({ registryPath, slug = "row1", appPort = 3300 }) {
+    const inst = installIsolated({ registryPath, slug, appPort });
+    rmSync(inst.targetDir, { recursive: true, force: true }); // the operator's `rm -rf`
+    return inst;
+  }
+
+  it("REFUSES to reclaim when the liveness inspection THROWS (an error is not an all-clear)", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    staleRow({ registryPath });
+    const before = readFileSync(registryPath, "utf8");
+    const down = recordingDown();
+
+    const deps = {
+      instanceRegistryPath: registryPath,
+      allocLockPath,
+      runComposeDown: down.fn,
+      inspectProjectOwnership: () => {
+        throw new Error("Cannot connect to the Docker daemon at unix:///var/run/docker.sock.");
+      },
+    };
+    const refused = await teardownInstance({ slug: "row1", log: () => {}, deps });
+
+    expect(refused).toMatchObject({ released: false, reason: "inspect-failed" });
+    expect(refused.error?.message).toMatch(/Cannot connect to the Docker daemon/);
+    // NOTHING released: the row, its whole reservation, the bytes on disk.
+    expect(rowFor(registryPath, "row1")).not.toBeNull();
+    expect(readFileSync(registryPath, "utf8")).toBe(before);
+    expect(down.calls).toHaveLength(0);
+    // And the band is still held — the reservation really did survive.
+    expect(tryAllocateOffset(registryPath, 3301).offset).toBe(20000);
+
+    // --force is the eyes-open override (the operator asserts what we could not prove).
+    const forced = await teardownInstance({ slug: "row1", force: true, log: () => {}, deps });
+    expect(forced.released).toBe(true);
+    expect(tryAllocateOffset(registryPath, 3300).offset).toBe(10000);
+  });
+
+  it("treats a MALFORMED inspection result as 'could not inspect', never as zero containers", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    staleRow({ registryPath });
+
+    // Every shape that is not a usable container list. `undefined` is the one the
+    // old `?? live` fallback silently turned into "zero containers".
+    for (const bad of [undefined, null, {}, { containerRows: null }, { containerRows: "nope" }, "garbage"]) {
+      const result = await teardownInstance({
+        slug: "row1",
+        log: () => {},
+        deps: {
+          instanceRegistryPath: registryPath,
+          allocLockPath,
+          runComposeDown: recordingDown().fn,
+          inspectProjectOwnership: () => bad,
+        },
+      });
+      expect(result, `malformed inspection ${JSON.stringify(bad) ?? "undefined"} must refuse`).toMatchObject({
+        released: false,
+        reason: "inspect-failed",
+      });
+      expect(rowFor(registryPath, "row1")).not.toBeNull();
+    }
+  });
+
+  // The two above drive the INJECTED seam. These two drive the REAL default
+  // inspector, because that is where the fail-open actually lived: the
+  // best-effort `inspectProjectOwnership` never throws — it converts every docker
+  // error into empty sets — so a teardown defaulting to it would fail open even
+  // with the catch fixed. `capture` returns null on failure and "" on a genuinely
+  // empty project; the strict inspector promotes that difference into a throw.
+  it("the REAL inspector refuses when `docker ps` fails, and releases when it reports nothing", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    staleRow({ registryPath });
+    const base = { instanceRegistryPath: registryPath, allocLockPath, runComposeDown: recordingDown().fn };
+
+    // (a) daemon down / permission denied / command failure → capture() === null.
+    const refused = await teardownInstance({
+      slug: "row1",
+      log: () => {},
+      deps: { ...base, capture: () => null },
+    });
+    expect(refused).toMatchObject({ released: false, reason: "inspect-failed" });
+    expect(refused.error?.message).toMatch(/could not inspect Docker.*docker ps -a` failed/s);
+    expect(rowFor(registryPath, "row1")).not.toBeNull();
+
+    // (b) unparseable `docker inspect` output, with ids present → still an error,
+    //     never "zero containers".
+    const malformed = await teardownInstance({
+      slug: "row1",
+      log: () => {},
+      deps: {
+        ...base,
+        capture: (_cmd, args) => (args.includes("-q") ? "container-id-1" : "<not json>"),
+      },
+    });
+    expect(malformed).toMatchObject({ released: false, reason: "inspect-failed" });
+    expect(malformed.error?.message).toMatch(/unparseable JSON/);
+    expect(rowFor(registryPath, "row1")).not.toBeNull();
+
+    // (c) the real ALL-CLEAR: docker answered, exit 0, no containers ("" ≠ null).
+    //     This is the distinction the fix turns on, so it must still release.
+    const released = await teardownInstance({
+      slug: "row1",
+      log: () => {},
+      deps: { ...base, capture: () => "" },
+    });
+    expect(released.released).toBe(true);
+    expect(tryAllocateOffset(registryPath, 3300).offset).toBe(10000);
+  });
+
+  it("`--down` surfaces a failed inspection as a refusal naming the failure and the way out", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    staleRow({ registryPath });
+
+    await expect(
+      runInstall(["--down", "--instance", "row1", "--yes"], {
+        log: () => {},
+        deps: {
+          instanceRegistryPath: registryPath,
+          allocLockPath,
+          runComposeDown: recordingDown().fn,
+          capture: () => null,
+        },
+      }),
+      // Names the inspection failure, says nothing was released, offers retry OR --force.
+    ).rejects.toThrow(/NOTHING was released[\s\S]*re-run[\s\S]*--force[\s\S]*could not inspect Docker/);
+    expect(rowFor(registryPath, "row1")).not.toBeNull();
+  });
+
   it("names the reservation holders in the exhaustion error (the operator's remediation)", () => {
     const { registryPath } = newRegistryPaths();
     writeInstanceRegistry(registryPath, { version: 1, instances: {} });

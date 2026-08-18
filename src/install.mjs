@@ -3669,7 +3669,8 @@ export function planInstanceTeardown(row, { volumes = false } = {}) {
  *        tightening: a slug collision must never release someone else's row).
  * @param {boolean} [a.volumes] pass `-v` to the `down` (deletes the data volumes).
  * @param {boolean} [a.force]   release a row we cannot `down` ourselves (a co-use
- *        row, or a row whose checkout is gone while its project is still live).
+ *        row, or a row whose checkout is gone while its project is still live —
+ *        or whose liveness we could not determine because Docker errored).
  * @param {boolean} [a.dryRun]  print the plan; touch nothing.
  * @returns {Promise<{released:boolean, reason:string, plan:object|null, downRan:boolean}>}
  */
@@ -3685,7 +3686,13 @@ export async function teardownInstance({
   const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
   const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
   const runCompose = deps.runComposeDown ?? composeDown;
-  const inspectProject = deps.inspectProjectOwnership ?? ((names) => inspectProjectOwnership(names, deps));
+  // The reclaim path needs an inspector that can say "I could not tell", so it
+  // defaults to the STRICT `inspectProjectLiveness` (throws on any docker
+  // failure) — NOT the best-effort `inspectProjectOwnership`, whose contract is
+  // "any docker error yields empty sets", which is precisely the fail-open the
+  // reclaim gate must not inherit.
+  const inspectProject =
+    deps.inspectProjectLiveness ?? deps.inspectProjectOwnership ?? ((names) => inspectProjectLiveness(names, deps));
   const dirExists = deps.existsSync ?? existsSync;
 
   let outcome = { released: false, reason: "not-found", plan: null, downRan: false };
@@ -3737,21 +3744,55 @@ export async function teardownInstance({
       // when nothing of the project is still alive — a live container really
       // does hold those host ports, and handing them to the next install would
       // trade a stale reservation for a real collision.
-      let live = { containerRows: [], volumeRows: [] };
+      //
+      // An inspection ERROR is NOT an answer (review blocker: the safety failed
+      // OPEN). Docker being down, unreadable or unparseable tells us NOTHING
+      // about whether containers are live — folding it into "zero containers"
+      // would reclaim the row, skip the `down`, and hand a live stack's ports to
+      // the next install, i.e. void the refusal guarantee exactly when it is
+      // needed. So we distinguish three states, not two:
+      //   • inspected, zero containers  → safe to reclaim
+      //   • inspected, N > 0 containers → refuse ("stack-still-live")
+      //   • COULD NOT inspect           → refuse ("inspect-failed")
+      // Both refusals release nothing and are overridable by --force.
+      let live = null;
+      let inspectError = null;
       try {
-        live = inspectProject([row.composeProject]) ?? live;
-      } catch {
-        live = { containerRows: [], volumeRows: [] };
+        const result = inspectProject([row.composeProject]);
+        // Malformed/absent output is a failure to inspect, not an empty answer.
+        if (!result || !Array.isArray(result.containerRows)) {
+          throw new Error(
+            `docker inspection of project "${row.composeProject}" returned no usable container list ` +
+              `(got ${result === undefined ? "undefined" : JSON.stringify(result)?.slice(0, 120)}).`,
+          );
+        }
+        live = result;
+      } catch (e) {
+        inspectError = e;
       }
-      const containers = live.containerRows?.length ?? 0;
+
+      if (inspectError && !force) {
+        outcome = {
+          released: false,
+          reason: "inspect-failed",
+          plan,
+          downRan: false,
+          error: inspectError,
+        };
+        return;
+      }
+
+      const containers = live?.containerRows?.length ?? 0;
       if (containers > 0 && !force) {
         outcome = { released: false, reason: "stack-still-live", plan, downRan: false, liveContainers: containers };
         return;
       }
-      const leftoverVolumes = live.volumeRows?.length ?? 0;
+      const leftoverVolumes = live?.volumeRows?.length ?? 0;
       log(
         `  Checkout ${row.installDir} is gone — reclaiming the stale row for "${slug}" ` +
-          `(no compose file to \`down\` from; ${containers} live container(s) found).`,
+          (inspectError
+            ? `(no compose file to \`down\` from; --force overrode a FAILED liveness check: ${inspectError.message}).`
+            : `(no compose file to \`down\` from; ${containers} live container(s) found).`),
       );
       if (leftoverVolumes > 0) {
         log(
@@ -3901,6 +3942,12 @@ async function runInstallDown({ opts, log = console.log, deps = {} }) {
       `the checkout ${row.installDir} is gone but ${result.liveContainers} container(s) of project ` +
       `${row.composeProject} are still running — they really do hold those ports. Stop them ` +
       `(\`docker compose -p ${row.composeProject} down -v\`) and re-run, or pass --force to release the row anyway.`,
+    "inspect-failed":
+      `the checkout ${row.installDir} is gone, so the row can only be released after PROVING no container of ` +
+      `project ${row.composeProject} is still running — and that check itself FAILED, so NOTHING was released. ` +
+      `An inspection error is not an "all clear": containers may well be live and holding those ports. ` +
+      `Fix the Docker error and re-run \`cinatra install --down\`, or pass --force to release the row without the proof.` +
+      (result.error ? `\n  ${result.error.message}` : ""),
     "co-use-needs-force":
       `"${row.slug}" is a co-use instance: it owns a separate database (${(row.createdResources ?? []).join(", ") || "unknown"}) ` +
       `but no stack of its own. Drop that database yourself, then re-run with --force to release the row.`,
@@ -4163,6 +4210,96 @@ function inspectProjectOwnership(projectNames, deps = {}) {
       parsed = JSON.parse(raw);
     } catch {
       parsed = [];
+    }
+    for (const v of Array.isArray(parsed) ? parsed : []) {
+      if (!v || typeof v.Name !== "string" || volSeen.has(v.Name)) continue;
+      volSeen.add(v.Name);
+      const labels = v.Labels ?? {};
+      volumeRows.push({
+        name: v.Name,
+        project: labels["com.docker.compose.project"] || null,
+        workingDir: labels["com.docker.compose.project.working_dir"] || null,
+      });
+    }
+  }
+  return { containerRows, volumeRows };
+}
+
+/**
+ * cinatra-cli#232 — STRICT liveness inspection of a compose project, for the
+ * one caller where an inspection error must NOT be read as "nothing is live":
+ * `teardownInstance`'s reclaim path (the checkout is gone, so the row can only
+ * be released after PROVING no container of the project survives).
+ *
+ * The difference from `inspectProjectOwnership` is the whole point. That one is
+ * documented best-effort — "any docker error yields empty sets, never throws" —
+ * which is right for a heuristic ownership decision that only ever gets more
+ * cautious when it learns less. Here the polarity is inverted: learning nothing
+ * would make us LESS cautious (release the row, skip the `down`), so a daemon
+ * that is down, a permission denial, a failed command or unparseable output must
+ * surface as an ERROR and refuse, not as an empty set that reclaims.
+ *
+ * `capture()` returns null on any non-zero exit or spawn throw, and "" (exit 0,
+ * no matches) for a genuinely empty project — that is exactly the distinction
+ * this function promotes into a throw.
+ *
+ * @throws {Error} when Docker cannot be asked, or answers unusably.
+ * @returns {{containerRows: object[], volumeRows: object[]}}
+ */
+function inspectProjectLiveness(projectNames, deps = {}) {
+  const cap = deps.capture ?? capture;
+  const names = (Array.isArray(projectNames) ? projectNames : [projectNames]).filter(Boolean);
+  const fail = (what, detail) =>
+    new Error(
+      `could not inspect Docker for ${what}: ${detail}. ` +
+        `Is the Docker daemon running and reachable by this user?`,
+    );
+
+  const containerRows = [];
+  const seen = new Set();
+  for (const name of names) {
+    const ids = cap("docker", ["ps", "-a", "--filter", `label=com.docker.compose.project=${name}`, "-q"]);
+    // null = the command FAILED (non-zero exit / could not spawn). "" = it
+    // succeeded and the project has no containers. Never conflate the two.
+    if (ids == null) throw fail(`project "${name}"`, "`docker ps -a` failed");
+    const idList = ids.split("\n").map((s) => s.trim()).filter(Boolean);
+    if (idList.length === 0) continue;
+    const raw = cap("docker", ["inspect", ...idList]);
+    if (raw == null) throw fail(`project "${name}"`, "`docker inspect` failed");
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      // We KNOW there are container ids; unparseable detail must not become
+      // "zero containers".
+      throw fail(`project "${name}"`, `\`docker inspect\` returned unparseable JSON (${e.message})`);
+    }
+    if (!Array.isArray(parsed)) throw fail(`project "${name}"`, "`docker inspect` returned a non-array payload");
+    for (const r of parsed) {
+      const id = r?.Id ?? JSON.stringify(r);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      containerRows.push(r);
+    }
+  }
+
+  // Volumes are advisory here (they hold no host port, so they never gate the
+  // release — we only mention them). A volume-side docker failure must NOT sink
+  // an otherwise conclusive container answer, so it degrades to "unknown".
+  const volumeRows = [];
+  const volSeen = new Set();
+  for (const name of names) {
+    const vols = cap("docker", ["volume", "ls", "--filter", `label=com.docker.compose.project=${name}`, "-q"]);
+    if (vols == null) continue;
+    const volList = vols.split("\n").map((s) => s.trim()).filter(Boolean);
+    if (volList.length === 0) continue;
+    const raw = cap("docker", ["volume", "inspect", ...volList]);
+    if (raw == null) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      continue;
     }
     for (const v of Array.isArray(parsed) ? parsed : []) {
       if (!v || typeof v.Name !== "string" || volSeen.has(v.Name)) continue;
