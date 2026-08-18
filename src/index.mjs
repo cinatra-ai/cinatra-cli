@@ -837,6 +837,14 @@ Usage:
                                # limit in MB (256 .. 65536; unset keeps the checkout's own).
                                # CINATRA_PREVIEW_BUILD_TYPECHECK=1 restores the in-build tsc
                                # (skipped by default, as the CI image build does).
+                               # CINATRA_PREVIEW_BUILD_CPUS sets the build's page-data WORKER
+                               # COUNT directly — 3 means three workers (1 .. 256). A MANY-CORE
+                               # builder needs it: unset, the build defaults to
+                               # os.cpus().length - 1 workers, and a docker --cpus cap does not
+                               # change what that call reports.
+                               # CINATRA_PREVIEW_BUILD_BUNDLER=turbopack|webpack picks the
+                               # bundler; webpack fails on the V8 heap the MEMORY_MB lever moves,
+                               # the default fails on native memory it does not.
                                # Env-only so they apply to \`install --mode preview\` too.
   cinatra instance preview status [--slug <slug>]
   cinatra instance preview list
@@ -942,10 +950,43 @@ Commands:
                       different failure, and an exit-code-137 kill only says
                       something sent SIGKILL — neither names its own cause.
                       Check Docker/host memory pressure first; more VM RAM may
-                      help, but cinatra-cli#210 measured a native wall that
-                      survived 4 GB to 14 GB, and clearing that needs the
-                      checkout-side concurrency / bundler-fallback control that
-                      issue tracks.
+                      help, but a native wall has been measured that survived
+                      4 GB to 14 GB. The two levers below are what address it.
+                      Mind the PHASE: the worker count bounds what runs AFTER
+                      compile (page-data collection / static generation), so it
+                      does not fix a death DURING compile — that is what the
+                      bundler choice addresses.
+
+                      BUILD WORKERS: the build runs page-data collection across
+                      a pool of worker processes, and this lever IS that count —
+                      <n> in means exactly <n> workers, not one fewer. Only the
+                      UNSET default is derived, as os.cpus().length - 1, and a
+                      docker --cpus or --cpuset-cpus cap does NOT change what
+                      that call reports. So an UNTUNED many-core builder keeps a
+                      wide worker pool however narrow its CPU quota is, and each
+                      worker is a whole extra node process with its own heap.
+                      Set the count with
+
+                        CINATRA_PREVIEW_BUILD_CPUS=<workers>
+
+                      accepted range 1 .. 256; 3 gives three workers. It becomes
+                      the build-arg CINATRA_BUILD_CPUS=<n>. UNSET passes nothing,
+                      so the resolved SHA keeps its own default worker count.
+
+                      BUILD BUNDLER: the default bundler dies on NATIVE memory,
+                      which no NODE_OPTIONS value bounds. The other one dies on
+                      the V8 heap, which CINATRA_PREVIEW_BUILD_MEMORY_MB does
+                      move. Switch with
+
+                        CINATRA_PREVIEW_BUILD_BUNDLER=turbopack|webpack
+
+                      which becomes the build-arg CINATRA_BUILD_BUNDLER. UNSET
+                      passes nothing and the resolved SHA keeps its own choice.
+
+                      Neither is a cure. The checkout documents a builder-memory
+                      floor, and a builder far below it fails on both bundler
+                      paths. These levers make a many-core build TUNABLE from the
+                      CLI; they do not remove that floor.
 
                       IN-BUILD TYPECHECK: preview forwards CI=true to the image
                       build, matching how the CI image is built — it skips the
@@ -961,12 +1002,13 @@ Commands:
                       generic signal, so this switch can affect more than the
                       typecheck alone.
 
-                      Both are env-only (not flags), like the budget, so the same
-                      levers apply to create, refresh AND \`install --mode
-                      preview\`; both are hard errors on a malformed value. They
-                      reach the build as --build-arg, so they only bite on a SHA
-                      whose Dockerfile declares the matching ARG — the build says
-                      so out loud when it does not.
+                      All four are env-only (not flags), like the budget, so the
+                      same levers apply to create, refresh AND \`install --mode
+                      preview\`; all four are hard errors on a malformed value,
+                      raised before any state is claimed. They reach the build as
+                      --build-arg, so they only bite on a SHA whose Dockerfile
+                      declares the matching ARG. The build says so out loud when
+                      it does not, and it builds anyway.
   instance preview status|list
                       Show a preview's (or all previews') resolved SHA, built
                       image tag, provenance, durable volume, and state.

@@ -8,6 +8,35 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The preview image build can finally be tuned for a many-core builder.** The
+  checkout's Dockerfile declares two build args as its documented remedy for a
+  constrained or many-core host, and no CLI surface could send either one: the
+  preview build assembled its `--build-arg` set from the memory ceiling and `CI`
+  alone. So the remedy was unreachable from `cinatra install --mode preview` and
+  from `cinatra instance preview create | refresh`, and the only ways through
+  were to keep adding memory to the Docker VM, to reconfigure the whole machine
+  down to fewer cores, or to bypass the CLI with a hand-run `docker build`. Two
+  environment levers now reach the build. `CINATRA_PREVIEW_BUILD_CPUS` (1 .. 256)
+  sets the build's page-data worker COUNT directly: `3` gives three workers, not
+  two. It matters because only the UNSET default is derived, as
+  `os.cpus().length - 1`, and a Docker `--cpus` or `--cpuset-cpus` cap does not
+  change what that call reports. So an untuned many-core builder keeps a wide
+  worker pool however narrow its CPU quota is. The count bounds what runs AFTER
+  compile, so it does not fix a death DURING compile.
+  `CINATRA_PREVIEW_BUILD_BUNDLER=turbopack|webpack` picks the bundler, which
+  decides whether the existing memory ceiling is a lever at all: the default
+  bundler dies on native memory, which `--max-old-space-size` does not bound,
+  and the other dies on the V8 heap, which it does. Both follow the levers that
+  came before them exactly: environment variables rather than flags, so one
+  setting covers all three entrypoints; unset means unset, so an untuned preview
+  still builds the resolved commit exactly as that commit's own Dockerfile
+  defines; a malformed value is a hard error raised before any state is claimed;
+  both are logged as part of the build's identity; and a commit whose Dockerfile
+  predates the args still builds, with a warning that the values are very likely
+  ignored. A failed build now names the lever that fits the death it died: on
+  the default bundler path a native out-of-memory kill points at the worker count
+  and the bundler, not only at the V8 old-space ceiling that cannot move it. Neither lever removes the builder-memory floor the checkout documents.
+
 - **`cinatra instance preview stop | start`, and a refresh that stops rebuilding
   what it already has.** Every way to change a preview container used to go
   through a full `docker build`: there was no verb to stop, start or
