@@ -70,6 +70,7 @@ import {
   readInstanceRegistry,
   writeInstanceRegistry,
 } from "../src/instance-registry.mjs";
+import { envFileSuppliedKeys } from "../src/wayflow-runtime.mjs";
 import { readMarker } from "../src/instance-marker.mjs";
 
 // The six keys the runtime's container config must carry. Three are static
@@ -225,13 +226,17 @@ function fakeComposeConfig(dir, seen = []) {
 
 /** What the bring-up does just before `docker compose up`: run the checkout's
  *  generator, which writes the narrow file from `.env.local`. */
-function writeWayflowEnvFile(dir, { token = "fixture-bridge-token", baseUrl = "http://localhost:13010/" } = {}) {
+function writeWayflowEnvFile(dir, {
+  token = "fixture-bridge-token",
+  attest = "fixture-attest-key",
+  baseUrl = "http://localhost:13010/",
+} = {}) {
   mkdirSync(path.join(dir, "docker", "wayflow"), { recursive: true });
   writeFileSync(
     path.join(dir, WAYFLOW_ENV_REL),
     [
       `CINATRA_BRIDGE_TOKEN=${token}`,
-      "CINATRA_CONTEXT_ATTEST_KEY=fixture-attest-key",
+      `CINATRA_CONTEXT_ATTEST_KEY=${attest}`,
       `WAYFLOW_BASE_URL=${baseUrl}`,
       "",
     ].join("\n"),
@@ -1500,9 +1505,22 @@ describe("which Compose this suite exercised (cinatra#2654 D1)", () => {
 
 /** The whole real-compose claim, run against ONE compose binary. Render-only:
  *  `config` on a fixture with no published ports and no `up` — nothing is
- *  started, nothing binds a host port. Both routes are asserted for what they
- *  ARE, never permissively: a Compose that drops the reference on the preserving
- *  route FAILS here rather than slipping past an `if`. */
+ *  started, nothing binds a host port.
+ *
+ *  Round 3 fixed the ASSERTION rather than the branch structure. A test that
+ *  simply reds whenever the engine inlines would red CI forever (ubuntu-latest
+ *  ships 2.38.2, which inlines). The dangerous case is not "this engine
+ *  inlines" — it is the CLI believing something different from what the engine
+ *  does, because that is what makes it write a frozen file while reporting a
+ *  referenced one. So:
+ *
+ *    (a) the PROBE'S VERDICT is compared against this engine's actually observed
+ *        rendering of THIS fixture. Either direction of mismatch FAILS.
+ *    (b) on the fallback route the generated document is asserted to carry the
+ *        FULL token route — every key every one of the four env files supplies —
+ *        not merely that the fallback branch ran.
+ *    (c) the fixture carries all FOUR of the checkout's narrow-env-file services.
+ */
 function realComposeSuite(engine) {
   const run = (args, opts = {}) =>
     engine.bin
@@ -1513,37 +1531,77 @@ function realComposeSuite(engine) {
       ? execFileSync(engine.bin, args.slice(1), { cwd: opts?.cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
       : execFileSync(command, args, { cwd: opts?.cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 
-  // The two keys `.env.local` supplies, so the generator may re-symbolise them.
-  const SCRUBBABLE = new Set(["CINATRA_BRIDGE_TOKEN", "CINATRA_CONTEXT_ATTEST_KEY"]);
+  // The keys `.env.local` supplies, so the generator may re-symbolise them. The
+  // graphiti/plane secrets are deliberately NOT here — the checkout's own
+  // compose says the OpenAI key lives in the app DATABASE and the Plane PAT is
+  // minted by the provision script, so neither is on the scrub allowlist.
+  const SCRUBBABLE = new Set(["CINATRA_BRIDGE_TOKEN", "CINATRA_CONTEXT_ATTEST_KEY", "NANGO_ENCRYPTION_KEY"]);
   const ENV_LOCAL_TOKEN = "envlocal-bridge-token";
+  const ENV_LOCAL_ATTEST = "envlocal-attest-key";
+
+  /** service → its narrow env file, as the checkout declares them. */
+  const FOUR = { wayflow: WAYFLOW_ENV_REL, ...SIBLING_ENV_FILE_SERVICES };
 
   const writeFixtureCheckout = () => {
-    writeFileSync(
-      path.join(dir, "docker-compose.yml"),
-      [
-        "services:",
-        "  wayflow:",
+    const yaml = ["services:"];
+    yaml.push(
+      "  wayflow:",
+      "    image: busybox",
+      "    env_file:",
+      `      - path: ./${WAYFLOW_ENV_REL.split(path.sep).join("/")}`,
+      "        required: false",
+      "    environment:",
+      '      PORT: "3010"',
+      '      CINATRA_AGENTS_DIR: "/agents"',
+      '      CINATRA_BASE_URL: "http://host.docker.internal:3000"',
+      "    profiles:",
+      "      - wayflow",
+    );
+    for (const [svc, rel] of Object.entries(SIBLING_ENV_FILE_SERVICES)) {
+      yaml.push(
+        `  ${svc}:`,
         "    image: busybox",
         "    env_file:",
-        "      - path: ./docker/wayflow/.wayflow.env",
+        `      - path: ./${rel}`,
         "        required: false",
         "    environment:",
-        '      PORT: "3010"',
-        '      CINATRA_AGENTS_DIR: "/agents"',
-        '      CINATRA_BASE_URL: "http://host.docker.internal:3000"',
-        "    profiles:",
-        "      - wayflow",
-        "",
-      ].join("\n"),
-    );
+        `      SERVICE_NAME: "${svc}"`,
+      );
+    }
+    yaml.push("");
+    writeFileSync(path.join(dir, "docker-compose.yml"), yaml.join("\n"));
     // What `ensureEnvLocal` minted; the isolated `up` reads it as --env-file.
     writeFileSync(
       path.join(dir, ".env.local"),
-      `CINATRA_BRIDGE_TOKEN=${ENV_LOCAL_TOKEN}\nCINATRA_CONTEXT_ATTEST_KEY=envlocal-attest-key\n`,
+      [
+        `CINATRA_BRIDGE_TOKEN=${ENV_LOCAL_TOKEN}`,
+        `CINATRA_CONTEXT_ATTEST_KEY=${ENV_LOCAL_ATTEST}`,
+        `NANGO_ENCRYPTION_KEY=${SIBLING_ENV_FILE_KEYS["nango-server"].value}`,
+        "",
+      ].join("\n"),
       { mode: 0o600 },
     );
-    // What `gen-wayflow-env.mjs` derives from it, before the render.
-    writeWayflowEnvFile(dir, { token: ENV_LOCAL_TOKEN });
+    // What the four generators derive, before the render.
+    writeWayflowEnvFile(dir, { token: ENV_LOCAL_TOKEN, attest: ENV_LOCAL_ATTEST });
+    writeSiblingEnvFiles(dir);
+  };
+
+  /** What this engine ACTUALLY does to the fixture when asked to preserve
+   *  references — per service, so a PARTIAL preservation is visible too. */
+  const observePreservation = () => {
+    const forced = composeConfigForFiles(dir, ["docker-compose.yml"], { capture }, {
+      allProfiles: true,
+      preserveEnvFiles: true,
+    });
+    // A render that FAILS (an engine that rejects the unknown flag) preserves
+    // nothing — the same verdict the CLI's probe reaches by the same route.
+    if (!forced) return Object.fromEntries(Object.keys(FOUR).map((svc) => [svc, false]));
+    return Object.fromEntries(
+      Object.keys(FOUR).map((svc) => {
+        const raw = forced.services?.[svc]?.env_file;
+        return [svc, Array.isArray(raw) ? raw.length > 0 : Boolean(raw)];
+      }),
+    );
   };
 
   const render = () => {
@@ -1562,9 +1620,36 @@ function realComposeSuite(engine) {
     return { doc, resolved };
   };
 
-  it(`(${engine.version}) a first-install render reaches the container with all six keys`, () => {
+  /** The keys each of the four env files supplies, and the value it supplies. */
+  const expectedWiring = () => {
+    const out = {};
+    for (const [svc, rel] of Object.entries(FOUR)) {
+      out[svc] = parseEnvFile(readFileSync(path.join(dir, rel), "utf8"));
+    }
+    return out;
+  };
+
+  it(`(${engine.version}) THE PROBE'S VERDICT MATCHES what this engine does to the fixture`, () => {
+    // The dangerous case, in BOTH directions: the CLI believing the reference
+    // survives when the render inlines (it writes a frozen file and reports a
+    // referenced one — the D1 defect, reached through the flag meant to prevent
+    // it), or believing it inlines when the render preserves (it takes a
+    // degraded route for no reason). Either FAILS here, loudly, by name.
+    writeFixtureCheckout();
+    const observed = observePreservation();
+    const disagree = Object.entries(observed).filter(([, kept]) => kept !== engine.preserves);
+    expect(
+      disagree.length === 0
+        ? "probe and render agree"
+        : `probe says preserves=${engine.preserves}, but this engine rendered ` +
+          disagree.map(([svc, kept]) => `${svc}: env_file ${kept ? "PRESERVED" : "INLINED"}`).join(", "),
+    ).toBe("probe and render agree");
+  });
+
+  it(`(${engine.version}) a first-install render carries the FULL token route for all four services`, () => {
     writeFixtureCheckout();
     const { doc, resolved } = render();
+    const wiring = expectedWiring();
 
     // STRICT: the route this engine actually takes is the one asserted.
     expect(
@@ -1572,38 +1657,56 @@ function realComposeSuite(engine) {
         sourceDoc: resolved,
         wayflowEnvFilePath: path.join(dir, WAYFLOW_ENV_REL),
         envFilesPreserved: engine.preserves,
+        envFileKeysAt: (abs) => envFileSuppliedKeys(abs),
+        declaredEnvFiles: checkoutDeclaredEnvFiles(dir),
         baseDir: dir,
       }),
     ).toEqual([]);
+
     if (engine.preserves) {
-      expect(doc.services.wayflow.env_file).toBeDefined();
+      for (const [svc, rel] of Object.entries(FOUR)) {
+        expect(doc.services[svc].env_file.map((e) => e.path)).toContain(path.join(dir, rel));
+      }
       expect(doc.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBeUndefined();
     } else {
-      // Fallback: inlined, then re-symbolised — a resolvable placeholder, not a
-      // frozen secret.
-      expect(doc.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBe("${CINATRA_BRIDGE_TOKEN}");
-      expect(doc.services.wayflow.environment.CINATRA_CONTEXT_ATTEST_KEY).toBe("${CINATRA_CONTEXT_ATTEST_KEY}");
+      // FALLBACK: the reference is gone (this engine inlined it), so the
+      // generated document itself has to carry the whole route — every key of
+      // every one of the four files, with a NON-EMPTY value. Not "the branch
+      // ran": the actual wiring.
+      for (const [svc, supplied] of Object.entries(wiring)) {
+        for (const key of Object.keys(supplied)) {
+          const value = doc.services[svc].environment?.[key];
+          expect(`${svc}.${key}=${value ?? "<missing>"}`).toBe(
+            `${svc}.${key}=${SCRUBBABLE.has(key) ? `\${${key}}` : supplied[key]}`,
+          );
+        }
+      }
     }
-    // On BOTH routes: no host secret is persisted in the generated file.
+
+    // On BOTH routes: no key `.env.local` supplies is persisted in the file.
     const file = path.join(dir, ISOLATED_COMPOSE_FILENAME);
     writeIsolatedComposeFile(file, doc);
     const body = readFileSync(file, "utf8");
     expect(body).not.toContain(ENV_LOCAL_TOKEN);
-    expect(body).not.toContain("fixture-attest-key");
+    expect(body).not.toContain(ENV_LOCAL_ATTEST);
+    expect(body).not.toContain(SIBLING_ENV_FILE_KEYS["nango-server"].value);
     // …and it declares its own ownership.
     expect(body.startsWith("# GENERATED FILE — DO NOT EDIT.")).toBe(true);
 
-    // Ask compose itself what the isolated `up` would give the container — which
-    // also proves the comment header is valid compose YAML.
+    // Ask compose itself what the isolated `up` would give each container —
+    // which also proves the comment header is valid compose YAML.
     const rendered = JSON.parse(
       run(
         ["--env-file", ".env.local", "--profile", "*", "-f", ISOLATED_COMPOSE_FILENAME, "config", "--format", "json"],
         { cwd: dir },
       ),
     );
-    const env = rendered.services.wayflow.environment;
-    expect(Object.keys(env).sort()).toEqual([...SIX_KEYS].sort());
-    expect(env.CINATRA_BRIDGE_TOKEN).toBe(ENV_LOCAL_TOKEN);
+    for (const [svc, supplied] of Object.entries(wiring)) {
+      for (const [key, value] of Object.entries(supplied)) {
+        expect(`${svc}.${key}=${rendered.services[svc].environment?.[key]}`).toBe(`${svc}.${key}=${value}`);
+      }
+    }
+    expect(Object.keys(rendered.services.wayflow.environment).sort()).toEqual([...SIX_KEYS].sort());
   });
 
   it(`(${engine.version}) a rotated token still reaches the container`, () => {
@@ -1618,10 +1721,11 @@ function realComposeSuite(engine) {
     const rotated = "rotated-bridge-token";
     writeFileSync(
       path.join(dir, ".env.local"),
-      `CINATRA_BRIDGE_TOKEN=${rotated}\nCINATRA_CONTEXT_ATTEST_KEY=envlocal-attest-key\n`,
+      `CINATRA_BRIDGE_TOKEN=${rotated}\nCINATRA_CONTEXT_ATTEST_KEY=${ENV_LOCAL_ATTEST}\n` +
+        `NANGO_ENCRYPTION_KEY=${SIBLING_ENV_FILE_KEYS["nango-server"].value}\n`,
       { mode: 0o600 },
     );
-    writeWayflowEnvFile(dir, { token: rotated });
+    writeWayflowEnvFile(dir, { token: rotated, attest: ENV_LOCAL_ATTEST });
 
     const rendered = JSON.parse(
       run(
@@ -1643,7 +1747,7 @@ function realComposeSuite(engine) {
         "  wayflow:",
         "    image: busybox",
         "    env_file:",
-        "      - path: ./docker/wayflow/.wayflow.env",
+        `      - path: ./${WAYFLOW_ENV_REL.split(path.sep).join("/")}`,
         "        required: false",
         "    environment:",
         '      CINATRA_BRIDGE_TOKEN: ""',
@@ -1657,9 +1761,14 @@ function realComposeSuite(engine) {
   it(`(${engine.version}) the CLI's own probe agrees with what this engine does`, () => {
     // Only meaningful for the DEFAULT `docker compose` — the CLI probes that one.
     if (engine.bin) return;
+    writeFixtureCheckout();
     __resetComposeFeatureProbe();
-    expect(composeSupportsNoEnvResolution({})).toBe(engine.preserves);
+    const cliVerdict = composeSupportsNoEnvResolution({});
     __resetComposeFeatureProbe();
+    // The CLI's throwaway probe, the suite's own probe, and this engine's
+    // rendering of the four-service fixture must all say the same thing.
+    expect(cliVerdict).toBe(engine.preserves);
+    expect(new Set(Object.values(observePreservation()))).toEqual(new Set([cliVerdict]));
   });
 }
 
