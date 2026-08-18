@@ -230,13 +230,16 @@ export const PREVIEW_BUILD_TYPECHECK_ENV = "CINATRA_PREVIEW_BUILD_TYPECHECK";
 // checkout's Dockerfile and its constrained-host-builds document, never here,
 // because a copy would drift:
 //
-//   - `next build` fans page-data collection out to (cores - 1) worker
-//     processes and sizes that from `os.cpus().length`. A `--cpus` or
-//     `--cpuset-cpus` cap does NOT change what that call reports, so a
-//     many-core builder keeps the wide fan-out however narrow its CPU quota is.
-//     Each worker is a whole extra node process with its own heap. Bounding the
-//     CPU count is therefore a real memory lever (it bounds the fan-out with
-//     it), and it is the one that a 16 GiB builder needed before it completed.
+//   - `next build` runs page-data collection / static generation across a pool
+//     of worker processes, and `CINATRA_BUILD_CPUS=<n>` IS that worker count:
+//     it reaches next as `experimental.cpus`, which next assigns straight to the
+//     worker count, so `3` means three workers. Only the UNSET default is
+//     derived, as `os.cpus().length - 1`, and a `--cpus` or `--cpuset-cpus` cap
+//     does NOT change what that call reports, so an UNTUNED many-core builder
+//     keeps a wide pool however narrow its CPU quota is. Each worker is a whole
+//     extra node process with its own heap. Setting the worker count is
+//     therefore a real memory lever, and it is the one that a 16 GiB builder
+//     needed before it completed.
 //   - Turbopack (the default) dies on NATIVE memory, which `--max-old-space-size`
 //     does not bound at all. Webpack dies on the V8 heap, which it does. So the
 //     bundler choice decides whether the memory ceiling is a lever or a placebo.
@@ -1305,15 +1308,16 @@ export function resolveBuildTypecheck(env = {}) {
 }
 
 /**
- * Resolve the CPU COUNT the image build plans from, or `null` when the operator
- * set nothing. It is a COUNT OF CPUS, not directly a count of workers: the build
- * derives its page-data worker fan-out from this number (one fewer), which is
- * why bounding it bounds the fan-out.
+ * Resolve the number of page-data / static-generation WORKERS the image build
+ * runs, or `null` when the operator set nothing. The value IS the worker count:
+ * it reaches the build as `CINATRA_BUILD_CPUS=<n>`, which the checkout hands to
+ * next as `experimental.cpus`, and next assigns that straight to the worker
+ * count. `3` in means three workers, not two.
  *
- * This is the lever a many-core builder needs. `next build` takes that number
- * from `os.cpus().length` unless it is told otherwise, and a docker `--cpus` or
- * `--cpuset-cpus` cap does not change what that call reports, so the fan-out
- * stays wide however narrow the CPU quota is. Each worker is a whole extra node
+ * This is the lever a many-core builder needs. Only the UNSET default is
+ * derived, as `os.cpus().length - 1`, and a docker `--cpus` or `--cpuset-cpus`
+ * cap does not change what that call reports, so an UNTUNED build keeps a wide
+ * worker pool however narrow the CPU quota is. Each worker is a whole extra node
  * process with its own heap, so the count is a memory decision, not only a speed
  * one.
  *
@@ -1328,19 +1332,20 @@ export function resolveBuildCpus(env = {}) {
   const reject = (why) => {
     throw new Error(
       `${PREVIEW_BUILD_CPUS_ENV}=${JSON.stringify(raw)} is invalid: ${why}. ` +
-        `Set it to a whole number of BUILD CPUS between ${PREVIEW_BUILD_CPUS_MIN} and ` +
-        `${PREVIEW_BUILD_CPUS_MAX}, or unset it to leave the checkout's own default fan-out in place. ` +
+        `Set it to a whole number of BUILD WORKERS between ${PREVIEW_BUILD_CPUS_MIN} and ` +
+        `${PREVIEW_BUILD_CPUS_MAX}, or unset it to leave the checkout's own default worker count in place. ` +
         `It becomes --build-arg ${PREVIEW_BUILD_CPUS_ARG}=<n> for the image build; the unit is a COUNT ` +
-        `of CPUS, which the build turns into one fewer page-data worker (no "cores"/"%" suffix).`,
+        `of WORKERS — <n> IS how many page-data workers the build runs, so 3 means three (no "cores"/"%" ` +
+        `suffix). Only the UNSET default is derived, as os.cpus().length - 1.`,
     );
   };
   // Digits only, mirroring the other numeric levers: rules out "4.5", "4e0",
   // "4 cores", "0x4", "+4", "-1", "Infinity" in one predicate.
-  if (!/^\d+$/.test(value)) reject("it is not a whole number of build CPUs");
+  if (!/^\d+$/.test(value)) reject("it is not a whole number of build workers");
   const cpus = Number(value);
   if (!Number.isSafeInteger(cpus)) reject("it is not a representable whole number");
-  if (cpus < PREVIEW_BUILD_CPUS_MIN) reject(`it is below the ${PREVIEW_BUILD_CPUS_MIN} CPU minimum`);
-  if (cpus > PREVIEW_BUILD_CPUS_MAX) reject(`it exceeds the ${PREVIEW_BUILD_CPUS_MAX} CPU maximum`);
+  if (cpus < PREVIEW_BUILD_CPUS_MIN) reject(`it is below the ${PREVIEW_BUILD_CPUS_MIN} worker minimum`);
+  if (cpus > PREVIEW_BUILD_CPUS_MAX) reject(`it exceeds the ${PREVIEW_BUILD_CPUS_MAX} worker maximum`);
   return cpus;
 }
 
@@ -1499,10 +1504,10 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
   // build has not failed yet must be able to discover the levers without going
   // back to the help.
   deps.log?.(
-    `  build CPUs: ` +
+    `  build workers: ` +
       (build.cpus === null
-        ? `the checkout's own default fan-out (${PREVIEW_BUILD_CPUS_ENV} sets the count, ` +
-          `${PREVIEW_BUILD_CPUS_MIN}..${PREVIEW_BUILD_CPUS_MAX}).`
+        ? `the checkout's own default worker count, os.cpus().length - 1 (${PREVIEW_BUILD_CPUS_ENV} ` +
+          `sets it directly, ${PREVIEW_BUILD_CPUS_MIN}..${PREVIEW_BUILD_CPUS_MAX}).`
         : `${build.cpus} (${PREVIEW_BUILD_CPUS_ENV} override).`) +
       ` Bundler: ` +
       (build.bundler === null
@@ -1567,10 +1572,11 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
             `something sent SIGKILL — neither identifies the cause, and ${PREVIEW_BUILD_MEMORY_ENV} does not ` +
             `bound native allocation. Check Docker/host memory pressure first; more VM RAM MAY help, but ` +
             `a native wall has been measured that survived 4 GB to 14 GB. The build-concurrency / ` +
-            `bundler-fallback levers are what address it. Bound the page-data worker fan-out with ` +
-            `${PREVIEW_BUILD_CPUS_ENV} (${PREVIEW_BUILD_CPUS_MIN}..${PREVIEW_BUILD_CPUS_MAX}; this build used ${
-              build.cpus === null ? `the checkout's own default fan-out` : `${build.cpus}`
-            }), which a docker --cpus cap does NOT do because the build sizes its workers from ` +
+            `bundler-fallback levers are what address it. Set the page-data worker COUNT with ` +
+            `${PREVIEW_BUILD_CPUS_ENV} (${PREVIEW_BUILD_CPUS_MIN}..${PREVIEW_BUILD_CPUS_MAX}; <n> IS the ` +
+            `worker count, so 3 means three — this build used ${
+              build.cpus === null ? `the checkout's own default worker count, os.cpus().length - 1` : `${build.cpus}`
+            }), which a docker --cpus cap does NOT do because an UNTUNED build derives that default from ` +
             `os.cpus().length. ` +
             // Name the bundler advice that fits the bundler this build actually
             // ran. Telling an operator who already pinned webpack to "switch

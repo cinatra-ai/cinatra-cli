@@ -1554,7 +1554,7 @@ describe("preview build levers — memory ceiling + CI forward (#210)", () => {
   });
 });
 
-// The image build's NATIVE-memory levers: the build worker fan-out and the
+// The image build's NATIVE-memory levers: the build worker COUNT and the
 // bundler selection.
 //
 // The bug these cover is the same shape as the memory lever's was. The
@@ -1564,7 +1564,7 @@ describe("preview build levers — memory ceiling + CI forward (#210)", () => {
 // `instance preview` verbs. The decisive assertions are therefore at the
 // `docker build` ARGV level, not at the resolver: values that exist in principle
 // and never reach the subprocess are exactly what failed before.
-describe("preview build levers: worker fan-out + bundler selection", () => {
+describe("preview build levers: worker count + bundler selection", () => {
   const withCpus = (v) => ({ [PREVIEW_BUILD_CPUS_ENV]: v });
   const withBundler = (v) => ({ [PREVIEW_BUILD_BUNDLER_ENV]: v });
   const buildArgv = (fake) => fake.calls.find((c) => c[0] === "build");
@@ -1589,9 +1589,9 @@ describe("preview build levers: worker fan-out + bundler selection", () => {
     expect(PREVIEW_BUILD_BUNDLERS).toEqual(["turbopack", "webpack"]);
   });
 
-  it("UNSET means unset: the resolved SHA keeps its own fan-out and bundler", () => {
+  it("UNSET means unset: the resolved SHA keeps its own worker count and bundler", () => {
     // A preview builds an ARBITRARY SHA. Asserting the CLI's idea of a good
-    // CPU count or bundler onto it would silently override a checkout that
+    // worker count or bundler onto it would silently override a checkout that
     // chose otherwise, and the two would drift on the next change.
     expect(resolveBuildCpus({})).toBeNull();
     expect(resolveBuildCpus(withCpus(""))).toBeNull();
@@ -1607,14 +1607,14 @@ describe("preview build levers: worker fan-out + bundler selection", () => {
     expect(args.join(" ")).not.toContain(PREVIEW_BUILD_BUNDLER_ARG);
   });
 
-  it("a valid CPU count wins, at both ends of the accepted band", () => {
+  it("a valid worker count wins, at both ends of the accepted band", () => {
     expect(resolveBuildCpus(withCpus("3"))).toBe(3);
     expect(resolveBuildCpus(withCpus(" 4 "))).toBe(4);
     expect(resolveBuildCpus(withCpus(String(PREVIEW_BUILD_CPUS_MIN)))).toBe(PREVIEW_BUILD_CPUS_MIN);
     expect(resolveBuildCpus(withCpus(String(PREVIEW_BUILD_CPUS_MAX)))).toBe(PREVIEW_BUILD_CPUS_MAX);
   });
 
-  it("a malformed or out-of-range CPU count is a HARD error, never ignored or clamped", () => {
+  it("a malformed or out-of-range worker count is a HARD error, never ignored or clamped", () => {
     for (const v of ["0", "-1", "1.5", "4 cores", "1e1", "Infinity", "auto", "0x4", "+4"]) {
       let err;
       try {
@@ -1626,6 +1626,12 @@ describe("preview build levers: worker fan-out + bundler selection", () => {
       expect(err.message).toContain(PREVIEW_BUILD_CPUS_ENV);
       expect(err.message).toContain(JSON.stringify(v)); // the offending value is quoted back
       expect(err.message).toContain(String(PREVIEW_BUILD_CPUS_MAX)); // the accepted range
+      // The UNIT is workers, and <n> IS the worker count (cinatra-cli#229
+      // review): an operator told the value becomes "one fewer worker" sets 4
+      // to get 3 and gets 4 — the over-fan-out #228 exists to stop.
+      expect(err.message).toMatch(/COUNT of WORKERS/);
+      expect(err.message).toMatch(/3 means three/);
+      expect(err.message).not.toMatch(/one fewer|process fewer|fewer page-data/);
     }
     expect(() => resolveBuildCpus(withCpus(String(PREVIEW_BUILD_CPUS_MAX + 1)))).toThrow(/exceeds/);
   });
@@ -1734,7 +1740,7 @@ describe("preview build levers: worker fan-out + bundler selection", () => {
     const out = lines.join("\n");
     // Untuned: says the checkout owns both, and still names the levers so they
     // are discoverable BEFORE an operator needs them.
-    expect(out).toMatch(/build CPUs: the checkout's own default fan-out/);
+    expect(out).toMatch(/build workers: the checkout's own default worker count/);
     expect(out).toContain(PREVIEW_BUILD_CPUS_ENV);
     expect(out).toContain(PREVIEW_BUILD_BUNDLER_ENV);
 
@@ -1749,7 +1755,11 @@ describe("preview build levers: worker fan-out + bundler selection", () => {
       },
     });
     const out2 = lines2.join("\n");
-    expect(out2).toMatch(/build CPUs: 3/);
+    // The identity line is labelled WORKERS and reports the value verbatim:
+    // 3 in, "3" logged — never "2" (cinatra-cli#229 review).
+    expect(out2).toMatch(/build workers: 3/);
+    expect(out2).not.toMatch(/build workers: 2\b/);
+    expect(out2).not.toMatch(/build CPUs/);
     expect(out2).toMatch(/Bundler: webpack/);
   });
 
@@ -1777,7 +1787,10 @@ describe("preview build levers: worker fan-out + bundler selection", () => {
     expect(err.message).toMatch(/Neither removes the checkout's documented builder-memory floor/);
     // And the build's own settings are quoted back, so the operator is not told
     // to set something they already set.
-    expect(err.message).toMatch(/this build used the checkout's own default fan-out/);
+    expect(err.message).toMatch(/this build used the checkout's own default worker count/);
+    // The lever is named in its true unit.
+    expect(err.message).toMatch(/<n> IS the worker count, so 3 means three/);
+    expect(err.message).not.toMatch(/one fewer|process fewer|fewer page-data/);
 
     const failWith = (buildControlEnv) => {
       try {
@@ -1796,7 +1809,7 @@ describe("preview build levers: worker fan-out + bundler selection", () => {
     // who already pinned webpack to switch bundler is not actionable, and it
     // hides that on webpack the V8 ceiling IS the applicable lever.
     const onWebpack = failWith({ ...withCpus("3"), ...withBundler("webpack") });
-    expect(onWebpack.message).toMatch(/this build used 3/); // the fan-out is a lever on both paths
+    expect(onWebpack.message).toMatch(/this build used 3/); // the worker count is a lever on both paths
     expect(onWebpack.message).toMatch(/already ran on webpack/);
     expect(onWebpack.message).toMatch(new RegExp(`${PREVIEW_BUILD_MEMORY_ENV} is the ceiling that applies here`));
     expect(onWebpack.message).not.toMatch(/pin webpack with/);

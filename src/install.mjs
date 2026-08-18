@@ -674,7 +674,7 @@ export function parseInstallArgs(argv = []) {
   // reached. Validating only at the preview stage would let a typo cost an
   // operator a full install before surfacing. That argument covers the build
   // budget and every `--build-arg` lever equally: the memory ceiling, the
-  // typecheck switch, the build CPU count and the bundler are all read from
+  // typecheck switch, the build worker count and the bundler are all read from
   // the same operator environment and all reach the same build. Preview-only:
   // these variables have no meaning for a plain dev/prod/demo install, and
   // rejecting them there would break an operator who simply exports one in
