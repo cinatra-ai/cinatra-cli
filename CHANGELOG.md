@@ -109,7 +109,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
   ended in exactly the failure this release fixes — a crash-looping runtime
   behind an install that exited 0 and reported ready — and it was never
   isolated-specific. `--no-wayflow` installs without the agent runtime, and the
-  failure names both recoveries.
+  failure names both recoveries. That non-zero exit is proven by running the
+  real `bin/cinatra.mjs` as a subprocess against a fixture checkout whose
+  generator breaks, and reading its actual exit status, the rollback it logged
+  and the ready marker it did not write.
 
 - **A preview no longer wires itself to another instance's services, and it can
   finally reach its own connection service.** The preview composition decided
