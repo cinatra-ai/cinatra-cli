@@ -36,10 +36,11 @@
 //      nothing built, nothing started and no ready instance, and
 //   7. the generated file says, in itself, that it is CLI-owned.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
@@ -1355,9 +1356,9 @@ process.exit(0);
     expect(thrown.message).toContain(".wayflow.env");
     expect(thrown.message).toContain("CINATRA_CONTEXT_ATTEST_KEY");
     expect(thrown.message).toContain("--no-wayflow");
-    // `bin/cinatra.mjs` turns a thrown error with no typed `.exitCode` into
-    // `process.exit(1)` — a non-zero exit for this failure.
-    expect(Number.isInteger(thrown.exitCode) && thrown.exitCode > 0 ? thrown.exitCode : 1).toBe(1);
+    // (The EXIT STATUS is not asserted here — re-deriving it from the caught
+    // error would only restate the mapping. It is proven for real by the
+    // subprocess test below, which reads an actual `process.exit` status.)
     // Nothing started, nothing recorded, nothing generated.
     expect(upCalls).toBe(0);
     expect(readInstanceRegistry(regPath).registry.instances).toEqual({});
@@ -1383,7 +1384,6 @@ process.exit(0);
     // generated compose — proven by the rollback it then ran on them.
     expect(lines.join("\n")).toContain("rolling back the pending instance");
     expect(thrown.message).toContain("CINATRA_CONTEXT_ATTEST_KEY");
-    expect(Number.isInteger(thrown.exitCode) && thrown.exitCode > 0 ? thrown.exitCode : 1).toBe(1);
 
     // The generator really did run twice (render-time, then bring-up).
     expect(Number(readFileSync(callsPath, "utf8"))).toBe(2);
@@ -1396,6 +1396,194 @@ process.exit(0);
     // NO READY MARKER — the exact "exited 0 and recorded [ready]" lie D1 was.
     const marker = readMarker(installDir);
     expect(marker.status === "ok" ? marker.marker?.state : null).not.toBe("ready");
+  });
+
+  // ── REAL EXIT-CODE PROOF (cinatra#2654 D1, round 3) ──────────────────────
+  //
+  // The tests above run `runInstall` IN PROCESS and can only observe a thrown
+  // error; the exit STATUS an operator's shell sees is `bin/cinatra.mjs`'s doing.
+  // Reading that mapping out of the source with a regex is not a proof — it
+  // cannot tell whether the error reaches the mapping at all. So this runs the
+  // real binary as a SUBPROCESS and reads its actual status.
+  //
+  // `bin/cinatra.mjs` calls `runInstall(rest)` with no `deps`, so the Docker /
+  // network seams are supplied through the TEST-ONLY injection seam
+  // (`CINATRA_TEST_INSTALL_DEPS`, added for exactly this and named as such). The
+  // FAILURE itself is not injected through it: it comes from the fixture
+  // checkout's own `scripts/gen-wayflow-env.mjs`, which writes a partial file on
+  // its Nth invocation — a real generator defect, in the real generator, reached
+  // by the real bring-up.
+  const DEPS_MODULE_SRC = `
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+
+const installDir = process.env.CINATRA_TEST_E2E_INSTALL_DIR;
+const BAND = [
+  { service: "postgres", host: "127.0.0.1", port: 5434 },
+  { service: "wayflow", host: "127.0.0.1", port: 3010 },
+];
+
+function parseEnvFile(body) {
+  const out = {};
+  for (const line of String(body).split("\\n")) {
+    const m = line.match(/^\\s*([A-Z0-9_]+)\\s*=\\s*(.*?)\\s*$/);
+    if (m) out[m[1]] = m[2];
+  }
+  return out;
+}
+
+/** The checkout's compose as \`config\` renders it, with the same env-file
+ *  resolution behaviour the real engine has. */
+function composeConfig(preserveEnvFiles) {
+  const envFile = path.join(installDir, "docker", "wayflow", ".wayflow.env");
+  const doc = {
+    name: "cinatra",
+    networks: { default: { name: "cinatra_default" } },
+    volumes: { pgdata: {} },
+    services: {
+      postgres: {
+        image: "postgres:16",
+        environment: { POSTGRES_PASSWORD: "postgres" },
+        ports: [{ mode: "ingress", target: 5432, published: "5434", protocol: "tcp", host_ip: "127.0.0.1" }],
+      },
+      wayflow: {
+        build: { context: path.join(installDir, "docker", "wayflow") },
+        profiles: ["wayflow"],
+        environment: {
+          PORT: "3010",
+          CINATRA_AGENTS_DIR: "/agents",
+          CINATRA_BASE_URL: "http://host.docker.internal:3000",
+        },
+        env_file: [{ path: envFile, required: false }],
+        ports: [{ mode: "ingress", target: 3010, published: "3010", protocol: "tcp", host_ip: "127.0.0.1" }],
+      },
+    },
+  };
+  if (!preserveEnvFiles) {
+    for (const svc of Object.values(doc.services)) {
+      for (const entry of Array.isArray(svc.env_file) ? svc.env_file : []) {
+        const f = typeof entry === "string" ? entry : entry?.path;
+        const fromFile = f && existsSync(f) ? parseEnvFile(readFileSync(f, "utf8")) : {};
+        svc.environment = { ...fromFile, ...(svc.environment ?? {}) };
+      }
+      delete svc.env_file;
+    }
+  }
+  return doc;
+}
+
+export default () => ({
+  runPreflight: () => ({ ok: true, failures: [], warnings: [], mode: "dev", infraWillStart: true }),
+  commandExists: () => true,
+  composeAvailable: () => true,
+  composePublishedPortsForTarget: () => BAND,
+  composeSupportsNoEnvResolution: () => true,
+  composeConfigForFiles: (targetDir, files, d, opts) => composeConfig(!!opts?.preserveEnvFiles),
+  detectPortConflicts: async (band) =>
+    band.filter((b) => b.port === 5434).map((b) => ({ ...b, holder: "test-holder" })),
+  readCloneRegistry: () => null,
+  inspectProjectOwnership: () => ({ containerRows: [], volumeRows: [] }),
+  targetComposeOwnedPorts: () => new Set(),
+  liveComposeInspect: () => [],
+  assertRecreateSafe: () => {},
+  ensureNangoSecretKey: () => null,
+  buildWayflowImage: () => ({ ok: true, stderr: "", status: 0 }),
+  runComposeDown: () => {},
+});
+`;
+
+  it("REAL EXIT CODE: `bin/cinatra.mjs` exits NON-ZERO, rolls back, and leaves no ready marker", () => {
+    const installDir = clone("e2e-subprocess");
+    const depsModule = path.join(sandbox, "e2e-deps.mjs");
+    writeFileSync(depsModule, DEPS_MODULE_SRC);
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        fileURLToPath(new URL("../bin/cinatra.mjs", import.meta.url)),
+        "install",
+        "--dir", installDir,
+        "--repo-url", `file://${originRepo}`,
+        "--ref", "main",
+        "--yes", "--no-install",
+        "--on-conflict", "isolated",
+        "--instance", "e2e-subprocess",
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CINATRA_INSTANCE_REGISTRY: regPath,
+          CINATRA_ALLOC_LOCK: path.join(path.dirname(regPath), "alloc.lock"),
+          CINATRA_TEST_WAYFLOW_CALLS: callsPath,
+          // The render-time generation succeeds; the bring-up's (second) one
+          // writes a partial file. So the run reaches a PROVISIONING row and a
+          // written generated compose, and must then roll all of it back.
+          CINATRA_TEST_WAYFLOW_BREAK_AT: "2",
+          CINATRA_TEST_INSTALL_DEPS: depsModule,
+          CINATRA_TEST_E2E_INSTALL_DIR: installDir,
+        },
+      },
+    );
+
+    const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+    // A REAL non-zero exit status, from a real `process.exit` — not a signal,
+    // and not a mapping re-derived from a caught error.
+    expect(result.signal).toBe(null);
+    expect(result.status).toBeTypeOf("number");
+    expect(result.status).not.toBe(0);
+    // …for THIS failure, attributably.
+    expect(output).toContain("Refusing to start the WayFlow agent runtime");
+    expect(output).toContain("CINATRA_CONTEXT_ATTEST_KEY");
+    // THE ROLLBACK RAN.
+    expect(output).toContain("rolling back the pending instance");
+    expect(readInstanceRegistry(regPath).registry.instances).toEqual({});
+    expect(existsSync(path.join(installDir, ISOLATED_COMPOSE_FILENAME))).toBe(false);
+    // NO READY MARKER — the exact "exited 0 and recorded [ready]" lie D1 was.
+    const marker = readMarker(installDir);
+    expect(marker.status === "ok" ? marker.marker?.state : null).not.toBe("ready");
+    // The generator really did run twice (render-time, then bring-up).
+    expect(Number(readFileSync(callsPath, "utf8"))).toBe(2);
+  });
+
+  it("REAL EXIT CODE, control: the same subprocess exits 0 when the generator is whole", () => {
+    // Proves the non-zero status above is caused by the generation failure and
+    // not by the harness — same binary, same seams, same fixture, one env var
+    // different. The bring-up's `docker compose up` is the only thing stubbed.
+    const installDir = clone("e2e-subprocess-ok");
+    const depsModule = path.join(sandbox, "e2e-deps-ok.mjs");
+    writeFileSync(
+      depsModule,
+      DEPS_MODULE_SRC.replace("export default () => ({", "export default () => ({\n  bringUpInfra: () => {},"),
+    );
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        fileURLToPath(new URL("../bin/cinatra.mjs", import.meta.url)),
+        "install",
+        "--dir", installDir,
+        "--repo-url", `file://${originRepo}`,
+        "--ref", "main",
+        "--yes", "--no-install",
+        "--on-conflict", "isolated",
+        "--instance", "e2e-subprocess-ok",
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CINATRA_INSTANCE_REGISTRY: regPath,
+          CINATRA_ALLOC_LOCK: path.join(path.dirname(regPath), "alloc.lock"),
+          CINATRA_TEST_WAYFLOW_CALLS: callsPath,
+          CINATRA_TEST_INSTALL_DEPS: depsModule,
+          CINATRA_TEST_E2E_INSTALL_DIR: installDir,
+        },
+      },
+    );
+
+    expect(`status=${result.status} ${result.stderr ?? ""}`).toBe("status=0 ");
+    expect(readInstanceRegistry(regPath).registry.instances["e2e-subprocess-ok"].state).toBe("ready");
   });
 
   it("CONTROL: the same install SUCCEEDS when the generator writes the full key set", async () => {
@@ -1424,13 +1612,6 @@ process.exit(0);
     expect(readFileSync(path.join(installDir, ISOLATED_COMPOSE_FILENAME), "utf8")).not.toContain(token);
   });
 
-  it("bin/cinatra.mjs still maps an untyped thrown error to a non-zero exit", () => {
-    // The assertion above computes the mapping; this guards the mapping itself,
-    // so the two cannot drift apart silently.
-    const bin = readFileSync(new URL("../bin/cinatra.mjs", import.meta.url), "utf8");
-    expect(bin).toContain("process.exit(code)");
-    expect(bin).toMatch(/error\.exitCode\s*>\s*0\s*\?\s*error\.exitCode\s*:\s*1/);
-  });
 });
 
 // ---------------------------------------------------------------------------

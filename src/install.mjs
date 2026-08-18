@@ -48,7 +48,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
 import { isValidSlug } from "./clone-registry.mjs";
@@ -5717,8 +5717,41 @@ async function provisionExecutionPlane({ targetDir, opts, log = console.log }) {
   }
 }
 
+/**
+ * TEST-ONLY INJECTION SEAM. `bin/cinatra.mjs` calls `runInstall(rest)` with no
+ * `deps`, so a test that needs the REAL binary as a SUBPROCESS — the only way to
+ * observe an actual `process.exit` STATUS, rather than re-deriving it from a
+ * caught error — has no other way to stub the Docker/network seams.
+ *
+ * `CINATRA_TEST_INSTALL_DEPS=<path to an .mjs module>` imports that module and
+ * uses its default export (a value, or a function returning one) as the `deps`
+ * object. It can only ever replace seams that ALREADY exist as injectable deps —
+ * it adds no new capability and no new code path. Named `CINATRA_TEST_*`, unset
+ * in every real run, and it fails LOUD (throws) rather than silently continuing
+ * with an unstubbed install, so a broken test can never masquerade as a pass.
+ */
+async function loadTestOnlyInstallDeps() {
+  const spec = process.env.CINATRA_TEST_INSTALL_DEPS;
+  if (typeof spec !== "string" || spec.trim() === "") return {};
+  const mod = await import(pathToFileURL(path.resolve(spec)).href);
+  const value = mod.default;
+  const resolved = typeof value === "function" ? await value() : value;
+  if (!resolved || typeof resolved !== "object") {
+    throw new Error(
+      `CINATRA_TEST_INSTALL_DEPS=${spec} did not default-export a deps object (test-only seam).`,
+    );
+  }
+  return resolved;
+}
+
 export async function runInstall(argv = [], { log = console.log, deps = {} } = {}) {
   const opts = parseInstallArgs(argv);
+
+  // TEST-ONLY INJECTION SEAM (cinatra#2654 D1, round 3) — see
+  // `loadTestOnlyInstallDeps`. Merged UNDER the caller's `deps`, so an in-process
+  // caller always wins and production behaviour is unchanged when the env var is
+  // unset (which is always, outside this repo's own tests).
+  deps = { ...(await loadTestOnlyInstallDeps()), ...deps };
 
   // cinatra-cli#40: co-use (shared-infra) signals route to the executeCoUse path
   // (no longer a flat refusal). The HARD safety gate — the donor app must isolate
