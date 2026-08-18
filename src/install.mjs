@@ -115,7 +115,8 @@ import {
   writeIsolatedComposeFile,
   renderIsolatedComposeYaml,
   assertComposeHostUrlsRemapped,
-  wayflowEnvWiringGap,
+  composeEnvWiringGaps,
+  parseIsolatedComposeDoc,
   ISOLATED_COMPOSE_FILENAME,
 } from "./install-isolation.mjs";
 import {
@@ -166,7 +167,9 @@ import {
   waitForWayflowHealth,
   wayflowBuildFailureMessage,
   wayflowEnvFailureMessage,
+  wayflowEnvSuppliedKeys,
   wayflowStatusLines,
+  WAYFLOW_ENV_FILE,
 } from "./wayflow-runtime.mjs";
 import {
   deriveCoUseSlug,
@@ -891,6 +894,47 @@ function composeAvailable() {
   } catch {
     return false;
   }
+}
+
+// ── cinatra#2654 D1 — Compose feature probe for `config --no-env-resolution` ──
+//
+// The isolated render depends on `--no-env-resolution` to keep each service's
+// `env_file:` in the resolved document. That flag is NOT in every Compose v2:
+// an older plugin treats it as an unknown flag, `docker compose config` exits
+// non-zero, `capture` returns null, and the install dies with "Could not resolve
+// the checkout's `docker compose config`" — attributable, but it would block an
+// install that has no other problem. Assuming the flag silently is worse: the
+// document then comes back with the env files INLINED, which is precisely the
+// tokenless runtime this fix exists to kill.
+//
+// PROBE, don't version-gate. That is this codebase's established shape for
+// tool capabilities — `commandExists` runs `<cmd> --version`, `composeAvailable`
+// runs `docker compose version`, the pnpm/corepack selection probes each
+// candidate — and nowhere does it parse a version string and compare it to a
+// floor. A floor would also be wrong here in a way a probe is not: the flag has
+// been backported across vendored Compose builds whose `version` strings do not
+// order cleanly (Docker Desktop, the standalone plugin, distro packages).
+//
+// `config --help` lists the flag on a Compose that has it, needs no compose
+// file, touches no daemon, and writes nothing. Cached per process (the answer
+// cannot change inside one install) and injectable for tests.
+let composeNoEnvResolutionSupport = null;
+export function composeSupportsNoEnvResolution({ cwd = undefined, captureImpl = capture } = {}) {
+  if (composeNoEnvResolutionSupport !== null) return composeNoEnvResolutionSupport;
+  const help = captureImpl("docker", ["compose", "config", "--help"], cwd ? { cwd } : {});
+  composeNoEnvResolutionSupport = typeof help === "string" && help.includes("--no-env-resolution");
+  return composeNoEnvResolutionSupport;
+}
+/** Test seam: forget the cached probe result. */
+export function __resetComposeFeatureProbe() {
+  composeNoEnvResolutionSupport = null;
+}
+
+/** The version string this box's Compose reports, for the fallback warning.
+ *  Best-effort — the message degrades to "this Compose" when it is unavailable. */
+function composeVersionString(captureImpl = capture) {
+  const raw = captureImpl("docker", ["compose", "version", "--short"]);
+  return typeof raw === "string" && raw.trim() ? raw.trim() : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -2319,6 +2363,55 @@ export function composeConfigForFiles(targetDir, composeFiles, deps = {}, { allP
   }
 }
 
+/**
+ * cinatra#2654 D1 — the ONE resolution the isolated paths use, and the one place
+ * that decides which env-file route this Compose can give us.
+ *
+ * Preferred route (`--no-env-resolution` supported): the resolved document keeps
+ * each service's `env_file:`, so the generated compose REFERENCES the narrow
+ * generated files and reads their content at `up` time. A rotated token
+ * propagates and no host secret is persisted in the generated file.
+ *
+ * FALLBACK route (an older Compose without the flag): resolve normally. This is
+ * safe rather than a silent regression because of two things that hold on this
+ * path by construction:
+ *   1. the caller PROVISIONS `docker/wayflow/.wayflow.env` before this
+ *      resolution, so what compose inlines is the REAL, current wiring — never
+ *      the empty render the D1 defect produced; and
+ *   2. `generateIsolatedCompose` then re-symbolises those inlined secret values
+ *      back to `${KEY}` (CINATRA_BRIDGE_TOKEN and CINATRA_CONTEXT_ATTEST_KEY are
+ *      both secret-named and both supplied by `.env.local`), and the isolated
+ *      `up` resolves them from `--env-file .env.local`. So the generated file
+ *      still holds no plaintext secret, and a token rotated in `.env.local`
+ *      still reaches the container.
+ * What the fallback does NOT preserve is the reference for NON-secret keys
+ * (WAYFLOW_BASE_URL) — those are frozen at render time until the next reconcile
+ * re-renders. That degradation is stated in the warning rather than hidden, and
+ * `composeEnvWiringGaps` is told which route ran so it asserts the right one.
+ *
+ * @returns {{ config: object|null, envFilesPreserved: boolean }}
+ */
+function resolveIsolatedComposeConfig({ targetDir, deps = {}, log = console.log }) {
+  const getConfig = deps.composeConfigForFiles ?? composeConfigForFiles;
+  const supports = (deps.composeSupportsNoEnvResolution ?? composeSupportsNoEnvResolution)({ cwd: targetDir });
+  if (!supports) {
+    const version = (deps.composeVersionString ?? composeVersionString)();
+    log(
+      `  ⚠ This Docker Compose (${version ?? "version unknown"}) has no \`config --no-env-resolution\`, so the ` +
+        "isolated compose cannot keep its `env_file:` references. Falling back to a resolved render: the " +
+        `WayFlow env (${WAYFLOW_ENV_FILE}) is provisioned FIRST so the real wiring is inlined, and its secrets ` +
+        "are re-symbolised to `${KEY}` and resolved from `.env.local` at `up` time (no secret is written to the " +
+        "generated file). Non-secret values are frozen until the next `cinatra install` re-renders. " +
+        "Upgrade Docker Compose to get the referencing behaviour.",
+    );
+  }
+  const config = getConfig(targetDir, ["docker-compose.yml", "docker-compose.dev.yml"], deps, {
+    allProfiles: true,
+    preserveEnvFiles: supports,
+  });
+  return { config, envFilesPreserved: supports };
+}
+
 /** Inspect the live containers of the compose project rooted at `targetDir`
  *  (default base pair, cwd-scoped). Returns the parsed `docker inspect` array
  *  for the classifier (working_dir-label ownership). Empty array on any error. */
@@ -2891,7 +2984,6 @@ function printInstanceStatus({ targetDir, listAll, log = console.log, deps = {} 
 async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = console.log, deps = {} }) {
   const probePorts = deps.detectPortConflicts ?? detectPortConflicts;
   const startInfra = deps.bringUpInfra ?? bringUpInfra;
-  const getConfig = deps.composeConfigForFiles ?? composeConfigForFiles;
   const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
   const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
   const readClone = deps.readCloneRegistry ?? (() => null);
@@ -2947,13 +3039,16 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
     if (!provisioned.ok) throw new Error(wayflowEnvFailureMessage(provisioned.reason));
   }
 
-  // cinatra#2654 D1, half two: `preserveEnvFiles` keeps each service's `env_file:`
-  // in the resolved document instead of inlining a render-time snapshot of it. The
-  // isolated compose is PERSISTED and re-used by every later `up`, so a service
-  // whose secrets arrive through a narrow generated file must keep the REFERENCE
-  // — that is what lets a rotated token reach the container, and what keeps the
-  // generated file free of host secrets.
-  const resolvedConfig = getConfig(targetDir, ["docker-compose.yml", "docker-compose.dev.yml"], deps, { allProfiles: true, preserveEnvFiles: true });
+  // cinatra#2654 D1, half two: resolve WITHOUT resolving service env files, so
+  // each service's `env_file:` survives into the generated document instead of
+  // being replaced by a render-time snapshot of its content. The isolated compose
+  // is PERSISTED and re-used by every later `up`, so a service whose secrets
+  // arrive through a narrow generated file must keep the REFERENCE — that is what
+  // lets a rotated token reach the container, and what keeps the generated file
+  // free of host secrets. `envFilesPreserved` reports whether this Compose could
+  // do it; on an older one the documented fallback route ran instead, and the
+  // invariant below asserts THAT route rather than assuming this one.
+  const { config: resolvedConfig, envFilesPreserved } = resolveIsolatedComposeConfig({ targetDir, deps, log });
   if (!resolvedConfig) {
     throw new Error(
       "Could not resolve the checkout's `docker compose config` to build an isolated stack. " +
@@ -3116,12 +3211,14 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
     // time, not as a silent cross-instance OAuth/self-URL leak to the main stack.
     assertComposeHostUrlsRemapped(doc, new Set(baseBand.map((b) => b.port)));
 
-    // cinatra#2654 D1 invariant: the generated `wayflow` service must keep a
-    // ROUTE for the bridge token — the preserved `env_file:` (read at up-time)
-    // or an explicit non-empty value. Holds by construction now that the render
-    // does not resolve env files; assert it so a regression fails loud HERE
-    // instead of as a crash-looping runtime behind an install that exits 0.
-    assertWayflowEnvWired(doc);
+    // cinatra#2654 D1 invariant: every `env_file:` the resolved source carried
+    // survives, the `wayflow` service keeps a ROUTE for the bridge token (the
+    // preserved reference to the exact `.wayflow.env` path, or — on the fallback
+    // render — a non-empty value), and no service re-introduces the empty
+    // `environment:` override that would beat its env file. Holds by construction;
+    // assert it so a regression fails loud HERE instead of as a crash-looping
+    // runtime behind an install that exits 0.
+    assertGeneratedEnvWiring({ doc, sourceDoc: resolvedConfig, targetDir, envFilesPreserved, deps });
 
     // Persist the generated compose + provisioning row + marker (recording the
     // generated SOLE file as composeFiles[]).
@@ -3173,14 +3270,9 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       // reconcile too, so it re-renders the generated compose exactly like the
       // plain re-run (reconvergeIsolated) does — else which flag the operator
       // repeated would decide whether a fixed generator ever reaches the
-      // instance. Best-effort, same contract as there.
-      let slotPorts = slot.ports;
-      try {
-        const regen = await regenerateIsolatedComposeInPlace({ targetDir, row: slot, log, deps });
-        if (regen.regenerated && regen.ports) slotPorts = regen.ports;
-      } catch (err) {
-        log(`  ⚠ Isolated compose regeneration skipped (${err instanceof Error ? err.message : err}); using the recorded compose.`);
-      }
+      // instance. Same LOUD contract as there: a failure aborts.
+      const regen = await regenerateIsolatedCompose({ targetDir, row: slot, log, deps });
+      const slotPorts = regen.regenerated && regen.ports ? regen.ports : slot.ports;
       ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: slot.appPort, ports: slotPorts, log });
       startInfra({
         slug,
@@ -3357,14 +3449,35 @@ function assertScrubbedKeysSupplied(targetDir, scrubbedKeys = []) {
 }
 
 /** cinatra#2654 D1 invariant guard. The generated isolated compose is the SOLE
- *  file every later `up` of this instance reads, so a `wayflow` service written
- *  without a route for CINATRA_BRIDGE_TOKEN is a permanently crash-looping
- *  runtime that no reconcile repairs. Fail at generation time, by name. */
-function assertWayflowEnvWired(doc) {
-  const gap = wayflowEnvWiringGap(doc);
-  if (!gap) return;
+ *  file every later `up` of this instance reads, so a service written without a
+ *  route to the wiring it needs is a permanently broken runtime that no
+ *  reconcile repairs. Fail at generation time, by name, BEFORE the file is
+ *  written or anything is started.
+ *
+ *  Three checks, all in `composeEnvWiringGaps`: every `env_file:` the resolved
+ *  SOURCE document carried survives into the generated one (generic — this is
+ *  what covers nango-server / knowledge-graph-mcp / plane-mcp alongside
+ *  wayflow, with no per-service table); the wayflow service references the
+ *  exact `.wayflow.env` path the bring-up writes (or, on the documented
+ *  fallback render, carries a non-empty token value); and no service sets an
+ *  EMPTY `environment:` value for a key its env file supplies, because that
+ *  empty value OVERRIDES the file — the precedence trap the checkout's own
+ *  compose comments name. */
+function assertGeneratedEnvWiring({ doc, sourceDoc, targetDir, envFilesPreserved, deps = {} }) {
+  const suppliedKeys = deps.wayflowEnvSuppliedKeys ?? wayflowEnvSuppliedKeys;
+  const wayflowEnvFilePath = path.join(targetDir, WAYFLOW_ENV_FILE);
+  const keysByPath = (absPath) =>
+    path.resolve(absPath) === path.resolve(wayflowEnvFilePath) ? suppliedKeys({ targetDir }) : null;
+  const gaps = composeEnvWiringGaps(doc, {
+    sourceDoc,
+    wayflowEnvFilePath,
+    envFilesPreserved,
+    envFileKeysAt: keysByPath,
+    baseDir: targetDir,
+  });
+  if (gaps.length === 0) return;
   throw new Error(
-    `Refusing to write the isolated compose — ${gap} (cinatra#2654). ` +
+    `Refusing to write the isolated compose — ${gaps.join("; ")} (cinatra#2654). ` +
       "This is an internal invariant violation; please report it.",
   );
 }
@@ -4734,16 +4847,15 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
   // broken) generator is repaired by the very `cinatra install` re-run the
   // failure messages and the doctor prescribe — that recovery used to be a
   // no-op, which is how a wayflow service with no bridge token survived.
-  // Best-effort: any failure leaves the recorded compose untouched and the
-  // reconcile proceeds with it. On success the (possibly enlarged) remapped-port
-  // map drives the env re-point + Nango health probe below.
-  let effectivePorts = row.ports ?? {};
-  try {
-    const regen = await regenerateIsolatedComposeInPlace({ targetDir, row, log, deps });
-    if (regen.regenerated && regen.ports) effectivePorts = regen.ports;
-  } catch (err) {
-    log(`  ⚠ Isolated compose regeneration skipped (${err instanceof Error ? err.message : err}); using the recorded compose.`);
-  }
+  // A regeneration FAILURE aborts the reconcile (cinatra#2654 D1): it used to be
+  // caught and logged, after which the reconcile brought the stack up from the
+  // OLD, unrepaired compose and reported success — so the one recovery the
+  // failure messages prescribe silently did nothing. Only the two
+  // not-re-derivable conditions are non-fatal, and they say so by name. On
+  // success the (possibly enlarged) remapped-port map drives the env re-point +
+  // Nango health probe below.
+  const regen = await regenerateIsolatedCompose({ targetDir, row, log, deps });
+  const effectivePorts = regen.regenerated && regen.ports ? regen.ports : (row.ports ?? {});
 
   // Re-point the env at the recorded remapped ports + bring up WITH
   // `--env-file .env.local` so the generated isolated compose's scrubbed
@@ -4786,6 +4898,29 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
   return { infraPlan: "isolated", instance: row, done: true };
 }
 
+/** cinatra#2654 D1 — the ONE reconcile-facing wrapper around
+ *  `regenerateIsolatedComposeInPlace`, so both reconcile entrances treat a
+ *  failure identically: it PROPAGATES. A not-re-derivable SKIP is reported
+ *  prominently (it means this instance's generated compose cannot be repaired in
+ *  place, which an operator needs to know) and the reconcile continues with the
+ *  recorded file. Nothing here swallows an error. */
+async function regenerateIsolatedCompose({ targetDir, row, log = console.log, deps = {} }) {
+  const result = await (deps.regenerateIsolatedComposeInPlace ?? regenerateIsolatedComposeInPlace)({
+    targetDir,
+    row,
+    log,
+    deps,
+  });
+  if (result.skipped && result.skipped !== "absent") {
+    log(
+      `  ⚠ Could not re-derive ${ISOLATED_COMPOSE_FILENAME} for "${row.slug}" — ${result.skipped}. ` +
+        "Bringing the stack up from the RECORDED file; if this instance is misconfigured, re-create it with " +
+        "`cinatra instance remove <slug>` followed by a fresh `cinatra install --on-conflict=isolated`.",
+    );
+  }
+  return result;
+}
+
 /**
  * cinatra-cli#113 / cinatra#2654 D1 — regenerate a recorded isolated stack's
  * `docker-compose.cinatra-isolated.yml` IN PLACE from the checkout's current
@@ -4805,41 +4940,58 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
  * an existing instance.
  *
  * Idempotent and safe:
- *   - No-op when the file is missing or unparseable (best-effort — never
- *     clobber an operator edit).
+ *   - No-op only when the file is ABSENT (there is nothing to re-derive in
+ *     place). A file that is present but not a CLI-generated document is
+ *     REPLACED — see the operator-edits policy in the body.
  *   - Regenerates at the instance's ORIGINAL band offset (persisted on the row
  *     for fresh installs; derived from the recorded ports vs the base band for a
- *     legacy row, refusing on any ambiguity), so every already-remapped default
- *     service keeps its EXACT host port. A determinism guard re-checks that no
- *     shared service's port moved before overwriting; on any disagreement it
- *     refuses (throws) rather than relocate a possibly-running service.
- *   - Runs the same #57 (scrubbed-key resolution) + #97 (self-URL remap)
- *     invariants the primary generator asserts.
+ *     legacy row), so every already-remapped default service keeps its EXACT
+ *     host port. A determinism guard re-checks that no shared service's port
+ *     moved before overwriting.
+ *   - Runs the same #57 (scrubbed-key resolution) + #97 (self-URL remap) +
+ *     #2654 (env-file wiring) invariants the primary generator asserts.
  *   - On success updates the recorded `ports` (enlarged) + persists `offset`.
  *
- * @returns {Promise<{ regenerated: boolean, ports?: object }>}
+ * SKIP vs FAILURE (cinatra#2654 D1). Two conditions mean the file CANNOT be
+ * re-derived safely and never could be — an ambiguous legacy band offset, and a
+ * base band that shifted so a shared service's host port would move. Those
+ * return `{ regenerated: false, skipped: <reason> }`: the caller reports them
+ * prominently and proceeds with the recorded compose, because relocating a
+ * possibly-running service is worse than a stale file. EVERYTHING ELSE — an
+ * unresolvable `docker compose config`, a violated invariant, a write error — is
+ * a genuine failure and THROWS, and callers must not swallow it: continuing
+ * would start the old, defective compose while printing success, which is the
+ * defect this whole change exists to remove.
+ *
+ * @returns {Promise<{ regenerated: boolean, ports?: object, skipped?: string }>}
  */
 export async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.log, deps = {} }) {
-  const getConfig = deps.composeConfigForFiles ?? composeConfigForFiles;
   const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
   const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
 
   const isoPath = path.join(targetDir, ISOLATED_COMPOSE_FILENAME);
-  if (!existsSync(isoPath)) return { regenerated: false };
+  if (!existsSync(isoPath)) return { regenerated: false, skipped: "absent" };
 
-  // The generated isolated compose is JSON rendered into a `.yml` (YAML 1.2 is a
-  // JSON superset), so it parses straight back with JSON.parse — no YAML dep.
-  let existingDoc;
-  try {
-    existingDoc = JSON.parse(readFileSync(isoPath, "utf8"));
-  } catch {
-    // An unparseable file is left untouched (never clobber an operator edit).
-    return { regenerated: false };
-  }
+  // OPERATOR-EDITS POLICY (cinatra#2654 D1). The generated file is CLI-OWNED and
+  // regeneration IS the contract: it is re-derived in full here, and nothing from
+  // the previous copy is preserved. The previous copy is read for ONE purpose —
+  // to report whether the content actually changed — and a file we cannot parse
+  // is regenerated too rather than skipped. The old "never clobber an operator
+  // edit" guard was not a preservation mechanism (every parseable file was
+  // overwritten wholesale anyway); it only meant that CORRUPTING the file was the
+  // way to pin a defective compose in place, which is exactly how a wayflow
+  // service with no bridge token survived. The file itself now says so in a
+  // header comment; operator customisation belongs in the checkout's own compose
+  // files, which every regeneration re-reads.
+  //
+  // The generated document is JSON under that comment header (YAML 1.2 is a JSON
+  // superset), so it parses straight back with no YAML dependency.
+  const existingDoc = parseIsolatedComposeDoc(readFileSync(isoPath, "utf8"));
   // Re-resolve the checkout's base config WITH every profile-gated service and
   // WITHOUT resolving service env files — byte-for-byte the same resolution a
-  // fresh isolated install performs (cinatra#2654 D1).
-  const resolvedConfig = getConfig(targetDir, ["docker-compose.yml", "docker-compose.dev.yml"], deps, { allProfiles: true, preserveEnvFiles: true });
+  // fresh isolated install performs, including the same fallback when this
+  // Compose cannot do it (cinatra#2654 D1).
+  const { config: resolvedConfig, envFilesPreserved } = resolveIsolatedComposeConfig({ targetDir, deps, log });
   if (!resolvedConfig) {
     throw new Error("could not resolve `docker compose config` to regenerate the isolated compose");
   }
@@ -4856,7 +5008,14 @@ export async function regenerateIsolatedComposeInPlace({ targetDir, row, log = c
     offset = deriveBandOffsetFromRow(row.ports ?? {}, baseBand);
   }
   if (!Number.isInteger(offset) || offset <= 0) {
-    throw new Error("could not derive the isolated band offset from the recorded ports (ambiguous); skipping regeneration");
+    // Not re-derivable: a legacy row whose recorded ports do not identify one
+    // offset. A SKIP, not a failure (see the contract above).
+    return {
+      regenerated: false,
+      skipped:
+        "the isolated band offset could not be derived from the recorded ports (ambiguous), so the generated " +
+        "compose cannot be safely re-derived",
+    };
   }
 
   const envFileKeys = computeIsolatedScrubAllowlist(targetDir);
@@ -4874,23 +5033,27 @@ export async function regenerateIsolatedComposeInPlace({ targetDir, row, log = c
   // container on a new host port. Holds by construction at a stable offset; this
   // catches a shifted base band or a mis-derived offset.
   if (!sharedServicePortsAgree(row.ports ?? {}, ports)) {
-    throw new Error(
-      "regeneration would move an already-remapped service's host port (base band shifted or offset ambiguous); " +
-        "leaving the recorded compose untouched",
-    );
+    // Also not re-derivable: re-rendering would relocate a possibly-running
+    // container's host port. A SKIP, not a failure.
+    return {
+      regenerated: false,
+      skipped:
+        "regeneration would move an already-remapped service's host port (the checkout's base band shifted), " +
+        "so the recorded compose is left untouched",
+    };
   }
 
   // The same invariants the primary isolated generator asserts (fail loud on a
   // regression, never a silent blank-secret or a self-URL leak to the main stack).
   assertScrubbedKeysSupplied(targetDir, scrubbedKeys);
   assertComposeHostUrlsRemapped(doc, new Set(baseBand.map((b) => b.port)));
-  assertWayflowEnvWired(doc);
+  assertGeneratedEnvWiring({ doc, sourceDoc: resolvedConfig, targetDir, envFilesPreserved, deps });
 
-  const changed = renderIsolatedComposeYaml(doc) !== renderIsolatedComposeYaml(existingDoc);
+  const changed = existingDoc === null || renderIsolatedComposeYaml(doc) !== renderIsolatedComposeYaml(existingDoc);
   writeIsolatedComposeFile(isoPath, doc);
   log(
     `  ↻ Regenerated ${ISOLATED_COMPOSE_FILENAME} from this checkout's compose at the recorded band ` +
-      `offset (${changed ? "content updated" : "content unchanged"}).`,
+      `offset (${existingDoc === null ? "previous copy was not a CLI-generated document — replaced" : changed ? "content updated" : "content unchanged"}).`,
   );
 
   // Persist the enlarged remapped-port map + the offset (so a legacy row's next
@@ -4967,7 +5130,7 @@ export async function runIsolatedA2aPeers(argv = [], { targetDir = null, log = c
   const isoPath = path.join(dir, ISOLATED_COMPOSE_FILENAME);
   const readDoc = () => {
     try {
-      return JSON.parse(readFileSync(isoPath, "utf8"));
+      return parseIsolatedComposeDoc(readFileSync(isoPath, "utf8"));
     } catch {
       return null;
     }

@@ -62,6 +62,38 @@ project adheres to [Semantic Versioning](https://semver.org/).
   image build already did. A runtime that is observed restarting is reported as
   a crash loop with the command that shows why, not as a slow cold start.
 
+  The flag that keeps the reference (`docker compose config
+  --no-env-resolution`) is now PROBED rather than assumed, because a Compose
+  that does not have it would have failed the flag silently and produced the
+  same tokenless runtime through a different door. On a Compose without it the
+  install says so, names the version, and takes a stated fallback: the env file
+  is provisioned before the render either way, so what compose inlines is the
+  real wiring, and the generator re-symbolises those secrets to `${KEY}` values
+  the isolated `up` resolves from `.env.local` — no secret is written into the
+  generated file, and a rotated token still reaches the container. The
+  render-time invariant now checks the *path* the wayflow service references
+  (not merely that some `env_file:` is present), rejects an explicitly EMPTY
+  `environment:` value that would override the file it points at, and covers
+  `nango-server`, `knowledge-graph-mcp` and `plane-mcp` on the same terms by
+  requiring every `env_file:` the resolved source carried to survive into the
+  generated document. The generated `docker-compose.cinatra-isolated.yml` now
+  states in a header comment that it is CLI-owned and re-derived in full on
+  every run — it never preserved an operator edit, and a file it could not parse
+  is regenerated rather than skipped, which had made corrupting the file the way
+  to pin a defective compose in place. A reconcile that *fails* to regenerate
+  now aborts instead of quietly bringing the old file up.
+
+  **Behaviour change beyond the isolated path.** Because `bringUpInfra` is the
+  single seam every local bring-up uses, judging the bridge-token step by the
+  file rather than the exit code also changes the DEFAULT install: a checkout
+  that cannot produce `docker/wayflow/.wayflow.env` with a non-empty
+  `CINATRA_BRIDGE_TOKEN` and `CINATRA_CONTEXT_ATTEST_KEY` now ABORTS where it
+  previously warned and continued. This is intended. The warn-and-continue path
+  ended in exactly the failure this release fixes — a crash-looping runtime
+  behind an install that exited 0 and reported ready — and it was never
+  isolated-specific. `--no-wayflow` installs without the agent runtime, and the
+  failure names both recoveries.
+
 - **A preview no longer wires itself to another instance's services, and it can
   finally reach its own connection service.** The preview composition decided
   where this instance's services live by string manipulation: it swapped a

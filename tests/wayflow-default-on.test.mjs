@@ -255,7 +255,12 @@ describe("bringUpInfra — WayFlow rides every install-owned bring-up", () => {
 describe("generateWayflowEnv", () => {
   // The generated file the container actually reads. cinatra#2654 D1: the
   // result is judged by THIS file, not by the generator's exit code.
-  const wroteToken = () => "CINATRA_BRIDGE_TOKEN=fixture-bridge-token\nWAYFLOW_BASE_URL=http://localhost:3010\n";
+  // cinatra#2654 D1: the postcondition is the REQUIRED key set, not the token
+  // alone — a file missing CINATRA_CONTEXT_ATTEST_KEY yields a runtime that
+  // starts and then fails closed on every context callback.
+  const wroteToken = () =>
+    "CINATRA_BRIDGE_TOKEN=fixture-bridge-token\nCINATRA_CONTEXT_ATTEST_KEY=fixture-attest-key\n" +
+    "WAYFLOW_BASE_URL=http://localhost:3010\n";
   const wroteNothing = () => {
     throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
   };
@@ -328,6 +333,44 @@ describe("generateWayflowEnv", () => {
     });
     expect(res).toEqual({ ok: true, skipped: true, reason: "generator-absent" });
     expect(lines.join("\n")).toContain("gen-wayflow-env.mjs");
+  });
+
+  it("cinatra#2654: a PARTIAL file (bridge token only) is NOT ok — the required set is checked", () => {
+    const res = generateWayflowEnv({
+      targetDir: "/repo",
+      log: () => {},
+      existsImpl: () => true,
+      readImpl: () => "CINATRA_BRIDGE_TOKEN=fixture-bridge-token\n",
+      spawnImpl: () => ({ status: 0 }),
+    });
+    expect(res.ok).toBe(false);
+    // Named, so the operator knows WHICH key the generator failed to write.
+    expect(res.reason).toContain("CINATRA_CONTEXT_ATTEST_KEY");
+    expect(res.reason).not.toContain("CINATRA_BRIDGE_TOKEN");
+  });
+
+  it("cinatra#2654: a missing EXPECTED key (WAYFLOW_BASE_URL) WARNS by name and still succeeds", () => {
+    const lines = [];
+    const res = generateWayflowEnv({
+      targetDir: "/repo",
+      log: (l) => lines.push(String(l)),
+      existsImpl: () => true,
+      readImpl: () => "CINATRA_BRIDGE_TOKEN=t\nCINATRA_CONTEXT_ATTEST_KEY=k\n",
+      spawnImpl: () => ({ status: 0 }),
+    });
+    expect(res.ok).toBe(true);
+    expect(lines.join("\n")).toContain("WAYFLOW_BASE_URL");
+  });
+
+  it("cinatra#2654: an unset OPENAI_API_KEY is never a reason to fail (legitimately absent)", () => {
+    const res = generateWayflowEnv({
+      targetDir: "/repo",
+      log: () => {},
+      existsImpl: () => true,
+      readImpl: wroteToken,
+      spawnImpl: () => ({ status: 0 }),
+    });
+    expect(res.ok).toBe(true);
   });
 
   it("cinatra#2654: no generator AND no usable env file is a FAILURE, not a warning", () => {

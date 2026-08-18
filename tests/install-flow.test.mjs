@@ -13,6 +13,7 @@ import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { DEFAULT_REPO_URL, parseInstallArgs, runInstall } from "../src/install.mjs";
+import { parseIsolatedComposeDoc } from "../src/install-isolation.mjs";
 import { readInstanceRegistry } from "../src/instance-registry.mjs";
 import { readMarker } from "../src/instance-marker.mjs";
 import { RecreatePreflightError } from "../src/recreate-preflight.mjs";
@@ -215,6 +216,11 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
       ...dockerPresentDeps(),
       composePublishedPortsForTarget: () => DEFAULT_BAND,
       composeConfigForFiles: () => RESOLVED_CONFIG,
+      // cinatra#2654 D1: pin the Compose feature probe so these tests assert the
+      // PRESERVED-reference route regardless of the Compose on the machine
+      // running them (the injected `composeConfigForFiles` above always returns
+      // a document that keeps `env_file:`, so the route must match).
+      composeSupportsNoEnvResolution: () => true,
       targetComposeOwnedPorts: () => new Set(),
       liveComposeInspect: () => [],
       readCloneRegistry: () => null,
@@ -912,7 +918,7 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     // .env.local, so the generated compose keeps its LITERAL value — it must NOT
     // be re-symbolised to a `${POSTGRES_PASSWORD}` that nothing supplies (which
     // would resolve BLANK at `up` and break a fresh postgres on its own volume).
-    const genDoc = JSON.parse(body);
+    const genDoc = parseIsolatedComposeDoc(body);
     expect(genDoc.services.postgres.environment.POSTGRES_PASSWORD).toBe("secret-plain");
     expect(body).not.toContain("${POSTGRES_PASSWORD}");
     // Registry row recorded ready with the isolated project + app port.
@@ -1063,7 +1069,7 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     // follow the host-port shift (3003 → 13003); the service-DNS infra URL is
     // left verbatim; the bare SERVER_PORT number is untouched.
     const genBody = readFileSync(path.join(installDir, "docker-compose.cinatra-isolated.yml"), "utf8");
-    const nangoEnv = JSON.parse(genBody).services["nango-server"].environment;
+    const nangoEnv = parseIsolatedComposeDoc(genBody).services["nango-server"].environment;
     expect(nangoEnv.NANGO_SERVER_URL).toBe("http://localhost:13003");
     expect(nangoEnv.NANGO_PUBLIC_SERVER_URL).toBe("http://localhost:13003");
     expect(nangoEnv.RECORDS_DATABASE_URL).toBe("postgresql://nango-db:5432/nango");
@@ -1131,7 +1137,7 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
 
     // Generated isolated compose: wayflow present, `profiles` retained (a plain
     // `up` must not start it), published port shifted into the isolated band.
-    const gen = JSON.parse(readFileSync(path.join(installDir, "docker-compose.cinatra-isolated.yml"), "utf8"));
+    const gen = parseIsolatedComposeDoc(readFileSync(path.join(installDir, "docker-compose.cinatra-isolated.yml"), "utf8"));
     expect(gen.services.wayflow).toBeDefined();
     expect(gen.services.wayflow.profiles).toEqual(["wayflow", "drupal", "wordpress"]);
     expect(String(gen.services.wayflow.ports[0].published)).toBe("13010");
