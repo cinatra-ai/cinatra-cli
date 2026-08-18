@@ -309,7 +309,7 @@ describe("`config --no-env-resolution` is probed BEHAVIOURALLY, never assumed (c
   // The probe renders a throwaway compose whose only env source is an env_file
   // and asks whether the reference SURVIVED — it does not ask whether the flag
   // is spelled in `--help`, because those are different questions and this PR's
-  // own CI proved they can disagree (see the v2.38.2 case below).
+  // own CI proved they can disagree (see the 2.38.2 case below).
   const probeOutput = (svc) =>
     JSON.stringify({ services: { "cinatra-env-resolution-probe": svc } });
 
@@ -329,8 +329,8 @@ describe("`config --no-env-resolution` is probed BEHAVIOURALLY, never assumed (c
     expect(calls[0].cwd).toMatch(/cinatra-compose-probe-/);
   });
 
-  it("REGRESSION CONTROL (Compose v2.38.2): the flag is ACCEPTED and still inlines — UNSUPPORTED", () => {
-    // Measured, not assumed: `docker compose config --help` on v2.38.2 (GitHub
+  it("REGRESSION CONTROL (Compose 2.38.2): the flag is ACCEPTED and still inlines — UNSUPPORTED", () => {
+    // Measured, not assumed: `docker compose config --help` on 2.38.2 (GitHub
     // ubuntu-latest) lists `--no-env-resolution`, the flag is accepted, exit 0 —
     // and the output has the env file's content in `environment:` with the
     // directive gone. A `--help` probe would have called that supported and the
@@ -1135,7 +1135,7 @@ process.exit(0);
 /** Ask a REAL compose binary the two questions this suite needs: which version
  *  it is, and whether `config --no-env-resolution` actually PRESERVES an
  *  `env_file:` reference (not merely whether the flag is spelled in --help —
- *  v2.38.2 accepts the flag and inlines anyway). `bin` is the `docker` wrapper
+ *  2.38.2 accepts the flag and inlines anyway). `bin` is the `docker` wrapper
  *  by default; CINATRA_TEST_COMPOSE_BIN points at a standalone compose binary so
  *  a second version can be exercised on the same box. */
 function probeRealCompose(bin = null) {

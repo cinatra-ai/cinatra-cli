@@ -66,7 +66,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
   PROBED — by rendering a throwaway compose and checking whether `env_file:`
   actually survived, not by looking for the flag in `--help` or comparing a
   version to a floor. Those are different questions, and they disagree in
-  practice: Compose v2.38.2 lists the flag, accepts it, exits 0 — and inlines the
+  practice: Compose 2.38.2 lists the flag, accepts it, exits 0 — and inlines the
   env file anyway. A spelling check would have called that supported and frozen a
   snapshot, which is the original defect. On a Compose that does not keep the
   reference the install says so, names the version, and takes a stated fallback:

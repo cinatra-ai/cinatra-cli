@@ -906,10 +906,10 @@ function composeAvailable() {
 // and — the part this PR's own CI proved — the FLAG being present is not the
 // same as the behaviour being present:
 //
-//   Compose v2.38.2 (GitHub `ubuntu-latest`): `config --help` LISTS
+//   Compose 2.38.2 (GitHub `ubuntu-latest`): `config --help` LISTS
 //     `--no-env-resolution`, the flag is accepted, exit 0 — and the output still
 //     inlines the env file's content into `environment:` and drops `env_file:`.
-//   Compose v5.5.0: same flag, and the reference is preserved.
+//   Compose 5.5.0: same flag, and the reference is preserved.
 //
 // So a `--help` (or version) check is worthless here: it answers "is the flag
 // spelled in this build" when the question is "does this build keep the
