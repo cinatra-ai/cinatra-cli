@@ -21,7 +21,7 @@
 
 import path from "node:path";
 import { spawnSync as nodeSpawnSync } from "node:child_process";
-import { existsSync as nodeExistsSync } from "node:fs";
+import { existsSync as nodeExistsSync, readFileSync as nodeReadFileSync } from "node:fs";
 
 /** The compose service name AND the compose profile that gates it. */
 export const WAYFLOW_SERVICE = "wayflow";
@@ -96,15 +96,55 @@ export function wayflowStatusLines(mode, { endpoint = "http://localhost:3010" } 
   return [`  Agent runtime: WayFlow started with the stack (${endpoint}).`];
 }
 
+/** The narrow, generated container env the `wayflow` service reads through its
+ *  compose `env_file` (`required: false`). Path is repo-relative — it lives
+ *  INSIDE the checkout the install owns, next to the compose file that
+ *  references it. */
+export const WAYFLOW_ENV_FILE = path.join("docker", "wayflow", ".wayflow.env");
+
+/** The one key whose absence crash-loops the runtime ("[agent_loader] FATAL:
+ *  CINATRA_BRIDGE_TOKEN is unset or empty … Refusing to start."). */
+export const WAYFLOW_BRIDGE_TOKEN_KEY = "CINATRA_BRIDGE_TOKEN";
+
+/**
+ * True iff `docker/wayflow/.wayflow.env` exists AND carries a non-empty
+ * `CINATRA_BRIDGE_TOKEN`. This is the POSTCONDITION of the generator, checked
+ * independently of it: the install may only promise a runtime once the token
+ * actually reached the file the container reads.
+ *
+ * Parsing mirrors `scripts/gen-wayflow-env.mjs`'s own dotenv regex (same shape,
+ * same quote stripping) so the two never disagree about what "supplied" means.
+ * Never logs a value.
+ */
+export function wayflowEnvHasBridgeToken({ targetDir, readImpl = nodeReadFileSync } = {}) {
+  try {
+    const body = String(readImpl(path.join(targetDir, WAYFLOW_ENV_FILE), "utf8"));
+    for (const line of body.split("\n")) {
+      const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+      if (match && match[1] === WAYFLOW_BRIDGE_TOKEN_KEY) {
+        return match[2].replace(/^["']|["']$/g, "").trim() !== "";
+      }
+    }
+    return false;
+  } catch {
+    return false; // absent / unreadable — the container would start tokenless
+  }
+}
+
 /**
  * Regenerate the narrow WayFlow container env (`docker/wayflow/.wayflow.env`)
  * from `.env.local`, the same call `npm run services` and the setup script
  * make. It MUST run before the compose `up`: the runtime reads
  * `CINATRA_BRIDGE_TOKEN` from that file and crash-loops without it.
  *
- * A checkout without the generator (an older tree) is a WARN, not a failure —
- * compose tolerates the missing `env_file` and the container still fails loud
- * on a missing token. A generator that EXISTS and FAILS aborts the caller.
+ * HONESTY (cinatra#2654 D1). The result is judged by the FILE, not by the
+ * generator's exit code: a `.wayflow.env` that does not exist, or that carries
+ * no non-empty bridge token, is `ok: false` — the caller must abort rather than
+ * start a runtime that cannot authenticate its callbacks and then report a ready
+ * instance. That is the same loud, attributable shape the broken-image-build
+ * path already has. A checkout without the generator (an older tree) is a WARN
+ * only when a usable `.wayflow.env` is ALREADY on disk; without one there is no
+ * route for the token into the container, so it is a failure too.
  *
  * @returns {{ ok: boolean, skipped: boolean, reason: string|null }}
  */
@@ -113,13 +153,25 @@ export function generateWayflowEnv({
   log = console.log,
   spawnImpl = nodeSpawnSync,
   existsImpl = nodeExistsSync,
+  readImpl = nodeReadFileSync,
   execPath = process.execPath,
 } = {}) {
+  const hasToken = () => wayflowEnvHasBridgeToken({ targetDir, readImpl });
   const generator = path.join(targetDir, "scripts", "gen-wayflow-env.mjs");
   if (!existsImpl(generator)) {
+    if (!hasToken()) {
+      return {
+        ok: false,
+        skipped: false,
+        reason:
+          `scripts/gen-wayflow-env.mjs is absent from this checkout and ${WAYFLOW_ENV_FILE} carries no ` +
+          `non-empty ${WAYFLOW_BRIDGE_TOKEN_KEY}`,
+      };
+    }
     log(
-      "  ⚠ scripts/gen-wayflow-env.mjs is absent from this checkout — starting WayFlow without " +
-        "regenerating docker/wayflow/.wayflow.env. If agent replies stay empty, the bridge token is missing.",
+      "  ⚠ scripts/gen-wayflow-env.mjs is absent from this checkout — starting WayFlow with the " +
+        `${WAYFLOW_ENV_FILE} already on disk (it supplies ${WAYFLOW_BRIDGE_TOKEN_KEY}). Update the checkout to ` +
+        "keep a rotated token propagating.",
     );
     return { ok: true, skipped: true, reason: "generator-absent" };
   }
@@ -134,6 +186,15 @@ export function generateWayflowEnv({
       ok: false,
       skipped: false,
       reason: `gen-wayflow-env.mjs failed (exit ${status})${result?.error ? `: ${result.error.message}` : ""}`,
+    };
+  }
+  if (!hasToken()) {
+    return {
+      ok: false,
+      skipped: false,
+      reason:
+        `gen-wayflow-env.mjs exited 0 but ${WAYFLOW_ENV_FILE} carries no non-empty ` +
+        `${WAYFLOW_BRIDGE_TOKEN_KEY} (the file the container reads is the authority, not the exit code)`,
     };
   }
   return { ok: true, skipped: false, reason: null };

@@ -32,6 +32,36 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **An isolated install no longer starts an agent runtime that cannot boot, and
+  a re-run finally repairs one that already exists.** An isolated install writes
+  its own flattened compose file and brings the stack up from that file alone.
+  It rendered that file with `docker compose config`, which *resolves* every
+  service `env_file:` — it copies whatever the file held at that moment into
+  `environment:` and drops the reference. The WayFlow runtime takes its bridge
+  token from exactly such a file, `docker/wayflow/.wayflow.env`, and the
+  bring-up writes that file one second *after* the render. A first install on a
+  clean directory therefore froze the runtime with three static keys and no
+  `CINATRA_BRIDGE_TOKEN`: the container refused to start ("FATAL:
+  CINATRA_BRIDGE_TOKEN is unset or empty"), every agent run failed with
+  ECONNREFUSED, and the install still exited 0, printed complete and recorded
+  the instance as ready. A *second* install on the same directory worked, purely
+  because the first attempt's file was on disk by then — so the failure only
+  ever hit a real operator's first install. The isolated render now asks compose
+  not to resolve service env files, so the generated compose *references*
+  `docker/wayflow/.wayflow.env` and reads its content when the stack comes up —
+  which is what the checkout's own compose file specifies for this service, and
+  what keeps a rotated token propagating instead of freezing a copy of it into a
+  generated file. A reconcile (`cinatra install` re-run, the recovery the
+  failure message and the doctor both name) now re-renders that generated
+  compose instead of skipping the work, so an instance installed by the broken
+  path is repaired in place rather than carrying the defect forever. And the
+  install now judges the bridge-token step by the file it was supposed to
+  produce rather than by the generator's exit code: when the token cannot be
+  produced, the install stops with a named, attributable failure — nothing
+  built, nothing started, no instance marked ready — exactly as a broken runtime
+  image build already did. A runtime that is observed restarting is reported as
+  a crash loop with the command that shows why, not as a slow cold start.
+
 - **A preview no longer wires itself to another instance's services, and it can
   finally reach its own connection service.** The preview composition decided
   where this instance's services live by string manipulation: it swapped a

@@ -1013,10 +1013,14 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
             RECORDS_DATABASE_URL: "postgresql://nango-db:5432/nango",
           },
         },
-        // WayFlow is a compose service in the band (host port 3010).
+        // WayFlow is a compose service in the band (host port 3010). Its host
+        // secrets arrive through the narrow generated env file (cinatra#2654 D1
+        // — the isolated render must keep that reference, so the fixture carries
+        // it exactly as `docker compose config --no-env-resolution` emits it).
         wayflow: {
           image: "cinatra-wayflow",
           environment: { PORT: "3010", CINATRA_BASE_URL: "http://host.docker.internal:3000" },
+          env_file: [{ path: "./docker/wayflow/.wayflow.env", required: false }],
           ports: [{ published: "3010", target: 3010, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
         },
       },
@@ -1077,6 +1081,8 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
       image: "cinatra-wayflow",
       profiles: ["wayflow", "drupal", "wordpress"],
       environment: { PORT: "3010" },
+      // cinatra#2654 D1: the bridge-token env file the runtime reads at up-time.
+      env_file: [{ path: "./docker/wayflow/.wayflow.env", required: false }],
       ports: [{ published: "3010", target: 3010, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
     };
     const CONFIG_ALL_PROFILES = {

@@ -650,6 +650,61 @@ export function generateIsolatedCompose({ resolvedConfig, offset, projectName, s
   return { doc, ports: remappedPorts, scrubbedKeys: [...scrubbedKeys], remappedEnvUrls: [...remappedEnvUrls] };
 }
 
+// ── cinatra#2654 D1 — the env-file wiring invariant ─────────────────────────
+//
+// The `wayflow` service takes its host secrets (CINATRA_BRIDGE_TOKEN,
+// CINATRA_CONTEXT_ATTEST_KEY, OPENAI_API_KEY, WAYFLOW_BASE_URL) from a NARROW
+// generated file the bring-up writes just before `up`:
+//
+//   env_file: [{ path: ./docker/wayflow/.wayflow.env, required: false }]
+//
+// `docker compose config` RESOLVES that file — it inlines whatever the file held
+// AT RENDER TIME into `environment:` and drops the `env_file:` directive. On a
+// FIRST install the file does not exist yet, so the generated isolated compose
+// froze the service with three static keys and no bridge token, the runtime
+// crash-looped, and the missing wiring survived every later bring-up (only a
+// SECOND install on the same directory worked, because the first attempt's file
+// was on disk by then). The isolated render therefore asks compose NOT to
+// resolve service env files (`--no-env-resolution`), which keeps `env_file:` in
+// the generated document so its CONTENT is read at up-time — the same contract
+// the base compose file states for this service.
+//
+// This is the defensive invariant for that: a generated document whose `wayflow`
+// service can be started with no route for the bridge token is a regression, and
+// it must fail LOUD at install time rather than as a crash-looping container
+// behind an install that exited 0.
+
+/** The `wayflow` compose service — the one the agent runs reach. */
+const WAYFLOW_SERVICE_NAME = "wayflow";
+/** The key whose absence makes the runtime refuse to start. */
+const WAYFLOW_TOKEN_KEY = "CINATRA_BRIDGE_TOKEN";
+
+/**
+ * Why a generated compose document gives its `wayflow` service NO route for the
+ * bridge token, or null when it has one. A route is either the preserved
+ * `env_file:` (read at up-time from the file the bring-up regenerates) or an
+ * explicit non-empty `CINATRA_BRIDGE_TOKEN` in `environment:` (a `${VAR}`
+ * placeholder counts — the isolated `up` resolves it from `--env-file
+ * .env.local`, and the separate scrub invariant proves that key is supplied).
+ *
+ * A document with no `wayflow` service at all is fine (nothing to wire).
+ * Structural only — it never reads the env file and never touches a value.
+ */
+export function wayflowEnvWiringGap(doc) {
+  const svc = doc?.services?.[WAYFLOW_SERVICE_NAME];
+  if (!svc || typeof svc !== "object") return null;
+  const envFiles = Array.isArray(svc.env_file) ? svc.env_file : svc.env_file ? [svc.env_file] : [];
+  if (envFiles.length > 0) return null;
+  const env = svc.environment;
+  const inline = env && typeof env === "object" && !Array.isArray(env) ? env[WAYFLOW_TOKEN_KEY] : undefined;
+  if (typeof inline === "string" && inline.trim() !== "") return null;
+  return (
+    `the generated compose service "${WAYFLOW_SERVICE_NAME}" carries neither an \`env_file:\` reference to ` +
+    `docker/wayflow/.wayflow.env nor a non-empty ${WAYFLOW_TOKEN_KEY} in \`environment:\`, so the agent runtime ` +
+    `would start with no bridge token and crash-loop`
+  );
+}
+
 /**
  * Render the generated compose doc to a string. Docker Compose reads YAML, and
  * YAML 1.2 is a JSON superset, so a `.yml` file containing the doc as
@@ -687,6 +742,7 @@ export const __test = {
   findUnmappedComposeHostUrls,
   generateIsolatedCompose,
   renderIsolatedComposeYaml,
+  wayflowEnvWiringGap,
 };
 
 // Expose the constant for callers that build the generated filename.

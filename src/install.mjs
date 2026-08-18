@@ -113,7 +113,9 @@ import {
   classifyPortHolder,
   generateIsolatedCompose,
   writeIsolatedComposeFile,
+  renderIsolatedComposeYaml,
   assertComposeHostUrlsRemapped,
+  wayflowEnvWiringGap,
   ISOLATED_COMPOSE_FILENAME,
 } from "./install-isolation.mjs";
 import {
@@ -1867,10 +1869,20 @@ export function bringUpInfra({ slug = null, deps = {}, targetDir, log = console.
     if (health.healthy) {
       log("  WayFlow agent runtime is healthy.");
     } else if (composeProject) {
+      // cinatra#2654 D1: a RESTARTING container is not a slow cold start, it is a
+      // boot that keeps failing. Say which one was observed — the matrix showed
+      // the cold-start wording used for a 20-restart crash loop, which read as
+      // "wait a minute" when the truth was "it will never come up".
+      const restarting = /restarting/i.test(String(health.state ?? ""));
       log(
-        `  ⚠ The WayFlow agent runtime is not healthy yet${health.state ? ` (${health.state})` : ""}. ` +
-          "A cold start mounts every installed agent. Re-run `cinatra doctor` in a minute; " +
-          "if it stays down, check the container logs.",
+        restarting
+          ? `  ⚠ The WayFlow agent runtime is CRASH-LOOPING (${health.state}) — this is a failing boot, not a slow ` +
+              `cold start. Read the reason with \`docker logs ${composeProject}-wayflow-1\` (a missing ` +
+              "CINATRA_BRIDGE_TOKEN is the usual one) and re-run `cinatra install` once it is fixed; agent runs " +
+              "fail with ECONNREFUSED until it is healthy."
+          : `  ⚠ The WayFlow agent runtime is not healthy yet${health.state ? ` (${health.state})` : ""}. ` +
+              "A cold start mounts every installed agent. Re-run `cinatra doctor` in a minute; " +
+              "if it stays down, check the container logs.",
       );
     }
   }
@@ -2269,7 +2281,7 @@ async function typedConfirm(question, phrase) {
  *  the isolated container. Reading from `.env.local` makes the resolved config
  *  carry the real operator values, which the generator then re-symbolises back to
  *  `${KEY}` (resolved again from `.env.local` at up-time): end-to-end consistent. */
-function composeConfigForFiles(targetDir, composeFiles, deps = {}, { allProfiles = false } = {}) {
+export function composeConfigForFiles(targetDir, composeFiles, deps = {}, { allProfiles = false, preserveEnvFiles = false } = {}) {
   const cap = deps.capture ?? capture;
   const fileArgs = (composeFiles && composeFiles.length
     ? composeFiles
@@ -2288,7 +2300,23 @@ function composeConfigForFiles(targetDir, composeFiles, deps = {}, { allProfiles
   // Opt-in: only the ISOLATED path passes `allProfiles` — the default-install
   // preflight keeps probing only the ports a default `up` would actually bind.
   const profileArgs = allProfiles ? ["--profile", "*"] : [];
-  const raw = cap("docker", ["compose", ...envArgs, ...profileArgs, ...fileArgs, "config", "--format", "json"], { cwd: targetDir });
+  // cinatra#2654 D1: `config` RESOLVES every service `env_file:` — it inlines
+  // the file's CONTENT (as of render time) into `environment:` and drops the
+  // directive. The isolated install renders its compose BEFORE the bring-up
+  // writes `docker/wayflow/.wayflow.env`, so a FIRST install froze the wayflow
+  // service with three static keys, no CINATRA_BRIDGE_TOKEN, and no way for one
+  // to arrive later: the runtime crash-looped and every reconcile re-used the
+  // same frozen file. `--no-env-resolution` keeps `env_file:` in the resolved
+  // document, so the generated isolated compose REFERENCES the narrow file and
+  // reads its content at `up` time — which is exactly what the base compose
+  // specifies for wayflow/nango-server/knowledge-graph-mcp/plane-mcp ("an empty
+  // `environment:` value OVERRIDES an env_file value on the same key, so the key
+  // must NOT appear in `environment:`"). It also keeps a rotated token
+  // propagating and stops the render persisting host secrets in the file.
+  // Opt-in: only the ISOLATED render (which PERSISTS its resolved document)
+  // needs it; the read-only band/preflight resolutions are unchanged.
+  const envResolutionArgs = preserveEnvFiles ? ["--no-env-resolution"] : [];
+  const raw = cap("docker", ["compose", ...envArgs, ...profileArgs, ...fileArgs, "config", ...envResolutionArgs, "--format", "json"], { cwd: targetDir });
   if (!raw) return null;
   try {
     return JSON.parse(raw);
@@ -2912,7 +2940,13 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
   // self-advertised URL stay on the DONOR's band (cinatra-cli#97 leak via the
   // profiles path — eng#513 sweep). Each service keeps its `profiles` attribute
   // in the generated file, so a plain `up` still starts only the default set.
-  const resolvedConfig = getConfig(targetDir, ["docker-compose.yml", "docker-compose.dev.yml"], deps, { allProfiles: true });
+  // cinatra#2654 D1: `preserveEnvFiles` keeps each service's `env_file:` in the
+  // resolved document instead of inlining a render-time snapshot of it. The
+  // isolated compose is PERSISTED and re-used by every later `up`, so a service
+  // whose secrets arrive through a narrow generated file (wayflow's
+  // docker/wayflow/.wayflow.env — written by the bring-up, AFTER this render)
+  // must keep the reference, not a snapshot taken before the file exists.
+  const resolvedConfig = getConfig(targetDir, ["docker-compose.yml", "docker-compose.dev.yml"], deps, { allProfiles: true, preserveEnvFiles: true });
   if (!resolvedConfig) {
     throw new Error(
       "Could not resolve the checkout's `docker compose config` to build an isolated stack. " +
@@ -3075,6 +3109,13 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
     // time, not as a silent cross-instance OAuth/self-URL leak to the main stack.
     assertComposeHostUrlsRemapped(doc, new Set(baseBand.map((b) => b.port)));
 
+    // cinatra#2654 D1 invariant: the generated `wayflow` service must keep a
+    // ROUTE for the bridge token — the preserved `env_file:` (read at up-time)
+    // or an explicit non-empty value. Holds by construction now that the render
+    // does not resolve env files; assert it so a regression fails loud HERE
+    // instead of as a crash-looping runtime behind an install that exits 0.
+    assertWayflowEnvWired(doc);
+
     // Persist the generated compose + provisioning row + marker (recording the
     // generated SOLE file as composeFiles[]).
     const generatedFile = writeIsolatedComposeFile(path.join(targetDir, ISOLATED_COMPOSE_FILENAME), doc);
@@ -3121,7 +3162,19 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
     const slot = persisted.slot;
     const envFile = path.join(targetDir, ".env.local");
     if (!opts.dryRun) {
-      ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: slot.appPort, ports: slot.ports, log });
+      // cinatra#2654 D1: an explicit `--on-conflict=isolated` re-run is a
+      // reconcile too, so it re-renders the generated compose exactly like the
+      // plain re-run (reconvergeIsolated) does — else which flag the operator
+      // repeated would decide whether a fixed generator ever reaches the
+      // instance. Best-effort, same contract as there.
+      let slotPorts = slot.ports;
+      try {
+        const regen = await regenerateIsolatedComposeInPlace({ targetDir, row: slot, log, deps });
+        if (regen.regenerated && regen.ports) slotPorts = regen.ports;
+      } catch (err) {
+        log(`  ⚠ Isolated compose regeneration skipped (${err instanceof Error ? err.message : err}); using the recorded compose.`);
+      }
+      ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: slot.appPort, ports: slotPorts, log });
       startInfra({
         slug,
         deps,
@@ -3130,7 +3183,7 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
         composeFiles: slot.composeFiles,
         composeProject: slot.composeProject,
         envFile: existsSync(envFile) ? envFile : null,
-        nangoHealthUrl: nangoHealthUrlForPorts(slot.ports),
+        nangoHealthUrl: nangoHealthUrlForPorts(slotPorts),
         wayflow: opts.wayflow !== false,
       });
       // cinatra-cli#128: record the deployed stateful-service versions in the
@@ -3294,6 +3347,19 @@ function assertScrubbedKeysSupplied(targetDir, scrubbedKeys = []) {
         `infra DBs (cinatra-cli#57). This is an internal invariant violation; please report it.`,
     );
   }
+}
+
+/** cinatra#2654 D1 invariant guard. The generated isolated compose is the SOLE
+ *  file every later `up` of this instance reads, so a `wayflow` service written
+ *  without a route for CINATRA_BRIDGE_TOKEN is a permanently crash-looping
+ *  runtime that no reconcile repairs. Fail at generation time, by name. */
+function assertWayflowEnvWired(doc) {
+  const gap = wayflowEnvWiringGap(doc);
+  if (!gap) return;
+  throw new Error(
+    `Refusing to write the isolated compose — ${gap} (cinatra#2654). ` +
+      "This is an internal invariant violation; please report it.",
+  );
 }
 
 // The infra-URL env keys an isolated install writes; an EXPORTED value for any
@@ -4654,15 +4720,16 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     log(`  [dry-run] would bring up isolated project ${row.composeProject} from ${(row.composeFiles ?? []).join(", ")}`);
     return { infraPlan: "isolated", instance: row, done: false, dryRun: true };
   }
-  // cinatra-cli#113: an instance recorded BEFORE the profile-gated services were
-  // baked into the isolated compose keeps a profile-less file across every
-  // reconcile — it never gains the a2a-peers (or wordpress/drupal/twenty/plane)
-  // services without a manual reset + reinstall. Regenerate it in place FIRST
-  // (idempotent — a no-op once the file already carries them), so a plain
-  // `cinatra install` on such an instance picks the profile-gated services up.
+  // cinatra-cli#113 / cinatra#2654 D1: the generated isolated compose is a
+  // DERIVED artifact of the checkout's compose at this instance's recorded band
+  // offset, and it is the only file this stack's `up` reads. Re-render it FIRST
+  // on every reconcile, so an instance whose file was written by an older (or
+  // broken) generator is repaired by the very `cinatra install` re-run the
+  // failure messages and the doctor prescribe — that recovery used to be a
+  // no-op, which is how a wayflow service with no bridge token survived.
   // Best-effort: any failure leaves the recorded compose untouched and the
-  // reconcile proceeds with it. On success the enlarged remapped-port map drives
-  // the env re-point + Nango health probe below.
+  // reconcile proceeds with it. On success the (possibly enlarged) remapped-port
+  // map drives the env re-point + Nango health probe below.
   let effectivePorts = row.ports ?? {};
   try {
     const regen = await regenerateIsolatedComposeInPlace({ targetDir, row, log, deps });
@@ -4713,17 +4780,26 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
 }
 
 /**
- * cinatra-cli#113 — regenerate a recorded isolated stack's
- * `docker-compose.cinatra-isolated.yml` IN PLACE so it carries the profile-gated
- * services (a2a-peers / wordpress / drupal / twenty / plane). An instance
- * recorded BEFORE those services were baked into the isolated compose keeps a
- * profile-less file across every reconcile; this brings it up to parity without
- * a reset + reinstall.
+ * cinatra-cli#113 / cinatra#2654 D1 — regenerate a recorded isolated stack's
+ * `docker-compose.cinatra-isolated.yml` IN PLACE from the checkout's current
+ * compose, at the instance's recorded band offset.
+ *
+ * cinatra-cli#113 introduced this to pick up the profile-gated services
+ * (a2a-peers / wordpress / drupal / twenty / plane) for an instance recorded
+ * before they were baked in, and skipped the work as soon as those services were
+ * present. cinatra#2654 D1 proved that "present" test is the wrong stopping
+ * condition: a FIRST install already writes those services, so the file was
+ * never regenerated again (its mtime was unchanged across a reconcile) and a
+ * defect BAKED INTO the generated document — a wayflow service with no bridge
+ * token — survived every documented recovery, including the `cinatra install`
+ * re-run the failure message and the doctor both prescribe. A reconcile now
+ * ALWAYS re-renders: the generated file is a derived artifact of the checkout's
+ * compose at a fixed offset, so re-deriving it is how a fixed generator reaches
+ * an existing instance.
  *
  * Idempotent and safe:
- *   - No-op when the file already carries an a2a-peers service with a published
- *     port (the specific marker that the profile-gated services are present), or
- *     when the file is missing/unparseable (best-effort — never clobber).
+ *   - No-op when the file is missing or unparseable (best-effort — never
+ *     clobber an operator edit).
  *   - Regenerates at the instance's ORIGINAL band offset (persisted on the row
  *     for fresh installs; derived from the recorded ports vs the base band for a
  *     legacy row, refusing on any ambiguity), so every already-remapped default
@@ -4736,7 +4812,7 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
  *
  * @returns {Promise<{ regenerated: boolean, ports?: object }>}
  */
-async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.log, deps = {} }) {
+export async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.log, deps = {} }) {
   const getConfig = deps.composeConfigForFiles ?? composeConfigForFiles;
   const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
   const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
@@ -4753,13 +4829,10 @@ async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.
     // An unparseable file is left untouched (never clobber an operator edit).
     return { regenerated: false };
   }
-  // Already carries the profile-gated peers → nothing to do (the common case: a
-  // fresh install, or an instance already regenerated once).
-  if (isolatedComposeHasA2aPeers(existingDoc)) return { regenerated: false };
-
-  // Re-resolve the checkout's base config WITH every profile-gated service — the
-  // same resolution a fresh isolated install performs.
-  const resolvedConfig = getConfig(targetDir, ["docker-compose.yml", "docker-compose.dev.yml"], deps, { allProfiles: true });
+  // Re-resolve the checkout's base config WITH every profile-gated service and
+  // WITHOUT resolving service env files — byte-for-byte the same resolution a
+  // fresh isolated install performs (cinatra#2654 D1).
+  const resolvedConfig = getConfig(targetDir, ["docker-compose.yml", "docker-compose.dev.yml"], deps, { allProfiles: true, preserveEnvFiles: true });
   if (!resolvedConfig) {
     throw new Error("could not resolve `docker compose config` to regenerate the isolated compose");
   }
@@ -4804,11 +4877,13 @@ async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.
   // regression, never a silent blank-secret or a self-URL leak to the main stack).
   assertScrubbedKeysSupplied(targetDir, scrubbedKeys);
   assertComposeHostUrlsRemapped(doc, new Set(baseBand.map((b) => b.port)));
+  assertWayflowEnvWired(doc);
 
+  const changed = renderIsolatedComposeYaml(doc) !== renderIsolatedComposeYaml(existingDoc);
   writeIsolatedComposeFile(isoPath, doc);
   log(
-    `  ↻ Regenerated ${ISOLATED_COMPOSE_FILENAME} to include the profile-gated services ` +
-      `(a2a-peers + wordpress/drupal/twenty/plane) at the recorded band offset.`,
+    `  ↻ Regenerated ${ISOLATED_COMPOSE_FILENAME} from this checkout's compose at the recorded band ` +
+      `offset (${changed ? "content updated" : "content unchanged"}).`,
   );
 
   // Persist the enlarged remapped-port map + the offset (so a legacy row's next

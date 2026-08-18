@@ -253,12 +253,20 @@ describe("bringUpInfra — WayFlow rides every install-owned bring-up", () => {
 // ---------------------------------------------------------------------------
 
 describe("generateWayflowEnv", () => {
+  // The generated file the container actually reads. cinatra#2654 D1: the
+  // result is judged by THIS file, not by the generator's exit code.
+  const wroteToken = () => "CINATRA_BRIDGE_TOKEN=fixture-bridge-token\nWAYFLOW_BASE_URL=http://localhost:3010\n";
+  const wroteNothing = () => {
+    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  };
+
   it("runs the checkout's own generator with --require-bridge-token", () => {
     const seen = [];
     const res = generateWayflowEnv({
       targetDir: "/repo",
       log: () => {},
       existsImpl: () => true,
+      readImpl: wroteToken,
       spawnImpl: (cmd, args, opts) => {
         seen.push({ cmd, args, cwd: opts?.cwd });
         return { status: 0 };
@@ -276,24 +284,64 @@ describe("generateWayflowEnv", () => {
       targetDir: "/repo",
       log: () => {},
       existsImpl: () => true,
+      readImpl: wroteToken,
       spawnImpl: () => ({ status: 3 }),
     });
     expect(res.ok).toBe(false);
     expect(res.reason).toContain("exit 3");
   });
 
-  it("an older checkout without the generator warns and proceeds", () => {
+  it("cinatra#2654: a generator that exits 0 without writing the token is NOT ok", () => {
+    const res = generateWayflowEnv({
+      targetDir: "/repo",
+      log: () => {},
+      existsImpl: () => true,
+      readImpl: wroteNothing,
+      spawnImpl: () => ({ status: 0 }),
+    });
+    expect(res.ok).toBe(false);
+    expect(res.reason).toContain(".wayflow.env");
+    expect(res.reason).toContain("CINATRA_BRIDGE_TOKEN");
+  });
+
+  it("cinatra#2654: an EMPTY bridge token in the written file is NOT ok", () => {
+    const res = generateWayflowEnv({
+      targetDir: "/repo",
+      log: () => {},
+      existsImpl: () => true,
+      readImpl: () => "CINATRA_BRIDGE_TOKEN=\nWAYFLOW_BASE_URL=http://localhost:3010\n",
+      spawnImpl: () => ({ status: 0 }),
+    });
+    expect(res.ok).toBe(false);
+  });
+
+  it("an older checkout without the generator warns and proceeds — IF the env file already supplies the token", () => {
     const lines = [];
     const res = generateWayflowEnv({
       targetDir: "/repo",
       log: (l) => lines.push(String(l)),
       existsImpl: () => false,
+      readImpl: wroteToken,
       spawnImpl: () => {
         throw new Error("must not spawn");
       },
     });
     expect(res).toEqual({ ok: true, skipped: true, reason: "generator-absent" });
     expect(lines.join("\n")).toContain("gen-wayflow-env.mjs");
+  });
+
+  it("cinatra#2654: no generator AND no usable env file is a FAILURE, not a warning", () => {
+    const res = generateWayflowEnv({
+      targetDir: "/repo",
+      log: () => {},
+      existsImpl: () => false,
+      readImpl: wroteNothing,
+      spawnImpl: () => {
+        throw new Error("must not spawn");
+      },
+    });
+    expect(res.ok).toBe(false);
+    expect(res.reason).toContain("absent");
   });
 });
 
