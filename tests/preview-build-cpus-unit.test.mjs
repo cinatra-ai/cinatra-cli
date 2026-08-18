@@ -65,6 +65,8 @@ describe("the preview build CPU lever is documented as a WORKER COUNT (cinatra-c
     expect(block).toMatch(/3 gives three workers/);
     // The derived default is named, and named ONLY as the unset default.
     expect(block).toMatch(/UNSET default is derived, as os\.cpus\(\)\.length - 1/);
+    // The lever's own phase (non-blocking note of the same review).
+    expect(out).toMatch(/does not fix a death DURING compile/);
   });
 
   it("the command descriptions carry the same unit, and none of the old phrasing", () => {

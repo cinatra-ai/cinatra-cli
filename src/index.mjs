@@ -952,6 +952,10 @@ Commands:
                       Check Docker/host memory pressure first; more VM RAM may
                       help, but a native wall has been measured that survived
                       4 GB to 14 GB. The two levers below are what address it.
+                      Mind the PHASE: the worker count bounds what runs AFTER
+                      compile (page-data collection / static generation), so it
+                      does not fix a death DURING compile — that is what the
+                      bundler choice addresses.
 
                       BUILD WORKERS: the build runs page-data collection across
                       a pool of worker processes, and this lever IS that count —

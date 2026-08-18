@@ -1788,8 +1788,11 @@ describe("preview build levers: worker count + bundler selection", () => {
     // And the build's own settings are quoted back, so the operator is not told
     // to set something they already set.
     expect(err.message).toMatch(/this build used the checkout's own default worker count/);
-    // The lever is named in its true unit.
+    // The lever is named in its true unit, and the PHASE it acts in is stated:
+    // it bounds page-data/static generation AFTER compile, and cannot rescue a
+    // death DURING compile (cinatra-cli#229 review, non-blocking note).
     expect(err.message).toMatch(/<n> IS the worker count, so 3 means three/);
+    expect(err.message).toMatch(/does not fix a death DURING compile/);
     expect(err.message).not.toMatch(/one fewer|process fewer|fewer page-data/);
 
     const failWith = (buildControlEnv) => {

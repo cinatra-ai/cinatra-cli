@@ -21,7 +21,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
   two. It matters because only the UNSET default is derived, as
   `os.cpus().length - 1`, and a Docker `--cpus` or `--cpuset-cpus` cap does not
   change what that call reports. So an untuned many-core builder keeps a wide
-  worker pool however narrow its CPU quota is.
+  worker pool however narrow its CPU quota is. The count bounds what runs AFTER
+  compile, so it does not fix a death DURING compile.
   `CINATRA_PREVIEW_BUILD_BUNDLER=turbopack|webpack` picks the bundler, which
   decides whether the existing memory ceiling is a lever at all: the default
   bundler dies on native memory, which `--max-old-space-size` does not bound,

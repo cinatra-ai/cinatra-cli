@@ -239,7 +239,9 @@ export const PREVIEW_BUILD_TYPECHECK_ENV = "CINATRA_PREVIEW_BUILD_TYPECHECK";
 //     keeps a wide pool however narrow its CPU quota is. Each worker is a whole
 //     extra node process with its own heap. Setting the worker count is
 //     therefore a real memory lever, and it is the one that a 16 GiB builder
-//     needed before it completed.
+//     needed before it completed. It bounds work that happens AFTER compile
+//     (page-data collection / static generation); it does not fix a death
+//     DURING compile.
 //   - Turbopack (the default) dies on NATIVE memory, which `--max-old-space-size`
 //     does not bound at all. Webpack dies on the V8 heap, which it does. So the
 //     bundler choice decides whether the memory ceiling is a lever or a placebo.
@@ -1577,7 +1579,9 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
             `worker count, so 3 means three — this build used ${
               build.cpus === null ? `the checkout's own default worker count, os.cpus().length - 1` : `${build.cpus}`
             }), which a docker --cpus cap does NOT do because an UNTUNED build derives that default from ` +
-            `os.cpus().length. ` +
+            `os.cpus().length. Mind the PHASE: the worker count bounds what runs AFTER compile (page-data ` +
+            `collection / static generation), so it does not fix a death DURING compile — that is what the ` +
+            `bundler choice addresses. ` +
             // Name the bundler advice that fits the bundler this build actually
             // ran. Telling an operator who already pinned webpack to "switch
             // bundler" is not actionable, and it hides the fact that on webpack
