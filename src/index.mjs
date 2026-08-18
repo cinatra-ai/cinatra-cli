@@ -481,6 +481,7 @@ Usage:
                   [--nango-url <url>] [--graphiti-url <url>] [--teardown-existing]
                   [--allow-shared-graphiti] [--external-db-disposable] [--resume]
                   [--dry-run] [--status] [--list-instances]
+                  [--down [--instance <slug>|--dir <path>] [--teardown-existing] --yes]
   cinatra update [--ref <ref>] [--force] [--docker=auto|always|--no-docker]
   cinatra upgrade [--ref <ref>] [--force] [--docker=auto|always|--no-docker]
   cinatra login --app-url <https://instance> [--profile <name>] [--default]
@@ -589,6 +590,14 @@ Commands:
                     --dry-run               Show the plan; make no changes.
                     --status                Read-only: this checkout's instance state (registry/live = truth).
                     --list-instances        Read-only: list all recorded instances.
+                    --down                  Tear down a recorded instance (--instance <slug>, else --dir,
+                                            else this checkout) and RELEASE its port reservations —
+                                            the app port and the whole remapped infra band — in one
+                                            atomic registry write. Requires --yes non-interactively.
+                                            Add --teardown-existing to also delete its data volumes
+                                            (typed confirm). Reclaims a STALE row whose checkout is
+                                            already gone, refusing while its containers still run
+                                            (--force overrides). A failed \`down\` releases NOTHING.
   update            Two-choice update. In a terminal, pick: (1) Update the CLI
   (alias: upgrade)  [default] — \`npm install -g @cinatra-ai/cinatra@latest\`; or
                     (2) Update a Cinatra instance — move THIS checkout forward by

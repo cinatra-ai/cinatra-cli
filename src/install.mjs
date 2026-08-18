@@ -93,6 +93,7 @@ import {
   releaseInstance,
   getInstance,
   listInstances,
+  findInstanceByInstallDir,
 } from "./instance-registry.mjs";
 import {
   writeMarker,
@@ -719,6 +720,11 @@ export function parseInstallArgs(argv = []) {
     resume: argv.includes("--resume"),
     status: argv.includes("--status"),
     listInstances: argv.includes("--list-instances"),
+    // cinatra-cli#232: tear a recorded instance down and RELEASE its port
+    // reservations (the band/app-port a torn-down instance used to hold
+    // forever). `--teardown-existing` reuses its existing meaning here — also
+    // delete the data volumes, behind the same typed confirm.
+    down: argv.includes("--down"),
     teardownExisting: argv.includes("--teardown-existing"),
     // Explicit acknowledgement that an --infra=external --db-url target is
     // DISPOSABLE (setup + migrations may mutate it irreversibly; it is never
@@ -3583,6 +3589,327 @@ function composeDown(targetDir, { composeFiles = null, composeProject = null, vo
   if (result.status !== 0) throw new Error(`docker compose down failed (exit ${result.status}).${stderr ? `\n${stderr}` : ""}`);
 }
 
+// ---------------------------------------------------------------------------
+// cinatra-cli#232 — `cinatra install --down`: TEAR DOWN a recorded instance and
+// RELEASE its port reservations.
+//
+// The gap this closes. Before this, nothing in the CLI ever released a READY
+// instance's row. The only two release paths were the FAILED-install rollback
+// (`rollbackIsolatedInstance`) and `--on-conflict=stop-existing`; an operator
+// who finished with an instance tore its stack down by hand (`docker compose
+// down -v`, `rm -rf <dir>`) and the row survived — still recorded `[ready]`,
+// still holding its app port and its whole remapped infra band. Since
+// `allocateBandOffset` only searches offsets 10000..50000 in steps of 10000,
+// FIVE such rows exhaust every candidate and the sixth isolated install refuses
+// (cinatra#2654 clean-install matrix, finding D5).
+//
+// ── The atomicity story, precisely ─────────────────────────────────────────
+// An instance's port reservation is NOT a second ledger. `reservedPorts()`
+// derives it directly from the row's own `appPort` + `ports` map, so
+// "release the reservation" and "remove the row" are THE SAME mutation,
+// persisted by ONE atomic temp+rename write (`writeInstanceRegistry`). That is
+// what makes the release indivisible: there is no ordering in which some of an
+// instance's ports are freed and others stay held, and none in which the row is
+// gone while its ports stay reserved.
+//
+// The only real ordering question is the `down`, and it is answered the way
+// `rollbackIsolatedInstance` already answers it (review hardening #3): the
+// `down` runs FIRST and INSIDE the same held `alloc.lock` as the release.
+//   • `down` throws  → we return BEFORE touching the registry. The FULL
+//     reservation survives, so a retried `--down` finishes the job and a live
+//     stack is never left unregistered. A failed teardown cannot half-release.
+//   • `down` succeeds → the single release write happens while the lock is
+//     still held, so a concurrent install can neither observe the freed ports
+//     while the stack is still up, nor race the write.
+// Everything OUTSIDE the lock (marker file, generated compose file) is
+// best-effort cleanup of HINTS — never a reservation — and runs only after a
+// successful release, so its failure can never desynchronise the two.
+// ---------------------------------------------------------------------------
+
+/** Rows whose recorded resources this command may `down`. A "co-use" row records
+ *  the DONOR's compose project (it owns no stack of its own), so running `down`
+ *  on it would tear down the donor's live stack — never do that. An "external"
+ *  row points at operator-supplied infra that is not install-owned. Both still
+ *  hold an app-port reservation, which is released without any `down`. */
+function teardownOwnsStack(row) {
+  return row?.infraMode === "new";
+}
+
+/** cinatra-cli#232 — the recorded facts a teardown of `row` acts on. Pure, so the
+ *  plan can be printed (`--dry-run`) and asserted without any Docker. */
+export function planInstanceTeardown(row, { volumes = false } = {}) {
+  if (!row) return null;
+  const ports = [];
+  for (const list of Object.values(row.ports ?? {})) {
+    for (const port of Array.isArray(list) ? list : []) if (Number.isInteger(port)) ports.push(port);
+  }
+  if (Number.isInteger(row.appPort)) ports.push(row.appPort);
+  return {
+    slug: row.slug,
+    installDir: row.installDir,
+    composeProject: row.composeProject,
+    composeFiles: [...(row.composeFiles ?? [])],
+    infraMode: row.infraMode,
+    state: row.state,
+    // `down` only for a row that owns its own stack; `-v` only when asked.
+    down: teardownOwnsStack(row),
+    volumes: teardownOwnsStack(row) && volumes === true,
+    // Exactly the reservations the single registry write releases.
+    releasesPorts: ports.sort((a, b) => a - b),
+  };
+}
+
+/**
+ * Tear down instance `slug` and release its reservations.
+ *
+ * @param {object}  a
+ * @param {string}  a.slug
+ * @param {string|null} [a.expectInstallDir] when set, the row is only touched if
+ *        its recorded installDir resolves to this path (the cinatra-cli#39
+ *        tightening: a slug collision must never release someone else's row).
+ * @param {boolean} [a.volumes] pass `-v` to the `down` (deletes the data volumes).
+ * @param {boolean} [a.force]   release a row we cannot `down` ourselves (a co-use
+ *        row, or a row whose checkout is gone while its project is still live).
+ * @param {boolean} [a.dryRun]  print the plan; touch nothing.
+ * @returns {Promise<{released:boolean, reason:string, plan:object|null, downRan:boolean}>}
+ */
+export async function teardownInstance({
+  slug,
+  expectInstallDir = null,
+  volumes = false,
+  force = false,
+  dryRun = false,
+  log = console.log,
+  deps = {},
+}) {
+  const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
+  const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
+  const runCompose = deps.runComposeDown ?? composeDown;
+  const inspectProject = deps.inspectProjectOwnership ?? ((names) => inspectProjectOwnership(names, deps));
+  const dirExists = deps.existsSync ?? existsSync;
+
+  let outcome = { released: false, reason: "not-found", plan: null, downRan: false };
+  let cleanupTarget = null;
+
+  await withAllocLock(lockPath, async () => {
+    // A malformed registry THROWS here (requireUsableInstanceRegistry) rather
+    // than being silently reset — releasing a row we could not parse could hand
+    // a live instance's band to the next install.
+    const reg = requireUsableInstanceRegistry(registryPath);
+    const row = getInstance(reg, slug);
+    if (!row) {
+      outcome = { released: false, reason: "not-found", plan: null, downRan: false };
+      return;
+    }
+    if (expectInstallDir != null && path.resolve(row.installDir) !== path.resolve(expectInstallDir)) {
+      outcome = { released: false, reason: "dir-mismatch", plan: planInstanceTeardown(row, { volumes }), downRan: false };
+      return;
+    }
+
+    const plan = planInstanceTeardown(row, { volumes });
+    const checkoutPresent = dirExists(row.installDir);
+
+    if (dryRun) {
+      outcome = { released: false, reason: "dry-run", plan, downRan: false };
+      return;
+    }
+
+    // ── Decide whether we can bring the stack down ourselves ────────────────
+    if (plan.down && checkoutPresent) {
+      // The normal path: the recorded project + files, torn down from the
+      // recorded dir, BEFORE the registry is touched.
+      try {
+        runCompose(row.installDir, {
+          composeFiles: row.composeFiles,
+          composeProject: composeProjectArgForRow(row),
+          volumes: plan.volumes,
+        });
+      } catch (e) {
+        // Down failed → return WITHOUT touching the registry. The reservation is
+        // intact and whole; a retried `--down` finishes the teardown.
+        outcome = { released: false, reason: "down-failed", plan, downRan: true, error: e };
+        return;
+      }
+      outcome.downRan = true;
+    } else if (plan.down && !checkoutPresent) {
+      // RECLAIM (the stale-row case the matrix hit): the checkout is gone, so
+      // there is no compose file to `down` from. Releasing the row is only safe
+      // when nothing of the project is still alive — a live container really
+      // does hold those host ports, and handing them to the next install would
+      // trade a stale reservation for a real collision.
+      let live = { containerRows: [], volumeRows: [] };
+      try {
+        live = inspectProject([row.composeProject]) ?? live;
+      } catch {
+        live = { containerRows: [], volumeRows: [] };
+      }
+      const containers = live.containerRows?.length ?? 0;
+      if (containers > 0 && !force) {
+        outcome = { released: false, reason: "stack-still-live", plan, downRan: false, liveContainers: containers };
+        return;
+      }
+      const leftoverVolumes = live.volumeRows?.length ?? 0;
+      log(
+        `  Checkout ${row.installDir} is gone — reclaiming the stale row for "${slug}" ` +
+          `(no compose file to \`down\` from; ${containers} live container(s) found).`,
+      );
+      if (leftoverVolumes > 0) {
+        log(
+          `  ⚠ ${leftoverVolumes} named volume(s) still labelled for project ${row.composeProject} remain. ` +
+            `They hold no host port (the reservation is released regardless); remove them with ` +
+            `\`docker volume rm\` if you want the disk back.`,
+        );
+      }
+    } else if (!plan.down) {
+      // external / co-use: nothing of ours to `down`. A co-use row additionally
+      // owns a separate database that only the operator can safely drop, so it
+      // needs the explicit acknowledgement.
+      if (row.infraMode === "co-use" && !force) {
+        outcome = { released: false, reason: "co-use-needs-force", plan, downRan: false };
+        return;
+      }
+      log(
+        row.infraMode === "co-use"
+          ? `  Instance "${slug}" is co-use: it owns no stack of its own (its project is the donor's), ` +
+              `so nothing is brought down. Releasing its row + app-port reservation only.`
+          : `  Instance "${slug}" points at external infra (not install-owned), so nothing is brought down. ` +
+              `Releasing its row + app-port reservation only.`,
+      );
+    }
+
+    // ── The release: ONE mutation, ONE atomic write, still under the lock ────
+    // Removing the row IS releasing `appPort` + every port in `ports` — they are
+    // the same bytes. Nothing can observe a partial release.
+    const { registry: next } = releaseInstance(reg, slug);
+    writeInstanceRegistry(registryPath, next);
+    outcome = { ...outcome, released: true, reason: "released", plan };
+    cleanupTarget = { installDir: row.installDir, composeFiles: row.composeFiles ?? [], present: checkoutPresent };
+  });
+
+  // Best-effort cleanup of the per-checkout HINTS, only after a real release.
+  // Never a reservation — a failure here cannot desynchronise anything.
+  if (outcome.released && cleanupTarget?.present) {
+    try {
+      const markerFile = path.join(cleanupTarget.installDir, ".cinatra", "instance.json");
+      if (existsSync(markerFile)) spawnSync("rm", ["-f", markerFile]);
+    } catch {
+      /* best-effort */
+    }
+    try {
+      for (const f of cleanupTarget.composeFiles) {
+        const generated = path.join(cleanupTarget.installDir, f);
+        if (f === ISOLATED_COMPOSE_FILENAME && existsSync(generated)) spawnSync("rm", ["-f", generated]);
+      }
+    } catch {
+      /* best-effort */
+    }
+  }
+  return outcome;
+}
+
+/** Resolve which recorded row `cinatra install --down` targets: an explicit
+ *  `--instance <slug>`, else the row whose installDir is `--dir` (or, with
+ *  neither, the cwd / `<cwd>/cinatra`). Pure — the registry is passed in. */
+export function resolveTeardownTarget({ registry, instance = null, dir = null, cwd = process.cwd() }) {
+  if (instance) {
+    const row = getInstance(registry, instance);
+    return { slug: instance, row, byDir: null };
+  }
+  const candidates = dir
+    ? [path.resolve(dir)]
+    : [path.resolve(cwd), path.resolve(cwd, DEFAULT_INSTALL_DIRNAME)];
+  for (const candidate of candidates) {
+    const hit = findInstanceByInstallDir(registry, candidate);
+    if (hit) return { slug: hit.slug, row: hit.slot, byDir: candidate };
+  }
+  return { slug: null, row: null, byDir: candidates[0] };
+}
+
+/** `cinatra install --down` — the command wrapper: resolve the target, confirm,
+ *  then run the transactional teardown. Returns a small result object (the
+ *  caller returns it from `runInstall`). */
+async function runInstallDown({ opts, log = console.log, deps = {} }) {
+  const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
+  const registry = requireUsableInstanceRegistry(registryPath);
+  const { slug, row, byDir } = resolveTeardownTarget({
+    registry,
+    instance: opts.instance ?? null,
+    dir: opts.dir ?? null,
+  });
+
+  if (!row) {
+    const recorded = listInstances(registry).map((i) => `    • ${i.slug}  [${i.state}]  dir ${i.installDir}`);
+    throw new Error(
+      (slug
+        ? `No recorded instance "${slug}" to tear down.`
+        : `No recorded instance for ${byDir}. Pass --dir <path> or --instance <slug>.`) +
+        (recorded.length ? `\n  Recorded instances:\n${recorded.join("\n")}` : `\n  (the registry records no instances)`),
+    );
+  }
+
+  const plan = planInstanceTeardown(row, { volumes: opts.teardownExisting === true });
+  log(`Tearing down instance "${row.slug}" (${row.mode}, ${row.infraMode}, project ${row.composeProject}).`);
+  log(`  dir:      ${row.installDir}`);
+  if (plan.down) {
+    log(`  compose:  down -p ${row.composeProject} -f ${plan.composeFiles.join(" -f ")}${plan.volumes ? " -v" : ""}`);
+  } else {
+    log(`  compose:  (nothing install-owned to bring down for an ${row.infraMode} instance)`);
+  }
+  log(`  releases: ${plan.releasesPorts.length ? plan.releasesPorts.join(", ") : "(no recorded host ports)"}`);
+
+  if (opts.dryRun) {
+    log("  [dry-run] no changes made.");
+    return { down: true, dryRun: true, plan };
+  }
+
+  // Volume deletion is irreversible → the SAME typed confirm `--teardown-existing`
+  // already uses for stop-existing, never satisfiable by a bare `--yes`.
+  if (plan.down && opts.teardownExisting) {
+    const ok = await typedConfirm(
+      `⚠ --teardown-existing will DELETE instance "${row.slug}"'s data volumes (project ${row.composeProject}).\n` +
+        `  This is IRREVERSIBLE.`,
+      `delete ${row.slug}`,
+    );
+    if (!ok) {
+      throw new Error(`Aborted: volume teardown of "${row.slug}" not confirmed (type "delete ${row.slug}").`);
+    }
+  } else if (!(await confirm(`Stop instance "${row.slug}" and release its port reservations?`, { yes: opts.yes }))) {
+    throw new Error(`Aborted: teardown of "${row.slug}" not confirmed (pass --yes to run non-interactively).`);
+  }
+
+  const result = await teardownInstance({
+    slug: row.slug,
+    // Targeting by --instance is explicit; targeting by dir must only release a
+    // row that still points at THAT dir.
+    expectInstallDir: opts.instance ? null : byDir,
+    volumes: opts.teardownExisting === true,
+    force: opts.force === true,
+    log,
+    deps,
+  });
+
+  if (result.released) {
+    log(`✓ Instance "${row.slug}" torn down; its reservations are released (${plan.releasesPorts.join(", ") || "none recorded"}).`);
+    return { down: true, released: true, slug: row.slug, plan };
+  }
+  const why = {
+    "down-failed":
+      `\`docker compose down\` failed, so NOTHING was released — the row and its whole reservation are intact. ` +
+      `Fix the docker error and re-run \`cinatra install --down\`; a partial release is never left behind.` +
+      (result.error ? `\n  ${result.error.message}` : ""),
+    "stack-still-live":
+      `the checkout ${row.installDir} is gone but ${result.liveContainers} container(s) of project ` +
+      `${row.composeProject} are still running — they really do hold those ports. Stop them ` +
+      `(\`docker compose -p ${row.composeProject} down -v\`) and re-run, or pass --force to release the row anyway.`,
+    "co-use-needs-force":
+      `"${row.slug}" is a co-use instance: it owns a separate database (${(row.createdResources ?? []).join(", ") || "unknown"}) ` +
+      `but no stack of its own. Drop that database yourself, then re-run with --force to release the row.`,
+    "dir-mismatch": `the recorded row for "${row.slug}" no longer points at ${byDir} — refusing to release a row we did not resolve.`,
+    "not-found": `the row for "${row.slug}" disappeared before the lock was taken (nothing to release).`,
+  }[result.reason] ?? `teardown did not release the row (${result.reason}).`;
+  throw new Error(`Teardown of "${row.slug}" did not complete: ${why}`);
+}
+
 /** Derive an instance slug from the install dir basename (sanitised to the slug
  *  shape). The default install dir basename is `cinatra` → slug `cinatra`. */
 function deriveInstanceSlug(targetDir) {
@@ -5356,6 +5683,13 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     const dirForStatus = opts.dir ? path.resolve(opts.dir) : null;
     printInstanceStatus({ targetDir: dirForStatus, listAll: opts.listInstances && !opts.status, log, deps });
     return { status: true };
+  }
+
+  // cinatra-cli#232 — `--down` short-circuit. A teardown reads the registry and
+  // stops a stack; it must NOT run the install preflight, resolve a ref, or
+  // clone anything, so it returns here for the same reason `--status` does.
+  if (opts.down) {
+    return await runInstallDown({ opts, log, deps });
   }
 
   // Injectable seams (default to the real implementations — production behavior
