@@ -37,11 +37,14 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
@@ -899,30 +902,80 @@ function composeAvailable() {
 // ── cinatra#2654 D1 — Compose feature probe for `config --no-env-resolution` ──
 //
 // The isolated render depends on `--no-env-resolution` to keep each service's
-// `env_file:` in the resolved document. That flag is NOT in every Compose v2:
-// an older plugin treats it as an unknown flag, `docker compose config` exits
-// non-zero, `capture` returns null, and the install dies with "Could not resolve
-// the checkout's `docker compose config`" — attributable, but it would block an
-// install that has no other problem. Assuming the flag silently is worse: the
-// document then comes back with the env files INLINED, which is precisely the
-// tokenless runtime this fix exists to kill.
+// `env_file:` in the resolved document. That behaviour is NOT in every Compose,
+// and — the part this PR's own CI proved — the FLAG being present is not the
+// same as the behaviour being present:
 //
-// PROBE, don't version-gate. That is this codebase's established shape for
-// tool capabilities — `commandExists` runs `<cmd> --version`, `composeAvailable`
-// runs `docker compose version`, the pnpm/corepack selection probes each
-// candidate — and nowhere does it parse a version string and compare it to a
-// floor. A floor would also be wrong here in a way a probe is not: the flag has
-// been backported across vendored Compose builds whose `version` strings do not
-// order cleanly (Docker Desktop, the standalone plugin, distro packages).
+//   Compose v2.38.2 (GitHub `ubuntu-latest`): `config --help` LISTS
+//     `--no-env-resolution`, the flag is accepted, exit 0 — and the output still
+//     inlines the env file's content into `environment:` and drops `env_file:`.
+//   Compose v5.5.0: same flag, and the reference is preserved.
 //
-// `config --help` lists the flag on a Compose that has it, needs no compose
-// file, touches no daemon, and writes nothing. Cached per process (the answer
+// So a `--help` (or version) check is worthless here: it answers "is the flag
+// spelled in this build" when the question is "does this build keep the
+// reference". Getting that wrong is not a cosmetic difference — a render that
+// silently inlines IS the tokenless runtime this fix exists to kill.
+//
+// PROBE THE BEHAVIOUR, not the spelling — which is still this codebase's
+// established shape for tool capabilities (`commandExists` runs `<cmd>
+// --version`, `composeAvailable` runs `docker compose version`: run the thing
+// and look at what it does), just applied to the property we actually depend on
+// rather than to a proxy for it. A version FLOOR would be wrong twice over: it
+// would have accepted 2.38.2, and the behaviour is backported unevenly across
+// vendored builds (Docker Desktop, the standalone plugin, distro packages)
+// whose version strings do not order into one line.
+//
+// The probe renders a two-line throwaway compose in a temp dir and asks whether
+// `env_file:` survived. No daemon, no image, no network, nothing in the
+// checkout; the temp dir is removed either way. Cached per process (the answer
 // cannot change inside one install) and injectable for tests.
 let composeNoEnvResolutionSupport = null;
-export function composeSupportsNoEnvResolution({ cwd = undefined, captureImpl = capture } = {}) {
+
+/** The probe fixture: a service whose ONLY env source is a narrow env_file —
+ *  the exact shape the isolated render must preserve. */
+const ENV_RESOLUTION_PROBE_COMPOSE = JSON.stringify(
+  {
+    services: {
+      "cinatra-env-resolution-probe": {
+        image: "busybox",
+        env_file: [{ path: "./.cinatra-probe.env", required: false }],
+      },
+    },
+  },
+  null,
+  2,
+);
+
+export function composeSupportsNoEnvResolution({ captureImpl = capture, tmpRoot = os.tmpdir() } = {}) {
   if (composeNoEnvResolutionSupport !== null) return composeNoEnvResolutionSupport;
-  const help = captureImpl("docker", ["compose", "config", "--help"], cwd ? { cwd } : {});
-  composeNoEnvResolutionSupport = typeof help === "string" && help.includes("--no-env-resolution");
+  let probeDir = null;
+  try {
+    probeDir = mkdtempSync(path.join(tmpRoot, "cinatra-compose-probe-"));
+    writeFileSync(path.join(probeDir, ".cinatra-probe.env"), "CINATRA_ENV_RESOLUTION_PROBE=1\n");
+    writeFileSync(path.join(probeDir, "docker-compose.yml"), ENV_RESOLUTION_PROBE_COMPOSE);
+    const raw = captureImpl(
+      "docker",
+      ["compose", "-f", "docker-compose.yml", "config", "--no-env-resolution", "--format", "json"],
+      { cwd: probeDir },
+    );
+    // Unknown flag / any other failure → `capture` returns null → UNSUPPORTED.
+    // Fail CLOSED: an unknown answer must never be read as "the reference is
+    // kept", because that assumption is the defect.
+    const doc = raw ? JSON.parse(raw) : null;
+    const svc = doc?.services?.["cinatra-env-resolution-probe"];
+    const kept = Array.isArray(svc?.env_file) ? svc.env_file.length > 0 : Boolean(svc?.env_file);
+    composeNoEnvResolutionSupport = Boolean(kept);
+  } catch {
+    composeNoEnvResolutionSupport = false;
+  } finally {
+    if (probeDir) {
+      try {
+        rmSync(probeDir, { recursive: true, force: true });
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
   return composeNoEnvResolutionSupport;
 }
 /** Test seam: forget the cached probe result. */
@@ -931,7 +984,7 @@ export function __resetComposeFeatureProbe() {
 }
 
 /** The version string this box's Compose reports, for the fallback warning.
- *  Best-effort — the message degrades to "this Compose" when it is unavailable. */
+ *  Best-effort — the message degrades to "version unknown" when unavailable. */
 function composeVersionString(captureImpl = capture) {
   const raw = captureImpl("docker", ["compose", "version", "--short"]);
   return typeof raw === "string" && raw.trim() ? raw.trim() : null;
@@ -2393,7 +2446,7 @@ export function composeConfigForFiles(targetDir, composeFiles, deps = {}, { allP
  */
 function resolveIsolatedComposeConfig({ targetDir, deps = {}, log = console.log }) {
   const getConfig = deps.composeConfigForFiles ?? composeConfigForFiles;
-  const supports = (deps.composeSupportsNoEnvResolution ?? composeSupportsNoEnvResolution)({ cwd: targetDir });
+  const supports = (deps.composeSupportsNoEnvResolution ?? composeSupportsNoEnvResolution)({});
   if (!supports) {
     const version = (deps.composeVersionString ?? composeVersionString)();
     log(

@@ -305,43 +305,74 @@ describe("first isolated install on a clean directory (cinatra#2654 D1)", () => 
 //    the token.
 // ---------------------------------------------------------------------------
 
-describe("`config --no-env-resolution` is probed, never assumed (cinatra#2654 D1)", () => {
-  // The probe follows this codebase's established shape for tool capabilities
-  // (`commandExists` runs `<cmd> --version`, `composeAvailable` runs `docker
-  // compose version`) rather than parsing a version string against a floor.
-  it("reports SUPPORTED when `docker compose config --help` lists the flag", () => {
+describe("`config --no-env-resolution` is probed BEHAVIOURALLY, never assumed (cinatra#2654 D1)", () => {
+  // The probe renders a throwaway compose whose only env source is an env_file
+  // and asks whether the reference SURVIVED — it does not ask whether the flag
+  // is spelled in `--help`, because those are different questions and this PR's
+  // own CI proved they can disagree (see the v2.38.2 case below).
+  const probeOutput = (svc) =>
+    JSON.stringify({ services: { "cinatra-env-resolution-probe": svc } });
+
+  it("reports SUPPORTED when the rendered probe still carries `env_file:`", () => {
     const calls = [];
     const supported = composeSupportsNoEnvResolution({
-      captureImpl: (cmd, args) => {
-        calls.push({ cmd, args });
-        return "Options:\n      --no-env-resolution       Don't resolve service env files\n";
+      captureImpl: (cmd, args, opts) => {
+        calls.push({ cmd, args, cwd: opts?.cwd });
+        return probeOutput({ image: "busybox", env_file: [{ path: "/probe/.cinatra-probe.env", required: false }] });
       },
     });
     expect(supported).toBe(true);
-    expect(calls[0]).toEqual({ cmd: "docker", args: ["compose", "config", "--help"] });
+    expect(calls[0].cmd).toBe("docker");
+    expect(calls[0].args).toContain("--no-env-resolution");
+    expect(calls[0].args.indexOf("--no-env-resolution")).toBeGreaterThan(calls[0].args.indexOf("config"));
+    // Rendered in a temp dir, never in the checkout.
+    expect(calls[0].cwd).toMatch(/cinatra-compose-probe-/);
   });
 
-  it("reports UNSUPPORTED when the flag is absent from the help output", () => {
+  it("REGRESSION CONTROL (Compose v2.38.2): the flag is ACCEPTED and still inlines — UNSUPPORTED", () => {
+    // Measured, not assumed: `docker compose config --help` on v2.38.2 (GitHub
+    // ubuntu-latest) lists `--no-env-resolution`, the flag is accepted, exit 0 —
+    // and the output has the env file's content in `environment:` with the
+    // directive gone. A `--help` probe would have called that supported and the
+    // render would have frozen a snapshot: the original defect, unchanged.
     expect(
-      composeSupportsNoEnvResolution({ captureImpl: () => "Options:\n      --format string\n" }),
+      composeSupportsNoEnvResolution({
+        captureImpl: () =>
+          probeOutput({ image: "busybox", environment: { CINATRA_ENV_RESOLUTION_PROBE: "1" } }),
+      }),
     ).toBe(false);
   });
 
-  it("reports UNSUPPORTED when the probe itself fails (capture returns null)", () => {
-    // Fail CLOSED: an unknown answer must not be read as "the flag is there",
-    // because assuming it is exactly the silent tokenless render D1 was.
+  it("reports UNSUPPORTED when the probe itself fails (unknown flag → capture returns null)", () => {
+    // Fail CLOSED: an unknown answer must not be read as "the reference is kept".
     expect(composeSupportsNoEnvResolution({ captureImpl: () => null })).toBe(false);
+  });
+
+  it("reports UNSUPPORTED on unparseable probe output", () => {
+    expect(composeSupportsNoEnvResolution({ captureImpl: () => "not json" })).toBe(false);
   });
 
   it("caches the answer for the process (one probe per install, not one per render)", () => {
     let calls = 0;
     const probe = () => {
       calls += 1;
-      return "--no-env-resolution";
+      return probeOutput({ env_file: ["/probe/.cinatra-probe.env"] });
     };
     composeSupportsNoEnvResolution({ captureImpl: probe });
     composeSupportsNoEnvResolution({ captureImpl: probe });
     expect(calls).toBe(1);
+  });
+
+  it("leaves nothing behind: the probe's temp dir is removed", () => {
+    let seenCwd = null;
+    composeSupportsNoEnvResolution({
+      captureImpl: (_cmd, _args, opts) => {
+        seenCwd = opts?.cwd;
+        return probeOutput({ env_file: ["/probe/.cinatra-probe.env"] });
+      },
+    });
+    expect(seenCwd).toBeTruthy();
+    expect(existsSync(seenCwd)).toBe(false);
   });
 
   /** The whole isolated render, driven through `runInstall`'s executor seams,
@@ -1101,48 +1132,87 @@ process.exit(0);
 // Render-only: `docker compose config` on a fixture with no published ports and
 // no `up`. Nothing is started, nothing binds a host port.
 
-const realCompose = (() => {
+/** Ask a REAL compose binary the two questions this suite needs: which version
+ *  it is, and whether `config --no-env-resolution` actually PRESERVES an
+ *  `env_file:` reference (not merely whether the flag is spelled in --help —
+ *  v2.38.2 accepts the flag and inlines anyway). `bin` is the `docker` wrapper
+ *  by default; CINATRA_TEST_COMPOSE_BIN points at a standalone compose binary so
+ *  a second version can be exercised on the same box. */
+function probeRealCompose(bin = null) {
+  const run = (args, opts = {}) =>
+    bin
+      ? execFileSync(bin, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...opts })
+      : execFileSync("docker", ["compose", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...opts });
   try {
-    const version = execFileSync("docker", ["compose", "version", "--short"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    }).trim();
-    const help = execFileSync("docker", ["compose", "config", "--help"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    return { available: true, version, supportsNoEnvResolution: help.includes("--no-env-resolution") };
+    const version = run(["version", "--short"]).trim();
+    const probeDir = mkdtempSync(path.join(os.tmpdir(), "x2654-cprobe-"));
+    try {
+      writeFileSync(path.join(probeDir, ".p.env"), "P=1\n");
+      writeFileSync(
+        path.join(probeDir, "docker-compose.yml"),
+        JSON.stringify({ services: { p: { image: "busybox", env_file: [{ path: "./.p.env", required: false }] } } }),
+      );
+      const out = run(["-f", "docker-compose.yml", "config", "--no-env-resolution", "--format", "json"], {
+        cwd: probeDir,
+      });
+      const svc = JSON.parse(out)?.services?.p;
+      const preserves = Array.isArray(svc?.env_file) ? svc.env_file.length > 0 : Boolean(svc?.env_file);
+      return { available: true, version, preserves, bin };
+    } finally {
+      rmSync(probeDir, { recursive: true, force: true });
+    }
   } catch {
-    return { available: false, version: null, supportsNoEnvResolution: false };
+    return { available: false, version: null, preserves: false, bin };
   }
-})();
+}
 
-// Record, in the run's own output, WHICH Compose this suite actually exercised —
-// so "verified against the real compose" is a fact anyone can read off the log
-// (locally and on CI) rather than a claim. It runs unconditionally, so a SKIPPED
-// real-compose section is visible for what it is instead of silently absent.
+const realCompose = probeRealCompose();
+
+// A SECOND compose binary, opt-in via CINATRA_TEST_COMPOSE_BIN — how the other
+// route is exercised against a real engine on a box that ships only one Compose.
+const altComposeBin = process.env.CINATRA_TEST_COMPOSE_BIN ?? null;
+const altCompose = altComposeBin ? probeRealCompose(altComposeBin) : { available: false, version: null, preserves: false, bin: null };
+
+// Record, in the run's own output, WHICH Compose this suite exercised — so
+// "verified against the real compose" is a fact anyone can read off the log
+// rather than a claim. Runs unconditionally, so a SKIPPED real-compose section
+// is visible for what it is instead of silently absent.
 describe("which Compose this suite exercised (cinatra#2654 D1)", () => {
   it("reports the real `docker compose` it found, or that it found none", () => {
     console.log(
       `[cinatra#2654 D1] real docker compose: available=${realCompose.available} ` +
-        `version=${realCompose.version ?? "n/a"} --no-env-resolution=${realCompose.supportsNoEnvResolution}`,
+        `version=${realCompose.version ?? "n/a"} preserves-env_file=${realCompose.preserves}`,
     );
-    // A Compose that IS present must answer the feature probe one way or the
-    // other; an absent one must not claim support.
-    expect(typeof realCompose.supportsNoEnvResolution).toBe("boolean");
-    if (!realCompose.available) expect(realCompose.supportsNoEnvResolution).toBe(false);
+    if (altComposeBin) {
+      console.log(
+        `[cinatra#2654 D1] alt compose (${altComposeBin}): available=${altCompose.available} ` +
+          `version=${altCompose.version ?? "n/a"} preserves-env_file=${altCompose.preserves}`,
+      );
+    }
+    expect(typeof realCompose.preserves).toBe("boolean");
+    // An absent Compose can never claim the behaviour.
+    if (!realCompose.available) expect(realCompose.preserves).toBe(false);
   });
 });
 
-describe.skipIf(!realCompose.available)("real `docker compose config` (render only, no services)", () => {
-  it(`this box's Compose (${realCompose.version}) answers the feature probe the same way the CLI does`, () => {
-    // The skip is honest: it fires only when `docker compose` is absent. When it
-    // runs, the CLI's own probe must agree with what `--help` says, because the
-    // whole route selection hangs off that one answer.
-    __resetComposeFeatureProbe();
-    expect(composeSupportsNoEnvResolution({})).toBe(realCompose.supportsNoEnvResolution);
-    __resetComposeFeatureProbe();
-  });
+/** The whole real-compose claim, run against ONE compose binary. Render-only:
+ *  `config` on a fixture with no published ports and no `up` — nothing is
+ *  started, nothing binds a host port. Both routes are asserted for what they
+ *  ARE, never permissively: a Compose that drops the reference on the preserving
+ *  route FAILS here rather than slipping past an `if`. */
+function realComposeSuite(engine) {
+  const run = (args, opts = {}) =>
+    engine.bin
+      ? execFileSync(engine.bin, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...opts })
+      : execFileSync("docker", ["compose", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...opts });
+  const capture = (command, args, opts) =>
+    engine.bin
+      ? execFileSync(engine.bin, args.slice(1), { cwd: opts?.cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
+      : execFileSync(command, args, { cwd: opts?.cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+
+  // The two keys `.env.local` supplies, so the generator may re-symbolise them.
+  const SCRUBBABLE = new Set(["CINATRA_BRIDGE_TOKEN", "CINATRA_CONTEXT_ATTEST_KEY"]);
+  const ENV_LOCAL_TOKEN = "envlocal-bridge-token";
 
   const writeFixtureCheckout = () => {
     writeFileSync(
@@ -1163,19 +1233,20 @@ describe.skipIf(!realCompose.available)("real `docker compose config` (render on
         "",
       ].join("\n"),
     );
+    // What `ensureEnvLocal` minted; the isolated `up` reads it as --env-file.
+    writeFileSync(
+      path.join(dir, ".env.local"),
+      `CINATRA_BRIDGE_TOKEN=${ENV_LOCAL_TOKEN}\nCINATRA_CONTEXT_ATTEST_KEY=envlocal-attest-key\n`,
+      { mode: 0o600 },
+    );
+    // What `gen-wayflow-env.mjs` derives from it, before the render.
+    writeWayflowEnvFile(dir, { token: ENV_LOCAL_TOKEN });
   };
 
-  const capture = (command, args, opts) =>
-    execFileSync(command, args, { cwd: opts?.cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-
-  it("a first-install render + a later env file gives the container all six keys", () => {
-    writeFixtureCheckout();
-    // The fixed ordering: the bridge-token env file is provisioned BEFORE the
-    // isolated compose is resolved.
-    writeWayflowEnvFile(dir);
+  const render = () => {
     const resolved = composeConfigForFiles(dir, ["docker-compose.yml"], { capture }, {
       allProfiles: true,
-      preserveEnvFiles: realCompose.supportsNoEnvResolution,
+      preserveEnvFiles: engine.preserves,
     });
     const { doc } = generateIsolatedCompose({
       resolvedConfig: resolved,
@@ -1183,47 +1254,82 @@ describe.skipIf(!realCompose.available)("real `docker compose config` (render on
       projectName: "cinatra_row1",
       slug: "row1",
       appPort: 3300,
-      envFileKeys: new Set(),
+      envFileKeys: SCRUBBABLE,
     });
+    return { doc, resolved };
+  };
 
-    // STRICT, not permissive: the route this box's Compose actually takes is the
-    // one asserted, and a Compose that inlines or DROPS the reference on the
-    // supported path fails here rather than passing under an `if`.
+  it(`(${engine.version}) a first-install render reaches the container with all six keys`, () => {
+    writeFixtureCheckout();
+    const { doc, resolved } = render();
+
+    // STRICT: the route this engine actually takes is the one asserted.
     expect(
       composeEnvWiringGaps(doc, {
+        sourceDoc: resolved,
         wayflowEnvFilePath: path.join(dir, WAYFLOW_ENV_REL),
-        envFilesPreserved: realCompose.supportsNoEnvResolution,
+        envFilesPreserved: engine.preserves,
         baseDir: dir,
       }),
     ).toEqual([]);
-    if (realCompose.supportsNoEnvResolution) {
+    if (engine.preserves) {
       expect(doc.services.wayflow.env_file).toBeDefined();
       expect(doc.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBeUndefined();
-      expect(renderIsolatedComposeYaml(doc)).not.toContain("fixture-bridge-token");
+    } else {
+      // Fallback: inlined, then re-symbolised — a resolvable placeholder, not a
+      // frozen secret.
+      expect(doc.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBe("${CINATRA_BRIDGE_TOKEN}");
+      expect(doc.services.wayflow.environment.CINATRA_CONTEXT_ATTEST_KEY).toBe("${CINATRA_CONTEXT_ATTEST_KEY}");
     }
-    writeIsolatedComposeFile(path.join(dir, ISOLATED_COMPOSE_FILENAME), doc);
+    // On BOTH routes: no host secret is persisted in the generated file.
+    const file = path.join(dir, ISOLATED_COMPOSE_FILENAME);
+    writeIsolatedComposeFile(file, doc);
+    const body = readFileSync(file, "utf8");
+    expect(body).not.toContain(ENV_LOCAL_TOKEN);
+    expect(body).not.toContain("fixture-attest-key");
+    // …and it declares its own ownership.
+    expect(body.startsWith("# GENERATED FILE — DO NOT EDIT.")).toBe(true);
 
-    // The bring-up regenerates the env file, then the `up` reads the GENERATED
-    // compose. Ask compose itself what the service's environment resolves to —
-    // which also proves the CLI-ownership comment header is valid compose YAML.
-    writeWayflowEnvFile(dir, { token: "fixture-rotated-token" });
+    // Ask compose itself what the isolated `up` would give the container — which
+    // also proves the comment header is valid compose YAML.
     const rendered = JSON.parse(
-      capture(
-        "docker",
-        ["compose", "--profile", "*", "-f", ISOLATED_COMPOSE_FILENAME, "config", "--format", "json"],
+      run(
+        ["--env-file", ".env.local", "--profile", "*", "-f", ISOLATED_COMPOSE_FILENAME, "config", "--format", "json"],
         { cwd: dir },
       ),
     );
-    expect(Object.keys(rendered.services.wayflow.environment).sort()).toEqual([...SIX_KEYS].sort());
-    expect(rendered.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).not.toBe("");
-    if (realCompose.supportsNoEnvResolution) {
-      // A preserved reference means the ROTATED value is the one that reaches the
-      // container, rather than a copy frozen at render time.
-      expect(rendered.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBe("fixture-rotated-token");
-    }
+    const env = rendered.services.wayflow.environment;
+    expect(Object.keys(env).sort()).toEqual([...SIX_KEYS].sort());
+    expect(env.CINATRA_BRIDGE_TOKEN).toBe(ENV_LOCAL_TOKEN);
   });
 
-  it("PRECEDENCE, asked of compose itself: an empty `environment:` value beats the env_file", () => {
+  it(`(${engine.version}) a rotated token still reaches the container`, () => {
+    writeFixtureCheckout();
+    const { doc } = render();
+    writeIsolatedComposeFile(path.join(dir, ISOLATED_COMPOSE_FILENAME), doc);
+
+    // Rotation, as the CLI performs it: the new value goes into `.env.local`,
+    // and the bring-up regenerates `.wayflow.env` from it. Both routes must
+    // follow it — the preserved reference reads the file at `up` time, the
+    // fallback's `${KEY}` resolves from `--env-file .env.local`.
+    const rotated = "rotated-bridge-token";
+    writeFileSync(
+      path.join(dir, ".env.local"),
+      `CINATRA_BRIDGE_TOKEN=${rotated}\nCINATRA_CONTEXT_ATTEST_KEY=envlocal-attest-key\n`,
+      { mode: 0o600 },
+    );
+    writeWayflowEnvFile(dir, { token: rotated });
+
+    const rendered = JSON.parse(
+      run(
+        ["--env-file", ".env.local", "--profile", "*", "-f", ISOLATED_COMPOSE_FILENAME, "config", "--format", "json"],
+        { cwd: dir },
+      ),
+    );
+    expect(rendered.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBe(rotated);
+  });
+
+  it(`(${engine.version}) PRECEDENCE, asked of compose itself: an empty \`environment:\` value beats the env_file`, () => {
     // The premise the invariant is built on, verified against the real engine
     // rather than taken from a comment.
     writeWayflowEnvFile(dir);
@@ -1241,33 +1347,26 @@ describe.skipIf(!realCompose.available)("real `docker compose config` (render on
         "",
       ].join("\n"),
     );
-    const rendered = JSON.parse(
-      capture("docker", ["compose", "-f", "docker-compose.yml", "config", "--format", "json"], { cwd: dir }),
-    );
+    const rendered = JSON.parse(run(["-f", "docker-compose.yml", "config", "--format", "json"], { cwd: dir }));
     expect(rendered.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBe("");
   });
 
-  it("the generated file's comment header is accepted by compose (JSON-in-YAML + comments)", () => {
-    writeFixtureCheckout();
-    writeWayflowEnvFile(dir);
-    const resolved = composeConfigForFiles(dir, ["docker-compose.yml"], { capture }, {
-      allProfiles: true,
-      preserveEnvFiles: realCompose.supportsNoEnvResolution,
-    });
-    const { doc } = generateIsolatedCompose({
-      resolvedConfig: resolved,
-      offset: 10000,
-      projectName: "cinatra_hdr",
-      slug: "hdr",
-      appPort: 3300,
-      envFileKeys: new Set(),
-    });
-    const file = path.join(dir, ISOLATED_COMPOSE_FILENAME);
-    writeIsolatedComposeFile(file, doc);
-    expect(readFileSync(file, "utf8").startsWith("# GENERATED FILE — DO NOT EDIT.")).toBe(true);
-    const out = capture("docker", ["compose", "--profile", "*", "-f", ISOLATED_COMPOSE_FILENAME, "config"], {
-      cwd: dir,
-    });
-    expect(out).toContain("wayflow");
+  it(`(${engine.version}) the CLI's own probe agrees with what this engine does`, () => {
+    // Only meaningful for the DEFAULT `docker compose` — the CLI probes that one.
+    if (engine.bin) return;
+    __resetComposeFeatureProbe();
+    expect(composeSupportsNoEnvResolution({})).toBe(engine.preserves);
+    __resetComposeFeatureProbe();
   });
+}
+
+describe.skipIf(!realCompose.available)("real `docker compose config` (render only, no services)", () => {
+  realComposeSuite(realCompose);
+});
+
+// Opt-in second engine (CINATRA_TEST_COMPOSE_BIN=<path to a compose binary>):
+// how the OTHER route is exercised against a real engine on a box that ships
+// only one Compose.
+describe.skipIf(!altCompose.available)("real alternate `docker compose` (render only, no services)", () => {
+  realComposeSuite(altCompose);
 });

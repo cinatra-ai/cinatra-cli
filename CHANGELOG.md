@@ -62,11 +62,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
   image build already did. A runtime that is observed restarting is reported as
   a crash loop with the command that shows why, not as a slow cold start.
 
-  The flag that keeps the reference (`docker compose config
-  --no-env-resolution`) is now PROBED rather than assumed, because a Compose
-  that does not have it would have failed the flag silently and produced the
-  same tokenless runtime through a different door. On a Compose without it the
-  install says so, names the version, and takes a stated fallback: the env file
+  Whether Compose keeps the reference (`config --no-env-resolution`) is now
+  PROBED — by rendering a throwaway compose and checking whether `env_file:`
+  actually survived, not by looking for the flag in `--help` or comparing a
+  version to a floor. Those are different questions, and they disagree in
+  practice: Compose v2.38.2 lists the flag, accepts it, exits 0 — and inlines the
+  env file anyway. A spelling check would have called that supported and frozen a
+  snapshot, which is the original defect. On a Compose that does not keep the
+  reference the install says so, names the version, and takes a stated fallback:
+  the env file
   is provisioned before the render either way, so what compose inlines is the
   real wiring, and the generator re-symbolises those secrets to `${KEY}` values
   the isolated `up` resolves from `.env.local` — no secret is written into the
