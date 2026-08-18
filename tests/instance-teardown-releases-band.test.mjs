@@ -13,10 +13,11 @@
 // down` injected. No Docker, no services, no network.
 
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
   planInstanceTeardown,
@@ -1036,5 +1037,194 @@ describe("cinatra-cli#232 — two concurrent allocations cannot collide or lose 
     expect(a.appPort).toBe(b.appPort);
     // …and the later rename erased the earlier row. This is what the lock buys.
     expect(Object.keys(readInstanceRegistry(registryPath).registry.instances)).toEqual(["race-a"]);
+  });
+});
+
+// =========================================================================
+// Review gap 3 — the failed-install rollback, driven through the REAL install.
+//
+// Calling `rollbackIsolatedInstance` directly (above) proves the rollback frees
+// what it is handed; it cannot prove the install actually REACHES it, nor that
+// what the install reserved is what the rollback releases. So this drives the
+// real `runInstall --on-conflict=isolated` and injects the failure at
+// `bringUpInfra` — after the reservation is allocated, probed and PERSISTED as a
+// provisioning row, which is the window the D5 leak lived in. The reservation is
+// captured from the registry at the moment of failure, then proven gone and
+// genuinely reusable: a second real install lands on the SAME band offset AND
+// the SAME app port.
+describe("cinatra-cli#232 — a failed real install leaves its band + app port reusable", () => {
+  let sandbox;
+  let originRepo;
+
+  beforeAll(() => {
+    sandbox = mkdtempSync(path.join(os.tmpdir(), "cli232-inst-"));
+    const src = path.join(sandbox, "src");
+    mkdirSync(path.join(src, "packages", "migrations"), { recursive: true });
+    writeFileSync(path.join(src, "pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n");
+    writeFileSync(
+      path.join(src, "packages", "migrations", "package.json"),
+      JSON.stringify({ name: "@cinatra-ai/migrations", version: "0.0.0" }),
+    );
+    writeFileSync(path.join(src, "package.json"), JSON.stringify({ name: "cinatra-host", cinatra: { devExtensions: {} } }));
+    writeFileSync(path.join(src, ".env.example"), "BETTER_AUTH_SECRET=\nCINATRA_RUNTIME_MODE=development\n");
+    writeFileSync(path.join(src, ".gitignore"), ".env.local\nextensions/\n");
+    const G = (args, cwd) =>
+      execFileSync("git", args, {
+        cwd,
+        env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" },
+        stdio: "ignore",
+      });
+    G(["init", "-b", "main"], src);
+    G(["add", "-A"], src);
+    G(["commit", "-m", "init"], src);
+    originRepo = path.join(sandbox, "origin.git");
+    G(["clone", "--bare", src, originRepo], sandbox);
+  });
+  afterAll(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  // The checkout's resolved `docker compose config` — the band the isolated
+  // executor remaps. Mirrors tests/install-flow.test.mjs' fixture.
+  const RESOLVED_CONFIG = {
+    name: "cinatra",
+    services: {
+      postgres: { image: "postgres:16", ports: [{ published: "5434", target: 5432, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }] },
+      redis: { image: "redis", ports: [{ published: "6379", target: 6379, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }] },
+      "nango-server": { image: "nango", ports: [{ published: "3003", target: 3003, host_ip: "0.0.0.0", protocol: "tcp", mode: "host" }] },
+      "nango-db": { image: "postgres:16", ports: [{ published: "5435", target: 5432, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }] },
+    },
+    networks: { default: { name: "cinatra_default" } },
+    volumes: { "cinatra-postgres": { name: "cinatra_cinatra-postgres" } },
+  };
+  const DEFAULT_BAND = [
+    { service: "postgres", host: "127.0.0.1", port: 5434 },
+    { service: "redis", host: "127.0.0.1", port: 6379 },
+    { service: "nango-server", host: "0.0.0.0", port: 3003 },
+    { service: "nango-db", host: "127.0.0.1", port: 5435 },
+  ];
+  // The DEFAULT band is held by someone else (so the run takes the isolated
+  // path); every remapped band and the app-port probe come back free.
+  const conflictOnDefaultBand = async (band) => {
+    const pg = band.find((b) => b.service === "postgres");
+    if (pg && pg.port === 5434) return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+    return [];
+  };
+
+  function installDeps({ registryPath, allocLockPath }, extra = {}) {
+    return {
+      runPreflight: () => ({ ok: true, failures: [], warnings: [], mode: "dev", infraWillStart: true }),
+      commandExists: () => true,
+      composeAvailable: () => true,
+      instanceRegistryPath: registryPath,
+      allocLockPath,
+      composePublishedPortsForTarget: () => DEFAULT_BAND,
+      composeConfigForFiles: () => RESOLVED_CONFIG,
+      targetComposeOwnedPorts: () => new Set(),
+      liveComposeInspect: () => [],
+      readCloneRegistry: () => null,
+      inspectProjectOwnership: () => ({ containerRows: [], volumeRows: [] }),
+      detectPortConflicts: conflictOnDefaultBand,
+      runComposeDown: () => {},
+      bringUpInfra: () => {},
+      ...extra,
+    };
+  }
+
+  const isolatedArgs = (dir, slug) => [
+    "--dir", dir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+    "--yes", "--no-install", "--on-conflict", "isolated", "--instance", slug, "--port-offset", "auto",
+  ];
+
+  it("rolls back a bring-up failure and the retry re-uses the SAME band offset and app port", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    const installDir = path.join(sandbox, "iso-rollback");
+    const down = recordingDown();
+
+    // The failure is injected AFTER the reservation exists: read the persisted
+    // provisioning row from inside `bringUpInfra`, then fail the way a real
+    // unhealthy stack does.
+    let reservedAtFailure = null;
+    await expect(
+      runInstall(isolatedArgs(installDir, "iso232"), {
+        log: () => {},
+        deps: installDeps(
+          { registryPath, allocLockPath },
+          {
+            runComposeDown: down.fn,
+            bringUpInfra: () => {
+              reservedAtFailure = rowFor(registryPath, "iso232");
+              throw new Error("isolated bring-up failed: nango never became healthy");
+            },
+          },
+        ),
+      }),
+    ).rejects.toThrow(/nango never became healthy/);
+
+    // The reservation really was live at the moment of failure (else the test
+    // would be asserting the reuse of nothing).
+    expect(reservedAtFailure, "the install must have PERSISTED a reservation before bring-up").not.toBeNull();
+    expect(reservedAtFailure.state).toBe("provisioning");
+    expect(reservedAtFailure.offset).toBe(10000);
+    const heldPorts = [...Object.values(reservedAtFailure.ports).flat(), reservedAtFailure.appPort];
+    expect(heldPorts.length).toBeGreaterThan(1);
+
+    // The rollback ran, and released it: no row, and not one of its ports is
+    // still reserved.
+    expect(down.calls.length).toBeGreaterThan(0);
+    expect(rowFor(registryPath, "iso232")).toBeNull();
+    const reserved = reservedPorts({ instanceRegistry: readInstanceRegistry(registryPath).registry });
+    for (const p of heldPorts) expect(reserved.has(p), `port ${p} must not stay reserved`).toBe(false);
+
+    // The acceptance: a real retry gets the identical band AND app port back —
+    // the reservation is reusable, not merely absent from the file.
+    const retry = await runInstall(isolatedArgs(installDir, "iso232"), {
+      log: () => {},
+      deps: installDeps({ registryPath, allocLockPath }, { runComposeDown: down.fn }),
+    });
+    expect(retry.infraPlan).toBe("isolated");
+    const row = rowFor(registryPath, "iso232");
+    expect(row.state).toBe("ready");
+    expect(row.offset).toBe(reservedAtFailure.offset);
+    expect(row.appPort).toBe(reservedAtFailure.appPort);
+    expect(row.ports).toEqual(reservedAtFailure.ports);
+  });
+
+  it("five failed installs in a row never exhaust the band (each rollback gives its offset back)", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    const offsets = [];
+
+    // Without the release, five leaked provisioning rows exhaust 10000..50000
+    // and the sixth refuses — D5, reached through the FAILURE path this time.
+    for (let i = 0; i < 5; i += 1) {
+      let seen = null;
+      await expect(
+        runInstall(isolatedArgs(path.join(sandbox, `iso-fail-${i}`), `isofail${i}`), {
+          log: () => {},
+          deps: installDeps(
+            { registryPath, allocLockPath },
+            {
+              bringUpInfra: () => {
+                seen = rowFor(registryPath, `isofail${i}`);
+                throw new Error("isolated bring-up failed: nango never became healthy");
+              },
+            },
+          ),
+        }),
+      ).rejects.toThrow(/nango never became healthy/);
+      offsets.push(seen.offset);
+    }
+
+    // Every attempt got the LOWEST offset back — nothing accumulated.
+    expect(offsets).toEqual([10000, 10000, 10000, 10000, 10000]);
+    expect(listInstances(readInstanceRegistry(registryPath).registry)).toEqual([]);
+
+    // …and a sixth install still succeeds, on that same offset.
+    const ok = await runInstall(isolatedArgs(path.join(sandbox, "iso-sixth"), "isosixth"), {
+      log: () => {},
+      deps: installDeps({ registryPath, allocLockPath }),
+    });
+    expect(ok.infraPlan).toBe("isolated");
+    expect(rowFor(registryPath, "isosixth").offset).toBe(10000);
   });
 });
