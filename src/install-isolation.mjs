@@ -450,6 +450,57 @@ function remapEnvHostUrlPorts(value, offset, publishedSet) {
   });
 }
 
+// ── cinatra-cli#231 — the HOST APP port is a SEPARATE allocation ─────────────
+//
+// A container that calls BACK into the Cinatra app reaches it through the Docker
+// host gateway, not over the compose network: the `wayflow` service carries
+// `CINATRA_BASE_URL: http://host.docker.internal:3000`. The #97 remap above
+// never touches that value, for two INDEPENDENT reasons:
+//
+//   1. `host.docker.internal` is not a loopback host, so LOOPBACK_HOSTPORT_SRC
+//      does not match it at all; and
+//   2. the app is not a compose service, so 3000 is not a published host port —
+//      and `3000 + offset` would be the WRONG answer even if it matched. The
+//      isolated app port is drawn from its OWN pool (3300..3399,
+//      instance-alloc.mjs INSTANCE_APP_PORT_MIN/MAX), NOT from the infra band.
+//
+// So this is a SUBSTITUTION with the instance's allocated `appPort`, never a
+// shift by `offset`. Left unrewritten, the isolated runtime's callbacks reach
+// whatever holds :3000 — the DEFAULT/main instance's app, or nothing at all.
+//
+// The default app port this CLI hands out from; mirrors instance-alloc.mjs
+// DEFAULT_APP_PORT. This module is import-light (node builtins only) by design,
+// so the value is a PARAMETER DEFAULT and the real install path passes the
+// authoritative constant in — the literal here only serves direct/test callers.
+const DEFAULT_HOST_APP_PORT = 3000;
+
+/** The hosts a container uses to dial the app ON THE HOST. `host.docker.internal`
+ *  is the Docker Desktop gateway; the loopback spellings appear on Linux with
+ *  `host-gateway` / `network_mode: host`. A service-DNS host is deliberately
+ *  absent — that is an IN-NETWORK URL and must stay verbatim. */
+const APP_HOSTPORT_SRC = "\\b(host\\.docker\\.internal|localhost|127\\.0\\.0\\.1):(\\d{1,5})\\b";
+
+/** Substitute the HOST APP port in every app-facing URL in `value`:
+ *  `<gateway-or-loopback>:<defaultAppPort>` → `<same host>:<appPort>`. Only
+ *  URL-shaped values (containing `://`) are considered, so a bare listen-port
+ *  config (`PORT: "3000"` — the container's OWN port, which must never move) is
+ *  untouched. `skipPorts` is the stack's pre-shift PUBLISHED host-port set: when
+ *  the default app port is genuinely published by a compose service, the #97
+ *  band remap owns it and this rewrite stands down, so the two can never both
+ *  claim the same number. A no-op when the instance runs on the default port.
+ *  Surgical string replace — scheme/path/query preserved exactly. Pure. */
+function remapEnvAppPortUrls(value, appPort, defaultAppPort, skipPorts) {
+  if (typeof value !== "string" || !value.includes("://")) return value;
+  if (!Number.isInteger(appPort) || appPort <= 0) return value;
+  if (!Number.isInteger(defaultAppPort) || defaultAppPort <= 0) return value;
+  if (appPort === defaultAppPort) return value;
+  if (skipPorts instanceof Set && skipPorts.has(defaultAppPort)) return value;
+  return value.replace(new RegExp(APP_HOSTPORT_SRC, "gi"), (match, host, portStr) => {
+    const port = Number.parseInt(portStr, 10);
+    return port === defaultAppPort ? `${host}:${appPort}` : match;
+  });
+}
+
 /** cinatra-cli#97 invariant scan: return the `service.KEY` list of any generated
  *  compose `environment` value that STILL references a loopback URL on an
  *  UN-OFFSET (original) published host port — i.e. a self-advertised URL that did
@@ -497,6 +548,55 @@ export function assertComposeHostUrlsRemapped(doc, originalPublishedPorts) {
   }
 }
 
+/** cinatra-cli#231 invariant scan: return the `service.KEY` list of any generated
+ *  compose `environment` value that STILL dials the DEFAULT app port through the
+ *  host gateway / loopback while THIS instance's app runs on its own `appPort`
+ *  (e.g. wayflow's `CINATRA_BASE_URL`). Empty ⇒ the invariant holds. Pure. */
+function findUnmappedComposeAppUrls(doc, { appPort, defaultAppPort, publishedPorts } = {}) {
+  const offenders = [];
+  if (!Number.isInteger(appPort) || appPort <= 0) return offenders;
+  if (!Number.isInteger(defaultAppPort) || defaultAppPort <= 0) return offenders;
+  if (appPort === defaultAppPort) return offenders;
+  // A genuinely published default app port belongs to the #97 band remap, which
+  // has its own invariant — do not double-report it here.
+  if (publishedPorts instanceof Set && publishedPorts.has(defaultAppPort)) return offenders;
+  const services = doc?.services && typeof doc.services === "object" ? doc.services : {};
+  for (const [svcName, svc] of Object.entries(services)) {
+    const env = svc?.environment;
+    if (!env || typeof env !== "object" || Array.isArray(env)) continue;
+    for (const [key, value] of Object.entries(env)) {
+      if (typeof value !== "string" || !value.includes("://")) continue;
+      for (const m of value.matchAll(new RegExp(APP_HOSTPORT_SRC, "gi"))) {
+        if (Number.parseInt(m[2], 10) === defaultAppPort) {
+          offenders.push(`${svcName}.${key}`);
+          break;
+        }
+      }
+    }
+  }
+  return offenders;
+}
+
+/** Throwing wrapper: assert the generated compose leaves NO app-facing URL on the
+ *  DEFAULT app port while this instance runs on its own allocated one
+ *  (cinatra-cli#231). Holds by construction (generateIsolatedCompose substitutes
+ *  them); asserted defensively so a future regression fails loud at install time
+ *  rather than as a runtime that silently calls back into the MAIN instance. */
+export function assertComposeAppUrlsRemapped(
+  doc,
+  { appPort, defaultAppPort = DEFAULT_HOST_APP_PORT, publishedPorts = null } = {},
+) {
+  const offenders = findUnmappedComposeAppUrls(doc, { appPort, defaultAppPort, publishedPorts });
+  if (offenders.length > 0) {
+    throw new Error(
+      `Isolated compose generation left ${offenders.length} app-facing URL(s) on the DEFAULT app port ` +
+        `${defaultAppPort} (${offenders.join(", ")}) while this instance's app runs on ${appPort} — the ` +
+        `isolated runtime would call back into the MAIN instance's app, or into nothing at all ` +
+        `(cinatra-cli#231). Internal invariant violation.`,
+    );
+  }
+}
+
 /**
  * Generate the resolved ISOLATED compose document.
  *
@@ -505,7 +605,12 @@ export function assertComposeHostUrlsRemapped(doc, originalPublishedPorts) {
  * @param {number} args.offset          host-port remap offset
  * @param {string} args.projectName     the isolated compose project (e.g. cinatra_<slug>)
  * @param {string} args.slug            the instance slug (for labels)
- * @param {number} [args.appPort]       the host app port (recorded in a label)
+ * @param {number} [args.appPort]       the host app port. Recorded in a label AND
+ *   substituted into every app-facing container URL that still names the default
+ *   app port (cinatra-cli#231) — the runtime's `CINATRA_BASE_URL` callback must
+ *   reach THIS instance's app, not the main one's.
+ * @param {number} [args.defaultAppPort] the app port the checkout's compose was
+ *   written against (instance-alloc.mjs DEFAULT_APP_PORT). Defaults to 3000.
  * @param {Set<string>} [args.envFileKeys] the keys the instance's env-file
  *   (`.env.local`) supplies. A secret value is re-symbolised to `${KEY}` ONLY
  *   when this Set contains its key — so every `${VAR}` the generator introduces
@@ -519,9 +624,18 @@ export function assertComposeHostUrlsRemapped(doc, originalPublishedPorts) {
  *   - scrubbedKeys: the env-file-supplied keys re-symbolised to `${KEY}` (NAMES
  *     only — never values; for transparency / the executor's invariant check).
  *   - remappedEnvUrls: the `service.KEY` names whose self-advertised loopback URL
- *     was shifted to the isolated host port (cinatra-cli#97; NAMES only).
+ *     was shifted to the isolated host port (cinatra-cli#97), or whose app-facing
+ *     URL was re-pointed at this instance's app port (cinatra-cli#231; NAMES only).
  */
-export function generateIsolatedCompose({ resolvedConfig, offset, projectName, slug, appPort = null, envFileKeys = null }) {
+export function generateIsolatedCompose({
+  resolvedConfig,
+  offset,
+  projectName,
+  slug,
+  appPort = null,
+  defaultAppPort = DEFAULT_HOST_APP_PORT,
+  envFileKeys = null,
+}) {
   if (!resolvedConfig || typeof resolvedConfig !== "object") {
     throw new Error("generateIsolatedCompose requires a parsed resolvedConfig object.");
   }
@@ -640,6 +754,24 @@ export function generateIsolatedCompose({ resolvedConfig, offset, projectName, s
         }
       }
 
+      // (6) cinatra-cli#231: re-point any APP-FACING URL still naming the default
+      // app port at THIS instance's allocated app port (wayflow's
+      // `CINATRA_BASE_URL: http://host.docker.internal:3000` → `:<appPort>`). This
+      // is a SUBSTITUTION, not a shift: the app port comes from its own pool, not
+      // from the infra band, and the gateway host is not loopback — so step (5)
+      // above cannot reach it on either count. Runs after the scrub (a `${VAR}`
+      // placeholder has no `://`) and after (5), which owns any genuinely
+      // published port.
+      if (svc.environment && typeof svc.environment === "object" && !Array.isArray(svc.environment)) {
+        for (const [k, v] of Object.entries(svc.environment)) {
+          const repointed = remapEnvAppPortUrls(v, appPort, defaultAppPort, originalPublishedPorts);
+          if (repointed !== v) {
+            svc.environment[k] = repointed;
+            remappedEnvUrls.add(`${svcName}.${k}`);
+          }
+        }
+      }
+
       // (3) Ownership labels. `config` emits labels as an object.
       const existing =
         svc.labels && typeof svc.labels === "object" && !Array.isArray(svc.labels) ? svc.labels : {};
@@ -685,6 +817,9 @@ export const __test = {
   remapServicePorts,
   remapEnvHostUrlPorts,
   findUnmappedComposeHostUrls,
+  remapEnvAppPortUrls,
+  findUnmappedComposeAppUrls,
+  DEFAULT_HOST_APP_PORT,
   generateIsolatedCompose,
   renderIsolatedComposeYaml,
 };

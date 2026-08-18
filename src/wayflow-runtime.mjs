@@ -27,6 +27,12 @@ import { existsSync as nodeExistsSync } from "node:fs";
 export const WAYFLOW_SERVICE = "wayflow";
 export const WAYFLOW_PROFILE = "wayflow";
 
+/** WayFlow's DEFAULT published host port — where an install that allocated no
+ *  band (the default plan) reaches its runtime. Mirrors instance-alloc.mjs
+ *  DEFAULT_WAYFLOW_PORT; this module stays import-light (node builtins only) by
+ *  design, so the value is restated rather than imported. */
+export const DEFAULT_WAYFLOW_PORT = 3010;
+
 /** The `.env.local` key that records what THIS install decided about the
  *  WayFlow runtime, so `cinatra doctor` can tell an intentional opt-out apart
  *  from a runtime that should be up and is not. */
@@ -78,7 +84,7 @@ export function normalizeWayflowRuntimeMode(raw) {
  *
  * @returns {string[]}
  */
-export function wayflowStatusLines(mode, { endpoint = "http://localhost:3010" } = {}) {
+export function wayflowStatusLines(mode, { endpoint = `http://localhost:${DEFAULT_WAYFLOW_PORT}` } = {}) {
   if (mode === WAYFLOW_RUNTIME_OFF) {
     return [
       "  Agent runtime: NOT started — intentional opt-out (--no-wayflow).",
@@ -94,6 +100,29 @@ export function wayflowStatusLines(mode, { endpoint = "http://localhost:3010" } 
     ];
   }
   return [`  Agent runtime: WayFlow started with the stack (${endpoint}).`];
+}
+
+/**
+ * The WayFlow endpoint THIS install's operator must actually open, derived from
+ * the SAME per-instance port allocation that `.env.local`'s `WAYFLOW_BASE_URL` is
+ * written from: `ports.wayflow[0]`, the generated isolated compose's remapped
+ * published host port (install.mjs `writeIsolatedAppEnv` reads the identical
+ * expression). An install that allocated no band passes no map and gets the
+ * default port.
+ *
+ * cinatra-cli#231: the success line used to state the hardcoded default while the
+ * instance ran on the offset port — pointing the operator at a dead port, or at
+ * the MAIN instance's runtime when one held the default.
+ *
+ * @param {Record<string, number[]>} [ports] the per-service remapped host-port map
+ * @returns {string}
+ */
+export function wayflowEndpointForPorts(ports) {
+  const list = ports?.[WAYFLOW_SERVICE];
+  const raw = Array.isArray(list) && list.length > 0 ? list[0] : null;
+  const port = Number.parseInt(String(raw ?? ""), 10);
+  const resolved = Number.isInteger(port) && port > 0 ? port : DEFAULT_WAYFLOW_PORT;
+  return `http://localhost:${resolved}`;
 }
 
 /**

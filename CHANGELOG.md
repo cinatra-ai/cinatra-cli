@@ -32,6 +32,30 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **An isolated install now states and provisions the endpoints it actually
+  allocated.** Two endpoint defects shared one root cause: the per-instance port
+  allocation was not threaded through to every place a port is spoken. The
+  install success line hardcoded `http://localhost:3010` for the WayFlow agent
+  runtime, although an isolated instance's runtime listens on the offset port
+  (`3010 + offset`) — exactly what the same install had already written into
+  `.env.local` as `WAYFLOW_BASE_URL`. The operator was pointed at a dead port,
+  or at the *main* instance's runtime when one held the default. Separately, the
+  generated isolated compose kept `CINATRA_BASE_URL:
+  http://host.docker.internal:3000` on the `wayflow` service while the isolated
+  app runs on its own allocated port, so everything the runtime called back into
+  the app on reached the wrong app. The success line now reads the same
+  `ports.wayflow[0]` that `.env.local` is written from, so the printed endpoint
+  and the recorded one cannot disagree. The compose generator now substitutes
+  the instance's allocated app port into every app-facing container URL that
+  still names the default one. That is a substitution and not a port shift: the
+  app port is drawn from its own pool (3300..3399), not from the infra band, so
+  `3000 + offset` would have been wrong as well. The rewrite covers the Docker
+  host gateway and the loopback spellings, leaves in-network service-DNS URLs
+  and bare listen ports alone, and stands down when a compose service genuinely
+  publishes the default app port, so it can never contend with the existing
+  band remap. A new render invariant refuses to write a generated compose that
+  still dials the default app port while the instance runs on another.
+
 - **A preview no longer wires itself to another instance's services, and it can
   finally reach its own connection service.** The preview composition decided
   where this instance's services live by string manipulation: it swapped a

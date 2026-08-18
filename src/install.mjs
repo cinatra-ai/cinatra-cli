@@ -108,12 +108,14 @@ import {
   assertAppPortFree,
   reservedPorts,
   validatePortOffset,
+  DEFAULT_APP_PORT,
 } from "./instance-alloc.mjs";
 import {
   classifyPortHolder,
   generateIsolatedCompose,
   writeIsolatedComposeFile,
   assertComposeHostUrlsRemapped,
+  assertComposeAppUrlsRemapped,
   ISOLATED_COMPOSE_FILENAME,
 } from "./install-isolation.mjs";
 import {
@@ -164,6 +166,7 @@ import {
   waitForWayflowHealth,
   wayflowBuildFailureMessage,
   wayflowStatusLines,
+  wayflowEndpointForPorts,
 } from "./wayflow-runtime.mjs";
 import {
   deriveCoUseSlug,
@@ -3051,6 +3054,10 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       projectName: composeProject,
       slug,
       appPort,
+      // cinatra-cli#231: the port the checkout's compose was written against, so
+      // every app-facing container URL still naming it is re-pointed at THIS
+      // instance's `appPort` (the runtime's CINATRA_BASE_URL callback).
+      defaultAppPort: DEFAULT_APP_PORT,
       envFileKeys,
     });
 
@@ -3074,6 +3081,17 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
     // construction; assert defensively so a regression fails loud at install
     // time, not as a silent cross-instance OAuth/self-URL leak to the main stack.
     assertComposeHostUrlsRemapped(doc, new Set(baseBand.map((b) => b.port)));
+
+    // cinatra-cli#231 invariant: NO generated service env may still dial the
+    // DEFAULT app port through the host gateway while this instance's app runs on
+    // its own allocated port — else the runtime's callback (wayflow's
+    // CINATRA_BASE_URL) reaches the MAIN instance's app, or nothing at all. Holds
+    // by construction; asserted defensively for the same reason as the #97 check.
+    assertComposeAppUrlsRemapped(doc, {
+      appPort,
+      defaultAppPort: DEFAULT_APP_PORT,
+      publishedPorts: new Set(baseBand.map((b) => b.port)),
+    });
 
     // Persist the generated compose + provisioning row + marker (recording the
     // generated SOLE file as composeFiles[]).
@@ -4786,6 +4804,7 @@ async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.
     projectName: row.composeProject,
     slug: row.slug,
     appPort: row.appPort ?? null,
+    defaultAppPort: DEFAULT_APP_PORT,
     envFileKeys,
   });
 
@@ -4804,6 +4823,11 @@ async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.
   // regression, never a silent blank-secret or a self-URL leak to the main stack).
   assertScrubbedKeysSupplied(targetDir, scrubbedKeys);
   assertComposeHostUrlsRemapped(doc, new Set(baseBand.map((b) => b.port)));
+  assertComposeAppUrlsRemapped(doc, {
+    appPort: row.appPort ?? null,
+    defaultAppPort: DEFAULT_APP_PORT,
+    publishedPorts: new Set(baseBand.map((b) => b.port)),
+  });
 
   writeIsolatedComposeFile(isoPath, doc);
   log(
@@ -6225,7 +6249,16 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
 
   // cinatra#2654: state the agent-runtime outcome in the summary — started,
   // deliberately opted out, or not owned by this install.
-  for (const line of wayflowStatusLines(wayflowRuntimeMode)) log(line);
+  // cinatra-cli#231: name the endpoint THIS instance actually listens on. The
+  // port comes from the same per-instance allocation `writeIsolatedAppEnv` writes
+  // WAYFLOW_BASE_URL from (`ports.wayflow[0]`), so the printed URL and the
+  // `.env.local` value can never disagree. A default/attach install allocated no
+  // band, has no map, and correctly keeps the default port.
+  for (const line of wayflowStatusLines(wayflowRuntimeMode, {
+    endpoint: wayflowEndpointForPorts(resolution?.instance?.ports),
+  })) {
+    log(line);
+  }
 
   log("");
   log("  Next:");
