@@ -1117,6 +1117,23 @@ const realCompose = (() => {
   }
 })();
 
+// Record, in the run's own output, WHICH Compose this suite actually exercised —
+// so "verified against the real compose" is a fact anyone can read off the log
+// (locally and on CI) rather than a claim. It runs unconditionally, so a SKIPPED
+// real-compose section is visible for what it is instead of silently absent.
+describe("which Compose this suite exercised (cinatra#2654 D1)", () => {
+  it("reports the real `docker compose` it found, or that it found none", () => {
+    console.log(
+      `[cinatra#2654 D1] real docker compose: available=${realCompose.available} ` +
+        `version=${realCompose.version ?? "n/a"} --no-env-resolution=${realCompose.supportsNoEnvResolution}`,
+    );
+    // A Compose that IS present must answer the feature probe one way or the
+    // other; an absent one must not claim support.
+    expect(typeof realCompose.supportsNoEnvResolution).toBe("boolean");
+    if (!realCompose.available) expect(realCompose.supportsNoEnvResolution).toBe(false);
+  });
+});
+
 describe.skipIf(!realCompose.available)("real `docker compose config` (render only, no services)", () => {
   it(`this box's Compose (${realCompose.version}) answers the feature probe the same way the CLI does`, () => {
     // The skip is honest: it fires only when `docker compose` is absent. When it
