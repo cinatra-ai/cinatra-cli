@@ -474,30 +474,61 @@ function remapEnvHostUrlPorts(value, offset, publishedSet) {
 // authoritative constant in — the literal here only serves direct/test callers.
 const DEFAULT_HOST_APP_PORT = 3000;
 
-/** The hosts a container uses to dial the app ON THE HOST. `host.docker.internal`
- *  is the Docker Desktop gateway; the loopback spellings appear on Linux with
- *  `host-gateway` / `network_mode: host`. A service-DNS host is deliberately
- *  absent — that is an IN-NETWORK URL and must stay verbatim. */
+/** The hosts a container uses to dial the app ON THE HOST. A service-DNS host is
+ *  deliberately absent — that is an IN-NETWORK URL and must stay verbatim.
+ *
+ *  The two classes are kept APART because ownership differs between them (see
+ *  `ownsAppPortUrl`): cinatra-cli#97's remap rewrites LOOPBACK hosts only, so a
+ *  GATEWAY URL can never belong to it. */
+const APP_GATEWAY_HOSTS = new Set(["host.docker.internal"]);
+const APP_LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1"]);
 const APP_HOSTPORT_SRC = "\\b(host\\.docker\\.internal|localhost|127\\.0\\.0\\.1):(\\d{1,5})\\b";
+
+/**
+ * Does THIS matched `<host>:<port>` belong to the app-port substitution?
+ *
+ * Decided PER MATCHED URL, never globally from the published-port set. A global
+ * stand-down keyed on "does the stack publish the default app port" is WRONG,
+ * because the two rewrites do not cover the same hosts:
+ *
+ *   - a GATEWAY host (`host.docker.internal`) always means the app ON THE HOST,
+ *     and cinatra-cli#97 NEVER rewrites it (its regex is loopback-only). So a
+ *     gateway URL is unconditionally ours. Standing down for it because some
+ *     unrelated service happens to publish 3000 would leave the URL pointing at
+ *     the default port with NO rewriter owning it and NO invariant reporting it
+ *     — the original defect, recurring under a supported compose shape.
+ *   - a LOOPBACK host defers to cinatra-cli#97 exactly when #97 actually remaps
+ *     that match, i.e. when the port is one the stack publishes. When it is not
+ *     published, #97 leaves the URL alone and it is ours.
+ *
+ * Shared by the rewriter and the invariant so the two can never disagree about
+ * who owns a given URL. Pure.
+ */
+function ownsAppPortUrl(host, port, defaultAppPort, publishedPorts) {
+  if (port !== defaultAppPort) return false;
+  const h = String(host).toLowerCase();
+  if (APP_GATEWAY_HOSTS.has(h)) return true;
+  if (!APP_LOOPBACK_HOSTS.has(h)) return false;
+  return !(publishedPorts instanceof Set && publishedPorts.has(port));
+}
 
 /** Substitute the HOST APP port in every app-facing URL in `value`:
  *  `<gateway-or-loopback>:<defaultAppPort>` → `<same host>:<appPort>`. Only
  *  URL-shaped values (containing `://`) are considered, so a bare listen-port
  *  config (`PORT: "3000"` — the container's OWN port, which must never move) is
- *  untouched. `skipPorts` is the stack's pre-shift PUBLISHED host-port set: when
- *  the default app port is genuinely published by a compose service, the #97
- *  band remap owns it and this rewrite stands down, so the two can never both
- *  claim the same number. A no-op when the instance runs on the default port.
- *  Surgical string replace — scheme/path/query preserved exactly. Pure. */
-function remapEnvAppPortUrls(value, appPort, defaultAppPort, skipPorts) {
+ *  untouched. Ownership of each matched URL is decided by `ownsAppPortUrl`, so a
+ *  value may have one match rewritten and another deferred to cinatra-cli#97.
+ *  `publishedPorts` is the stack's pre-shift PUBLISHED host-port set. A no-op
+ *  when the instance runs on the default port. Surgical string replace —
+ *  scheme/path/query preserved exactly. Pure. */
+function remapEnvAppPortUrls(value, appPort, defaultAppPort, publishedPorts) {
   if (typeof value !== "string" || !value.includes("://")) return value;
   if (!Number.isInteger(appPort) || appPort <= 0) return value;
   if (!Number.isInteger(defaultAppPort) || defaultAppPort <= 0) return value;
   if (appPort === defaultAppPort) return value;
-  if (skipPorts instanceof Set && skipPorts.has(defaultAppPort)) return value;
   return value.replace(new RegExp(APP_HOSTPORT_SRC, "gi"), (match, host, portStr) => {
     const port = Number.parseInt(portStr, 10);
-    return port === defaultAppPort ? `${host}:${appPort}` : match;
+    return ownsAppPortUrl(host, port, defaultAppPort, publishedPorts) ? `${host}:${appPort}` : match;
   });
 }
 
@@ -557,17 +588,20 @@ function findUnmappedComposeAppUrls(doc, { appPort, defaultAppPort, publishedPor
   if (!Number.isInteger(appPort) || appPort <= 0) return offenders;
   if (!Number.isInteger(defaultAppPort) || defaultAppPort <= 0) return offenders;
   if (appPort === defaultAppPort) return offenders;
-  // A genuinely published default app port belongs to the #97 band remap, which
-  // has its own invariant — do not double-report it here.
-  if (publishedPorts instanceof Set && publishedPorts.has(defaultAppPort)) return offenders;
   const services = doc?.services && typeof doc.services === "object" ? doc.services : {};
   for (const [svcName, svc] of Object.entries(services)) {
     const env = svc?.environment;
     if (!env || typeof env !== "object" || Array.isArray(env)) continue;
     for (const [key, value] of Object.entries(env)) {
       if (typeof value !== "string" || !value.includes("://")) continue;
+      // Same PER-URL ownership rule the rewriter used, so the invariant reports
+      // exactly what the rewriter was responsible for — never a global
+      // stand-down that would blind it to a gateway URL (cinatra-cli#231). A
+      // LOOPBACK URL left on a published default port is cinatra-cli#97's to
+      // report; `findUnmappedComposeHostUrls` covers it, so there is no gap here
+      // and no double-report either.
       for (const m of value.matchAll(new RegExp(APP_HOSTPORT_SRC, "gi"))) {
-        if (Number.parseInt(m[2], 10) === defaultAppPort) {
+        if (ownsAppPortUrl(m[1], Number.parseInt(m[2], 10), defaultAppPort, publishedPorts)) {
           offenders.push(`${svcName}.${key}`);
           break;
         }
@@ -760,8 +794,9 @@ export function generateIsolatedCompose({
       // is a SUBSTITUTION, not a shift: the app port comes from its own pool, not
       // from the infra band, and the gateway host is not loopback — so step (5)
       // above cannot reach it on either count. Runs after the scrub (a `${VAR}`
-      // placeholder has no `://`) and after (5), which owns any genuinely
-      // published port.
+      // placeholder has no `://`) and after (5). Ownership is decided PER URL by
+      // `ownsAppPortUrl`, not globally: a gateway URL is always ours, while a
+      // loopback URL on a genuinely published port is (5)'s.
       if (svc.environment && typeof svc.environment === "object" && !Array.isArray(svc.environment)) {
         for (const [k, v] of Object.entries(svc.environment)) {
           const repointed = remapEnvAppPortUrls(v, appPort, defaultAppPort, originalPublishedPorts);
@@ -819,6 +854,7 @@ export const __test = {
   findUnmappedComposeHostUrls,
   remapEnvAppPortUrls,
   findUnmappedComposeAppUrls,
+  ownsAppPortUrl,
   DEFAULT_HOST_APP_PORT,
   generateIsolatedCompose,
   renderIsolatedComposeYaml,

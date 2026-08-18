@@ -31,7 +31,13 @@ import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { runInstall } from "../src/install.mjs";
-import { __test as isoTest } from "../src/install-isolation.mjs";
+import {
+  __test as isoTest,
+  assertComposeAppUrlsRemapped,
+  assertComposeHostUrlsRemapped,
+  generateIsolatedCompose,
+} from "../src/install-isolation.mjs";
+import { DEFAULT_APP_PORT as ALLOCATOR_DEFAULT_APP_PORT } from "../src/instance-alloc.mjs";
 import {
   DEFAULT_WAYFLOW_PORT,
   WAYFLOW_RUNTIME_LOCAL,
@@ -39,7 +45,7 @@ import {
   wayflowStatusLines,
 } from "../src/wayflow-runtime.mjs";
 
-const { remapEnvAppPortUrls, findUnmappedComposeAppUrls, DEFAULT_HOST_APP_PORT } = isoTest;
+const { remapEnvAppPortUrls, findUnmappedComposeAppUrls, ownsAppPortUrl, DEFAULT_HOST_APP_PORT } = isoTest;
 
 // The allocation this install is pinned to. Both are explicit so the expected
 // endpoints are arithmetic, not whatever the allocator happened to pick.
@@ -112,13 +118,56 @@ describe("cinatra-cli#231 — remapEnvAppPortUrls (the compose fix)", () => {
     );
   });
 
-  it("stands down when the default app port IS a published compose port (the band remap owns it)", () => {
+  it("defers a LOOPBACK url to cinatra-cli#97 when the default app port IS published", () => {
     // Both rewrites must never claim the same number: if a compose service really
-    // publishes 3000, cinatra-cli#97's +offset shift is the correct owner.
+    // publishes 3000, cinatra-cli#97's +offset shift owns the LOOPBACK spelling.
+    const published = new Set([3000, 5434]);
+    expect(remapEnvAppPortUrls("http://localhost:3000", APP_PORT, 3000, published)).toBe("http://localhost:3000");
+    expect(remapEnvAppPortUrls("http://127.0.0.1:3000", APP_PORT, 3000, published)).toBe("http://127.0.0.1:3000");
+  });
+
+  // ── the review's HIGH finding ────────────────────────────────────────────────
+  // Ownership is PER URL, not global. cinatra-cli#97 rewrites LOOPBACK hosts
+  // only, so it can never own a `host.docker.internal` URL. A stand-down keyed
+  // globally on "the stack publishes 3000" left the gateway URL with NO rewriter
+  // and NO invariant — the original defect, recurring under a supported shape.
+  it("HIGH regression: a GATEWAY url is still substituted even when a service publishes 3000", () => {
     const published = new Set([3000, 5434]);
     expect(remapEnvAppPortUrls("http://host.docker.internal:3000", APP_PORT, 3000, published)).toBe(
-      "http://host.docker.internal:3000",
+      `http://host.docker.internal:${APP_PORT}`,
     );
+  });
+
+  it("HIGH regression: within ONE value, the gateway match is substituted and the loopback match deferred", () => {
+    const published = new Set([3000]);
+    expect(
+      remapEnvAppPortUrls("http://host.docker.internal:3000/a http://localhost:3000/b", APP_PORT, 3000, published),
+    ).toBe(`http://host.docker.internal:${APP_PORT}/a http://localhost:3000/b`);
+  });
+
+  it("HIGH regression: the invariant still reports a gateway leak when 3000 is published", () => {
+    const published = new Set([3000, 5434]);
+    const leaked = { services: { wayflow: { environment: { CINATRA_BASE_URL: "http://host.docker.internal:3000" } } } };
+    expect(findUnmappedComposeAppUrls(leaked, { appPort: APP_PORT, defaultAppPort: 3000, publishedPorts: published })).toEqual(
+      ["wayflow.CINATRA_BASE_URL"],
+    );
+    // ...and does NOT claim a loopback URL that belongs to cinatra-cli#97, whose
+    // own invariant (findUnmappedComposeHostUrls) covers that case.
+    const loopback = { services: { nango: { environment: { NANGO_SERVER_URL: "http://localhost:3000" } } } };
+    expect(findUnmappedComposeAppUrls(loopback, { appPort: APP_PORT, defaultAppPort: 3000, publishedPorts: published })).toEqual([]);
+  });
+
+  it("the ownership predicate states the rule directly", () => {
+    const published = new Set([3000]);
+    // gateway: ours unconditionally, published or not.
+    expect(ownsAppPortUrl("host.docker.internal", 3000, 3000, published)).toBe(true);
+    expect(ownsAppPortUrl("host.docker.internal", 3000, 3000, new Set())).toBe(true);
+    // loopback: ours only when #97 would NOT remap it.
+    expect(ownsAppPortUrl("localhost", 3000, 3000, published)).toBe(false);
+    expect(ownsAppPortUrl("localhost", 3000, 3000, new Set())).toBe(true);
+    // a different port, or a non-app host, is never ours.
+    expect(ownsAppPortUrl("host.docker.internal", 3010, 3000, published)).toBe(false);
+    expect(ownsAppPortUrl("cinatra-app", 3000, 3000, new Set())).toBe(false);
   });
 
   it("is a no-op when this instance runs on the default port anyway", () => {
@@ -136,10 +185,66 @@ describe("cinatra-cli#231 — remapEnvAppPortUrls (the compose fix)", () => {
     expect(findUnmappedComposeAppUrls(fixed, { appPort: APP_PORT, defaultAppPort: 3000, publishedPorts: skip })).toEqual([]);
   });
 
-  it("the module's fallback default app port matches the allocator's", () => {
-    // install.mjs passes instance-alloc's DEFAULT_APP_PORT on the real path; this
-    // pins the import-light module's own fallback so the two cannot drift apart.
-    expect(DEFAULT_HOST_APP_PORT).toBe(3000);
+  // The end-to-end shape of the HIGH finding, through the REAL generator: a
+  // service genuinely publishes 3000 (so the #97 band remap is live on that
+  // number) AND the runtime dials the app through the gateway on 3000.
+  it("HIGH regression, end to end: both rewrites coexist on port 3000 without either standing down", () => {
+    const cfg = {
+      name: "cinatra",
+      services: {
+        // A service that really publishes 3000 and self-advertises on loopback:
+        // cinatra-cli#97 owns BOTH its published port and that URL.
+        gateway: {
+          environment: { PUBLIC_URL: "http://localhost:3000" },
+          ports: [{ published: "3000", target: 3000, protocol: "tcp", mode: "host" }],
+        },
+        // The runtime dialling the HOST app through the Docker gateway: ours,
+        // regardless of what `gateway` above publishes.
+        wayflow: {
+          environment: { PORT: "3010", CINATRA_BASE_URL: "http://host.docker.internal:3000" },
+          ports: [{ published: "3010", target: 3010, protocol: "tcp", mode: "host" }],
+        },
+      },
+      networks: { default: { name: "cinatra_default" } },
+    };
+    const { doc } = generateIsolatedCompose({
+      resolvedConfig: cfg,
+      offset: OFFSET,
+      projectName: "cinatra_dual",
+      slug: "dual",
+      appPort: APP_PORT,
+      defaultAppPort: 3000,
+    });
+
+    // The gateway URL followed the APP-PORT substitution (this is the bug the
+    // global stand-down re-introduced: it used to come out unchanged at :3000).
+    expect(doc.services.wayflow.environment.CINATRA_BASE_URL).toBe(`http://host.docker.internal:${APP_PORT}`);
+    // The loopback self-URL followed the #97 BAND shift, unchanged in behaviour.
+    expect(doc.services.gateway.environment.PUBLIC_URL).toBe(`http://localhost:${3000 + OFFSET}`);
+    // Published host ports still shift by the band offset.
+    expect(String(doc.services.gateway.ports[0].published)).toBe(String(3000 + OFFSET));
+
+    // Both invariants hold on the result, and neither stood down.
+    const published = new Set([3000, 3010]);
+    expect(() => assertComposeHostUrlsRemapped(doc, published)).not.toThrow();
+    expect(() =>
+      assertComposeAppUrlsRemapped(doc, { appPort: APP_PORT, defaultAppPort: 3000, publishedPorts: published }),
+    ).not.toThrow();
+
+    // And the app invariant would have CAUGHT the leak in this exact shape.
+    const leaked = JSON.parse(JSON.stringify(doc));
+    leaked.services.wayflow.environment.CINATRA_BASE_URL = "http://host.docker.internal:3000";
+    expect(() =>
+      assertComposeAppUrlsRemapped(leaked, { appPort: APP_PORT, defaultAppPort: 3000, publishedPorts: published }),
+    ).toThrow(/cinatra-cli#231/);
+  });
+
+  it("the module's fallback default app port IS the allocator's", () => {
+    // install.mjs passes instance-alloc's DEFAULT_APP_PORT on the real path, and
+    // install-isolation.mjs restates it as a fallback because it is import-light.
+    // Compare the two CONSTANTS directly — not a literal — so changing the
+    // allocator's value fails here instead of silently splitting the two.
+    expect(DEFAULT_HOST_APP_PORT).toBe(ALLOCATOR_DEFAULT_APP_PORT);
   });
 });
 
