@@ -80,12 +80,25 @@ project adheres to [Semantic Versioning](https://semver.org/).
   `environment:` value that would override the file it points at, and covers
   `nango-server`, `knowledge-graph-mcp` and `plane-mcp` on the same terms by
   requiring every `env_file:` the resolved source carried to survive into the
-  generated document. The generated `docker-compose.cinatra-isolated.yml` now
+  generated document — and, because an inlining Compose has already stripped
+  those references from the source document before that rule can look, it also
+  checks all four services against the env files the checkout itself declares:
+  the reference when this Compose preserves it, and otherwise every VALUE those
+  files supply. The empty-override rejection reads each service's own env file
+  off disk, so it protects all four in production rather than only `wayflow`.
+  The generated `docker-compose.cinatra-isolated.yml` now
   states in a header comment that it is CLI-owned and re-derived in full on
   every run — it never preserved an operator edit, and a file it could not parse
   is regenerated rather than skipped, which had made corrupting the file the way
   to pin a defective compose in place. A reconcile that *fails* to regenerate
-  now aborts instead of quietly bringing the old file up.
+  now aborts instead of quietly bringing the old file up. The two cases where a
+  generated compose genuinely *cannot* be re-derived — an ambiguous legacy band
+  offset, a shifted base band — no longer warn and start the recorded file
+  either: that file may be the exact tokenless compose the reconcile exists to
+  repair, so it is VALIDATED against the same wiring invariant first. If it
+  passes, the bring-up proceeds and says it was checked; if it fails (or cannot
+  be parsed), the bring-up is REFUSED with the recovery named, rather than
+  starting a runtime already known to have no bridge token.
 
   **Behaviour change beyond the isolated path.** Because `bringUpInfra` is the
   single seam every local bring-up uses, judging the bridge-token step by the

@@ -44,7 +44,9 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  CHECKOUT_ENV_FILE_SERVICES,
   ISOLATED_COMPOSE_FILENAME,
+  checkoutDeclaredEnvFiles,
   composeEnvWiringGaps,
   generateIsolatedCompose,
   parseIsolatedComposeDoc,
@@ -56,6 +58,7 @@ import {
   bringUpInfra,
   composeConfigForFiles,
   composeSupportsNoEnvResolution,
+  regenerateIsolatedCompose,
   regenerateIsolatedComposeInPlace,
   rollbackIsolatedInstance,
   runInstall,
@@ -139,12 +142,41 @@ function baseComposeDoc() {
 
 /** The other three services that take host secrets from a narrow generated env
  *  file rather than from `environment:` — the same contract as wayflow, and the
- *  same reason (an empty `environment:` value would override the file). */
+ *  same reason (an empty `environment:` value would override the file).
+ *
+ *  Paths read off `cinatra-ai/cinatra`'s own `docker-compose.yml` `env_file:`
+ *  blocks (round 3 — the earlier fixture guessed `docker/kg-mcp/.kg.env` and
+ *  `docker/plane-mcp/.plane.env`, neither of which the checkout declares), and
+ *  they MUST equal the production table `CHECKOUT_ENV_FILE_SERVICES` — asserted
+ *  below, so the fixture cannot drift away from what the CLI actually protects. */
 const SIBLING_ENV_FILE_SERVICES = {
   "nango-server": "docker/nango/.nango.env",
-  "knowledge-graph-mcp": "docker/kg-mcp/.kg.env",
-  "plane-mcp": "docker/plane-mcp/.plane.env",
+  "knowledge-graph-mcp": "docker/graphiti/.graphiti.env",
+  "plane-mcp": "docker/plane-mcp/.plane-mcp.env",
 };
+
+/** The key each of those files supplies in the fixtures, and whether `.env.local`
+ *  also supplies it (which decides whether the fallback render may re-symbolise
+ *  it to `${KEY}` or has to freeze the literal). */
+const SIBLING_ENV_FILE_KEYS = {
+  "nango-server": { key: "NANGO_ENCRYPTION_KEY", value: "envlocal-nango-key", inEnvLocal: true },
+  // The app's OpenAI key lives in the app DATABASE, not `.env.local` —
+  // gen-graphiti-env.mjs resolves it from there (see the checkout's compose
+  // comment), so it is NOT on the scrub allowlist.
+  "knowledge-graph-mcp": { key: "OPENAI_API_KEY", value: "graphiti-only-openai-key", inEnvLocal: false },
+  // The Plane PAT is minted into the env file by provision-plane.mjs.
+  "plane-mcp": { key: "PLANE_API_TOKEN", value: "plane-only-pat", inEnvLocal: false },
+};
+
+/** Write the three sibling env files into a checkout, as their generators do. */
+function writeSiblingEnvFiles(dir) {
+  for (const [svc, rel] of Object.entries(SIBLING_ENV_FILE_SERVICES)) {
+    const abs = path.join(dir, rel);
+    mkdirSync(path.dirname(abs), { recursive: true });
+    const { key, value } = SIBLING_ENV_FILE_KEYS[svc];
+    writeFileSync(abs, `${key}=${value}\n`, { mode: 0o600 });
+  }
+}
 
 /** `baseComposeDoc()` plus the three siblings, each with its own narrow
  *  `env_file:` and a published port so the band is non-empty. */
@@ -774,6 +806,277 @@ describe("reconcile regenerates the isolated compose (cinatra#2654 D1)", () => {
     });
     expect(result.regenerated).toBe(false);
     expect(result.skipped).toContain("ambiguous");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5b. All FOUR services are protected on the PRODUCTION assertion path, on BOTH
+//     render routes — not only in a unit test that supplies its own key reader.
+//     (cinatra#2654 D1, round 3)
+// ---------------------------------------------------------------------------
+
+describe("four-service protection is ACTIVE in production (cinatra#2654 D1)", () => {
+  const OFFSET = 10000;
+  /** The band `baseComposeDocWithSiblings` publishes, shifted by OFFSET. */
+  const row = {
+    slug: "row4",
+    composeProject: "cinatra_row4",
+    composeFiles: [ISOLATED_COMPOSE_FILENAME],
+    ports: {
+      postgres: [15434],
+      wayflow: [13010],
+      "nango-server": [13003],
+      "knowledge-graph-mcp": [13004],
+      "plane-mcp": [13005],
+    },
+    appPort: 3300,
+    offset: OFFSET,
+  };
+
+  /** A `docker compose config` fake for a checkout with ALL FOUR narrow-env-file
+   *  services. `mutate` edits the RESOLVED document, i.e. it models what the
+   *  render (or a future generator change) actually hands the generator — so a
+   *  reference the source itself never carried cannot be caught by the
+   *  source-driven rule, which is the whole point of these cases. */
+  const fourServiceConfig = (mutate = null) => (targetDir, files, d, opts) => {
+    const doc = baseComposeDocWithSiblings(dir);
+    doc.services.wayflow.env_file = [{ path: path.join(dir, WAYFLOW_ENV_REL), required: false }];
+    doc.services.wayflow.build = { context: path.join(dir, "docker", "wayflow") };
+    if (!opts?.preserveEnvFiles) {
+      // The inlining engine: content in, directive out — the D1 mechanism.
+      for (const svc of Object.values(doc.services)) {
+        for (const entry of Array.isArray(svc.env_file) ? svc.env_file : []) {
+          const f = typeof entry === "string" ? entry : entry?.path;
+          const fromFile = f && existsSync(f) ? parseEnvFile(readFileSync(f, "utf8")) : {};
+          svc.environment = { ...fromFile, ...(svc.environment ?? {}) };
+        }
+        delete svc.env_file;
+      }
+    }
+    if (mutate) mutate(doc);
+    return doc;
+  };
+
+  /** A checkout with all four env files on disk, a `.env.local` that supplies the
+   *  keys the scrub allowlist needs, and a recorded registry row. */
+  const setup = ({ preserves = true, mutate = null, recordedDoc = undefined } = {}) => {
+    writeFileSync(
+      path.join(dir, ".env.local"),
+      [
+        "CINATRA_BRIDGE_TOKEN=fixture-bridge-token",
+        "CINATRA_CONTEXT_ATTEST_KEY=fixture-attest-key",
+        `NANGO_ENCRYPTION_KEY=${SIBLING_ENV_FILE_KEYS["nango-server"].value}`,
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    writeWayflowEnvFile(dir);
+    writeSiblingEnvFiles(dir);
+    writeFileSync(
+      path.join(dir, ISOLATED_COMPOSE_FILENAME),
+      recordedDoc === undefined ? renderIsolatedComposeYaml({ name: row.composeProject, services: {} }) : recordedDoc,
+      { mode: 0o600 },
+    );
+    const registryPath = path.join(dir, "instances.json");
+    const { registry } = allocateInstance({ version: 1, instances: {} }, row.slug, {
+      mode: "dev",
+      installDir: dir,
+      composeProject: row.composeProject,
+      composeFiles: row.composeFiles,
+      ports: row.ports,
+      appPort: row.appPort,
+      offset: OFFSET,
+      repoUrl: "https://github.com/cinatra-ai/cinatra.git",
+      ref: "main",
+      infraMode: "new",
+      state: "provisioning",
+    });
+    writeInstanceRegistry(registryPath, markInstanceReady(registry, row.slug));
+    return {
+      registryPath,
+      deps: {
+        instanceRegistryPath: registryPath,
+        allocLockPath: path.join(dir, "alloc.lock"),
+        composeSupportsNoEnvResolution: () => preserves,
+        composeVersionString: () => (preserves ? "5.5.0" : "2.38.2"),
+        composeConfigForFiles: fourServiceConfig(mutate),
+      },
+    };
+  };
+
+  const regen = (deps, override = {}) =>
+    regenerateIsolatedComposeInPlace({ targetDir: dir, row: { ...row, ...override }, log: () => {}, deps });
+
+  it("the fixture's service→file table IS the production table", () => {
+    // A fixture that names files the checkout does not declare protects nothing.
+    expect(Object.fromEntries(CHECKOUT_ENV_FILE_SERVICES.map((e) => [e.service, e.file]))).toEqual({
+      wayflow: WAYFLOW_ENV_REL,
+      ...Object.fromEntries(
+        Object.entries(SIBLING_ENV_FILE_SERVICES).map(([svc, rel]) => [svc, path.join(...rel.split("/"))]),
+      ),
+    });
+  });
+
+  it("checkoutDeclaredEnvFiles lists only files that EXIST (drift is fail-open)", () => {
+    expect(checkoutDeclaredEnvFiles(dir)).toEqual([]);
+    writeWayflowEnvFile(dir);
+    writeSiblingEnvFiles(dir);
+    expect(checkoutDeclaredEnvFiles(dir).map((e) => e.service).sort()).toEqual([
+      "knowledge-graph-mcp",
+      "nango-server",
+      "plane-mcp",
+      "wayflow",
+    ]);
+    // A renamed/removed env file drops out rather than failing the install.
+    rmSync(path.join(dir, SIBLING_ENV_FILE_SERVICES["plane-mcp"]));
+    expect(checkoutDeclaredEnvFiles(dir).map((e) => e.service)).not.toContain("plane-mcp");
+  });
+
+  it("PRESERVING route: a sibling reference the SOURCE never carried is still caught", async () => {
+    // The source-driven rule cannot see this — the resolved document has no
+    // `env_file:` for nango-server to compare against. Only the checkout's own
+    // declared table does, which is exactly what round 3 added.
+    const { deps } = setup({ preserves: true, mutate: (doc) => delete doc.services["nango-server"].env_file });
+    await expect(regen(deps)).rejects.toThrow(
+      /Refusing to write the isolated compose[\s\S]*"nango-server"[\s\S]*\.nango\.env/,
+    );
+  });
+
+  for (const svc of Object.keys(SIBLING_ENV_FILE_SERVICES)) {
+    it(`PRECEDENCE in production: an EMPTY ${svc} override is rejected with the REAL key reader`, async () => {
+      // No `envFileKeysAt` is injected here — the production path reads the
+      // sibling's env file off disk itself. Before round 3 it returned null for
+      // every non-wayflow path and this rendering sailed through.
+      const { key } = SIBLING_ENV_FILE_KEYS[svc];
+      const { deps } = setup({
+        preserves: true,
+        mutate: (doc) => {
+          doc.services[svc].environment = { ...doc.services[svc].environment, [key]: "" };
+        },
+      });
+      await expect(regen(deps)).rejects.toThrow(
+        new RegExp(`Refusing to write the isolated compose[\\s\\S]*"${svc}" sets an EMPTY ${key}`),
+      );
+    });
+  }
+
+  it("FALLBACK route: a sibling whose VALUE was lost fails the install by name", async () => {
+    // On an inlining Compose the reference is gone by the engine's own doing, so
+    // "did the reference survive" protects nothing. What must survive is the
+    // value — and this render loses it.
+    const { deps } = setup({
+      preserves: false,
+      mutate: (doc) => {
+        doc.services["plane-mcp"].environment[SIBLING_ENV_FILE_KEYS["plane-mcp"].key] = "";
+      },
+    });
+    await expect(regen(deps)).rejects.toThrow(
+      /Refusing to write the isolated compose[\s\S]*"plane-mcp" would start with NO value for PLANE_API_TOKEN/,
+    );
+  });
+
+  it("FALLBACK route, healthy: every sibling's value survives into the generated document", async () => {
+    const { deps } = setup({ preserves: false });
+    const result = await regen(deps);
+    expect(result.regenerated).toBe(true);
+    const doc = parseIsolatedComposeDoc(readFileSync(path.join(dir, ISOLATED_COMPOSE_FILENAME), "utf8"));
+    // A key `.env.local` supplies is re-symbolised (resolved from --env-file at
+    // `up`, never persisted).
+    expect(doc.services["nango-server"].environment.NANGO_ENCRYPTION_KEY).toBe("${NANGO_ENCRYPTION_KEY}");
+    // A key `.env.local` does NOT supply cannot be re-symbolised — `${KEY}` would
+    // resolve BLANK (cinatra-cli#57). It is frozen as its literal instead, which
+    // is the documented cost of the fallback route (the file is written 0600).
+    expect(doc.services["knowledge-graph-mcp"].environment.OPENAI_API_KEY).toBe("graphiti-only-openai-key");
+    expect(doc.services["plane-mcp"].environment.PLANE_API_TOKEN).toBe("plane-only-pat");
+    // wayflow's own full key set survives too, as placeholders.
+    expect(doc.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBe("${CINATRA_BRIDGE_TOKEN}");
+    expect(doc.services.wayflow.environment.CINATRA_CONTEXT_ATTEST_KEY).toBe("${CINATRA_CONTEXT_ATTEST_KEY}");
+    expect(doc.services.wayflow.environment.WAYFLOW_BASE_URL).toBeTruthy();
+  });
+
+  it("PRESERVING route, healthy: all four references survive into the generated document", async () => {
+    const { deps } = setup({ preserves: true });
+    expect((await regen(deps)).regenerated).toBe(true);
+    const doc = parseIsolatedComposeDoc(readFileSync(path.join(dir, ISOLATED_COMPOSE_FILENAME), "utf8"));
+    for (const entry of checkoutDeclaredEnvFiles(dir)) {
+      expect(doc.services[entry.service].env_file.map((e) => e.path)).toContain(entry.path);
+    }
+  });
+
+  // ── RECONCILE MUST NOT KNOWINGLY START THE TOKENLESS ARTIFACT (round 3) ────
+
+  /** A generated document that IS wired correctly, at the recorded offset. */
+  const healthyRecorded = () => {
+    const { doc } = generateIsolatedCompose({
+      resolvedConfig: fourServiceConfig()(dir, [], {}, { preserveEnvFiles: true }),
+      offset: OFFSET,
+      projectName: row.composeProject,
+      slug: row.slug,
+      appPort: row.appPort,
+      envFileKeys: new Set(["CINATRA_BRIDGE_TOKEN", "CINATRA_CONTEXT_ATTEST_KEY", "NANGO_ENCRYPTION_KEY"]),
+    });
+    return renderIsolatedComposeYaml(doc);
+  };
+
+  /** The same document with the wayflow token route removed — the exact artifact
+   *  D1 produced, and the one a reconcile used to start behind a ⚠. */
+  const tokenlessRecorded = () => {
+    const doc = parseIsolatedComposeDoc(healthyRecorded());
+    delete doc.services.wayflow.env_file;
+    return renderIsolatedComposeYaml(doc);
+  };
+
+  /** A legacy row whose recorded ports identify no single offset — a real,
+   *  typed SKIP from the production code, not a stubbed one. */
+  const legacyRow = { ...row, offset: null, ports: {} };
+
+  it("SKIP + a recorded file that PASSES the invariant: proceed, and SAY it was validated", async () => {
+    const { deps } = setup({ preserves: true, recordedDoc: healthyRecorded() });
+    const lines = [];
+    const result = await regenerateIsolatedCompose({
+      targetDir: dir,
+      row: legacyRow,
+      log: (l) => lines.push(String(l)),
+      deps,
+    });
+    expect(result.regenerated).toBe(false);
+    expect(result.skipped).toContain("ambiguous");
+    expect(lines.join("\n")).toContain("VALIDATED the recorded file");
+    expect(lines.join("\n")).toContain("it PASSES");
+  });
+
+  it("SKIP + a recorded file that FAILS the invariant: REFUSE the bring-up, naming the recovery", async () => {
+    const { deps } = setup({ preserves: true, recordedDoc: tokenlessRecorded() });
+    const lines = [];
+    await expect(
+      regenerateIsolatedCompose({ targetDir: dir, row: legacyRow, log: (l) => lines.push(String(l)), deps }),
+    ).rejects.toThrow(/Refusing to bring up isolated instance "row4"[\s\S]*FAILS the env-file wiring invariant/);
+    // Attributable: the skip reason, the key that has no route, and the recovery.
+    const err = await regenerateIsolatedCompose({ targetDir: dir, row: legacyRow, log: () => {}, deps }).catch((e) => e);
+    expect(err.message).toContain("ambiguous");
+    expect(err.message).toContain("CINATRA_BRIDGE_TOKEN");
+    expect(err.message).toContain("cinatra instance remove row4");
+    expect(err.message).toContain("--on-conflict=isolated");
+    // …and it never said "bringing the stack up from the RECORDED file".
+    expect(lines.join("\n")).not.toContain("Bringing the stack up");
+  });
+
+  it("SKIP + an UNPARSEABLE recorded file: REFUSE (it cannot be validated)", async () => {
+    const { deps } = setup({ preserves: true, recordedDoc: "services:\n  wayflow:\n    image: busybox\n" });
+    await expect(
+      regenerateIsolatedCompose({ targetDir: dir, row: legacyRow, log: () => {}, deps }),
+    ).rejects.toThrow(/is not a CLI-generated document, so its env-file wiring cannot be validated/);
+  });
+
+  it("SKIP on a SHIFTED BASE BAND is validated the same way", async () => {
+    // The second not-re-derivable condition: regeneration would move a live
+    // service's host port. The recorded file is tokenless, so the bring-up is
+    // refused rather than warned about.
+    const { deps } = setup({ preserves: true, recordedDoc: tokenlessRecorded() });
+    const shifted = { ...row, ports: { ...row.ports, postgres: [19999] } };
+    await expect(
+      regenerateIsolatedCompose({ targetDir: dir, row: shifted, log: () => {}, deps }),
+    ).rejects.toThrow(/base band shifted[\s\S]*FAILS the env-file wiring invariant/);
   });
 });
 

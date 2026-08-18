@@ -8,7 +8,7 @@
 // is fully hermetically testable.
 // ---------------------------------------------------------------------------
 
-import { writeFileSync, chmodSync } from "node:fs";
+import { writeFileSync, chmodSync, existsSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
@@ -686,6 +686,58 @@ export function generateIsolatedCompose({ resolvedConfig, offset, projectName, s
 // about — is a regression, and it must fail LOUD at install time rather than as
 // a crash-looping container behind an install that exited 0.
 
+// ── The checkout's DECLARED narrow env files (cinatra#2654 D1, round 3) ──────
+//
+// Read off `cinatra-ai/cinatra`'s own `docker-compose.yml` (`env_file:` blocks)
+// and its `.gitignore`. All FOUR are GENERATED and gitignored — none is
+// repo-committed:
+//
+//   service              file                              written by
+//   wayflow              docker/wayflow/.wayflow.env        scripts/gen-wayflow-env.mjs
+//   nango-server         docker/nango/.nango.env            scripts/gen-nango-env.mjs
+//   knowledge-graph-mcp  docker/graphiti/.graphiti.env      scripts/gen-graphiti-env.mjs
+//   plane-mcp            docker/plane-mcp/.plane-mcp.env    scripts/fixtures/provision-plane.mjs
+//
+// WHY THIS TABLE EXISTS, given the generic source-driven rule below. On the
+// PRESERVING route the resolved source document still carries every `env_file:`,
+// so the generic rule covers all four (and any future service) with no table.
+// On the FALLBACK route it cannot: an inlining Compose has ALREADY dropped those
+// directives from the source document, so "every reference the source carried
+// must survive" is vacuously true and the three siblings had NO production
+// protection at all. This table is what the fallback route checks instead — not
+// the reference (the engine destroyed it, that is its behaviour, not our bug)
+// but the thing production actually needs: every VALUE those files supply must
+// still reach the container.
+//
+// DRIFT IS FAIL-OPEN BY DESIGN: an entry only applies when its file EXISTS in
+// the checkout, so a renamed/removed env file quietly drops out of the table
+// rather than failing an install, and the generic source-driven rule still
+// covers the new path on the preserving route.
+//
+// Only `wayflow`'s generator is invoked by THIS CLI (`generateWayflowEnv` →
+// `scripts/gen-wayflow-env.mjs`), because cinatra#2654 D1 is the wayflow runtime
+// crash-loop and `bringUpInfra` starts the wayflow profile. The other three are
+// written by the checkout's own `npm run services` / `setup:dev` / plane
+// provisioning, which the CLI does not call (it invokes `cinatra instance setup
+// <mode>` directly). Their `env_file:` entries are `required: false`, so a
+// bring-up without them is bootable-but-degraded — the app's own documented
+// state, not something this change introduces.
+export const CHECKOUT_ENV_FILE_SERVICES = [
+  { service: "wayflow", file: path.join("docker", "wayflow", ".wayflow.env") },
+  { service: "nango-server", file: path.join("docker", "nango", ".nango.env") },
+  { service: "knowledge-graph-mcp", file: path.join("docker", "graphiti", ".graphiti.env") },
+  { service: "plane-mcp", file: path.join("docker", "plane-mcp", ".plane-mcp.env") },
+];
+
+/** The entries of `CHECKOUT_ENV_FILE_SERVICES` whose file is actually PRESENT in
+ *  this checkout, as absolute paths. Fail-open on drift (see the table above). */
+export function checkoutDeclaredEnvFiles(targetDir, { existsImpl = existsSync } = {}) {
+  return CHECKOUT_ENV_FILE_SERVICES.map(({ service, file }) => ({
+    service,
+    path: path.join(targetDir, file),
+  })).filter((entry) => existsImpl(entry.path));
+}
+
 /** The `wayflow` compose service — the one the agent runs reach. */
 export const WAYFLOW_SERVICE_NAME = "wayflow";
 /** The key whose absence makes the runtime refuse to start. */
@@ -742,6 +794,13 @@ function serviceEnvObject(svc) {
  *   explicit non-empty `environment:` value (a `${VAR}` placeholder counts — the
  *   isolated `up` resolves it from `--env-file .env.local`, and
  *   assertScrubbedKeysSupplied proves that key is supplied).
+ * @param {Array<{service:string, path:string}>} [opts.declaredEnvFiles]  the
+ *   env files the CHECKOUT declares for its four narrow-env-file services, as
+ *   absolute paths, already filtered to the ones present on disk
+ *   (`checkoutDeclaredEnvFiles`). This is the PRODUCTION coverage for
+ *   nango-server / knowledge-graph-mcp / plane-mcp on the FALLBACK route, where
+ *   `sourceDoc` has already lost its `env_file:` directives to the inlining
+ *   render and so can protect nothing. See the table above for why it is a table.
  * @param {string}  [opts.baseDir]  the checkout root, used to resolve a
  *   RELATIVE `env_file:` path (the form the compose file itself uses) against
  *   the same file an absolute one names.
@@ -755,6 +814,7 @@ export function composeEnvWiringGaps(doc, {
   wayflowEnvFilePath = null,
   envFilesPreserved = true,
   envFileKeysAt = null,
+  declaredEnvFiles = [],
   baseDir = null,
 } = {}) {
   const gaps = [];
@@ -818,6 +878,62 @@ export function composeEnvWiringGaps(doc, {
         `the generated compose service "${WAYFLOW_SERVICE_NAME}" carries no non-empty ${WAYFLOW_TOKEN_KEY} in ` +
           "`environment:` and this Compose could not preserve `env_file:` (no `--no-env-resolution`), so the " +
           "agent runtime would start with no bridge token and crash-loop",
+      );
+    }
+  }
+
+  // (2d) THE CHECKOUT'S DECLARED NARROW ENV FILES — the production coverage for
+  // all four services, on BOTH routes (cinatra#2654 D1, round 3). Check (1) is
+  // driven by the resolved SOURCE document, which on the fallback route has
+  // already had its `env_file:` directives destroyed by the inlining render — so
+  // without this, nango-server / knowledge-graph-mcp / plane-mcp were protected
+  // only on the route that never needed protecting.
+  const declared = Array.isArray(declaredEnvFiles) ? declaredEnvFiles : [];
+  const readKeys = (absPath) => (typeof envFileKeysAt === "function" ? envFileKeysAt(absPath) : null);
+  for (const entry of declared) {
+    const svcName = entry?.service;
+    const filePath = entry?.path;
+    if (typeof svcName !== "string" || typeof filePath !== "string") continue;
+    const svc = services[svcName];
+    // Absent from THIS document = the service is not in the resolved stack (a
+    // profile the render did not include). Nothing to protect.
+    if (!svc || typeof svc !== "object") continue;
+
+    if (envFilesPreserved) {
+      // The reference must survive. `wayflow` is exempt here only because (2b)
+      // already checks the same thing against the same path, with a message that
+      // names the bridge-token consequence.
+      if (svcName === WAYFLOW_SERVICE_NAME) continue;
+      if (!serviceEnvFilePaths(svc).some((g) => samePath(g, filePath, baseDir))) {
+        gaps.push(
+          `service "${svcName}" does not reference the checkout's own ${filePath} in \`env_file:\`, so the ` +
+            "host wiring that file supplies would never reach the container",
+        );
+      }
+      continue;
+    }
+
+    // FALLBACK route: this Compose inlined the file's content and dropped the
+    // directive, so the reference CANNOT survive — it is the engine's behaviour,
+    // not a defect in the generator. What must survive is the VALUE ROUTE: every
+    // key the file supplies has to be carried in `environment:` with a non-empty
+    // value (a `${VAR}` placeholder counts — the isolated `up` resolves it from
+    // `--env-file .env.local`, and assertScrubbedKeysSupplied proves that key is
+    // supplied). A key that arrives EMPTY is the exact D1 failure with a
+    // different mechanism, so it is named here too.
+    const keys = readKeys(filePath);
+    if (!(keys instanceof Set) || keys.size === 0) continue;
+    const env = serviceEnvObject(svc) ?? {};
+    const lost = [...keys].filter((key) => {
+      const value = env[key];
+      return !(value != null && String(value).trim() !== "");
+    });
+    if (lost.length > 0) {
+      gaps.push(
+        `service "${svcName}" would start with NO value for ${lost.join(", ")} — this Compose could not ` +
+          `preserve \`env_file:\` (no \`--no-env-resolution\`), so the only route left for the keys ` +
+          `${filePath} supplies is an explicit non-empty \`environment:\` value, and the generated document ` +
+          "does not carry one",
       );
     }
   }

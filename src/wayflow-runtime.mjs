@@ -133,6 +133,35 @@ export const WAYFLOW_ENV_REQUIRED_KEYS = ["CINATRA_BRIDGE_TOKEN", "CINATRA_CONTE
 export const WAYFLOW_ENV_EXPECTED_KEYS = ["WAYFLOW_BASE_URL"];
 
 /**
+ * The NON-EMPTY keys ANY narrow env file supplies, or null when it is absent /
+ * unreadable. Key NAMES only — never a value, and nothing here is logged.
+ *
+ * cinatra#2654 D1 (round 3). This is the generic form of the wayflow-only reader
+ * below, and it is what lets the PRODUCTION wiring invariant reason about the
+ * checkout's OTHER narrow env files (`docker/nango/.nango.env`,
+ * `docker/graphiti/.graphiti.env`, `docker/plane-mcp/.plane-mcp.env`) instead of
+ * only wayflow's. The parse is `scripts/gen-wayflow-env.mjs`'s own dotenv shape,
+ * which every one of those generators writes.
+ *
+ * @returns {Set<string>|null}
+ */
+export function envFileSuppliedKeys(absPath, { readImpl = nodeReadFileSync } = {}) {
+  let body;
+  try {
+    body = String(readImpl(absPath, "utf8"));
+  } catch {
+    return null;
+  }
+  const supplied = new Set();
+  for (const line of body.split("\n")) {
+    const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+    if (!match) continue;
+    if (match[2].replace(/^["']|["']$/g, "").trim() !== "") supplied.add(match[1]);
+  }
+  return supplied;
+}
+
+/**
  * Parse the narrow generated env file and report WHICH of the keys the runtime
  * needs it actually supplies with a non-empty value. This is the POSTCONDITION
  * of the generator, checked independently of it: the install may only promise a
@@ -145,18 +174,10 @@ export const WAYFLOW_ENV_EXPECTED_KEYS = ["WAYFLOW_BASE_URL"];
  * @returns {{ exists: boolean, supplied: Set<string>, missingRequired: string[], missingExpected: string[] }}
  */
 export function inspectWayflowEnvFile({ targetDir, readImpl = nodeReadFileSync } = {}) {
-  const supplied = new Set();
-  let exists = true;
-  try {
-    const body = String(readImpl(path.join(targetDir, WAYFLOW_ENV_FILE), "utf8"));
-    for (const line of body.split("\n")) {
-      const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
-      if (!match) continue;
-      if (match[2].replace(/^["']|["']$/g, "").trim() !== "") supplied.add(match[1]);
-    }
-  } catch {
-    exists = false; // absent / unreadable — the container would start tokenless
-  }
+  const read = envFileSuppliedKeys(path.join(targetDir, WAYFLOW_ENV_FILE), { readImpl });
+  // absent / unreadable — the container would start tokenless
+  const exists = read !== null;
+  const supplied = read ?? new Set();
   return {
     exists,
     supplied,

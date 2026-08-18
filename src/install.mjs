@@ -119,6 +119,7 @@ import {
   renderIsolatedComposeYaml,
   assertComposeHostUrlsRemapped,
   composeEnvWiringGaps,
+  checkoutDeclaredEnvFiles,
   parseIsolatedComposeDoc,
   ISOLATED_COMPOSE_FILENAME,
 } from "./install-isolation.mjs";
@@ -171,6 +172,7 @@ import {
   wayflowBuildFailureMessage,
   wayflowEnvFailureMessage,
   wayflowEnvSuppliedKeys,
+  envFileSuppliedKeys,
   wayflowStatusLines,
   WAYFLOW_ENV_FILE,
 } from "./wayflow-runtime.mjs";
@@ -3507,27 +3509,52 @@ function assertScrubbedKeysSupplied(targetDir, scrubbedKeys = []) {
  *  reconcile repairs. Fail at generation time, by name, BEFORE the file is
  *  written or anything is started.
  *
- *  Three checks, all in `composeEnvWiringGaps`: every `env_file:` the resolved
- *  SOURCE document carried survives into the generated one (generic — this is
- *  what covers nango-server / knowledge-graph-mcp / plane-mcp alongside
- *  wayflow, with no per-service table); the wayflow service references the
- *  exact `.wayflow.env` path the bring-up writes (or, on the documented
- *  fallback render, carries a non-empty token value); and no service sets an
- *  EMPTY `environment:` value for a key its env file supplies, because that
- *  empty value OVERRIDES the file — the precedence trap the checkout's own
- *  compose comments name. */
-function assertGeneratedEnvWiring({ doc, sourceDoc, targetDir, envFilesPreserved, deps = {} }) {
+ *  Four checks, all in `composeEnvWiringGaps`:
+ *    1. every `env_file:` the resolved SOURCE document carried survives into the
+ *       generated one (generic over any service — the rule that also covers a
+ *       FUTURE narrow-env-file service, on the preserving route);
+ *    2. the wayflow service references the exact `.wayflow.env` path the
+ *       bring-up writes (or, on the documented fallback render, carries a
+ *       non-empty token value);
+ *    3. ALL FOUR of the checkout's declared narrow-env-file services
+ *       (wayflow, nango-server, knowledge-graph-mcp, plane-mcp) keep their
+ *       wiring on BOTH routes — the reference when this Compose preserves it,
+ *       and otherwise every VALUE their env file supplies. Check 1 cannot do
+ *       this on the fallback route: an inlining render has already stripped the
+ *       directives from the source document, so it has nothing left to compare;
+ *    4. no service sets an EMPTY `environment:` value for a key its env file
+ *       supplies, because that empty value OVERRIDES the file — the precedence
+ *       trap the checkout's own compose comments name. The key reader is
+ *       GENERIC, so this holds for all four services in production and not only
+ *       in a unit test that passes its own reader. */
+function isolatedEnvWiringGaps({ doc, sourceDoc, targetDir, envFilesPreserved, deps = {} }) {
   const suppliedKeys = deps.wayflowEnvSuppliedKeys ?? wayflowEnvSuppliedKeys;
+  const readEnvFileKeys = deps.envFileSuppliedKeys ?? envFileSuppliedKeys;
   const wayflowEnvFilePath = path.join(targetDir, WAYFLOW_ENV_FILE);
+  // cinatra#2654 D1 (round 3): the key reader is GENERIC. It used to answer only
+  // for `.wayflow.env` and `null` for every other path, which silently disabled
+  // the per-service precedence check for nango-server / knowledge-graph-mcp /
+  // plane-mcp in production — their protection existed only in a unit test that
+  // passed its own reader. wayflow still goes through the injectable
+  // `wayflowEnvSuppliedKeys` seam so existing dep injection keeps working.
   const keysByPath = (absPath) =>
-    path.resolve(absPath) === path.resolve(wayflowEnvFilePath) ? suppliedKeys({ targetDir }) : null;
-  const gaps = composeEnvWiringGaps(doc, {
+    path.resolve(absPath) === path.resolve(wayflowEnvFilePath)
+      ? suppliedKeys({ targetDir })
+      : readEnvFileKeys(absPath);
+  return composeEnvWiringGaps(doc, {
     sourceDoc,
     wayflowEnvFilePath,
     envFilesPreserved,
     envFileKeysAt: keysByPath,
+    // All four narrow-env-file services the checkout declares, filtered to the
+    // files actually present — the production coverage on BOTH routes.
+    declaredEnvFiles: (deps.checkoutDeclaredEnvFiles ?? checkoutDeclaredEnvFiles)(targetDir),
     baseDir: targetDir,
   });
+}
+
+function assertGeneratedEnvWiring({ doc, sourceDoc, targetDir, envFilesPreserved, deps = {} }) {
+  const gaps = isolatedEnvWiringGaps({ doc, sourceDoc, targetDir, envFilesPreserved, deps });
   if (gaps.length === 0) return;
   throw new Error(
     `Refusing to write the isolated compose — ${gaps.join("; ")} (cinatra#2654). ` +
@@ -4953,11 +4980,24 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
 
 /** cinatra#2654 D1 — the ONE reconcile-facing wrapper around
  *  `regenerateIsolatedComposeInPlace`, so both reconcile entrances treat a
- *  failure identically: it PROPAGATES. A not-re-derivable SKIP is reported
- *  prominently (it means this instance's generated compose cannot be repaired in
- *  place, which an operator needs to know) and the reconcile continues with the
- *  recorded file. Nothing here swallows an error. */
-async function regenerateIsolatedCompose({ targetDir, row, log = console.log, deps = {} }) {
+ *  failure identically: it PROPAGATES. Nothing here swallows an error.
+ *
+ *  A not-re-derivable SKIP (round 3) is no longer a warn-and-start. The two skip
+ *  reasons — an ambiguous legacy band offset, a shifted base band — mean the file
+ *  CANNOT be repaired in place, and the file we would then start is exactly the
+ *  artifact the reconcile exists to repair: it may be the defective, tokenless
+ *  compose D1 produced. So the RECORDED file is VALIDATED against the same wiring
+ *  invariant the generator asserts:
+ *
+ *    - it PASSES  → say so, name the skip reason, and proceed. Proceeding is
+ *                   safe AND honest: the thing we are about to start has been
+ *                   checked, not merely assumed.
+ *    - it FAILS   → REFUSE to bring up, attributably, naming the recovery. A
+ *                   known-tokenless runtime is never started with a ⚠ in front
+ *                   of it — that is the "exited 0 and recorded ready" lie D1 was.
+ *
+ *  An UNPARSEABLE recorded file cannot be validated, so it is a refusal too. */
+export async function regenerateIsolatedCompose({ targetDir, row, log = console.log, deps = {} }) {
   const result = await (deps.regenerateIsolatedComposeInPlace ?? regenerateIsolatedComposeInPlace)({
     targetDir,
     row,
@@ -4965,13 +5005,57 @@ async function regenerateIsolatedCompose({ targetDir, row, log = console.log, de
     deps,
   });
   if (result.skipped && result.skipped !== "absent") {
-    log(
-      `  ⚠ Could not re-derive ${ISOLATED_COMPOSE_FILENAME} for "${row.slug}" — ${result.skipped}. ` +
-        "Bringing the stack up from the RECORDED file; if this instance is misconfigured, re-create it with " +
-        "`cinatra instance remove <slug>` followed by a fresh `cinatra install --on-conflict=isolated`.",
-    );
+    assertRecordedIsolatedComposeUsable({ targetDir, row, skipped: result.skipped, recorded: result.recorded, deps, log });
   }
   return result;
+}
+
+/** cinatra#2654 D1 (round 3) — the recorded `docker-compose.cinatra-isolated.yml`
+ *  must pass the SAME env-file wiring invariant a freshly generated one does
+ *  before a reconcile agrees to start it. Throws (never warns) when it does not.
+ *  `recorded` is the context the skip carried: the parsed recorded document, the
+ *  resolved source document from THIS checkout, and which render route this
+ *  Compose can give us. */
+function assertRecordedIsolatedComposeUsable({ targetDir, row, skipped, recorded, deps = {}, log = console.log }) {
+  const recovery =
+    `\n  Re-create the instance (its generated compose cannot be re-derived in place):\n` +
+    `    cinatra instance remove ${row.slug}\n` +
+    `    cinatra install --dir ${targetDir} --on-conflict=isolated`;
+
+  if (!recorded || !recorded.doc || typeof recorded.doc !== "object") {
+    throw new Error(
+      `Refusing to bring up isolated instance "${row.slug}" — ${skipped}, and the RECORDED ` +
+        `${ISOLATED_COMPOSE_FILENAME} is not a CLI-generated document, so its env-file wiring cannot be ` +
+        `validated. Starting it could run the WayFlow agent runtime with no bridge token (cinatra#2654).` +
+        recovery,
+    );
+  }
+
+  const gaps = isolatedEnvWiringGaps({
+    doc: recorded.doc,
+    sourceDoc: recorded.sourceDoc,
+    targetDir,
+    envFilesPreserved: recorded.envFilesPreserved,
+    deps,
+  });
+  if (gaps.length > 0) {
+    throw new Error(
+      `Refusing to bring up isolated instance "${row.slug}" — ${skipped}, and the RECORDED ` +
+        `${ISOLATED_COMPOSE_FILENAME} FAILS the env-file wiring invariant: ${gaps.join("; ")} (cinatra#2654). ` +
+        `The one recovery that repairs this file in place is unavailable for this instance, so bringing the ` +
+        `stack up would knowingly start a broken runtime.` +
+        recovery,
+    );
+  }
+
+  log(
+    `  ⚠ Could not re-derive ${ISOLATED_COMPOSE_FILENAME} for "${row.slug}" — ${skipped}. ` +
+      "VALIDATED the recorded file against the same env-file wiring invariant instead: it PASSES, so the " +
+      "stack is brought up from it. Non-wiring drift from this checkout's current compose is not repaired; " +
+      "re-create the instance if you need it re-derived (`cinatra instance remove " +
+      `${row.slug}` +
+      "` then a fresh `cinatra install --on-conflict=isolated`).",
+  );
 }
 
 /**
@@ -5008,9 +5092,11 @@ async function regenerateIsolatedCompose({ targetDir, row, log = console.log, de
  * SKIP vs FAILURE (cinatra#2654 D1). Two conditions mean the file CANNOT be
  * re-derived safely and never could be — an ambiguous legacy band offset, and a
  * base band that shifted so a shared service's host port would move. Those
- * return `{ regenerated: false, skipped: <reason> }`: the caller reports them
- * prominently and proceeds with the recorded compose, because relocating a
- * possibly-running service is worse than a stale file. EVERYTHING ELSE — an
+ * return `{ regenerated: false, skipped: <reason>, recorded: {…} }`, because
+ * relocating a possibly-running service is worse than a stale file. The caller
+ * then VALIDATES the recorded document with the same wiring invariant and
+ * REFUSES the bring-up if it fails (cinatra#2654 D1, round 3) — a skip is never
+ * a licence to start an unchecked file. EVERYTHING ELSE — an
  * unresolvable `docker compose config`, a violated invariant, a write error — is
  * a genuine failure and THROWS, and callers must not swallow it: continuing
  * would start the old, defective compose while printing success, which is the
@@ -5068,6 +5154,10 @@ export async function regenerateIsolatedComposeInPlace({ targetDir, row, log = c
       skipped:
         "the isolated band offset could not be derived from the recorded ports (ambiguous), so the generated " +
         "compose cannot be safely re-derived",
+      // The caller VALIDATES the recorded file with the same invariant before it
+      // agrees to start it (cinatra#2654 D1, round 3) — hand it everything that
+      // check needs, resolved from THIS checkout at THIS moment.
+      recorded: { doc: existingDoc, sourceDoc: resolvedConfig, envFilesPreserved },
     };
   }
 
@@ -5093,6 +5183,7 @@ export async function regenerateIsolatedComposeInPlace({ targetDir, row, log = c
       skipped:
         "regeneration would move an already-remapped service's host port (the checkout's base band shifted), " +
         "so the recorded compose is left untouched",
+      recorded: { doc: existingDoc, sourceDoc: resolvedConfig, envFilesPreserved },
     };
   }
 
