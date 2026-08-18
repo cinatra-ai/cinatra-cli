@@ -218,6 +218,7 @@ describe("cinatra-cli#233 — the reload + route probes speak the loader's contr
       fetchImpl: makeFetch({ healthSequence: [json(200, { status: "ok", agents: 29 })] }),
     });
     expect(ok.reachable).toBe(true);
+    expect(ok.healthy).toBe(true);
     expect(ok.agents).toBe(29);
     const down = await fetchWayflowHealth({
       endpoint: "http://localhost:3010",
@@ -227,6 +228,20 @@ describe("cinatra-cli#233 — the reload + route probes speak the loader's contr
     });
     expect(down.reachable).toBe(false);
     expect(down.agents).toBeNull();
+  });
+
+  it("an ANSWERING but unhealthy runtime is reachable and NOT healthy — answering is not serving", async () => {
+    const five = await fetchWayflowHealth({
+      endpoint: "http://localhost:3010",
+      fetchImpl: makeFetch({ healthSequence: [json(500, { error: "boom" })] }),
+    });
+    expect(five.reachable).toBe(true);
+    expect(five.healthy).toBe(false);
+    const unknown = await fetchWayflowHealth({
+      endpoint: "http://localhost:3010",
+      fetchImpl: makeFetch({ healthSequence: [json(200, { status: "error", agents: 3 })] }),
+    });
+    expect(unknown.healthy).toBe(false);
   });
 });
 
@@ -437,6 +452,55 @@ describe("cinatra-cli#233 — mountAgentSourcesAfterSync repairs the fresh-insta
     expect(logs.join("\n")).toContain("could not be mounted");
   });
 
+  it("a 5xx /.health with every route answering 405 is NOT success — answering is not health", async () => {
+    const root = makeCheckout(path.join(sandbox, "unhealthy"), { agents: ["acme/a"] });
+    const out = await mountAgentSourcesAfterSync({
+      targetDir: root,
+      composeArgs: COMPOSE_ARGS,
+      log: () => {},
+      deps: {
+        fetchImpl: makeFetch({ healthSequence: [json(500, { error: "boom" })], reload: json(200, { agents: 1 }), route: json(405, {}) }),
+        spawnSync: () => ({ status: 0 }),
+        sleepImpl: async () => {},
+      },
+    });
+    expect(out.status).toBe("failed");
+  });
+
+  it("an ABSENT agent count is not coverage — every route answering still does not prove it", async () => {
+    const root = makeCheckout(path.join(sandbox, "nocount"), { agents: ["acme/a"] });
+    const logs = [];
+    const out = await mountAgentSourcesAfterSync({
+      targetDir: root,
+      composeArgs: COMPOSE_ARGS,
+      log: (m) => logs.push(String(m)),
+      deps: {
+        // A 200 `ok` with NO `agents` field, and the route answering.
+        fetchImpl: makeFetch({ healthSequence: [json(200, { status: "ok" })], reload: json(200, {}), route: json(405, {}) }),
+        spawnSync: () => ({ status: 0 }),
+        sleepImpl: async () => {},
+      },
+    });
+    expect(out.status).toBe("failed");
+    expect(logs.join("\n")).toContain("no agent count");
+  });
+
+  it("a malformed /.health body is not health either", async () => {
+    const root = makeCheckout(path.join(sandbox, "malformed"), { agents: ["acme/a"] });
+    const broken = { status: 200, json: async () => { throw new Error("not json"); } };
+    const out = await mountAgentSourcesAfterSync({
+      targetDir: root,
+      composeArgs: COMPOSE_ARGS,
+      log: () => {},
+      deps: {
+        fetchImpl: makeFetch({ healthSequence: [broken], reload: json(200, { agents: 1 }), route: json(405, {}) }),
+        spawnSync: () => ({ status: 0 }),
+        sleepImpl: async () => {},
+      },
+    });
+    expect(out.status).toBe("failed");
+  });
+
   it("restartWayflowService refuses without a compose context rather than guessing a project", () => {
     expect(restartWayflowService({ targetDir: "/tmp", composeArgs: null, deps: { spawnSync: () => ({ status: 0 }) } })).toEqual({
       ok: false,
@@ -505,6 +569,19 @@ describe("cinatra-cli#233 — the doctor judges AVAILABILITY, not only health", 
   it("0 mounted AND no sources on disk → FAIL (nothing to run), and mounted-with-no-sources still passes", () => {
     expect(judgeAgentAvailability({ sources: [], agents: 0 }).verdict).toBe("fail");
     expect(judgeAgentAvailability({ sources: [], agents: 4 }).verdict).toBe("pass");
+  });
+
+  it("an ABSENT agent count is a SKIP, not a PASS — routes answering do not prove coverage", () => {
+    const v = judgeAgentAvailability({ sources: ["acme/a"], agents: null, probes: probesOf(["acme/a", 405]) });
+    expect(v.verdict).toBe("skip");
+    expect(v.detail).toContain("no agent count");
+    // …and with no sources either, still not a pass.
+    expect(judgeAgentAvailability({ sources: [], agents: null }).verdict).toBe("skip");
+  });
+
+  it("a 404 still decides even when the count is absent — a missing route is not an unknown", () => {
+    const v = judgeAgentAvailability({ sources: ["acme/a"], agents: null, probes: probesOf(["acme/a", 404]) });
+    expect(v.verdict).toBe("fail");
   });
 });
 

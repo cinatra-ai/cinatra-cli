@@ -215,10 +215,20 @@ export function readWayflowBridgeToken({ targetDir, deps = {} } = {}) {
   }
 }
 
-/** GET `/.health`. Returns `{ reachable, status, agents, body }`. Never throws. */
+/**
+ * GET `/.health`. Returns `{ reachable, healthy, status, agents, body }`.
+ *
+ * `reachable` is TRANSPORT only — the runtime answered something. `healthy` is
+ * the loader's own contract: HTTP 200 with `status` in {ok, degraded} (the same
+ * rule the compose healthcheck and the doctor apply). Availability is judged on
+ * `healthy`, never on `reachable`: a runtime answering 500 has answered, and
+ * proves nothing about what it serves (codex round 2).
+ *
+ * Never throws.
+ */
 export async function fetchWayflowHealth({ endpoint, fetchImpl, timeoutMs = HEALTH_TIMEOUT_MS } = {}) {
   const doFetch = fetchImpl ?? globalThis.fetch;
-  const out = { reachable: false, status: null, agents: null, body: null };
+  const out = { reachable: false, healthy: false, status: null, agents: null, body: null };
   if (typeof doFetch !== "function" || !endpoint) return out;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -234,6 +244,8 @@ export async function fetchWayflowHealth({ endpoint, fetchImpl, timeoutMs = HEAL
       }
     }
     out.agents = typeof out.body?.agents === "number" ? out.body.agents : null;
+    const reported = typeof out.body?.status === "string" ? out.body.status : null;
+    out.healthy = out.status === 200 && (reported === "ok" || reported === "degraded");
   } catch {
     // transport error/timeout — `reachable` stays false
   } finally {
@@ -369,14 +381,16 @@ export async function verifyAgentsAvailable({ endpoint, sources = [], fetchImpl,
     else if (typeof probe.status === "number" && probe.status >= 500) errored.push(label);
   }
   const mounted = typeof health.agents === "number" ? health.agents : null;
-  const countCovers = mounted === null || mounted >= sources.length;
+  // An ABSENT count is not coverage (codex round 2): only a number that covers
+  // the sources proves the runtime holds them. Fail closed on an unknown.
+  const countCovers = mounted !== null && mounted >= sources.length;
   const ok =
-    health.reachable && missing.length === 0 && errored.length === 0 && indeterminate.length === 0 && countCovers;
+    health.healthy && missing.length === 0 && errored.length === 0 && indeterminate.length === 0 && countCovers;
   return { ok, health, mounted, probes, missing, errored, indeterminate, countCovers };
 }
 
 /** One operator-facing phrase naming exactly what is not available. */
-function unavailabilityReason({ missing, errored, indeterminate, mounted, sources, countCovers }) {
+function unavailabilityReason({ missing, errored, indeterminate, mounted, sources, countCovers, health = null }) {
   // Name the ROUTES, not the labels: that is what an operator curls to confirm.
   const parts = [];
   if (missing.length > 0) parts.push(`${missing.length} agent route(s) answer HTTP 404 (${missing.map(agentRoutePath).join(", ")})`);
@@ -384,8 +398,18 @@ function unavailabilityReason({ missing, errored, indeterminate, mounted, source
   if (indeterminate.length > 0) {
     parts.push(`${indeterminate.length} agent route(s) gave no response (${indeterminate.map(agentRoutePath).join(", ")})`);
   }
-  if (!countCovers) parts.push(`the runtime reports ${mounted} mounted for ${sources.length} source(s) on disk`);
-  return parts.join("; ") || "the runtime is not answering";
+  if (health && !health.healthy) {
+    parts.push(
+      health.reachable
+        ? `/.health answered HTTP ${health.status ?? "?"} (status=${health.body?.status ?? "unparseable"})`
+        : "/.health is not answering",
+    );
+  } else if (mounted === null) {
+    parts.push("/.health reported no agent count, so coverage cannot be proven");
+  } else if (!countCovers) {
+    parts.push(`the runtime reports ${mounted} mounted for ${sources.length} source(s) on disk`);
+  }
+  return parts.join("; ") || "the runtime is not serving its agents";
 }
 
 /**
@@ -402,7 +426,7 @@ export async function waitForAgentsMounted({ endpoint, attempts = 40, intervalMs
   let last = { reachable: false, status: null, agents: null, body: null };
   for (let i = 0; i < attempts; i += 1) {
     last = await fetchWayflowHealth({ endpoint, fetchImpl: deps.fetchImpl });
-    if (last.reachable && typeof last.agents === "number" && last.agents > 0) return last;
+    if (last.healthy && typeof last.agents === "number" && last.agents > 0) return last;
     await sleep(intervalMs);
   }
   return last;
@@ -564,6 +588,15 @@ export function judgeAgentAvailability({ sources = [], agents = null, probes = [
     if (agents !== null && agents > 0) {
       return { verdict: "pass", detail: `${agents} agent(s) mounted (no agent sources under extensions/ in this checkout)`, remedy: null };
     }
+    if (agents === null) {
+      return {
+        verdict: "skip",
+        detail:
+          "/.health reported no agent count and this checkout has no agent sources on disk — availability could " +
+          "not be determined",
+        remedy: "Check the runtime's /.health contract (`agents` is expected), then re-run `cinatra doctor`.",
+      };
+    }
     return {
       verdict: "fail",
       detail:
@@ -607,7 +640,18 @@ export function judgeAgentAvailability({ sources = [], agents = null, probes = [
       remedy: "Wait for the loader to finish mounting agents, then re-run `cinatra doctor`.",
     };
   }
-  if (agents !== null && agents < sources.length) {
+  if (agents === null) {
+    // An absent count is not coverage: every route answering says those routes
+    // exist, not that the runtime holds all the sources. Unknown, so SKIP.
+    return {
+      verdict: "skip",
+      detail:
+        `every probed agent route answers, but /.health reported no agent count for the ${sources.length} source(s) ` +
+        "on disk — coverage could not be proven",
+      remedy: "Check the runtime's /.health contract (`agents` is expected), then re-run `cinatra doctor`.",
+    };
+  }
+  if (agents < sources.length) {
     return {
       verdict: "fail",
       detail:

@@ -65,7 +65,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
   names the missing routes and the recovery, any 5xx is a FAIL (mounted, not
   serving), and a route that gives no answer at all is a SKIP — an
   indeterminate probe is never reported as readiness. A route answering 405
-  (the route exists, GET is not its method) is the healthy signal.
+  (the route exists, GET is not its method) is the healthy signal. Coverage
+  must be proven, not assumed: a mounted count below the number of sources
+  fails, and a runtime that reports no count at all is a SKIP rather than a
+  pass.
 - **A preview no longer wires itself to another instance's services, and it can
   finally reach its own connection service.** The preview composition decided
   where this instance's services live by string manipulation: it swapped a
