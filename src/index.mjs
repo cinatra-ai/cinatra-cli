@@ -59,6 +59,15 @@ import {
   normalizeWayflowRuntimeMode,
   resolveRecordedComposeContext,
 } from "./wayflow-runtime.mjs";
+// cinatra-cli#233 — agent AVAILABILITY. A runtime that answers `/.health` `ok`
+// while mounting 0 agents is not agent-ready; the doctor compares the agent
+// sources on disk against what the runtime actually serves.
+import {
+  DEFAULT_WAYFLOW_ENDPOINT,
+  discoverAgentSources,
+  judgeAgentAvailability,
+  probeAgentRoute,
+} from "./wayflow-agent-mount.mjs";
 
 import {
   EXECUTION_MODES,
@@ -5253,20 +5262,64 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
         `${runningContainer}\`.`,
     );
   }
+  // cinatra-cli#233 — AVAILABILITY, not just health. `/.health` answers `ok`
+  // for a runtime that mounted NOTHING: the loader walks its bind-mounted
+  // `extensions/` directory once, at boot, and a fresh install starts it before
+  // the extension sources are cloned. cinatra#2654 row 7 measured exactly that —
+  // `{"status":"ok","agents":0,…}` with `/agents/cinatra-ai/blog-draft-writer-agent/`
+  // answering HTTP 404 — and this probe PASSED over it. So the verdict now
+  // compares what is mountable ON DISK against what the runtime actually serves,
+  // and probes a real agent route (404 = not mounted; 405 = mounted, wrong
+  // method — the reference evidence's own signal).
   const agentCount = typeof health?.agents === "number" ? health.agents : null;
-  const agentNote = agentCount === null ? "" : `; ${agentCount} agent(s) mounted`;
-  if (runtimeStatus === "degraded") {
-    const failed = Array.isArray(health?.failed_agents) ? health.failed_agents.length : null;
+  const agentSources = discoverAgentSources({ targetDir: repoRoot });
+  let routeProbe = { reachable: false, status: null, mounted: null };
+  if (agentSources.length > 0) {
+    routeProbe = await probeAgentRoute({
+      endpoint: wayflowOriginFromHealthUrl(healthUrl),
+      label: agentSources[0],
+      fetchImpl,
+      timeoutMs: DOCTOR_HTTP_TIMEOUT_MS,
+    });
+  }
+  const availability = judgeAgentAvailability({
+    sources: agentSources,
+    agents: agentCount,
+    routeStatus: routeProbe.status,
+    routeReachable: routeProbe.reachable,
+  });
+  const failed = Array.isArray(health?.failed_agents) ? health.failed_agents.length : null;
+  const degradedNote =
+    runtimeStatus === "degraded"
+      ? (failed === null ? "" : `; ${failed} agent(s) failed to load`) +
+        `; check \`docker logs ${runningContainer}\` for the per-agent errors`
+      : "";
+  if (availability.verdict === "fail") {
     return makeAssertion(
       id,
       label,
-      "pass",
-      `runtime up; /.health degraded${agentNote}` +
-        (failed === null ? "" : `; ${failed} agent(s) failed to load`) +
-        `; check \`docker logs ${runningContainer}\` for the per-agent errors`,
+      "fail",
+      `runtime up; /.health ${runtimeStatus} — but ${availability.detail}${degradedNote}`,
+      availability.remedy,
     );
   }
-  return makeAssertion(id, label, "pass", `runtime up; /.health ok${agentNote}`);
+  return makeAssertion(
+    id,
+    label,
+    "pass",
+    `runtime up; /.health ${runtimeStatus}; ${availability.detail}${degradedNote}`,
+  );
+}
+
+// The runtime ORIGIN behind the doctor's health URL, so an agent-route probe
+// addresses the same instance the health probe just answered for (an isolated
+// instance remaps the WayFlow host port). Falls back to the default endpoint.
+function wayflowOriginFromHealthUrl(healthUrl) {
+  try {
+    return new URL(healthUrl).origin;
+  } catch {
+    return DEFAULT_WAYFLOW_ENDPOINT;
+  }
 }
 
 // Assertion 8 — dev-app clone presence. The WP plugin + Drupal module clones must

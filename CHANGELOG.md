@@ -32,6 +32,30 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A fresh install can now actually run an agent: the WayFlow runtime mounts
+  the extension repos instead of starting before they exist.** The install
+  brought the local stack up — the agent runtime with it — and cloned the
+  declared extension repos afterwards. The runtime bind-mounts the checkout's
+  `extensions/` directory and walks it once, at boot, so a first install walked
+  an empty directory: it mounted **0 agents** and every
+  `/agents/<vendor>/<slug>/` route answered HTTP 404. Nothing surfaced it —
+  `/.health` still answered `ok`, the compose healthcheck passed, and
+  `cinatra doctor` reported the runtime ready — so an install that exited 0 and
+  recorded the instance ready could not run a single agent. The install now
+  makes the runtime re-read the directory **after** the agent sources are on
+  disk, through the loader's own hot-reload route (a restart of the one service
+  when that route is unavailable), and verifies the outcome against `/.health`
+  plus a real agent route rather than assuming it. The step runs only for an
+  install that owns a local runtime, and reports a failure by name instead of
+  failing an otherwise-provisioned instance.
+- **`cinatra doctor` checks agent AVAILABILITY, not only the health endpoint.**
+  The WayFlow readiness probe passed on any runtime answering `/.health` with
+  `ok` or `degraded`, which is exactly what a runtime that mounted nothing
+  answers. It now compares the agent sources on disk against what the runtime
+  serves and probes a real agent route: 0 mounted with sources present, or an
+  on-disk agent whose route answers 404, is a FAIL that names the cause and the
+  recovery. A mounted route answering 405 (the route exists, GET is not its
+  method) is the healthy signal.
 - **A preview no longer wires itself to another instance's services, and it can
   finally reach its own connection service.** The preview composition decided
   where this instance's services live by string manipulation: it swapped a

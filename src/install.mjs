@@ -158,6 +158,7 @@ import { resolveBuildTimeoutMs } from "./preview.mjs";
 import {
   WAYFLOW_PROFILE,
   WAYFLOW_RUNTIME_KEY,
+  WAYFLOW_RUNTIME_LOCAL,
   buildWayflowImage,
   generateWayflowEnv,
   resolveWayflowRuntimeMode,
@@ -165,6 +166,11 @@ import {
   wayflowBuildFailureMessage,
   wayflowStatusLines,
 } from "./wayflow-runtime.mjs";
+// cinatra-cli#233 — the runtime is started with the rest of the stack, BEFORE
+// the extension sources it bind-mounts are on disk, so a fresh install mounts
+// 0 agents. This module makes the running runtime pick them up once the sync
+// has put them there (builtins-only, injectable, hermetically testable).
+import { mountAgentSourcesAfterSync } from "./wayflow-agent-mount.mjs";
 import {
   deriveCoUseSlug,
   coUseDbName,
@@ -6130,6 +6136,55 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
       // this full-setup path — the --no-setup / --no-install branches above skip it.
       assertProdEnvComplete({ targetDir, log });
     }
+  }
+
+  // 7a1. cinatra-cli#233 — MOUNT the agent sources the runtime was started
+  //      before. Steps 4b/6 bring the local stack up, WayFlow included; step 7
+  //      (above) is what puts the agent sources on disk — the dev clone of the
+  //      declared extension repos, or the prod acquisition. The runtime
+  //      bind-mounts `./extensions:/agents:ro` and walks it ONCE at boot, so on
+  //      a FRESH install it walked an empty directory: 0 agents mounted, every
+  //      `/agents/<vendor>/<slug>/` route HTTP 404 — while `/.health` still
+  //      answers `ok` and the compose healthcheck passes, so nothing surfaced
+  //      it (cinatra#2654 row 7). This step is the ordering fix the runtime's
+  //      own hot-reload route exists for: it runs AFTER the sources exist, and
+  //      makes the runtime re-read them (reload, or a service restart when the
+  //      route is unavailable), then VERIFIES against `/.health` + a real agent
+  //      route.
+  //
+  //      Only for an install that OWNS a local runtime (`local` — not
+  //      `--no-wayflow`, not external/co-use), and never on a checkout-only run
+  //      that started no stack. Non-fatal by contract, like the health wait it
+  //      complements: the instance is already provisioned here, so a failure is
+  //      reported loudly and by name (and `cinatra doctor`'s agent-availability
+  //      probe fails on the same state) rather than rolling back a working
+  //      install. `deps.mountAgentSourcesAfterSync` is the test seam.
+  //
+  //      The compose project is what proves a bring-up actually happened on
+  //      this run: `defaultProject` is set only inside the default bring-up
+  //      block, and the isolated/attach plans carry the project they started.
+  //      Without one there is no runtime of ours to address, so the step does
+  //      not run (and never warns about a runtime nobody started).
+  const mountComposeProject =
+    infraPlan === "isolated" || infraPlan === "attach"
+      ? (resolution?.instance?.composeProject ?? null)
+      : defaultProject;
+  if (wayflowRuntimeMode === WAYFLOW_RUNTIME_LOCAL && mountComposeProject) {
+    const mountComposeFiles =
+      infraPlan === "isolated" || infraPlan === "attach" ? (resolution?.instance?.composeFiles ?? null) : null;
+    const mountEnvFile = path.join(targetDir, ".env.local");
+    const mount = deps.mountAgentSourcesAfterSync ?? mountAgentSourcesAfterSync;
+    await mount({
+      targetDir,
+      composeArgs: composeArgsFor({
+        composeFiles: mountComposeFiles,
+        composeProject: mountComposeProject,
+        envFile: existsSync(mountEnvFile) ? mountEnvFile : null,
+        profiles: [WAYFLOW_PROFILE],
+      }),
+      log,
+      deps: { spawnSync, ...(deps.wayflowMountDeps ?? {}) },
+    });
   }
 
   // 7a2. Execution plane (cinatra-cli#160): the install-time execution-mode choice
