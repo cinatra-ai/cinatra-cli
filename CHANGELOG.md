@@ -46,16 +46,26 @@ project adheres to [Semantic Versioning](https://semver.org/).
   disk, through the loader's own hot-reload route (a restart of the one service
   when that route is unavailable), and verifies the outcome against `/.health`
   plus a real agent route rather than assuming it. The step runs only for an
-  install that owns a local runtime, and reports a failure by name instead of
-  failing an otherwise-provisioned instance.
+  install that owns a local runtime, addresses only this host's loopback
+  runtime with the bridge token, and judges availability per agent route rather
+  than on the runtime's aggregate agent count.
+
+  **Behaviour change.** An install whose runtime cannot serve its agents no
+  longer exits 0. The instance is still provisioned (nothing is rolled back at
+  that point), so the tail states the condition, names both recoveries, and the
+  process claims the typed exit code **21** — the same
+  completed-with-a-named-defect shape the local-registry skew verdict uses. A
+  clean exit over a runtime that cannot run an agent is exactly the failure
+  this change removes.
 - **`cinatra doctor` checks agent AVAILABILITY, not only the health endpoint.**
   The WayFlow readiness probe passed on any runtime answering `/.health` with
   `ok` or `degraded`, which is exactly what a runtime that mounted nothing
   answers. It now compares the agent sources on disk against what the runtime
-  serves and probes a real agent route: 0 mounted with sources present, or an
-  on-disk agent whose route answers 404, is a FAIL that names the cause and the
-  recovery. A mounted route answering 405 (the route exists, GET is not its
-  method) is the healthy signal.
+  serves and probes **every** on-disk agent's own route: any 404 is a FAIL that
+  names the missing routes and the recovery, any 5xx is a FAIL (mounted, not
+  serving), and a route that gives no answer at all is a SKIP — an
+  indeterminate probe is never reported as readiness. A route answering 405
+  (the route exists, GET is not its method) is the healthy signal.
 - **A preview no longer wires itself to another instance's services, and it can
   finally reach its own connection service.** The preview composition decided
   where this instance's services live by string manipulation: it swapped a

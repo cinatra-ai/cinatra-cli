@@ -55,6 +55,43 @@ const RELOAD_TIMEOUT_MS = 30_000;
 const HEALTH_TIMEOUT_MS = 5_000;
 
 /**
+ * The typed exit code for an install that COMPLETED but left a runtime which
+ * cannot serve its agents. Mirrors `SETUP_EXIT_REGISTRY_SKEW` (20): the install
+ * really did provision the instance, so a bare "failed" would be false — but it
+ * must NOT exit 0 either, because the whole point of cinatra-cli#233 is that
+ * "exited 0 and recorded ready" hid a runtime that could not run an agent.
+ */
+export const INSTALL_EXIT_AGENTS_UNAVAILABLE = 21;
+
+/** Claim the typed code ONLY over a provably clean exit — never downgrade or
+ *  mask a non-zero a real failure already set (same rule as the skew code). */
+export function claimAgentsUnavailableExitCode(currentExitCode) {
+  const clean = currentExitCode === undefined || currentExitCode === null || currentExitCode === 0;
+  return clean ? INSTALL_EXIT_AGENTS_UNAVAILABLE : currentExitCode;
+}
+
+/**
+ * Is this endpoint the LOCAL runtime this install owns?
+ *
+ * SECURITY BOUNDARY (codex round 1, must-fix 4). The reload request carries
+ * `CINATRA_BRIDGE_TOKEN`, and the endpoint comes from `WAYFLOW_BASE_URL` in the
+ * checkout's `.env.local` — a value an install can inherit, a stale instance
+ * can leave behind, and a hostile checkout can set. Sending the token to an
+ * arbitrary origin would exfiltrate it. An install-owned runtime is a container
+ * publishing on THIS host's loopback interface, so the token is sent only
+ * there; any other endpoint keeps the token and takes the restart route (which
+ * needs no secret) instead.
+ */
+export function isLoopbackEndpoint(endpoint) {
+  try {
+    const host = new URL(endpoint).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "0.0.0.0";
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Every agent source on disk, discovered the way the loader discovers them:
  * a two-level walk of `<targetDir>/extensions/<vendor>/<slug>/cinatra/oas.json`.
  * Directories without that file are the loader's "probe pattern" and are
@@ -303,6 +340,55 @@ export function restartWayflowService({ targetDir, composeArgs = null, deps = {}
 }
 
 /**
+ * Is EVERY agent source on disk actually served by the runtime?
+ *
+ * codex round 1, must-fixes 2 + 3: a positive aggregate count proves nothing
+ * about the agent that was just cloned — a runtime holding two OLD agents
+ * reports `agents: 2` while the new source 404s. So availability is decided per
+ * source, by its own route, and the count is only a corroborating signal.
+ *
+ * Each source lands in exactly one bucket:
+ *   * `missing`       — HTTP 404: the route does not exist, the agent is not mounted;
+ *   * `errored`       — HTTP >= 500: mounted but not serving;
+ *   * `indeterminate` — no response at all: UNKNOWN, never read as either.
+ *
+ * `ok` requires health reachable, all three buckets empty, and a mounted count
+ * (when the loader reports one) that covers the sources.
+ */
+export async function verifyAgentsAvailable({ endpoint, sources = [], fetchImpl, timeoutMs = HEALTH_TIMEOUT_MS } = {}) {
+  const health = await fetchWayflowHealth({ endpoint, fetchImpl, timeoutMs });
+  const probes = [];
+  const missing = [];
+  const errored = [];
+  const indeterminate = [];
+  for (const label of sources) {
+    const probe = await probeAgentRoute({ endpoint, label, fetchImpl, timeoutMs });
+    probes.push({ label, status: probe.status, reachable: probe.reachable });
+    if (!probe.reachable) indeterminate.push(label);
+    else if (probe.status === 404) missing.push(label);
+    else if (typeof probe.status === "number" && probe.status >= 500) errored.push(label);
+  }
+  const mounted = typeof health.agents === "number" ? health.agents : null;
+  const countCovers = mounted === null || mounted >= sources.length;
+  const ok =
+    health.reachable && missing.length === 0 && errored.length === 0 && indeterminate.length === 0 && countCovers;
+  return { ok, health, mounted, probes, missing, errored, indeterminate, countCovers };
+}
+
+/** One operator-facing phrase naming exactly what is not available. */
+function unavailabilityReason({ missing, errored, indeterminate, mounted, sources, countCovers }) {
+  // Name the ROUTES, not the labels: that is what an operator curls to confirm.
+  const parts = [];
+  if (missing.length > 0) parts.push(`${missing.length} agent route(s) answer HTTP 404 (${missing.map(agentRoutePath).join(", ")})`);
+  if (errored.length > 0) parts.push(`${errored.length} agent route(s) answer 5xx (${errored.map(agentRoutePath).join(", ")})`);
+  if (indeterminate.length > 0) {
+    parts.push(`${indeterminate.length} agent route(s) gave no response (${indeterminate.map(agentRoutePath).join(", ")})`);
+  }
+  if (!countCovers) parts.push(`the runtime reports ${mounted} mounted for ${sources.length} source(s) on disk`);
+  return parts.join("; ") || "the runtime is not answering";
+}
+
+/**
  * Bounded poll of `/.health` until the runtime reports at least one mounted
  * agent. Used after the RESTART fallback: a restarted loader re-walks the
  * bind-mounted directory during boot, so the verification must not read the
@@ -357,8 +443,16 @@ export async function mountAgentSourcesAfterSync({
   }
 
   const endpoint = resolveWayflowEndpoint({ targetDir, env, deps });
-  const health = await fetchWayflowHealth({ endpoint, fetchImpl: deps.fetchImpl });
-  if (!health.reachable) {
+
+  // Is it ALREADY serving every source? Decided per agent route, never by the
+  // aggregate count alone (codex round 1, must-fix 2): a runtime holding two
+  // OLD agents reports `agents: 2` while the source just cloned still 404s.
+  const before = await verifyAgentsAvailable({ endpoint, sources, fetchImpl: deps.fetchImpl });
+  if (before.ok) {
+    log(`  WayFlow agent runtime already serves all ${sources.length} agent source(s) — no reload needed.`);
+    return { ...base, status: "already-mounted", mounted: before.mounted };
+  }
+  if (!before.health.reachable) {
     log(
       `  ⚠ WayFlow agent mount: ${endpoint}${WAYFLOW_HEALTH_PATH} is not answering, so the ${sources.length} agent ` +
         "source(s) on disk could not be mounted. The runtime mounts agents at boot; every `/agents/…` route " +
@@ -367,53 +461,79 @@ export async function mountAgentSourcesAfterSync({
     );
     return { ...base, status: "unreachable", reason: "health-unreachable" };
   }
-  if (typeof health.agents === "number" && health.agents >= sources.length) {
-    log(`  WayFlow agent runtime already mounts ${health.agents} agent(s) — no reload needed.`);
-    return { ...base, status: "already-mounted", mounted: health.agents };
-  }
 
   log(
     `- Mounting agent sources into the WayFlow runtime (${sources.length} on disk, ` +
-      `${health.agents ?? "unknown"} mounted) — it started before they were cloned…`,
+      `${before.mounted ?? "unknown"} mounted) — it started before they were cloned…`,
   );
-  const token = readWayflowBridgeToken({ targetDir, deps });
-  const reload = await reloadWayflowAgents({ endpoint, token, fetchImpl: deps.fetchImpl });
+  // SECRET BOUNDARY: the token goes to the loopback runtime this install owns,
+  // and nowhere else. A non-loopback endpoint takes the restart route, which
+  // needs no secret.
+  const local = isLoopbackEndpoint(endpoint);
+  const token = local ? readWayflowBridgeToken({ targetDir, deps }) : null;
+  const reload = local
+    ? await reloadWayflowAgents({ endpoint, token, fetchImpl: deps.fetchImpl })
+    : { ok: false, status: null, agents: null, reason: "endpoint-not-loopback" };
   let method = "reload";
   if (!reload.ok) {
-    // The route or the auth is unavailable on this runtime — a restart makes
-    // the loader re-walk the directory at boot, which is the same repair.
-    log(`  Hot-reload unavailable (${reload.reason}); restarting the ${WAYFLOW_SERVICE_NAME} service instead…`);
+    // The route, the auth or the endpoint's locality rules the reload out — a
+    // restart makes the loader re-walk the directory at boot: the same repair,
+    // without a secret.
+    log(`  Hot-reload not used (${reload.reason}); restarting the ${WAYFLOW_SERVICE_NAME} service instead…`);
     const restart = restartWayflowService({ targetDir, composeArgs, deps });
     method = "restart";
     if (!restart.ok) {
       log(
-        `  ⚠ WayFlow agent mount FAILED (reload: ${reload.reason}; restart: ${restart.reason}). The runtime is up ` +
-          `but mounts ${health.agents ?? "no"} of the ${sources.length} agent source(s) on disk, so ` +
-          `${agentRoutePath(label)} answers HTTP 404 and agent runs fail. Restart it by hand ` +
+        `  ⚠ WayFlow agent mount FAILED (reload: ${reload.reason}; restart: ${restart.reason}). ` +
+          `${unavailabilityReason({ ...before, sources })}, so agent runs fail. Restart the runtime by hand ` +
           "(`cinatra instance wayflow stop && cinatra instance wayflow start`), then re-run `cinatra doctor`.",
       );
-      return { ...base, status: "failed", method, mounted: health.agents ?? null, reason: restart.reason };
+      return { ...base, status: "failed", method, mounted: before.mounted, reason: restart.reason };
     }
     // A restarted loader re-walks the directory while it boots; give it the
     // same bounded window the install's own health wait gives a cold start.
     await waitForAgentsMounted({ endpoint, deps });
   }
 
-  // VERIFY against the runtime, never against the reload's own answer.
-  const after = await fetchWayflowHealth({ endpoint, fetchImpl: deps.fetchImpl });
-  const route = await probeAgentRoute({ endpoint, label, fetchImpl: deps.fetchImpl });
-  const mounted = typeof after.agents === "number" ? after.agents : (reload.agents ?? null);
-  if ((mounted !== null && mounted > 0) || route.mounted === true) {
-    log(`  WayFlow agent runtime mounted ${mounted ?? "the"} agent(s) (${method}); ${agentRoutePath(label)} answers HTTP ${route.status ?? "n/a"}.`);
-    return { ...base, status: "mounted", mounted, method };
+  // VERIFY against the runtime, per agent — never against the reload's own
+  // answer, and never on an aggregate count (codex round 1, must-fix 2).
+  const after = await verifyAgentsAvailable({ endpoint, sources, fetchImpl: deps.fetchImpl });
+  if (after.ok) {
+    log(`  WayFlow agent runtime serves all ${sources.length} agent source(s) (${method}); ${after.mounted ?? "n/a"} mounted.`);
+    return { ...base, status: "mounted", mounted: after.mounted, method };
   }
   log(
-    `  ⚠ WayFlow agent mount did not take effect (${method}): ${sources.length} agent source(s) are on disk but the ` +
-      `runtime reports ${mounted ?? "an unknown number of"} mounted and ${agentRoutePath(label)} answers HTTP ` +
-      `${route.status ?? "no response"}. Agent runs will fail until it mounts them. Check the container logs, then ` +
-      "re-run `cinatra install` (it reloads the runtime) and `cinatra doctor`.",
+    `  ⚠ WayFlow agent mount did not take effect (${method}): ${unavailabilityReason({ ...after, sources })}. ` +
+      "Agent runs will fail until the runtime serves them. Check the container logs, then re-run " +
+      "`cinatra install` (it reloads the runtime) and `cinatra doctor`.",
   );
-  return { ...base, status: "failed", method, mounted, reason: "verify-empty" };
+  return {
+    ...base,
+    status: "failed",
+    method,
+    mounted: after.mounted,
+    reason: unavailabilityReason({ ...after, sources }),
+  };
+}
+
+/**
+ * The operator-facing verdict for an install that provisioned an instance whose
+ * runtime cannot serve its agents. Stated at the install tail (where the
+ * operator reads it) and paired with the typed exit code, so
+ * "exited 0 and recorded ready" can no longer describe this state.
+ */
+export function agentsUnavailableVerdictLines(result) {
+  if (!result || (result.status !== "failed" && result.status !== "unreachable")) return [];
+  return [
+    "",
+    "  ⚠ This instance is provisioned, but its WayFlow agent runtime cannot serve its agents:",
+    `    ${result.reason ?? "the runtime did not mount the agent sources on disk"}.`,
+    `    ${result.sources} agent source(s) are on disk; every unmounted \`/agents/…\` route answers HTTP 404, so agent runs fail.`,
+    "    Recover: re-run `cinatra install` (it reloads the runtime after the extension sources are on disk),",
+    "    or restart it by hand (`cinatra instance wayflow stop && cinatra instance wayflow start`).",
+    "    Then confirm with `cinatra doctor` — its WayFlow probe checks agent availability, not only health.",
+    `    (Exit code ${INSTALL_EXIT_AGENTS_UNAVAILABLE}: the install completed; the agent runtime did not.)`,
+  ];
 }
 
 /**
@@ -422,10 +542,20 @@ export async function mountAgentSourcesAfterSync({
  * mounts nothing (cinatra#2654 row 7 — `{"agents":0}` and HTTP 404, health
  * still `ok`, doctor still PASS). Kept pure so the doctor owns the I/O.
  *
- * @param {{sources: string[], agents: number|null, routeStatus: number|null, routeReachable: boolean}} input
- * @returns {{verdict: "pass"|"fail", detail: string, remedy: string|null}}
+ * EVERY discovered source is judged by its OWN route (codex round 1, must-fix
+ * 3): probing only the first would pass a runtime that serves that one and none
+ * of the rest, and an aggregate count says nothing about identity. The three
+ * non-passing shapes are distinguished rather than merged:
+ *
+ *   * 404 on any source → FAIL (not mounted — the defect);
+ *   * >= 500 on any source → FAIL (mounted, not serving);
+ *   * no response → SKIP, never PASS (indeterminate; the same rule the health
+ *     probe already applies to a booting loader).
+ *
+ * @param {{sources: string[], agents: number|null, probes: {label: string, status: number|null, reachable: boolean}[]}} input
+ * @returns {{verdict: "pass"|"fail"|"skip", detail: string, remedy: string|null}}
  */
-export function judgeAgentAvailability({ sources = [], agents = null, routeStatus = null, routeReachable = false } = {}) {
+export function judgeAgentAvailability({ sources = [], agents = null, probes = [] } = {}) {
   const remedy =
     "Re-run `cinatra install` (it reloads the runtime after the extension sources are on disk), or restart the " +
     "runtime by hand (`cinatra instance wayflow stop && cinatra instance wayflow start`). " +
@@ -444,27 +574,48 @@ export function judgeAgentAvailability({ sources = [], agents = null, routeStatu
         "(dev), or acquire the prod extensions, then re-run `cinatra doctor`.",
     };
   }
-  if (agents === 0) {
-    return {
-      verdict: "fail",
-      detail:
-        `0 agents mounted while ${sources.length} agent source(s) are on disk — the runtime was started before the ` +
-        `extension sources existed, so ${agentRoutePath(sources[0])} answers HTTP 404 and every agent run fails`,
-      remedy,
-    };
-  }
-  if (routeReachable && routeStatus === 404) {
-    return {
-      verdict: "fail",
-      detail:
-        `${agents ?? "some"} agent(s) mounted, but ${agentRoutePath(sources[0])} answers HTTP 404 — the runtime's ` +
-        "mount predates this agent source on disk",
-      remedy,
-    };
-  }
-  const routeNote = routeReachable
-    ? `; ${agentRoutePath(sources[0])} answers HTTP ${routeStatus}`
-    : `; ${agentRoutePath(sources[0])} not probed (no response)`;
+  const missing = probes.filter((p) => p.reachable && p.status === 404).map((p) => p.label);
+  const errored = probes.filter((p) => p.reachable && typeof p.status === "number" && p.status >= 500).map((p) => p.label);
+  const indeterminate = probes.filter((p) => !p.reachable).map((p) => p.label);
   const countNote = agents === null ? `${sources.length} agent source(s) on disk` : `${agents} agent(s) mounted`;
-  return { verdict: "pass", detail: `${countNote}${routeNote}`, remedy: null };
+  if (missing.length > 0) {
+    const cause =
+      agents === 0
+        ? "the runtime was started before the extension sources existed"
+        : "the runtime's mount predates these agent sources on disk";
+    return {
+      verdict: "fail",
+      detail:
+        `${countNote}, but ${missing.length} of ${sources.length} agent source(s) answer HTTP 404 ` +
+        `(${missing.map(agentRoutePath).join(", ")}) — ${cause}, so those agent runs fail`,
+      remedy,
+    };
+  }
+  if (errored.length > 0) {
+    return {
+      verdict: "fail",
+      detail: `${countNote}, but ${errored.map(agentRoutePath).join(", ")} answer HTTP 5xx — mounted, not serving`,
+      remedy: "Check the runtime's container logs for the per-agent error, then re-run `cinatra doctor`.",
+    };
+  }
+  if (indeterminate.length > 0) {
+    return {
+      verdict: "skip",
+      detail:
+        `${countNote}, but ${indeterminate.map(agentRoutePath).join(", ")} gave no response — availability could ` +
+        "not be determined (loader still mounting?)",
+      remedy: "Wait for the loader to finish mounting agents, then re-run `cinatra doctor`.",
+    };
+  }
+  if (agents !== null && agents < sources.length) {
+    return {
+      verdict: "fail",
+      detail:
+        `every probed agent route answers, but the runtime reports ${agents} mounted for ${sources.length} agent ` +
+        "source(s) on disk — it is not serving all of them",
+      remedy,
+    };
+  }
+  const statuses = probes.map((p) => `${agentRoutePath(p.label)} HTTP ${p.status}`).join(", ");
+  return { verdict: "pass", detail: `${countNote}; all ${sources.length} agent source(s) answer (${statuses})`, remedy: null };
 }

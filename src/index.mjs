@@ -5273,32 +5273,29 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
   // method — the reference evidence's own signal).
   const agentCount = typeof health?.agents === "number" ? health.agents : null;
   const agentSources = discoverAgentSources({ targetDir: repoRoot });
-  let routeProbe = { reachable: false, status: null, mounted: null };
-  if (agentSources.length > 0) {
-    routeProbe = await probeAgentRoute({
-      endpoint: wayflowOriginFromHealthUrl(healthUrl),
-      label: agentSources[0],
-      fetchImpl,
-      timeoutMs: DOCTOR_HTTP_TIMEOUT_MS,
-    });
+  // EVERY discovered source is probed, not just the first: a runtime serving one
+  // and missing the rest is the same broken install.
+  const origin = wayflowOriginFromHealthUrl(healthUrl);
+  const probes = [];
+  for (const agentLabel of agentSources) {
+    const probe = await probeAgentRoute({ endpoint: origin, label: agentLabel, fetchImpl, timeoutMs: DOCTOR_HTTP_TIMEOUT_MS });
+    probes.push({ label: agentLabel, status: probe.status, reachable: probe.reachable });
   }
-  const availability = judgeAgentAvailability({
-    sources: agentSources,
-    agents: agentCount,
-    routeStatus: routeProbe.status,
-    routeReachable: routeProbe.reachable,
-  });
+  const availability = judgeAgentAvailability({ sources: agentSources, agents: agentCount, probes });
   const failed = Array.isArray(health?.failed_agents) ? health.failed_agents.length : null;
   const degradedNote =
     runtimeStatus === "degraded"
       ? (failed === null ? "" : `; ${failed} agent(s) failed to load`) +
         `; check \`docker logs ${runningContainer}\` for the per-agent errors`
       : "";
-  if (availability.verdict === "fail") {
+  if (availability.verdict !== "pass") {
+    // `skip` carries an INDETERMINATE availability probe (no response from an
+    // agent route on a runtime that is up) — the same "booting? never PASS"
+    // rule the health probe applies, so an unknown is never reported as ready.
     return makeAssertion(
       id,
       label,
-      "fail",
+      availability.verdict,
       `runtime up; /.health ${runtimeStatus} — but ${availability.detail}${degradedNote}`,
       availability.remedy,
     );

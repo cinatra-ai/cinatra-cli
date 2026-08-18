@@ -170,7 +170,11 @@ import {
 // the extension sources it bind-mounts are on disk, so a fresh install mounts
 // 0 agents. This module makes the running runtime pick them up once the sync
 // has put them there (builtins-only, injectable, hermetically testable).
-import { mountAgentSourcesAfterSync } from "./wayflow-agent-mount.mjs";
+import {
+  agentsUnavailableVerdictLines,
+  claimAgentsUnavailableExitCode,
+  mountAgentSourcesAfterSync,
+} from "./wayflow-agent-mount.mjs";
 import {
   deriveCoUseSlug,
   coUseDbName,
@@ -6158,7 +6162,13 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   //      complements: the instance is already provisioned here, so a failure is
   //      reported loudly and by name (and `cinatra doctor`'s agent-availability
   //      probe fails on the same state) rather than rolling back a working
-  //      install. `deps.mountAgentSourcesAfterSync` is the test seam.
+  //      install. But it does NOT let the install exit 0 either: the tail
+  //      restates the outcome and claims the typed exit code
+  //      INSTALL_EXIT_AGENTS_UNAVAILABLE (21), the same shape cinatra-cli#200
+  //      uses for a completed-with-a-named-defect install. "Exited 0 and
+  //      recorded ready" is exactly the lie this issue is about.
+  //      `deps.mountAgentSourcesAfterSync` is the test seam.
+  let agentMountResult = null;
   //
   //      The compose project is what proves a bring-up actually happened on
   //      this run: `defaultProject` is set only inside the default bring-up
@@ -6174,7 +6184,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
       infraPlan === "isolated" || infraPlan === "attach" ? (resolution?.instance?.composeFiles ?? null) : null;
     const mountEnvFile = path.join(targetDir, ".env.local");
     const mount = deps.mountAgentSourcesAfterSync ?? mountAgentSourcesAfterSync;
-    await mount({
+    agentMountResult = await mount({
       targetDir,
       composeArgs: composeArgsFor({
         composeFiles: mountComposeFiles,
@@ -6276,6 +6286,16 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     for (const line of registrySkewVerdictLines([], { context: "install-tail" })) log(line);
     // Never overwrite a non-zero this install already set for a real failure.
     process.exitCode = claimRegistrySkewExitCode(process.exitCode);
+  }
+
+  // 8c-bis. cinatra-cli#233 — the deferred AGENT-AVAILABILITY verdict. The
+  //     instance is provisioned, so this is not a rollback; but a runtime that
+  //     cannot serve its agents must not be reported as a clean success, which
+  //     is precisely the "exited 0, recorded ready, cannot run an agent" state
+  //     this issue exists to remove. Stated at the tail, with the typed code.
+  if (agentMountResult && (agentMountResult.status === "failed" || agentMountResult.status === "unreachable")) {
+    for (const line of agentsUnavailableVerdictLines(agentMountResult)) log(line);
+    process.exitCode = claimAgentsUnavailableExitCode(process.exitCode);
   }
 
   // cinatra#2654: state the agent-runtime outcome in the summary — started,
