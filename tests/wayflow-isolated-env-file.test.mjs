@@ -175,11 +175,15 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("first isolated install on a clean directory (cinatra#2654 D1)", () => {
-  // The real install ordering, with the fs + `docker` calls injected: render the
-  // isolated compose FIRST (nothing has written .wayflow.env yet), then let the
-  // bring-up write the env file, then read the service config the `up` sees.
-  const renderThenGenerate = ({ preserveEnvFiles }) => {
+  // The install ordering, with the fs + `docker` calls injected. `provisionFirst`
+  // is the fixed ordering (the env file is written BEFORE the compose is
+  // resolved); `provisionFirst: false` is the ordering the matrix measured, where
+  // the file appears one second after the render — the reference must carry the
+  // keys in BOTH cases, since only the second half of the pair is under this
+  // code's control once an instance exists.
+  const renderThenGenerate = ({ preserveEnvFiles, provisionFirst = true }) => {
     writeFileSync(path.join(dir, ".env.local"), "CINATRA_BRIDGE_TOKEN=fixture-bridge-token\n", { mode: 0o600 });
+    if (provisionFirst) writeWayflowEnvFile(dir);
     const seen = [];
     const resolved = composeConfigForFiles(
       dir,
@@ -196,8 +200,7 @@ describe("first isolated install on a clean directory (cinatra#2654 D1)", () => 
       envFileKeys: new Set(["CINATRA_BRIDGE_TOKEN"]),
     });
     writeIsolatedComposeFile(path.join(dir, ISOLATED_COMPOSE_FILENAME), doc);
-    // …only NOW does the bring-up provision the bridge-token env file. This is
-    // the ordering the matrix's mtimes proved (compose at :58, env at :59).
+    // The bring-up (re)provisions the bridge-token env file just before `up`.
     writeWayflowEnvFile(dir);
     return { doc, seen };
   };
@@ -222,6 +225,13 @@ describe("first isolated install on a clean directory (cinatra#2654 D1)", () => 
     expect(doc.services.wayflow.env_file[0].path).toBe(path.join(dir, WAYFLOW_ENV_REL));
   });
 
+  it("all six keys still arrive when the env file appears AFTER the render", () => {
+    // The matrix's mtimes (compose at :58, env at :59). The preserved reference
+    // is what makes that ordering survivable at all.
+    const { doc } = renderThenGenerate({ preserveEnvFiles: true, provisionFirst: false });
+    expect(Object.keys(effectiveServiceEnv(doc, "wayflow")).sort()).toEqual([...SIX_KEYS].sort());
+  });
+
   it("a rotated token propagates: the container follows the FILE, not the render", () => {
     const { doc } = renderThenGenerate({ preserveEnvFiles: true });
     writeWayflowEnvFile(dir, { token: "fixture-rotated-token" });
@@ -229,7 +239,7 @@ describe("first isolated install on a clean directory (cinatra#2654 D1)", () => 
   });
 
   it("REGRESSION CONTROL: resolving env files at render time reproduces the defect exactly", () => {
-    const { doc } = renderThenGenerate({ preserveEnvFiles: false });
+    const { doc } = renderThenGenerate({ preserveEnvFiles: false, provisionFirst: false });
     // The matrix's measured rendering of rows 1 to 5, key for key.
     expect(Object.keys(doc.services.wayflow.environment ?? {}).sort()).toEqual([
       "CINATRA_AGENTS_DIR",
@@ -499,8 +509,10 @@ describe.skipIf(!dockerComposeAvailable)("real `docker compose config` (render o
     const capture = (command, args, opts) =>
       execFileSync(command, args, { cwd: opts?.cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 
-    // FIRST install: .wayflow.env does not exist yet when the compose is rendered.
-    expect(existsSync(path.join(dir, WAYFLOW_ENV_REL))).toBe(false);
+    // The fixed ordering: the bridge-token env file is provisioned BEFORE the
+    // isolated compose is resolved (Compose versions differ on whether they keep
+    // a `required: false` env_file whose file does not exist yet).
+    writeWayflowEnvFile(dir);
     const resolved = composeConfigForFiles(dir, ["docker-compose.yml"], { capture }, {
       allProfiles: true,
       preserveEnvFiles: true,
@@ -514,11 +526,17 @@ describe.skipIf(!dockerComposeAvailable)("real `docker compose config` (render o
       envFileKeys: new Set(),
     });
     expect(wayflowEnvWiringGap(doc)).toBeNull();
+    // Where this Compose honours --no-env-resolution, the generated file carries
+    // the REFERENCE and no host secret; where it inlines regardless, the keys are
+    // still there. Both are asserted for what they are, never assumed.
+    if (doc.services.wayflow.env_file) {
+      expect(doc.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBeUndefined();
+    }
     writeIsolatedComposeFile(path.join(dir, ISOLATED_COMPOSE_FILENAME), doc);
 
-    // The bring-up then writes the env file, and the `up` reads the GENERATED
+    // The bring-up regenerates the env file, then the `up` reads the GENERATED
     // compose. Ask compose itself what the service's environment resolves to.
-    writeWayflowEnvFile(dir);
+    writeWayflowEnvFile(dir, { token: "fixture-rotated-token" });
     const rendered = JSON.parse(
       execFileSync("docker", ["compose", "--profile", "*", "-f", ISOLATED_COMPOSE_FILENAME, "config", "--format", "json"], {
         cwd: dir,
@@ -528,5 +546,10 @@ describe.skipIf(!dockerComposeAvailable)("real `docker compose config` (render o
     );
     expect(Object.keys(rendered.services.wayflow.environment).sort()).toEqual([...SIX_KEYS].sort());
     expect(rendered.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).not.toBe("");
+    // A preserved reference also means the rotated value is the one that reaches
+    // the container, rather than a copy frozen at render time.
+    if (doc.services.wayflow.env_file) {
+      expect(rendered.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBe("fixture-rotated-token");
+    }
   });
 });

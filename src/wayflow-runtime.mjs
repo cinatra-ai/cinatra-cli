@@ -200,6 +200,18 @@ export function generateWayflowEnv({
   return { ok: true, skipped: false, reason: null };
 }
 
+/** The error an unproducible bridge-token env raises. Names the file, the real
+ *  reason, and BOTH recoveries — the same shape as a failed image build, because
+ *  it is the same class of failure: a runtime that cannot start. */
+export function wayflowEnvFailureMessage(reason) {
+  return (
+    `Refusing to start the WayFlow agent runtime — ${reason}. ` +
+    "Without CINATRA_BRIDGE_TOKEN the runtime crash-loops and every agent run fails. " +
+    "Fix .env.local (re-run `cinatra install --reset-env` to mint the secrets), " +
+    "or re-run with `--no-wayflow` to install without the agent runtime."
+  );
+}
+
 /**
  * Build the WayFlow image for this stack. The service builds from
  * `./docker/wayflow` and has NO registry image, so a broken build must be a

@@ -165,6 +165,7 @@ import {
   resolveWayflowRuntimeMode,
   waitForWayflowHealth,
   wayflowBuildFailureMessage,
+  wayflowEnvFailureMessage,
   wayflowStatusLines,
 } from "./wayflow-runtime.mjs";
 import {
@@ -1823,14 +1824,7 @@ export function bringUpInfra({ slug = null, deps = {}, targetDir, log = console.
   const wayflowProfiles = wayflow ? [WAYFLOW_PROFILE] : [];
   if (wayflow) {
     const generated = (deps.generateWayflowEnv ?? generateWayflowEnv)({ targetDir, log });
-    if (!generated.ok) {
-      throw new Error(
-        `Refusing to start the WayFlow agent runtime — ${generated.reason}. ` +
-          "Without CINATRA_BRIDGE_TOKEN the runtime crash-loops and every agent run fails. " +
-          "Fix .env.local (re-run `cinatra install --reset-env` to mint the secrets), " +
-          "or re-run with `--no-wayflow` to install without the agent runtime.",
-      );
-    }
+    if (!generated.ok) throw new Error(wayflowEnvFailureMessage(generated.reason));
     const built = (deps.buildWayflowImage ?? buildWayflowImage)({
       targetDir,
       composeArgs: composeArgsFor({ composeFiles, composeProject, envFile, profiles: wayflowProfiles }),
@@ -2940,12 +2934,25 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
   // self-advertised URL stay on the DONOR's band (cinatra-cli#97 leak via the
   // profiles path — eng#513 sweep). Each service keeps its `profiles` attribute
   // in the generated file, so a plain `up` still starts only the default set.
-  // cinatra#2654 D1: `preserveEnvFiles` keeps each service's `env_file:` in the
-  // resolved document instead of inlining a render-time snapshot of it. The
+  // cinatra#2654 D1, half one: PROVISION the narrow bridge-token env file BEFORE
+  // resolving the compose, not just before the `up`. The bring-up regenerates it
+  // again later (after the isolated re-point, so its WAYFLOW_BASE_URL is this
+  // instance's) — running it here as well is cheap and idempotent, and it is what
+  // makes the render independent of Compose's own handling of an env_file whose
+  // file does not exist yet: some versions keep the `required: false` reference,
+  // others drop it, and a dropped reference is precisely the tokenless runtime
+  // this fixes. A failure aborts here, before anything is written or started.
+  if (!opts.dryRun && opts.wayflow !== false) {
+    const provisioned = (deps.generateWayflowEnv ?? generateWayflowEnv)({ targetDir, log });
+    if (!provisioned.ok) throw new Error(wayflowEnvFailureMessage(provisioned.reason));
+  }
+
+  // cinatra#2654 D1, half two: `preserveEnvFiles` keeps each service's `env_file:`
+  // in the resolved document instead of inlining a render-time snapshot of it. The
   // isolated compose is PERSISTED and re-used by every later `up`, so a service
-  // whose secrets arrive through a narrow generated file (wayflow's
-  // docker/wayflow/.wayflow.env — written by the bring-up, AFTER this render)
-  // must keep the reference, not a snapshot taken before the file exists.
+  // whose secrets arrive through a narrow generated file must keep the REFERENCE
+  // — that is what lets a rotated token reach the container, and what keeps the
+  // generated file free of host secrets.
   const resolvedConfig = getConfig(targetDir, ["docker-compose.yml", "docker-compose.dev.yml"], deps, { allProfiles: true, preserveEnvFiles: true });
   if (!resolvedConfig) {
     throw new Error(

@@ -219,6 +219,12 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
       liveComposeInspect: () => [],
       readCloneRegistry: () => null,
       bringUpInfra: () => {},
+      // cinatra#2654 D1: the isolated executor provisions the WayFlow
+      // bridge-token env before it resolves the compose. These tests drive
+      // conflict resolution and allocation against a sandbox checkout that has no
+      // `scripts/` tree, so the step is stubbed here exactly as the bring-up is;
+      // tests/wayflow-isolated-env-file.test.mjs owns its real behaviour.
+      generateWayflowEnv: () => ({ ok: true, skipped: true, reason: null }),
       runComposeDown: () => {},
       // cinatra-cli#35: default-path ownership preflight inspector — no existing
       // project/volume conflict by default (brand-new install). Per-test overrides
