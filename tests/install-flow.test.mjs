@@ -647,6 +647,74 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     return [];
   };
 
+  // ── cinatra#2654 D1 (round 4) — `--on-conflict=isolated --no-wayflow` on an
+  //    INLINING Compose. Provisioning `docker/wayflow/.wayflow.env` is gated on
+  //    the opt-out; the render-time wiring invariant was NOT. So the file was
+  //    never written, the inlining render carried no bridge token for the wayflow
+  //    service, and the fallback arm aborted the install — an install that had
+  //    explicitly asked for no agent runtime. ─────────────────────────────────
+  const WAYFLOW_RESOLVED_CONFIG = {
+    ...RESOLVED_CONFIG,
+    services: {
+      ...RESOLVED_CONFIG.services,
+      // As an INLINING engine hands it over: the `env_file:` directive is gone
+      // and, because `--no-wayflow` skipped provisioning, nothing replaced it.
+      wayflow: {
+        image: "cinatra/wayflow",
+        profiles: ["wayflow"],
+        environment: { PORT: "3010", CINATRA_AGENTS_DIR: "/agents" },
+        ports: [{ published: "3010", target: 3010, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+      },
+    },
+  };
+  const inliningWayflowDeps = (extra = {}) =>
+    flowDeps({
+      detectPortConflicts: conflictOnDefaultBand,
+      composeConfigForFiles: () => WAYFLOW_RESOLVED_CONFIG,
+      composeSupportsNoEnvResolution: () => false,
+      composeVersionString: () => "2.38.2",
+      // NOT stubbed to ok: `--no-wayflow` must mean the generator is never
+      // invoked at all. A call here fails the test loudly.
+      generateWayflowEnv: () => {
+        throw new Error("generateWayflowEnv must not run under --no-wayflow");
+      },
+      ...extra,
+    });
+
+  it("#2654 D1: --on-conflict=isolated --no-wayflow completes on an INLINING Compose", async () => {
+    const installDir = path.join(sandbox, "iso-no-wayflow");
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "isonowf",
+        "--port-offset", "auto", "--no-wayflow",
+      ],
+      { log: () => {}, deps: inliningWayflowDeps() },
+    );
+    expect(res.infraPlan).toBe("isolated");
+    expect(readInstanceRegistry(regPath).registry.instances.isonowf.state).toBe("ready");
+  });
+
+  it("#2654 D1: the SAME install WITHOUT --no-wayflow still aborts on the missing token route", async () => {
+    // The control: the gate is the opt-out, not a weakening of the invariant.
+    // Here the generator is stubbed to succeed but the render still inlines
+    // nothing, so the wayflow arm must fire exactly as before.
+    const installDir = path.join(sandbox, "iso-with-wayflow");
+    await expect(
+      runInstall(
+        [
+          "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+          "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "isowithwf",
+          "--port-offset", "auto",
+        ],
+        {
+          log: () => {},
+          deps: inliningWayflowDeps({ generateWayflowEnv: () => ({ ok: true, skipped: false, reason: null }) }),
+        },
+      ),
+    ).rejects.toThrow(/carries no non-empty CINATRA_BRIDGE_TOKEN/);
+  });
+
   it("#147 AC1/AC6: --dry-run --on-conflict=isolated (--port-offset auto) previews the SAME app port/offset/remapped band the real isolated run allocates — advisory, writing nothing, no lock", async () => {
     const installDir = path.join(sandbox, "iso147-parity-auto");
     const upCalls = [];

@@ -832,6 +832,12 @@ function serviceEnvObject(svc) {
  * @param {string}  [opts.wayflowEnvFilePath]  the absolute path the wayflow
  *   service is expected to reference (`<targetDir>/docker/wayflow/.wayflow.env`).
  *   Checked by PATH, not merely "some env_file is present".
+ * @param {boolean} [opts.wayflow=true]  whether the WayFlow agent runtime is in
+ *   scope for this run. `--no-wayflow` opts OUT of it: the bring-up never
+ *   provisions `.wayflow.env` and never activates the `wayflow` profile, so the
+ *   bridge-token route cannot exist and demanding it aborts an install that asked
+ *   not to have one (cinatra#2654 D1, round 4). The opt-out gates ONLY the
+ *   wayflow arm — every other service's env-file protection is unconditional.
  * @param {boolean} [opts.envFilesPreserved=true]  whether this render kept
  *   `env_file:` (i.e. compose supports `--no-env-resolution`). When false the
  *   run is on the documented fallback route, where the token must instead be an
@@ -856,6 +862,7 @@ function serviceEnvObject(svc) {
 export function composeEnvWiringGaps(doc, {
   sourceDoc = null,
   wayflowEnvFilePath = null,
+  wayflow: wayflowInScope = true,
   envFilesPreserved = true,
   envFileKeysAt = null,
   declaredEnvFiles = [],
@@ -882,8 +889,16 @@ export function composeEnvWiringGaps(doc, {
     }
   }
 
-  // (2) The wayflow bridge-token route, precedence-aware.
-  const wayflow = services[WAYFLOW_SERVICE_NAME];
+  // (2) The wayflow bridge-token route, precedence-aware. SKIPPED under
+  // `--no-wayflow` (cinatra#2654 D1, round 4): that flag makes the bring-up skip
+  // provisioning `.wayflow.env` (install.mjs' isolated generator gates the
+  // provisioning call on the same opt-out) and never activate the `wayflow`
+  // profile, so on an INLINING Compose there is nothing left to carry the token
+  // and this arm aborted an install that had explicitly asked for no agent
+  // runtime. The service may still be PRESENT in the document — every
+  // profile-gated service is rendered so it can be enabled later — it is simply
+  // not started, and a token route it does not need is not a gap.
+  const wayflow = wayflowInScope ? services[WAYFLOW_SERVICE_NAME] : null;
   if (wayflow && typeof wayflow === "object") {
     const env = serviceEnvObject(wayflow);
     const inline = env ? env[WAYFLOW_TOKEN_KEY] : undefined;
@@ -938,6 +953,10 @@ export function composeEnvWiringGaps(doc, {
     const svcName = entry?.service;
     const filePath = entry?.path;
     if (typeof svcName !== "string" || typeof filePath !== "string") continue;
+    // Same opt-out as (2): `--no-wayflow` means this service is never started
+    // and its env file is never provisioned, so neither its reference nor its
+    // value route is owed.
+    if (svcName === WAYFLOW_SERVICE_NAME && !wayflowInScope) continue;
     const svc = services[svcName];
     // Absent from THIS document = the service is not in the resolved stack (a
     // profile the render did not include). Nothing to protect.

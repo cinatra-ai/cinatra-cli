@@ -3274,7 +3274,14 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
     // `environment:` override that would beat its env file. Holds by construction;
     // assert it so a regression fails loud HERE instead of as a crash-looping
     // runtime behind an install that exits 0.
-    assertGeneratedEnvWiring({ doc, sourceDoc: resolvedConfig, targetDir, envFilesPreserved, deps });
+    assertGeneratedEnvWiring({
+      doc,
+      sourceDoc: resolvedConfig,
+      targetDir,
+      envFilesPreserved,
+      wayflow: opts.wayflow !== false,
+      deps,
+    });
 
     // Persist the generated compose + provisioning row + marker (recording the
     // generated SOLE file as composeFiles[]).
@@ -3327,7 +3334,7 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       // plain re-run (reconvergeIsolated) does — else which flag the operator
       // repeated would decide whether a fixed generator ever reaches the
       // instance. Same LOUD contract as there: a failure aborts.
-      const regen = await regenerateIsolatedCompose({ targetDir, row: slot, log, deps });
+      const regen = await regenerateIsolatedCompose({ targetDir, row: slot, log, wayflow: opts.wayflow !== false, deps });
       const slotPorts = regen.regenerated && regen.ports ? regen.ports : slot.ports;
       ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: slot.appPort, ports: slotPorts, log });
       startInfra({
@@ -3528,7 +3535,7 @@ function assertScrubbedKeysSupplied(targetDir, scrubbedKeys = []) {
  *       trap the checkout's own compose comments name. The key reader is
  *       GENERIC, so this holds for all four services in production and not only
  *       in a unit test that passes its own reader. */
-function isolatedEnvWiringGaps({ doc, sourceDoc, targetDir, envFilesPreserved, deps = {} }) {
+function isolatedEnvWiringGaps({ doc, sourceDoc, targetDir, envFilesPreserved, wayflow = true, deps = {} }) {
   const suppliedKeys = deps.wayflowEnvSuppliedKeys ?? wayflowEnvSuppliedKeys;
   const readEnvFileKeys = deps.envFileSuppliedKeys ?? envFileSuppliedKeys;
   const wayflowEnvFilePath = path.join(targetDir, WAYFLOW_ENV_FILE);
@@ -3550,6 +3557,11 @@ function isolatedEnvWiringGaps({ doc, sourceDoc, targetDir, envFilesPreserved, d
   return composeEnvWiringGaps(doc, {
     sourceDoc,
     wayflowEnvFilePath,
+    // cinatra#2654 D1, round 4: `--no-wayflow` skips provisioning `.wayflow.env`
+    // (below, at the isolated generator), so the bridge-token arm must be gated
+    // on the SAME opt-out or an inlining Compose aborts an install that asked
+    // for no agent runtime.
+    wayflow,
     envFilesPreserved,
     envFileKeysAt: keysByPath,
     // All four narrow-env-file services the checkout declares, filtered to the
@@ -3559,8 +3571,8 @@ function isolatedEnvWiringGaps({ doc, sourceDoc, targetDir, envFilesPreserved, d
   });
 }
 
-function assertGeneratedEnvWiring({ doc, sourceDoc, targetDir, envFilesPreserved, deps = {} }) {
-  const gaps = isolatedEnvWiringGaps({ doc, sourceDoc, targetDir, envFilesPreserved, deps });
+function assertGeneratedEnvWiring({ doc, sourceDoc, targetDir, envFilesPreserved, wayflow = true, deps = {} }) {
+  const gaps = isolatedEnvWiringGaps({ doc, sourceDoc, targetDir, envFilesPreserved, wayflow, deps });
   if (gaps.length === 0) return;
   throw new Error(
     `Refusing to write the isolated compose — ${gaps.join("; ")} (cinatra#2654). ` +
@@ -4940,7 +4952,7 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
   // not-re-derivable conditions are non-fatal, and they say so by name. On
   // success the (possibly enlarged) remapped-port map drives the env re-point +
   // Nango health probe below.
-  const regen = await regenerateIsolatedCompose({ targetDir, row, log, deps });
+  const regen = await regenerateIsolatedCompose({ targetDir, row, log, wayflow: opts.wayflow !== false, deps });
   const effectivePorts = regen.regenerated && regen.ports ? regen.ports : (row.ports ?? {});
 
   // Re-point the env at the recorded remapped ports + bring up WITH
@@ -5003,15 +5015,16 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
  *                   of it — that is the "exited 0 and recorded ready" lie D1 was.
  *
  *  An UNPARSEABLE recorded file cannot be validated, so it is a refusal too. */
-export async function regenerateIsolatedCompose({ targetDir, row, log = console.log, deps = {} }) {
+export async function regenerateIsolatedCompose({ targetDir, row, log = console.log, wayflow = true, deps = {} }) {
   const result = await (deps.regenerateIsolatedComposeInPlace ?? regenerateIsolatedComposeInPlace)({
     targetDir,
     row,
     log,
+    wayflow,
     deps,
   });
   if (result.skipped && result.skipped !== "absent") {
-    assertRecordedIsolatedComposeUsable({ targetDir, row, skipped: result.skipped, recorded: result.recorded, deps, log });
+    assertRecordedIsolatedComposeUsable({ targetDir, row, skipped: result.skipped, recorded: result.recorded, wayflow, deps, log });
   }
   return result;
 }
@@ -5022,7 +5035,7 @@ export async function regenerateIsolatedCompose({ targetDir, row, log = console.
  *  `recorded` is the context the skip carried: the parsed recorded document, the
  *  resolved source document from THIS checkout, and which render route this
  *  Compose can give us. */
-function assertRecordedIsolatedComposeUsable({ targetDir, row, skipped, recorded, deps = {}, log = console.log }) {
+function assertRecordedIsolatedComposeUsable({ targetDir, row, skipped, recorded, wayflow = true, deps = {}, log = console.log }) {
   const recovery =
     `\n  Re-create the instance (its generated compose cannot be re-derived in place):\n` +
     `    cinatra instance remove ${row.slug}\n` +
@@ -5042,6 +5055,7 @@ function assertRecordedIsolatedComposeUsable({ targetDir, row, skipped, recorded
     sourceDoc: recorded.sourceDoc,
     targetDir,
     envFilesPreserved: recorded.envFilesPreserved,
+    wayflow,
     deps,
   });
   if (gaps.length > 0) {
@@ -5110,7 +5124,7 @@ function assertRecordedIsolatedComposeUsable({ targetDir, row, skipped, recorded
  *
  * @returns {Promise<{ regenerated: boolean, ports?: object, skipped?: string }>}
  */
-export async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.log, deps = {} }) {
+export async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.log, wayflow = true, deps = {} }) {
   const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
   const lockPath = deps.allocLockPath ?? defaultAllocLockPath();
 
@@ -5197,7 +5211,7 @@ export async function regenerateIsolatedComposeInPlace({ targetDir, row, log = c
   // regression, never a silent blank-secret or a self-URL leak to the main stack).
   assertScrubbedKeysSupplied(targetDir, scrubbedKeys);
   assertComposeHostUrlsRemapped(doc, new Set(baseBand.map((b) => b.port)));
-  assertGeneratedEnvWiring({ doc, sourceDoc: resolvedConfig, targetDir, envFilesPreserved, deps });
+  assertGeneratedEnvWiring({ doc, sourceDoc: resolvedConfig, targetDir, envFilesPreserved, wayflow, deps });
 
   const changed = existingDoc === null || renderIsolatedComposeYaml(doc) !== renderIsolatedComposeYaml(existingDoc);
   writeIsolatedComposeFile(isoPath, doc);

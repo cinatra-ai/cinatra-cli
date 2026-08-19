@@ -1077,6 +1077,69 @@ describe("four-service protection is ACTIVE in production (cinatra#2654 D1)", ()
     expect(doc.services.wayflow.environment.WAYFLOW_BASE_URL).toBeTruthy();
   });
 
+  // ── `--no-wayflow` OPTS OUT OF THE WAYFLOW ARM (cinatra#2654 D1, round 4) ──
+  //
+  // Provisioning `.wayflow.env` is already gated on the opt-out, but the
+  // invariant was not: on an INLINING Compose the file is never written, so
+  // nothing inlines a token, so the fallback arm found no non-empty
+  // CINATRA_BRIDGE_TOKEN and aborted an install that had explicitly asked for no
+  // agent runtime. The gate belongs on the SAME flag, and ONLY on the wayflow arm.
+
+  it("--no-wayflow: the FALLBACK route no longer demands a token route it opted out of", async () => {
+    const { deps } = setup({ preserves: false });
+    // The opt-out ordering: no `.wayflow.env` was provisioned, so the inlining
+    // render carries no token for the wayflow service.
+    rmSync(path.join(dir, WAYFLOW_ENV_REL), { force: true });
+    await expect(regen(deps)).rejects.toThrow(/carries no non-empty CINATRA_BRIDGE_TOKEN/);
+    const result = await regenerateIsolatedComposeInPlace({
+      targetDir: dir,
+      row,
+      log: () => {},
+      wayflow: false,
+      deps,
+    });
+    expect(result.regenerated).toBe(true);
+  });
+
+  it("--no-wayflow gates ONLY the wayflow arm — the three siblings stay protected", async () => {
+    const { deps } = setup({
+      preserves: false,
+      mutate: (doc) => {
+        doc.services["plane-mcp"].environment[SIBLING_ENV_FILE_KEYS["plane-mcp"].key] = "";
+      },
+    });
+    rmSync(path.join(dir, WAYFLOW_ENV_REL), { force: true });
+    await expect(
+      regenerateIsolatedComposeInPlace({ targetDir: dir, row, log: () => {}, wayflow: false, deps }),
+    ).rejects.toThrow(/"plane-mcp" would start with NO value for PLANE_API_TOKEN/);
+  });
+
+  it("--no-wayflow: a reconcile that must VALIDATE the recorded file gates it too", async () => {
+    // The not-re-derivable route (round 3): the recorded file is checked against
+    // the same invariant before the stack is started. A tokenless wayflow service
+    // in that file is not a reason to refuse a `--no-wayflow` bring-up either.
+    const tokenless = renderIsolatedComposeYaml({
+      name: row.composeProject,
+      services: {
+        wayflow: { image: "cinatra/wayflow", environment: { PORT: "3010" } },
+        ...Object.fromEntries(
+          Object.entries(SIBLING_ENV_FILE_SERVICES).map(([svc]) => [
+            svc,
+            { image: `cinatra/${svc}`, environment: { [SIBLING_ENV_FILE_KEYS[svc].key]: SIBLING_ENV_FILE_KEYS[svc].value } },
+          ]),
+        ),
+      },
+    });
+    const { deps } = setup({ preserves: false, recordedDoc: tokenless });
+    const ambiguous = { ...row, offset: null, ports: {} };
+    await expect(
+      regenerateIsolatedCompose({ targetDir: dir, row: ambiguous, log: () => {}, deps }),
+    ).rejects.toThrow(/FAILS the env-file wiring invariant[\s\S]*CINATRA_BRIDGE_TOKEN/);
+    await expect(
+      regenerateIsolatedCompose({ targetDir: dir, row: ambiguous, log: () => {}, wayflow: false, deps }),
+    ).resolves.toMatchObject({ regenerated: false });
+  });
+
   it("PRESERVING route, healthy: all four references survive into the generated document", async () => {
     const { deps } = setup({ preserves: true });
     expect((await regen(deps)).regenerated).toBe(true);
