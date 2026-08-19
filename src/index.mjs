@@ -5175,11 +5175,28 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
   // cinatra-cli#230: the verdict names WHERE the project came from, so a wrong
   // project is diagnosable from the doctor line alone instead of needing a
   // registry dump to tell a real "no container" from a mis-addressed one.
-  const { project, source: projectSource, slug: instanceSlug } = wayflowComposeContext(repoRoot);
+  const {
+    project,
+    source: projectSource,
+    slug: instanceSlug,
+    reason: projectReason,
+  } = wayflowComposeContext(repoRoot);
+  // cinatra-cli#230 review, item 3: the fallback note used to claim "no
+  // instance registry record for this checkout" for EVERY fallback — including
+  // one taken because the registry could not be READ, where whether a record
+  // exists is unknown. That reads as a settled fact ("this checkout is
+  // unmanaged") when the truth is that doctor is guessing. Name the actual
+  // reason instead.
+  const fallbackWhy =
+    projectReason === "registry-unreadable"
+      ? "the instance registry could not be read, so this checkout's recorded project is UNKNOWN"
+      : projectReason === "row-without-project"
+        ? "this checkout has an instance registry record, but it records no compose project"
+        : "no instance registry record for this checkout";
   const projectNote =
     projectSource === "registry"
       ? `compose project "${project}" (recorded in the instance registry${instanceSlug ? ` for instance "${instanceSlug}"` : ""})`
-      : `compose project "${project}" (derived from the checkout directory name — no instance registry record for this checkout)`;
+      : `compose project "${project}" (derived from the checkout directory name — ${fallbackWhy})`;
   const healthUrl = wayflowHealthUrlFromEnv(env);
   const ps = doctorDockerRun(dockerImpl, [
     "ps",
@@ -5191,6 +5208,32 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
     "{{.Names}}",
   ]);
   const runningContainer = ps.ok ? (ps.stdout.trim().split("\n")[0] ?? "").trim() : "";
+  // cinatra-cli#230 review, item 3: with an UNREADABLE registry the project
+  // above is a GUESS, so neither direction of the lookup is an authoritative
+  // verdict about THIS instance — a container found under the basename may be
+  // another instance's (the exact mis-attribution #230 is about, pointing the
+  // other way), and one absent proves only that nothing runs under a name we
+  // had to invent. So this is a SKIP — which the report footer already states
+  // is NOT a pass — rather than a silent PASS on an unrelated container.
+  // The by-design opt-outs below are unaffected: `off`/`external` are read from
+  // the install's own .env.local and hold regardless of project resolution.
+  if (
+    projectReason === "registry-unreadable" &&
+    runtimeMode !== WAYFLOW_RUNTIME_OFF &&
+    runtimeMode !== WAYFLOW_RUNTIME_EXTERNAL
+  ) {
+    return makeAssertion(
+      id,
+      label,
+      "skip",
+      `cannot verify this instance's runtime: ${fallbackWhy}, so the check fell back to ${projectNote}` +
+        (runningContainer === ""
+          ? " and found no container there — which does NOT establish that this instance's runtime is down"
+          : `, where container "${runningContainer}" is running — which does NOT establish that it belongs to this instance`),
+      `Repair or remove the instance registry at ${instanceRegistryDefaultPath()} (it exists but could not be ` +
+        "read/parsed), then re-run `cinatra doctor` so the recorded compose project can be resolved.",
+    );
+  }
   if (runningContainer === "") {
     if (runtimeMode === WAYFLOW_RUNTIME_OFF) {
       return makeAssertion(

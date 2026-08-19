@@ -269,7 +269,25 @@ function unwrapRegistryRow(row) {
  * caller is about to address. `slug` names the instance when one was found,
  * so a caller can say WHICH install it is talking about (cinatra-cli#230).
  *
- * @returns {{ project: string, composeFiles: string[], source: "registry"|"fallback", slug: string|null }}
+ * `reason` says WHY the fallback was taken, because the three ways of getting
+ * there are NOT the same claim (cinatra-cli#230 review):
+ *
+ *   * `"no-record"`           — the registry was read and holds no row for this
+ *                               checkout. The basename is the right answer;
+ *                               this is an unmanaged checkout.
+ *   * `"registry-unreadable"` — the registry could not be read or parsed, so
+ *                               whether a row exists is UNKNOWN. The basename
+ *                               is a guess, and a container found under it may
+ *                               belong to an entirely different instance. A
+ *                               caller must not report this as "no record".
+ *   * `"row-without-project"` — a row for this checkout exists but records no
+ *                               compose project.
+ *
+ * `reason` is null when `source` is `"registry"`.
+ *
+ * @returns {{ project: string, composeFiles: string[], source: "registry"|"fallback",
+ *             slug: string|null,
+ *             reason: null|"no-record"|"registry-unreadable"|"row-without-project" }}
  */
 export function resolveRecordedComposeContext({
   repoRoot,
@@ -278,21 +296,34 @@ export function resolveRecordedComposeContext({
   findByInstallDir,
   baseComposeFiles = ["docker-compose.yml", "docker-compose.dev.yml"],
 } = {}) {
-  const fallback = {
+  const fallbackWith = (reason, composeFiles = baseComposeFiles, slug = null) => ({
     project: fallbackProject,
-    composeFiles: baseComposeFiles,
+    composeFiles,
     source: "fallback",
-    slug: null,
-  };
-  if (typeof readRegistry !== "function" || typeof findByInstallDir !== "function") return fallback;
+    slug,
+    reason,
+  });
+  // No usable seam at all: the caller cannot consult a registry, so it cannot
+  // know whether one records this checkout — same epistemic state as a
+  // registry it failed to read.
+  if (typeof readRegistry !== "function" || typeof findByInstallDir !== "function") {
+    return fallbackWith("registry-unreadable");
+  }
   let row = null;
   try {
-    row = findByInstallDir(readRegistry(), repoRoot) ?? null;
+    // A registry that is present-but-broken reads back as a NON-object here
+    // (the reader returns `registry: null` for a malformed file). Distinguish
+    // that from a readable registry with no matching row: only the latter
+    // licenses "there is no record for this checkout".
+    const registry = readRegistry();
+    if (!registry || typeof registry !== "object") return fallbackWith("registry-unreadable");
+    row = findByInstallDir(registry, repoRoot) ?? null;
   } catch {
-    return fallback; // a missing/malformed registry never breaks a lifecycle command
+    // a missing/malformed registry never breaks a lifecycle command
+    return fallbackWith("registry-unreadable");
   }
   const found = unwrapRegistryRow(row);
-  if (!found) return fallback;
+  if (!found) return fallbackWith("no-record");
   const { slot, slug } = found;
   const recordedProject =
     typeof slot.composeProject === "string" && slot.composeProject.trim() !== ""
@@ -302,8 +333,10 @@ export function resolveRecordedComposeContext({
     Array.isArray(slot.composeFiles) && slot.composeFiles.length > 0 ? slot.composeFiles : baseComposeFiles;
   if (recordedProject === null) {
     // The row exists but records no project. Say "fallback" — claiming
-    // "registry" here is exactly the lie that hid cinatra-cli#230.
-    return { project: fallbackProject, composeFiles, source: "fallback", slug };
+    // "registry" here is exactly the lie that hid cinatra-cli#230 — and name
+    // the distinct reason, so a caller does not report this as "no record"
+    // either: a record DOES exist, it just carries no project.
+    return fallbackWith("row-without-project", composeFiles, slug);
   }
-  return { project: recordedProject, composeFiles, source: "registry", slug };
+  return { project: recordedProject, composeFiles, source: "registry", slug, reason: null };
 }

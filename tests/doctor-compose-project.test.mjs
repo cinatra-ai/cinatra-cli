@@ -231,6 +231,7 @@ describe("doctor wayflow readiness — the basename fallback", () => {
     expect(a.verdict).toBe("fail");
     expect(a.detail).toContain(`compose project "${basenameProject}"`);
     expect(a.detail).toContain("derived from the checkout directory name");
+    expect(a.detail).toContain("no instance registry record for this checkout");
   });
 
   it("no registry record + a container under the basename project → PASS (unchanged behaviour)", async () => {
@@ -243,13 +244,116 @@ describe("doctor wayflow readiness — the basename fallback", () => {
     });
     expect(a.verdict).toBe("pass");
   });
+});
 
-  it("a malformed registry falls back to the basename instead of throwing", async () => {
+// ===========================================================================
+// cinatra-cli#230 review, item 3 — an UNREADABLE registry is not "no record".
+// ===========================================================================
+//
+// Both states fall back to the basename, but they are different CLAIMS:
+//
+//   no record          — the registry was read; this checkout is unmanaged, so
+//                        the basename IS its project. A verdict about the
+//                        container found there is authoritative.
+//   registry unreadable— whether a record exists is UNKNOWN. The basename is a
+//                        guess. A container found under it may belong to a
+//                        different instance entirely, and one absent proves
+//                        nothing about this instance's runtime.
+//
+// The note previously said "no instance registry record for this checkout" for
+// both, and the unreadable case could PASS on whatever happened to be running
+// under the basename — a silent, confident wrong answer of exactly the kind
+// #230 is about, pointing the other way.
+describe("doctor wayflow readiness — an unreadable registry is not a silent PASS", () => {
+  /** Registry file present but unparseable — `readInstanceRegistry` → malformed. */
+  function writeUnreadableRegistry() {
     writeFileSync(registryPath, "{ not json at all", "utf8");
+  }
+
+  it("does not PASS on a container found under the guessed basename project", async () => {
+    writeUnreadableRegistry();
     const basenameProject = effectiveComposeProjectName(installDir);
     const a = await doctorAssertWayflowReadiness({
       fetchImpl: healthyFetch(),
       dockerImpl: dockerWithWayflowIn(basenameProject),
+      repoRoot: installDir,
+      env: {},
+    });
+    // The container may be another instance's — doctor cannot tell, so it must
+    // not bless it. SKIP is explicitly "NOT a pass" in the report footer.
+    expect(a.verdict).not.toBe("pass");
+    expect(a.verdict).toBe("skip");
+    expect(a.detail).toContain("does NOT establish that it belongs to this instance");
+    expect(a.remediation).toMatch(/registry/i);
+  });
+
+  it("says the registry was UNREADABLE — never 'no instance registry record'", async () => {
+    writeUnreadableRegistry();
+    const a = await doctorAssertWayflowReadiness({
+      fetchImpl: REFUSING_FETCH,
+      dockerImpl: dockerWithWayflowIn("anything-else"),
+      repoRoot: installDir,
+      env: {},
+    });
+    expect(a.detail).toContain("the instance registry could not be read");
+    expect(a.detail).not.toContain("no instance registry record for this checkout");
+  });
+
+  it("does not FAIL either — an absent container under a guessed project proves nothing", async () => {
+    // The symmetric false verdict: reporting this instance's runtime DOWN on
+    // the strength of a project name doctor had to invent.
+    writeUnreadableRegistry();
+    const a = await doctorAssertWayflowReadiness({
+      fetchImpl: REFUSING_FETCH,
+      dockerImpl: dockerWithWayflowIn("anything-else"),
+      repoRoot: installDir,
+      env: {},
+    });
+    expect(a.verdict).toBe("skip");
+    expect(a.detail).toContain("does NOT establish that this instance's runtime is down");
+  });
+
+  it("still falls back rather than throwing — the lifecycle is never broken", async () => {
+    writeUnreadableRegistry();
+    const basenameProject = effectiveComposeProjectName(installDir);
+    const a = await doctorAssertWayflowReadiness({
+      fetchImpl: healthyFetch(),
+      dockerImpl: dockerWithWayflowIn(basenameProject),
+      repoRoot: installDir,
+      env: {},
+    });
+    expect(a.detail).toContain(`compose project "${basenameProject}"`);
+  });
+
+  it("the by-design opt-outs still win — they do not depend on project resolution", async () => {
+    // `off`/`external` are read from the install's own .env.local, so an
+    // unreadable registry must not convert a deliberate opt-out into a
+    // registry-repair SKIP that misdescribes it.
+    writeUnreadableRegistry();
+    const off = await doctorAssertWayflowReadiness({
+      fetchImpl: REFUSING_FETCH,
+      dockerImpl: dockerWithWayflowIn("anything-else"),
+      repoRoot: installDir,
+      env: { CINATRA_WAYFLOW_RUNTIME: "off" },
+    });
+    expect(off.verdict).toBe("skip");
+    expect(off.detail).toContain("--no-wayflow");
+
+    const external = await doctorAssertWayflowReadiness({
+      fetchImpl: REFUSING_FETCH,
+      dockerImpl: dockerWithWayflowIn("anything-else"),
+      repoRoot: installDir,
+      env: { CINATRA_WAYFLOW_RUNTIME: "external" },
+    });
+    expect(external.verdict).toBe("skip");
+    expect(external.detail).toContain("owns no local compose stack");
+  });
+
+  it("a readable registry recording the project is unaffected — still an authoritative PASS", async () => {
+    recordInstance();
+    const a = await doctorAssertWayflowReadiness({
+      fetchImpl: healthyFetch(),
+      dockerImpl: dockerWithWayflowIn(RECORDED_PROJECT),
       repoRoot: installDir,
       env: {},
     });
