@@ -284,7 +284,11 @@ describe("doctor wayflow readiness — an unreadable registry is not a silent PA
     expect(a.verdict).not.toBe("pass");
     expect(a.verdict).toBe("skip");
     expect(a.detail).toContain("does NOT establish that it belongs to this instance");
+    expect(a.detail).toContain(`"${basenameProject}-wayflow-1"`); // names what it found
     expect(a.remediation).toMatch(/registry/i);
+    // The reason is stated ONCE — the note is embedded in a sentence that
+    // already gives it, so repeating it reads as two different findings.
+    expect(a.detail.match(/could not be read/g)).toHaveLength(1);
   });
 
   it("says the registry was UNREADABLE — never 'no instance registry record'", async () => {

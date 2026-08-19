@@ -5226,7 +5226,8 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
       id,
       label,
       "skip",
-      `cannot verify this instance's runtime: ${fallbackWhy}, so the check fell back to ${projectNote}` +
+      `cannot verify this instance's runtime: ${fallbackWhy}. The check fell back to compose project ` +
+        `"${project}" (derived from the checkout directory name)` +
         (runningContainer === ""
           ? " and found no container there — which does NOT establish that this instance's runtime is down"
           : `, where container "${runningContainer}" is running — which does NOT establish that it belongs to this instance`),
