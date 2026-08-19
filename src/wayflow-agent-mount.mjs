@@ -30,10 +30,12 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 //   * the outcome is VERIFIED against `/.health` + a real agent route rather
 //     than assumed from the reload's exit status.
 //
-// Non-fatal by contract: this runs after the instance is provisioned, so it
-// repairs and REPORTS. What it must never do is stay quiet — an unmounted
-// runtime is now named here, and `cinatra doctor`'s agent-availability probe
-// fails on the same state.
+// No ROLLBACK, but no clean exit either: this runs after the instance is
+// provisioned, so it repairs and REPORTS rather than tearing a working install
+// down — and every outcome that leaves the runtime unable to serve its agents
+// (including having NO sources to serve) makes the install claim the typed exit
+// code instead of printing success. `cinatra doctor`'s agent-availability probe
+// fails on the same states.
 // ---------------------------------------------------------------------------
 
 /** The loader's hot-reload route (agent_loader.py base_routes). POST-only. */
@@ -48,8 +50,13 @@ export const WAYFLOW_SERVICE_NAME = "wayflow";
 export const AGENT_SOURCES_DIRNAME = "extensions";
 /** The checkout-relative narrow env file that carries CINATRA_BRIDGE_TOKEN. */
 export const WAYFLOW_ENV_FILE_REL = path.join("docker", "wayflow", ".wayflow.env");
-/** Default endpoint when `.env.local` records no WAYFLOW_BASE_URL. */
-export const DEFAULT_WAYFLOW_ENDPOINT = "http://localhost:3010";
+/**
+ * The port the loader listens on INSIDE the container. Compose publishes it on
+ * whatever HOST port this instance chose (3010 for the default stack, remapped
+ * for an isolated one), so asking compose which host port it published is what
+ * makes an endpoint THIS instance's rather than the default stack's.
+ */
+export const WAYFLOW_CONTAINER_PORT = 3010;
 
 const RELOAD_TIMEOUT_MS = 30_000;
 const HEALTH_TIMEOUT_MS = 5_000;
@@ -157,13 +164,72 @@ function normalizeEndpoint(raw) {
 }
 
 /**
- * The endpoint THIS instance publishes. An isolated instance remaps the WayFlow
- * host port and re-points `WAYFLOW_BASE_URL` in its own `.env.local`, so a
- * hardcoded :3010 would address the DEFAULT instance's runtime and reload
- * another stack. `env` (already-parsed keys) wins; otherwise `.env.local` is
- * read from the checkout. Falls back to the default endpoint.
+ * The `http://host:port` compose published the runtime on, parsed from one
+ * `docker compose … port wayflow 3010` line: `127.0.0.1:13010`, `0.0.0.0:13010`
+ * or `[::]:13010`. A WILDCARD bind is addressed on loopback — that is where this
+ * host reaches its own published container, and it keeps the bridge token on the
+ * loopback path the secret boundary requires. Returns null when unparseable.
  */
-export function resolveWayflowEndpoint({ targetDir, env = null, deps = {} } = {}) {
+export function endpointFromPublishedAddress(raw) {
+  const line = String(raw ?? "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)[0] ?? "";
+  const match = /^(?:(\[[^\]]*\]|[^:]*):)?(\d{1,5})$/.exec(line);
+  if (!match) return null;
+  const port = Number(match[2]);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  const host = (match[1] ?? "").replace(/^\[|\]$/g, "");
+  if (host === "" || host === "0.0.0.0" || host === "::" || host === "*") return `http://127.0.0.1:${port}`;
+  return `http://${host.includes(":") ? `[${host}]` : host}:${port}`;
+}
+
+/**
+ * Ask COMPOSE which host address it published this project's runtime on.
+ * `composeArgs` is the caller's fully-resolved `["compose", "-f", …, "-p", …]`
+ * prefix, so this module never re-derives a project. Never throws; null when
+ * there is no compose context, no daemon answer, or nothing published.
+ */
+export function publishedWayflowEndpoint({ targetDir, composeArgs = null, deps = {} } = {}) {
+  const spawn = deps.spawnSync;
+  if (typeof spawn !== "function") return null;
+  if (!Array.isArray(composeArgs) || composeArgs.length === 0) return null;
+  try {
+    const result = spawn("docker", [...composeArgs, "port", WAYFLOW_SERVICE_NAME, String(WAYFLOW_CONTAINER_PORT)], {
+      cwd: targetDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf8",
+    });
+    if (result?.status !== 0) return null;
+    return endpointFromPublishedAddress(result.stdout);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The endpoint THIS instance publishes — or `null`, which the caller must treat
+ * as a refusal to act.
+ *
+ * A hardcoded `:3010` fallback is not a guess, it is a WRONG ANSWER. An isolated
+ * or attached instance remaps the WayFlow host port, and one whose `.env.local`
+ * was never re-pointed still carries the donor's value — so defaulting addresses
+ * the DEFAULT stack: the reload and BOTH verifications talk to another
+ * instance's runtime, and when that one already serves the same labels the
+ * install reports `already-mounted` and exits 0 while THIS instance stays empty.
+ *
+ * So the order is evidence first, record second, refusal last:
+ *
+ *   1. what COMPOSE published for this project — measured, and unambiguously
+ *      this instance (the same project the bring-up used);
+ *   2. the recorded `WAYFLOW_BASE_URL` (`env`'s parsed keys, else `.env.local`)
+ *      — a record, and a stale one names another stack, so it never outranks
+ *      the measurement;
+ *   3. REFUSE. An unknown endpoint is not the default endpoint.
+ */
+export function resolveWayflowEndpoint({ targetDir, env = null, composeArgs = null, deps = {} } = {}) {
+  const published = publishedWayflowEndpoint({ targetDir, composeArgs, deps });
+  if (published) return published;
   const readFile = deps.readFileSync ?? readFileSync;
   const fromEnv = env ? normalizeEndpoint(env.WAYFLOW_BASE_URL) : null;
   if (fromEnv) return fromEnv;
@@ -174,10 +240,10 @@ export function resolveWayflowEndpoint({ targetDir, env = null, deps = {} } = {}
       const parsed = normalizeEndpoint(value);
       if (parsed) return parsed;
     } catch {
-      // no .env.local (or unreadable) — the default endpoint is the honest guess
+      // no .env.local (or unreadable) — fall through to the refusal
     }
   }
-  return DEFAULT_WAYFLOW_ENDPOINT;
+  return null;
 }
 
 /** Read one KEY=value out of an env-file body. Strips matching quotes. */
@@ -462,11 +528,47 @@ export async function mountAgentSourcesAfterSync({
   const label = sources[0] ?? null;
   const base = { sources: sources.length, mounted: null, method: null, label, reason: null };
   if (sources.length === 0) {
-    log("- WayFlow agent mount: no agent sources on disk (extensions/) — nothing to mount.");
-    return { ...base, status: "no-sources" };
+    // FAIL CLOSED. This step runs ONLY for an install that owns a local runtime,
+    // so "no agent sources on disk" is not a benign nothing-to-do: the runtime
+    // this install just started serves ZERO agents, every `/agents/…` route
+    // answers HTTP 404, and `judgeAgentAvailability` calls that identical state
+    // a doctor FAIL. Both real paths land here — the dev sync reporting
+    // `skipped`, and a prod acquisition that placed nothing — and both used to
+    // exit 0 over an instance that cannot run a single agent, which is the very
+    // lie this issue exists to remove.
+    log(
+      "  ⚠ WayFlow agent mount: NO agent sources on disk (extensions/<vendor>/<slug>/cinatra/oas.json), so the " +
+        "runtime this install started can serve no agents — every `/agents/…` route answers HTTP 404.",
+    );
+    return {
+      ...base,
+      status: "no-sources",
+      reason:
+        "no agent sources are on disk (extensions/<vendor>/<slug>/cinatra/oas.json), so the runtime has nothing " +
+        "to serve — the declared extension sync was skipped, or the acquisition placed nothing",
+    };
   }
 
-  const endpoint = resolveWayflowEndpoint({ targetDir, env, deps });
+  // Address THIS instance or nothing at all: an unresolvable endpoint is a
+  // failure, never the default stack (which a reload would repair instead,
+  // reporting THIS instance mounted).
+  const endpoint = resolveWayflowEndpoint({ targetDir, env, composeArgs, deps });
+  if (!endpoint) {
+    log(
+      `  ⚠ WayFlow agent mount: this instance's WayFlow endpoint could not be determined — compose published no ` +
+        `host port for the ${WAYFLOW_SERVICE_NAME} service and no usable WAYFLOW_BASE_URL is recorded. Refusing to ` +
+        `address the default stack: a reload sent there repairs ANOTHER instance's runtime and would report this ` +
+        `one mounted. The ${sources.length} agent source(s) on disk are not mounted.`,
+    );
+    return {
+      ...base,
+      status: "failed",
+      reason:
+        `this instance's WayFlow endpoint could not be determined (compose published no host port for the ` +
+        `${WAYFLOW_SERVICE_NAME} service and no usable WAYFLOW_BASE_URL is recorded), so the ${sources.length} ` +
+        "agent source(s) on disk could not be mounted",
+    };
+  }
 
   // Is it ALREADY serving every source? Decided per agent route, never by the
   // aggregate count alone (codex round 1, must-fix 2): a runtime holding two
@@ -541,20 +643,51 @@ export async function mountAgentSourcesAfterSync({
 }
 
 /**
+ * The mount statuses that mean "this install owns a runtime that cannot serve
+ * agents", i.e. the ones that must claim the typed exit code rather than exit 0.
+ *
+ * `no-sources` is one of them. It reads like a benign nothing-to-do and is not:
+ * the step only runs for an install that OWNS a local runtime, so it describes a
+ * runtime serving zero agents with every `/agents/…` route answering 404 — the
+ * identical state `judgeAgentAvailability` calls a doctor FAIL. Leaving it
+ * non-failing let an install exit 0 over exactly that whenever the dev sync
+ * reported `skipped` or prod acquisition placed nothing.
+ */
+export const AGENT_MOUNT_FAILING_STATUSES = Object.freeze(["failed", "unreachable", "no-sources"]);
+
+/** Does this mount result mean the install must not report a clean success? */
+export function agentMountFailedClosed(result) {
+  return Boolean(result) && AGENT_MOUNT_FAILING_STATUSES.includes(result.status);
+}
+
+/**
  * The operator-facing verdict for an install that provisioned an instance whose
  * runtime cannot serve its agents. Stated at the install tail (where the
  * operator reads it) and paired with the typed exit code, so
  * "exited 0 and recorded ready" can no longer describe this state.
  */
 export function agentsUnavailableVerdictLines(result) {
-  if (!result || (result.status !== "failed" && result.status !== "unreachable")) return [];
+  if (!agentMountFailedClosed(result)) return [];
+  // The recovery differs by cause: an unmounted runtime is reloaded, but a
+  // runtime with nothing on disk to mount needs the SOURCES first — telling that
+  // operator to restart the runtime would send them in a circle.
+  const evidence =
+    result.status === "no-sources"
+      ? [
+          "    No agent source reached disk, so the runtime has nothing to serve: every `/agents/…` route answers HTTP 404.",
+          "    Recover: clone the declared extension repos (dev: `cinatra.devExtensions` — the sync's skip reason is above)",
+          "    or acquire the prod extensions, then re-run `cinatra install` (it reloads the runtime once they are on disk).",
+        ]
+      : [
+          `    ${result.sources} agent source(s) are on disk; every unmounted \`/agents/…\` route answers HTTP 404, so agent runs fail.`,
+          "    Recover: re-run `cinatra install` (it reloads the runtime after the extension sources are on disk),",
+          "    or restart it by hand (`cinatra instance wayflow stop && cinatra instance wayflow start`).",
+        ];
   return [
     "",
     "  ⚠ This instance is provisioned, but its WayFlow agent runtime cannot serve its agents:",
     `    ${result.reason ?? "the runtime did not mount the agent sources on disk"}.`,
-    `    ${result.sources} agent source(s) are on disk; every unmounted \`/agents/…\` route answers HTTP 404, so agent runs fail.`,
-    "    Recover: re-run `cinatra install` (it reloads the runtime after the extension sources are on disk),",
-    "    or restart it by hand (`cinatra instance wayflow stop && cinatra instance wayflow start`).",
+    ...evidence,
     "    Then confirm with `cinatra doctor` — its WayFlow probe checks agent availability, not only health.",
     `    (Exit code ${INSTALL_EXIT_AGENTS_UNAVAILABLE}: the install completed; the agent runtime did not.)`,
   ];

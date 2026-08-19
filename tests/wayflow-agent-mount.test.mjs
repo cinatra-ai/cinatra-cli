@@ -25,11 +25,13 @@ import { runInstall } from "../src/install.mjs";
 import {
   AGENT_SOURCES_DIRNAME,
   INSTALL_EXIT_AGENTS_UNAVAILABLE,
-  DEFAULT_WAYFLOW_ENDPOINT,
   WAYFLOW_BRIDGE_TOKEN_HEADER,
   WAYFLOW_RELOAD_PATH,
+  agentMountFailedClosed,
   agentRoutePath,
+  agentsUnavailableVerdictLines,
   discoverAgentSources,
+  endpointFromPublishedAddress,
   fetchWayflowHealth,
   judgeAgentAvailability,
   mountAgentSourcesAfterSync,
@@ -44,7 +46,7 @@ const BRIDGE_TOKEN = "tok-233-never-logged";
 
 /** A checkout with `n` agent sources on disk, an `.env.local` and the narrow
  *  generated env file the runtime is configured from. */
-function makeCheckout(root, { agents = [], endpoint = null, token = BRIDGE_TOKEN } = {}) {
+function makeCheckout(root, { agents = [], endpoint = "http://localhost:13010", token = BRIDGE_TOKEN } = {}) {
   mkdirSync(root, { recursive: true });
   for (const label of agents) {
     const [vendor, slug] = label.split("/");
@@ -60,6 +62,23 @@ function makeCheckout(root, { agents = [], endpoint = null, token = BRIDGE_TOKEN
 }
 
 const json = (status, body) => ({ status, json: async () => body });
+
+/** A `spawnSync` double. Answers compose `port wayflow 3010` with `published`
+ *  (null models a container that publishes no host port) and every other call
+ *  with `status`. Records every argv. */
+function makeSpawn({ published = null, status = 0 } = {}) {
+  const calls = [];
+  const impl = (cmd, args = []) => {
+    calls.push([cmd, ...args]);
+    if (args.includes("port")) {
+      return published ? { status: 0, stdout: `${published}\n` } : { status: 1, stdout: "" };
+    }
+    return { status };
+  };
+  impl.calls = calls;
+  impl.restarts = () => calls.filter((c) => c.includes("restart"));
+  return impl;
+}
 
 /** A fetch double driven by an ordered script of `/.health` answers plus the
  *  reload answer and per-route answers, recording every request. `routes` maps
@@ -133,18 +152,58 @@ describe("cinatra-cli#233 — the endpoint and the bridge token", () => {
   });
   afterAll(() => rmSync(sandbox, { recursive: true, force: true }));
 
+  const COMPOSE = ["compose", "-p", "cinatra_iso", "--profile", "wayflow", "-f", "docker-compose.yml"];
+
   it("uses THIS instance's remapped endpoint from .env.local, not a hardcoded :3010", () => {
     const root = makeCheckout(path.join(sandbox, "isolated"), { endpoint: "http://localhost:13010" });
     expect(resolveWayflowEndpoint({ targetDir: root })).toBe("http://localhost:13010");
   });
 
-  it("an already-parsed env wins, and an absent/unparseable value falls back to the default endpoint", () => {
-    const root = makeCheckout(path.join(sandbox, "fallback"));
+  it("an already-parsed env wins over the file it was parsed from", () => {
+    const root = makeCheckout(path.join(sandbox, "parsed"), { endpoint: "http://localhost:13010" });
     expect(resolveWayflowEndpoint({ targetDir: root, env: { WAYFLOW_BASE_URL: "http://localhost:23010" } })).toBe(
       "http://localhost:23010",
     );
-    expect(resolveWayflowEndpoint({ targetDir: root })).toBe(DEFAULT_WAYFLOW_ENDPOINT);
-    expect(resolveWayflowEndpoint({ targetDir: root, env: { WAYFLOW_BASE_URL: "not a url" } })).toBe(DEFAULT_WAYFLOW_ENDPOINT);
+  });
+
+  it("REFUSES rather than defaulting when nothing names an endpoint (cinatra-cli#233)", () => {
+    // The whole hazard in one line: a hardcoded :3010 is not a guess, it is the
+    // DEFAULT stack — reloading and verifying THAT while this instance stays
+    // empty, and reporting `already-mounted` if it happens to serve the same
+    // labels. An unknown endpoint must stay unknown.
+    const root = makeCheckout(path.join(sandbox, "fallback"), { endpoint: null });
+    expect(resolveWayflowEndpoint({ targetDir: root })).toBeNull();
+    expect(resolveWayflowEndpoint({ targetDir: root, env: { WAYFLOW_BASE_URL: "not a url" } })).toBeNull();
+    expect(resolveWayflowEndpoint({ targetDir: root, env: { WAYFLOW_BASE_URL: "ftp://host/x" } })).toBeNull();
+    expect(resolveWayflowEndpoint({})).toBeNull();
+  });
+
+  it("reads the host address COMPOSE published, mapping a wildcard bind onto loopback", () => {
+    expect(endpointFromPublishedAddress("127.0.0.1:13010\n")).toBe("http://127.0.0.1:13010");
+    expect(endpointFromPublishedAddress("0.0.0.0:13010")).toBe("http://127.0.0.1:13010");
+    expect(endpointFromPublishedAddress("[::]:13010")).toBe("http://127.0.0.1:13010");
+    expect(endpointFromPublishedAddress("[::1]:13010")).toBe("http://[::1]:13010");
+    // Several published addresses (IPv4 + IPv6): the first is enough.
+    expect(endpointFromPublishedAddress("127.0.0.1:13010\n[::1]:13010\n")).toBe("http://127.0.0.1:13010");
+    expect(endpointFromPublishedAddress("")).toBeNull();
+    expect(endpointFromPublishedAddress(null)).toBeNull();
+    expect(endpointFromPublishedAddress("Error: no container found")).toBeNull();
+  });
+
+  it("what COMPOSE PUBLISHED beats a stale recorded value — the attached instance's .env.local names the DEFAULT stack", () => {
+    // groganz blocking 2: an isolated/attached instance whose `.env.local` was
+    // never re-pointed still carries :3010. The compose project this install
+    // brought up is the one that knows where THIS runtime answers.
+    const root = makeCheckout(path.join(sandbox, "stale-record"), { endpoint: "http://localhost:3010" });
+    const spawnSync = makeSpawn({ published: "127.0.0.1:13010" });
+    expect(resolveWayflowEndpoint({ targetDir: root, composeArgs: COMPOSE, deps: { spawnSync } })).toBe(
+      "http://127.0.0.1:13010",
+    );
+    expect(spawnSync.calls[0]).toEqual(["docker", ...COMPOSE, "port", "wayflow", "3010"]);
+    // ... and the record is still the fallback when compose publishes nothing.
+    expect(
+      resolveWayflowEndpoint({ targetDir: root, composeArgs: COMPOSE, deps: { spawnSync: makeSpawn({ published: null }) } }),
+    ).toBe("http://localhost:3010");
   });
 
   it("reads the bridge token from the narrow generated env file; an absent file is null, never a throw", () => {
@@ -280,19 +339,87 @@ describe("cinatra-cli#233 — mountAgentSourcesAfterSync repairs the fresh-insta
     expect(logs.join("\n")).not.toContain(BRIDGE_TOKEN);
   });
 
-  it("no agent sources on disk → states it and touches nothing (no reload, no restart)", async () => {
+  it("no agent sources on disk → touches nothing, and FAILS CLOSED (the runtime serves zero agents)", async () => {
+    // groganz blocking 1: this step runs only for an install that OWNS a local
+    // runtime, so "nothing on disk" is not a benign nothing-to-do — it is a
+    // runtime serving zero agents with every `/agents/…` route answering 404,
+    // the identical state `judgeAgentAvailability` calls a doctor FAIL.
     const root = makeCheckout(path.join(sandbox, "nosrc"));
     const fetchImpl = makeFetch();
-    const spawnSync = () => ({ status: 0 });
-    spawnSync.calls = 0;
+    const spawnSync = makeSpawn({ published: "127.0.0.1:13010" });
+    const logs = [];
+    const out = await mountAgentSourcesAfterSync({
+      targetDir: root,
+      composeArgs: COMPOSE_ARGS,
+      log: (m) => logs.push(String(m)),
+      deps: { fetchImpl, spawnSync },
+    });
+    expect(out.status).toBe("no-sources");
+    // Nothing was reloaded or restarted — there is nothing to mount.
+    expect(fetchImpl.calls).toHaveLength(0);
+    expect(spawnSync.restarts()).toHaveLength(0);
+    // But it is a FAILING status, so the install tail claims exit 21.
+    expect(agentMountFailedClosed(out)).toBe(true);
+    const verdict = agentsUnavailableVerdictLines(out).join("\n");
+    expect(verdict).toContain("cannot serve its agents");
+    expect(verdict).toContain(String(INSTALL_EXIT_AGENTS_UNAVAILABLE));
+    // The recovery is the SOURCES, not another runtime restart.
+    expect(verdict).toContain("extension repos");
+    expect(logs.join("\n")).toContain("NO agent sources on disk");
+  });
+
+  it("a mount that succeeded is NOT failed-closed (the predicate names exactly the broken states)", () => {
+    expect(agentMountFailedClosed({ status: "mounted" })).toBe(false);
+    expect(agentMountFailedClosed({ status: "already-mounted" })).toBe(false);
+    expect(agentMountFailedClosed(null)).toBe(false);
+    expect(agentsUnavailableVerdictLines({ status: "mounted" })).toEqual([]);
+    for (const status of ["failed", "unreachable", "no-sources"]) {
+      expect(agentMountFailedClosed({ status })).toBe(true);
+    }
+  });
+
+  it("an endpoint it cannot determine is a FAILURE — it refuses to address the default stack", async () => {
+    // groganz blocking 2, the decisive half: with no published port and no
+    // recorded value, defaulting to :3010 would reload ANOTHER instance's
+    // runtime and — if that one serves the same labels — report this one
+    // `already-mounted` and exit 0. So: no request leaves at all.
+    const root = makeCheckout(path.join(sandbox, "noendpoint"), { agents: ["acme/a"], endpoint: null });
+    const fetchImpl = makeFetch({ healthSequence: [json(200, { status: "ok", agents: 9 })], route: json(405, {}) });
+    const spawnSync = makeSpawn({ published: null });
+    const logs = [];
+    const out = await mountAgentSourcesAfterSync({
+      targetDir: root,
+      composeArgs: COMPOSE_ARGS,
+      log: (m) => logs.push(String(m)),
+      deps: { fetchImpl, spawnSync },
+    });
+    expect(out.status).toBe("failed");
+    expect(agentMountFailedClosed(out)).toBe(true);
+    expect(fetchImpl.calls).toHaveLength(0);
+    expect(spawnSync.restarts()).toHaveLength(0);
+    expect(logs.join("\n")).toContain("could not be determined");
+  });
+
+  it("the reload addresses the port COMPOSE published, not the stale :3010 in .env.local", async () => {
+    const root = makeCheckout(path.join(sandbox, "published"), {
+      agents: ["acme/a"],
+      endpoint: "http://localhost:3010",
+    });
+    const fetchImpl = makeFetch({
+      healthSequence: [json(200, { status: "ok", agents: 0 }), json(200, { status: "ok", agents: 1 })],
+      reload: json(200, { agents: 1 }),
+      route: json(405, {}),
+    });
     const out = await mountAgentSourcesAfterSync({
       targetDir: root,
       composeArgs: COMPOSE_ARGS,
       log: () => {},
-      deps: { fetchImpl, spawnSync },
+      deps: { fetchImpl, spawnSync: makeSpawn({ published: "127.0.0.1:13010" }) },
     });
-    expect(out.status).toBe("no-sources");
-    expect(fetchImpl.calls).toHaveLength(0);
+    expect(out.status).toBe("mounted");
+    expect(fetchImpl.calls.map((c) => c.url)).toContain(`http://127.0.0.1:13010${WAYFLOW_RELOAD_PATH}`);
+    // Not one request reached the default stack.
+    expect(fetchImpl.calls.some((c) => c.url.startsWith("http://localhost:3010"))).toBe(false);
   });
 
   it("a runtime that already SERVES them all is left alone (idempotent re-run / reconcile)", async () => {
@@ -348,25 +475,18 @@ describe("cinatra-cli#233 — mountAgentSourcesAfterSync repairs the fresh-insta
       healthSequence: [json(200, { status: "ok", agents: 0 }), json(200, { status: "ok", agents: 1 })],
       route: json(405, {}),
     });
-    const spawned = [];
+    const spawnSync = makeSpawn();
     const out = await mountAgentSourcesAfterSync({
       targetDir: root,
       composeArgs: COMPOSE_ARGS,
       log: () => {},
-      deps: {
-        fetchImpl,
-        spawnSync: (cmd, args) => {
-          spawned.push([cmd, ...args]);
-          return { status: 0 };
-        },
-        sleepImpl: async () => {},
-      },
+      deps: { fetchImpl, spawnSync, sleepImpl: async () => {} },
     });
     // No request to the reload route at all, so the token cannot leave the host.
     expect(fetchImpl.calls.filter((c) => c.url.endsWith(WAYFLOW_RELOAD_PATH))).toHaveLength(0);
     for (const call of fetchImpl.calls) expect(JSON.stringify(call.headers)).not.toContain(BRIDGE_TOKEN);
     expect(out.method).toBe("restart");
-    expect(spawned[0]).toContain("restart");
+    expect(spawnSync.restarts()).toHaveLength(1);
   });
 
   it("a runtime whose image predates the reload route RESTARTS the one service, under the caller's project", async () => {
@@ -376,24 +496,17 @@ describe("cinatra-cli#233 — mountAgentSourcesAfterSync repairs the fresh-insta
       reload: json(404, {}),
       route: json(405, {}),
     });
-    const spawned = [];
+    const spawnSync = makeSpawn();
     const out = await mountAgentSourcesAfterSync({
       targetDir: root,
       composeArgs: COMPOSE_ARGS,
       log: () => {},
-      deps: {
-        fetchImpl,
-        spawnSync: (cmd, args) => {
-          spawned.push([cmd, ...args]);
-          return { status: 0 };
-        },
-        sleepImpl: async () => {},
-      },
+      deps: { fetchImpl, spawnSync, sleepImpl: async () => {} },
     });
     expect(out.status).toBe("mounted");
     expect(out.method).toBe("restart");
     // The RECORDED project the caller resolved — never a basename-derived one.
-    expect(spawned[0]).toEqual(["docker", ...COMPOSE_ARGS, "restart", "wayflow"]);
+    expect(spawnSync.restarts()[0]).toEqual(["docker", ...COMPOSE_ARGS, "restart", "wayflow"]);
   });
 
   it("reload AND restart unavailable → a loud, named failure that prescribes the manual restart", async () => {
@@ -405,7 +518,7 @@ describe("cinatra-cli#233 — mountAgentSourcesAfterSync repairs the fresh-insta
       log: (m) => logs.push(String(m)),
       deps: {
         fetchImpl: makeFetch({ healthSequence: [json(200, { status: "ok", agents: 0 })], reload: json(503, {}) }),
-        spawnSync: () => ({ status: 1 }),
+        spawnSync: makeSpawn({ published: "127.0.0.1:13010", status: 1 }),
       },
     });
     expect(out.status).toBe("failed");
@@ -460,7 +573,7 @@ describe("cinatra-cli#233 — mountAgentSourcesAfterSync repairs the fresh-insta
       log: () => {},
       deps: {
         fetchImpl: makeFetch({ healthSequence: [json(500, { error: "boom" })], reload: json(200, { agents: 1 }), route: json(405, {}) }),
-        spawnSync: () => ({ status: 0 }),
+        spawnSync: makeSpawn(),
         sleepImpl: async () => {},
       },
     });
@@ -604,6 +717,20 @@ describe("cinatra-cli#233 — doctorAssertWayflowReadiness over a real checkout"
     return { status: 0, stdout: mine ? `${project}-wayflow-1` : "" };
   };
 
+  /** The docker double, extended with the `port` lookup the doctor derives this
+   *  instance's endpoint from (`published: null` = nothing mapped). */
+  const dockerFor = (project, published = "127.0.0.1:13010") => {
+    const ps = dockerWithWayflow(project);
+    return (args) => {
+      if (args[0] === "port") {
+        return args[1] === `${project}-wayflow-1` && published
+          ? { status: 0, stdout: `${published}\n` }
+          : { status: 1, stdout: "" };
+      }
+      return ps(args);
+    };
+  };
+
   async function assertFor(dirName, { agents, routeStatus, sources = ["cinatra-ai/blog-draft-writer-agent"], routes = {} }) {
     const root = makeCheckout(path.join(sandbox, dirName), { agents: sources });
     const project = effectiveComposeProjectName(root);
@@ -619,7 +746,7 @@ describe("cinatra-cli#233 — doctorAssertWayflowReadiness over a real checkout"
       if (routeStatus === null) throw new Error("ECONNREFUSED");
       return json(routeStatus, {});
     };
-    return doctorAssertWayflowReadiness({ fetchImpl, dockerImpl: dockerWithWayflow(project), repoRoot: root, env: {} });
+    return doctorAssertWayflowReadiness({ fetchImpl, dockerImpl: dockerFor(project), repoRoot: root, env: {} });
   }
 
   it("row 7 — container up, /.health ok, 0 agents mounted, agent route 404 → FAIL (this PASSED before)", async () => {
@@ -658,6 +785,27 @@ describe("cinatra-cli#233 — doctorAssertWayflowReadiness over a real checkout"
     expect(a.verdict).toBe("skip");
     expect(a.detail).toContain("could not be determined");
   });
+
+  it("a container publishing nothing, with nothing recorded → SKIP without probing the DEFAULT stack", async () => {
+    // The doctor half of groganz blocking 2: an endpoint it cannot determine is
+    // an unknown, and an unknown is never readiness — and never :3010, whose
+    // runtime belongs to another instance.
+    const root = makeCheckout(path.join(sandbox, "noendpoint"), { agents: ["acme/a"], endpoint: null });
+    const project = effectiveComposeProjectName(root);
+    const seen = [];
+    const a = await doctorAssertWayflowReadiness({
+      fetchImpl: async (url) => {
+        seen.push(String(url));
+        return json(200, { status: "ok", agents: 5 });
+      },
+      dockerImpl: dockerFor(project, null),
+      repoRoot: root,
+      env: {},
+    });
+    expect(a.verdict).toBe("skip");
+    expect(a.detail).toContain("could not be determined");
+    expect(seen).toHaveLength(0);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -671,6 +819,7 @@ describe("cinatra-cli#233 — doctorAssertWayflowReadiness over a real checkout"
 describe("cinatra-cli#233 — a fresh install arms the runtime only after the agent sources exist", () => {
   let sandbox;
   let hostOrigin;
+  let bareOrigin;
   let extOrigin;
 
   function git(args, cwd) {
@@ -728,6 +877,27 @@ describe("cinatra-cli#233 — a fresh install arms the runtime only after the ag
     git(["commit", "-m", "init"], hostSrc);
     hostOrigin = path.join(sandbox, "host-origin.git");
     git(["clone", "--bare", hostSrc, hostOrigin], sandbox);
+
+    // The same host repo DECLARING NO extensions: the dev sync reports
+    // `skipped`, so nothing ever reaches `extensions/` and the runtime this
+    // install started serves zero agents (groganz blocking 1).
+    const bareSrc = path.join(sandbox, "bare-src");
+    mkdirSync(path.join(bareSrc, "packages", "migrations"), { recursive: true });
+    writeFileSync(path.join(bareSrc, "pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n");
+    writeFileSync(
+      path.join(bareSrc, "packages", "migrations", "package.json"),
+      JSON.stringify({ name: "@cinatra-ai/migrations", version: "0.0.0" }),
+    );
+    writeFileSync(path.join(bareSrc, "package.json"), JSON.stringify({ name: "cinatra-host" }));
+    mkdirSync(path.join(bareSrc, "docker", "wayflow"), { recursive: true });
+    writeFileSync(path.join(bareSrc, "docker", "wayflow", ".wayflow.env"), `CINATRA_BRIDGE_TOKEN=${BRIDGE_TOKEN}\n`);
+    writeFileSync(path.join(bareSrc, ".env.example"), "BETTER_AUTH_SECRET=\nCINATRA_RUNTIME_MODE=development\n");
+    writeFileSync(path.join(bareSrc, ".gitignore"), ".env.local\nextensions/\n");
+    git(["init", "-b", "main"], bareSrc);
+    git(["add", "-A"], bareSrc);
+    git(["commit", "-m", "init"], bareSrc);
+    bareOrigin = path.join(sandbox, "bare-origin.git");
+    git(["clone", "--bare", bareSrc, bareOrigin], sandbox);
   });
   afterAll(() => rmSync(sandbox, { recursive: true, force: true }));
 
@@ -825,13 +995,13 @@ describe("cinatra-cli#233 — a fresh install arms the runtime only after the ag
   // runtime's own HTTP surface and the compose restart are faked, so the
   // discovery, the reload attempt, the fallback and the verification all run.
   describe("the REAL mount implementation inside a real install", () => {
-    async function realInstall(installDir, wayflowMountDeps) {
+    async function realInstall(installDir, wayflowMountDeps, { origin = null } = {}) {
       const logs = [];
       const before = process.exitCode;
       process.exitCode = 0;
       try {
         await runInstall(
-          ["--dir", installDir, "--repo-url", `file://${hostOrigin}`, "--ref", "main", "--yes", "--no-install"],
+          ["--dir", installDir, "--repo-url", `file://${origin ?? hostOrigin}`, "--ref", "main", "--yes", "--no-install"],
           {
             log: (m) => logs.push(String(m)),
             deps: {
@@ -869,7 +1039,9 @@ describe("cinatra-cli#233 — a fresh install arms the runtime only after the ag
           if (u.endsWith(WAYFLOW_RELOAD_PATH)) return json(503, {});
           return json(404, {});
         },
-        spawnSync: () => ({ status: 1 }),
+        // The port IS published (so the endpoint resolves); the restart itself
+        // is what fails.
+        spawnSync: makeSpawn({ published: "127.0.0.1:13010", status: 1 }),
         sleepImpl: async () => {},
       });
       // The install COMPLETED — and still does not report a clean success.
@@ -896,7 +1068,7 @@ describe("cinatra-cli#233 — a fresh install arms the runtime only after the ag
           if (u.endsWith("/.health")) return json(200, { status: "ok", agents: reloaded ? 1 : 0 });
           return json(reloaded ? 405 : 404, {});
         },
-        spawnSync: () => ({ status: 0 }),
+        spawnSync: makeSpawn({ published: "127.0.0.1:13010" }),
         sleepImpl: async () => {},
       });
       expect(exitCode).toBe(0);
@@ -905,9 +1077,40 @@ describe("cinatra-cli#233 — a fresh install arms the runtime only after the ag
       // to the loopback runtime — and to nothing else.
       const tokenCalls = seen.filter((c) => JSON.stringify(c.headers).includes(BRIDGE_TOKEN));
       expect(tokenCalls).toHaveLength(1);
-      expect(tokenCalls[0].url).toBe(`${DEFAULT_WAYFLOW_ENDPOINT}${WAYFLOW_RELOAD_PATH}`);
+      // ...at the loopback address THIS instance published, derived from the
+      // compose project the install brought up.
+      expect(tokenCalls[0].url).toBe(`http://127.0.0.1:13010${WAYFLOW_RELOAD_PATH}`);
       // And it never reached a log line.
       expect(logs.join("\n")).not.toContain(BRIDGE_TOKEN);
+    });
+
+    it("an install whose agent sources never reach disk exits 21, not 0 (the runtime serves NONE)", async () => {
+      // groganz blocking 1, end to end: the declared-extension sync is skipped,
+      // so `extensions/` stays empty and the runtime this install started can
+      // serve nothing — the same state `cinatra doctor` FAILs on. Before the
+      // fix this printed "✓ Cinatra install complete." and exited 0.
+      const installDir = path.join(sandbox, "real-nosources");
+      const seen = [];
+      const { logs, exitCode } = await realInstall(
+        installDir,
+        {
+          fetchImpl: async (url) => {
+            seen.push(String(url));
+            return json(200, { status: "ok", agents: 0 });
+          },
+          spawnSync: makeSpawn({ published: "127.0.0.1:13010" }),
+          sleepImpl: async () => {},
+        },
+        { origin: bareOrigin },
+      );
+      expect(discoverAgentSources({ targetDir: installDir })).toEqual([]);
+      expect(exitCode).toBe(INSTALL_EXIT_AGENTS_UNAVAILABLE);
+      const text = logs.join("\n");
+      expect(text).toContain("cannot serve its agents");
+      expect(text).toContain("extension repos");
+      expect(text).toContain("cinatra doctor");
+      // Nothing was reloaded or restarted: there was nothing to mount.
+      expect(seen).toHaveLength(0);
     });
   });
 });

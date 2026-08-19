@@ -56,7 +56,21 @@ project adheres to [Semantic Versioning](https://semver.org/).
   process claims the typed exit code **21** — the same
   completed-with-a-named-defect shape the local-registry skew verdict uses. A
   clean exit over a runtime that cannot run an agent is exactly the failure
-  this change removes.
+  this change removes. That includes an install that put **no** agent source on
+  disk at all — the declared-extension sync reporting `skipped`, or a prod
+  acquisition that placed nothing: the runtime it started serves zero agents,
+  which is the state `cinatra doctor` already fails on, so it is reported and
+  typed rather than passed over as nothing-to-do.
+
+  The runtime is addressed at the endpoint **this** instance publishes, which
+  is read from the compose project the install brought up rather than assumed.
+  An isolated or attached instance remaps the WayFlow host port, and one whose
+  `.env.local` was never re-pointed still carries the default stack's `:3010` —
+  so a hardcoded fallback reloaded and verified **another** instance's runtime,
+  and reported this one already-mounted when that runtime happened to serve the
+  same labels. The published host port now wins over any recorded value, and an
+  endpoint that cannot be determined is refused (and reported) rather than
+  defaulted.
 - **`cinatra doctor` checks agent AVAILABILITY, not only the health endpoint.**
   The WayFlow readiness probe passed on any runtime answering `/.health` with
   `ok` or `degraded`, which is exactly what a runtime that mounted nothing
@@ -68,7 +82,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
   (the route exists, GET is not its method) is the healthy signal. Coverage
   must be proven, not assumed: a mounted count below the number of sources
   fails, and a runtime that reports no count at all is a SKIP rather than a
-  pass.
+  pass. The probe addresses the host port this instance's own container
+  publishes rather than falling back to a hardcoded `:3010` — on an isolated or
+  attached instance that reported the default stack's readiness as this one's —
+  and an endpoint it cannot determine is a SKIP, never a default.
 - **A preview no longer wires itself to another instance's services, and it can
   finally reach its own connection service.** The preview composition decided
   where this instance's services live by string manipulation: it swapped a

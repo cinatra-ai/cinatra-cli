@@ -63,8 +63,10 @@ import {
 // while mounting 0 agents is not agent-ready; the doctor compares the agent
 // sources on disk against what the runtime actually serves.
 import {
-  DEFAULT_WAYFLOW_ENDPOINT,
+  WAYFLOW_CONTAINER_PORT,
+  WAYFLOW_HEALTH_PATH,
   discoverAgentSources,
+  endpointFromPublishedAddress,
   judgeAgentAvailability,
   probeAgentRoute,
 } from "./wayflow-agent-mount.mjs";
@@ -4543,24 +4545,34 @@ const DOCTOR_DRUPAL = {
 // runtime as down and printed a useless start hint.
 const DOCTOR_WAYFLOW = {
   service: "wayflow",
-  healthUrl: "http://localhost:3010/.health",
 };
 
 // cinatra#2654 — probe the endpoint THIS instance publishes. An isolated
 // instance remaps the WayFlow host port and re-points WAYFLOW_BASE_URL in its
 // own `.env.local`, so a hardcoded :3010 would probe the DEFAULT instance's
-// runtime and report another stack's health as this one's. Falls back to the
-// default endpoint when the variable is absent or unparseable.
-function wayflowHealthUrlFromEnv(env = {}) {
+// runtime and report another stack's health as this one's.
+//
+// cinatra-cli#233 — and so it REFUSES rather than defaulting: an absent or
+// unparseable value returns null, and the caller derives the endpoint from what
+// this instance's own container actually publishes (below) or reports the
+// endpoint as undetermined. A wrong endpoint is worse than no endpoint — it
+// reports another stack's readiness as this one's.
+function wayflowOriginFromEnv(env = {}) {
   const raw = typeof env.WAYFLOW_BASE_URL === "string" ? env.WAYFLOW_BASE_URL.trim() : "";
-  if (!raw) return DOCTOR_WAYFLOW.healthUrl;
+  if (!raw) return null;
   try {
     const parsed = new URL(raw);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return DOCTOR_WAYFLOW.healthUrl;
-    return `${parsed.protocol}//${parsed.host}/.health`;
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return `${parsed.protocol}//${parsed.host}`;
   } catch {
-    return DOCTOR_WAYFLOW.healthUrl;
+    return null;
   }
+}
+
+/** The recorded endpoint's `/.health` URL, or null when none is recorded. */
+function wayflowHealthUrlFromEnv(env = {}) {
+  const origin = wayflowOriginFromEnv(env);
+  return origin ? `${origin}${WAYFLOW_HEALTH_PATH}` : null;
 }
 
 // Resolve the effective Compose project name the way `docker compose` itself
@@ -5182,7 +5194,10 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
   // compose project, not the checkout basename — a default install records an
   // explicit instance-scoped project and an isolated one records its own.
   const { project } = wayflowComposeContext(repoRoot);
-  const healthUrl = wayflowHealthUrlFromEnv(env);
+  // Only what this checkout RECORDS, and only for the messages below — the
+  // endpoint actually probed is derived from this instance's own container once
+  // it is resolved (see the availability block).
+  const recordedHealthUrl = wayflowHealthUrlFromEnv(env);
   const ps = doctorDockerRun(dockerImpl, [
     "ps",
     "--filter",
@@ -5209,7 +5224,9 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
         label,
         "skip",
         "this install owns no local compose stack (external infra / co-use), so it neither owns nor started a local WayFlow runtime",
-        `Point WAYFLOW_BASE_URL at the runtime you operate and verify it answers ${healthUrl}.`,
+        recordedHealthUrl
+          ? `Point WAYFLOW_BASE_URL at the runtime you operate and verify it answers ${recordedHealthUrl}.`
+          : "Point WAYFLOW_BASE_URL at the runtime you operate and verify that origin answers `/.health`.",
       );
     }
     return makeAssertion(
@@ -5221,6 +5238,29 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
         "If this instance is meant to be lean, re-install with `--no-wayflow` so the opt-out is recorded.",
     );
   }
+  // cinatra-cli#233 — address THIS instance, or nothing at all. A hardcoded
+  // `:3010` fallback probes the DEFAULT stack: on an isolated or attached
+  // instance whose `.env.local` was never re-pointed, that reads another
+  // runtime's health AND another runtime's agent routes as this one's — a PASS
+  // over an instance serving nothing. The container just resolved by
+  // project+service label IS this instance, so ask Docker which host port it
+  // published; the recorded value is only the fallback; and an endpoint that
+  // cannot be determined is a SKIP (an unknown is never readiness), never a
+  // default.
+  const origin = publishedWayflowOrigin(dockerImpl, runningContainer) ?? wayflowOriginFromEnv(env);
+  if (!origin) {
+    return makeAssertion(
+      id,
+      label,
+      "skip",
+      `container ${runningContainer} is up, but it publishes no host port for ${WAYFLOW_CONTAINER_PORT} and this ` +
+        "instance records no usable WAYFLOW_BASE_URL — the endpoint it answers on could not be determined " +
+        "(a hardcoded :3010 would probe the default stack's runtime, not this one)",
+      "Publish the runtime's port (re-run `cinatra install` to reconcile this instance's stack), or set " +
+        "WAYFLOW_BASE_URL in `.env.local` to the endpoint this instance publishes, then re-run `cinatra doctor`.",
+    );
+  }
+  const healthUrl = `${origin}${WAYFLOW_HEALTH_PATH}`;
   // Probe /.health and parse its body. A transport error/timeout on a RUNNING
   // container is "booting?" → SKIP, never PASS (same rule as the CMS probes).
   const controller = new AbortController();
@@ -5274,8 +5314,8 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
   const agentCount = typeof health?.agents === "number" ? health.agents : null;
   const agentSources = discoverAgentSources({ targetDir: repoRoot });
   // EVERY discovered source is probed, not just the first: a runtime serving one
-  // and missing the rest is the same broken install.
-  const origin = wayflowOriginFromHealthUrl(healthUrl);
+  // and missing the rest is the same broken install. `origin` is the endpoint the
+  // health probe just answered on, so both address the same instance.
   const probes = [];
   for (const agentLabel of agentSources) {
     const probe = await probeAgentRoute({ endpoint: origin, label: agentLabel, fetchImpl, timeoutMs: DOCTOR_HTTP_TIMEOUT_MS });
@@ -5308,15 +5348,16 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
   );
 }
 
-// The runtime ORIGIN behind the doctor's health URL, so an agent-route probe
-// addresses the same instance the health probe just answered for (an isolated
-// instance remaps the WayFlow host port). Falls back to the default endpoint.
-function wayflowOriginFromHealthUrl(healthUrl) {
-  try {
-    return new URL(healthUrl).origin;
-  } catch {
-    return DEFAULT_WAYFLOW_ENDPOINT;
-  }
+// The host address Docker published THIS instance's runtime on. `docker port
+// <container> 3010` answers e.g. `127.0.0.1:13010` — the instance's OWN
+// (possibly remapped) host port, which is what makes the health probe and the
+// agent-route probes address this stack rather than the default one. Read-only,
+// no secret; null when nothing is published or the daemon does not answer.
+function publishedWayflowOrigin(dockerImpl, containerName) {
+  if (!containerName) return null;
+  const out = doctorDockerRun(dockerImpl, ["port", containerName, String(WAYFLOW_CONTAINER_PORT)]);
+  if (!out.ok) return null;
+  return endpointFromPublishedAddress(out.stdout);
 }
 
 // Assertion 8 — dev-app clone presence. The WP plugin + Drupal module clones must

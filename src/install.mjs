@@ -171,6 +171,7 @@ import {
 // 0 agents. This module makes the running runtime pick them up once the sync
 // has put them there (builtins-only, injectable, hermetically testable).
 import {
+  agentMountFailedClosed,
   agentsUnavailableVerdictLines,
   claimAgentsUnavailableExitCode,
   mountAgentSourcesAfterSync,
@@ -6293,7 +6294,12 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   //     cannot serve its agents must not be reported as a clean success, which
   //     is precisely the "exited 0, recorded ready, cannot run an agent" state
   //     this issue exists to remove. Stated at the tail, with the typed code.
-  if (agentMountResult && (agentMountResult.status === "failed" || agentMountResult.status === "unreachable")) {
+  //      Fail CLOSED on `no-sources` too: this step runs only for an install
+  //      that OWNS a local runtime, so "nothing on disk to mount" describes a
+  //      runtime serving ZERO agents — the dev sync reporting `skipped` (step 7
+  //      above) or a prod acquisition that placed nothing — which is the same
+  //      state the doctor FAILs on, not a benign nothing-to-do.
+  if (agentMountFailedClosed(agentMountResult)) {
     for (const line of agentsUnavailableVerdictLines(agentMountResult)) log(line);
     process.exitCode = claimAgentsUnavailableExitCode(process.exitCode);
   }
