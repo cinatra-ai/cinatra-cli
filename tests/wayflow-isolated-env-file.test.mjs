@@ -685,8 +685,13 @@ describe("a SYMLINKED install directory compares by FILE IDENTITY, not by spelli
 
   it("canonicalPath: an existing path realpaths; a wholly non-existent one resolves", () => {
     expect(canonicalPath(path.join(link, WAYFLOW_ENV_REL))).toBe(path.join(realpathSync(real), WAYFLOW_ENV_REL));
-    // Nothing in the chain exists → the plain resolved spelling, never a throw.
-    const nowhere = path.join(dir, "no-such-dir", "deeper", ".env");
+    // A deeper missing leaf still canonicalises its EXISTING ancestor — that is
+    // the whole point, and it holds however deep the missing tail is.
+    expect(canonicalPath(path.join(link, "docker", "wayflow", "not-created-yet.env")))
+      .toBe(path.join(realpathSync(real), "docker", "wayflow", "not-created-yet.env"));
+    // Nothing in the chain exists (only `/` resolves) → the plain resolved
+    // spelling, never a throw.
+    const nowhere = path.join(path.sep, "x2654-no-such-root", "deeper", ".env");
     expect(canonicalPath(nowhere)).toBe(path.resolve(nowhere));
     // Relative forms still resolve against the base first.
     expect(canonicalPath(`./${WAYFLOW_ENV_REL}`, link)).toBe(path.join(realpathSync(real), WAYFLOW_ENV_REL));
