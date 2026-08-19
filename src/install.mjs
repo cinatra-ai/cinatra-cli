@@ -3691,8 +3691,12 @@ export async function teardownInstance({
   // failure) — NOT the best-effort `inspectProjectOwnership`, whose contract is
   // "any docker error yields empty sets", which is precisely the fail-open the
   // reclaim gate must not inherit.
-  const inspectProject =
-    deps.inspectProjectLiveness ?? deps.inspectProjectOwnership ?? ((names) => inspectProjectLiveness(names, deps));
+  //
+  // `deps.inspectProjectLiveness` is therefore the ONLY seam here. It deliberately
+  // does NOT fall back to `deps.inspectProjectOwnership`: that alias re-admitted the
+  // fail-open inspector through the back door, and a test injecting the permissive
+  // name would have been silently honoured by the strict gate.
+  const inspectProject = deps.inspectProjectLiveness ?? ((names) => inspectProjectLiveness(names, deps));
   const dirExists = deps.existsSync ?? existsSync;
 
   let outcome = { released: false, reason: "not-found", plan: null, downRan: false };

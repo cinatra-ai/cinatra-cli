@@ -328,7 +328,7 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
         instanceRegistryPath: registryPath,
         allocLockPath,
         runComposeDown: down.fn,
-        inspectProjectOwnership: () => ({ containerRows: [], volumeRows: [] }),
+        inspectProjectLiveness: () => ({ containerRows: [], volumeRows: [] }),
       },
     });
 
@@ -347,7 +347,7 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
       instanceRegistryPath: registryPath,
       allocLockPath,
       runComposeDown: recordingDown().fn,
-      inspectProjectOwnership: () => ({ containerRows: [{ Id: "abc" }], volumeRows: [] }),
+      inspectProjectLiveness: () => ({ containerRows: [{ Id: "abc" }], volumeRows: [] }),
     };
     const refused = await teardownInstance({ slug: "row1", log: () => {}, deps });
     expect(refused).toMatchObject({ released: false, reason: "stack-still-live", liveContainers: 1 });
@@ -386,7 +386,7 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
       instanceRegistryPath: registryPath,
       allocLockPath,
       runComposeDown: down.fn,
-      inspectProjectOwnership: () => {
+      inspectProjectLiveness: () => {
         throw new Error("Cannot connect to the Docker daemon at unix:///var/run/docker.sock.");
       },
     };
@@ -422,7 +422,7 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
           instanceRegistryPath: registryPath,
           allocLockPath,
           runComposeDown: recordingDown().fn,
-          inspectProjectOwnership: () => bad,
+          inspectProjectLiveness: () => bad,
         },
       });
       expect(result, `malformed inspection ${JSON.stringify(bad) ?? "undefined"} must refuse`).toMatchObject({
@@ -433,7 +433,41 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
     }
   });
 
-  // The two above drive the INJECTED seam. These two drive the REAL default
+  // The reclaim gate's ONLY seam is `inspectProjectLiveness`. It used to also
+  // accept `deps.inspectProjectOwnership`, which re-admitted the fail-open
+  // inspector by name: a test injecting the permissive seam was honoured by the
+  // strict gate, so the gate was never actually exercised. Pin that the
+  // permissive name is now inert — injecting a fail-open all-clear under it must
+  // NOT release; the strict default runs and refuses on the dead daemon.
+  it("ignores a `inspectProjectOwnership` injection — the fail-open name is not a seam here", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    staleRow({ registryPath });
+    const before = readFileSync(registryPath, "utf8");
+    const down = recordingDown();
+
+    const result = await teardownInstance({
+      slug: "row1",
+      log: () => {},
+      deps: {
+        instanceRegistryPath: registryPath,
+        allocLockPath,
+        runComposeDown: down.fn,
+        // The fail-open inspector, offered under its own name, saying "all clear".
+        inspectProjectOwnership: () => ({ containerRows: [], volumeRows: [] }),
+        // ...while Docker is in fact unreachable. The strict default must win.
+        capture: () => null,
+      },
+    });
+
+    expect(result).toMatchObject({ released: false, reason: "inspect-failed" });
+    expect(result.error?.message).toMatch(/could not inspect Docker/);
+    expect(rowFor(registryPath, "row1")).not.toBeNull();
+    expect(readFileSync(registryPath, "utf8")).toBe(before);
+    expect(down.calls).toHaveLength(0);
+  });
+
+  // The three above drive the INJECTED seam. These two drive the REAL default
   // inspector, because that is where the fail-open actually lived: the
   // best-effort `inspectProjectOwnership` never throws — it converts every docker
   // error into empty sets — so a teardown defaulting to it would fail open even
