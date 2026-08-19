@@ -349,6 +349,34 @@ const RESOLVED_CONFIG = {
   volumes: { "cinatra-postgres": { name: "cinatra_cinatra-postgres" } },
 };
 
+function isolatedDeps() {
+  return {
+    runPreflight: () => ({ ok: true, failures: [], warnings: [], mode: "dev", infraWillStart: true }),
+    commandExists: () => true,
+    composeAvailable: () => true,
+    composePublishedPortsForTarget: () => DEFAULT_BAND,
+    composeConfigForFiles: () => RESOLVED_CONFIG,
+    targetComposeOwnedPorts: () => new Set(),
+    liveComposeInspect: () => [],
+    readCloneRegistry: () => null,
+    bringUpInfra: () => {},
+    runComposeDown: () => {},
+    inspectProjectOwnership: () => ({ containerRows: [], volumeRows: [] }),
+    // Force the isolated route: postgres on the DEFAULT band is held.
+    detectPortConflicts: async (band) => {
+      const pg = band.find((b) => b.service === "postgres");
+      if (pg && pg.port === 5434) return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
+      return [];
+    },
+    // cinatra-cli#236 forward-compat: that PR adds a Compose capability probe
+    // and a pre-render WayFlow env provisioning step to this seam. Both stubs
+    // are inert on a checkout without them, and keep this test hermetic on one
+    // with them (no daemon, no `scripts/` tree in the sandbox checkout).
+    composeSupportsNoEnvResolution: () => true,
+    generateWayflowEnv: () => ({ ok: true, skipped: true, reason: null }),
+  };
+}
+
 describe("cinatra-cli#231 — an isolated install at a NONZERO offset states and provisions ITS OWN endpoints", () => {
   let sandbox;
   let originRepo;
@@ -367,33 +395,6 @@ describe("cinatra-cli#231 — an isolated install at a NONZERO offset states and
     process.env.CINATRA_ALLOC_LOCK = path.join(d, "alloc.lock");
   });
 
-  function isolatedDeps() {
-    return {
-      runPreflight: () => ({ ok: true, failures: [], warnings: [], mode: "dev", infraWillStart: true }),
-      commandExists: () => true,
-      composeAvailable: () => true,
-      composePublishedPortsForTarget: () => DEFAULT_BAND,
-      composeConfigForFiles: () => RESOLVED_CONFIG,
-      targetComposeOwnedPorts: () => new Set(),
-      liveComposeInspect: () => [],
-      readCloneRegistry: () => null,
-      bringUpInfra: () => {},
-      runComposeDown: () => {},
-      inspectProjectOwnership: () => ({ containerRows: [], volumeRows: [] }),
-      // Force the isolated route: postgres on the DEFAULT band is held.
-      detectPortConflicts: async (band) => {
-        const pg = band.find((b) => b.service === "postgres");
-        if (pg && pg.port === 5434) return [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }];
-        return [];
-      },
-      // cinatra-cli#236 forward-compat: that PR adds a Compose capability probe
-      // and a pre-render WayFlow env provisioning step to this seam. Both stubs
-      // are inert on a checkout without them, and keep this test hermetic on one
-      // with them (no daemon, no `scripts/` tree in the sandbox checkout).
-      composeSupportsNoEnvResolution: () => true,
-      generateWayflowEnv: () => ({ ok: true, skipped: true, reason: null }),
-    };
-  }
 
   it("the success line names the OFFSET WayFlow port, and it agrees with .env.local", async () => {
     const installDir = path.join(sandbox, "iso231-line");
@@ -461,5 +462,174 @@ describe("cinatra-cli#231 — an isolated install at a NONZERO offset states and
     // .env.local both read, which is what makes them one allocation.
     expect(String(doc.services.wayflow.ports[0].published)).toBe(String(EXPECTED_WAYFLOW_PORT));
     expect(doc.services["nango-server"].environment.NANGO_SERVER_URL).toBe(`http://localhost:${3003 + OFFSET}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The RECONCILE path: a LEGACY row, re-converged.
+// ---------------------------------------------------------------------------
+//
+// Round-1 review blocker. `reconvergeIsolated` re-points `.env.local` from
+// `effectivePorts` — the map `regenerateIsolatedComposeInPlace` returns, which is
+// ENLARGED relative to the recorded row whenever the recorded row predates a
+// service being baked into the isolated compose. The determinism guard
+// (`sharedServicePortsAgree`) deliberately IGNORES services present only in the
+// regenerated map, so such a row reconciles happily — but it still carries no
+// `wayflow` entry.
+//
+// Returning the recorded row unchanged therefore re-opened this very issue on
+// the reconcile path: the tail printed the DEFAULT :3010 out of the stale map
+// while `.env.local` recorded the offset port. Under `--reset-env` it was not
+// merely a wrong print — step 5 re-resets `.env.local` and step 5b re-points it
+// from that same stale map, which has no `wayflow` key to re-point WITH, so the
+// FILE was left on the default port too.
+//
+// The fix hands the effective map back with the row. These tests pin both halves.
+describe("cinatra-cli#231 — a LEGACY recorded row re-converges onto ITS OWN wayflow port", () => {
+  let sandbox;
+  let originRepo;
+
+  beforeAll(() => {
+    sandbox = mkdtempSync(path.join(os.tmpdir(), "cin-231-legacy-"));
+    originRepo = buildFixtureOrigin(sandbox);
+  });
+  afterAll(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    const d = mkdtempSync(path.join(sandbox, "home-"));
+    process.env.CINATRA_INSTANCE_REGISTRY = path.join(d, "instances.json");
+    process.env.CINATRA_ALLOC_LOCK = path.join(d, "alloc.lock");
+  });
+
+  /** The deps of the acceptance suite, plus a stub for the version capture the
+   *  re-converge performs (best-effort on the real path; stubbed here so the
+   *  test never shells out to docker). */
+  function reconvergeDeps() {
+    return {
+      ...isolatedDeps(),
+      captureDeployedVersions: () => ({ ok: true, versions: {} }),
+    };
+  }
+
+  /** Install once at the pinned offset, then AGE the recorded row into a legacy
+   *  one: drop the `wayflow` entry from its port map (as a row recorded before
+   *  WayFlow was baked into the isolated compose has) and drop the persisted
+   *  `offset` (legacy rows have none — it gets re-derived from the shared
+   *  services). Returns the install dir. */
+  async function installThenAgeRow(name) {
+    const installDir = path.join(sandbox, name);
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", name,
+        "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ],
+      { log: () => {}, deps: reconvergeDeps() },
+    );
+    expect(res.infraPlan).toBe("isolated");
+
+    const regPath = process.env.CINATRA_INSTANCE_REGISTRY;
+    const reg = JSON.parse(readFileSync(regPath, "utf8"));
+    const slug = Object.keys(reg.instances).find(
+      (s) => path.resolve(reg.instances[s].installDir) === path.resolve(installDir),
+    );
+    expect(slug).toBeDefined();
+    const row = reg.instances[slug];
+    // Sanity: the FRESH row does carry the offset wayflow port — the ageing below
+    // is what removes it, so this test can only pass for the intended reason.
+    expect(row.ports.wayflow).toEqual([EXPECTED_WAYFLOW_PORT]);
+    delete row.ports.wayflow;
+    delete row.offset;
+    writeFileSync(regPath, JSON.stringify(reg, null, 2) + "\n");
+
+    return installDir;
+  }
+
+  function envOf(installDir) {
+    return readFileSync(path.join(installDir, ".env.local"), "utf8");
+  }
+
+  /** A plain re-run: no --on-conflict / --infra, so runInstall routes through the
+   *  isolated re-converge for a checkout the registry records as isolated. */
+  function reconverge(installDir, extraArgs = []) {
+    const lines = [];
+    return runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", ...extraArgs,
+      ],
+      { log: (l) => lines.push(String(l)), deps: reconvergeDeps() },
+    ).then((res) => ({ res, lines }));
+  }
+
+  it("prints the OFFSET wayflow port on the re-converge, and .env.local agrees", async () => {
+    const installDir = await installThenAgeRow("iso231-legacy");
+    // Point the file at the DEFAULT port first, so "agrees" can only be satisfied
+    // by the re-converge actually re-pointing it — not by a leftover value.
+    writeFileSync(
+      path.join(installDir, ".env.local"),
+      envOf(installDir).replace(/^WAYFLOW_BASE_URL=.*$/m, `WAYFLOW_BASE_URL=http://127.0.0.1:${DEFAULT_WAYFLOW_PORT}`),
+    );
+
+    const { res, lines } = await reconverge(installDir);
+    expect(res.infraPlan).toBe("isolated");
+    // It really did take the re-converge branch (not a fresh isolated install).
+    expect(lines.join("\n")).toContain("converging on its own stack");
+
+    const runtimeLine = lines.find((l) => l.includes("Agent runtime:"));
+    expect(runtimeLine).toBeDefined();
+    expect(runtimeLine).toContain(`http://localhost:${EXPECTED_WAYFLOW_PORT}`);
+    // The stale row's default port must not survive anywhere in the output.
+    expect(lines.join("\n")).not.toContain(`http://localhost:${DEFAULT_WAYFLOW_PORT}`);
+
+    const env = envOf(installDir);
+    expect(env).toMatch(new RegExp(`^WAYFLOW_BASE_URL=http://127\\.0\\.0\\.1:${EXPECTED_WAYFLOW_PORT}`, "m"));
+    const printedPort = Number(runtimeLine.match(/http:\/\/localhost:(\d+)/)[1]);
+    const recordedPort = Number(env.match(/^WAYFLOW_BASE_URL=http:\/\/127\.0\.0\.1:(\d+)/m)[1]);
+    expect(printedPort).toBe(recordedPort);
+  });
+
+  it("--reset-env re-points the REGENERATED file too (the stale map cannot re-point it)", async () => {
+    const installDir = await installThenAgeRow("iso231-legacy-reset");
+
+    const { res, lines } = await reconverge(installDir, ["--reset-env"]);
+    expect(res.infraPlan).toBe("isolated");
+
+    // Step 5 re-created .env.local from .env.example and step 5b re-pointed it
+    // from the map the re-converge handed back — which must be the EFFECTIVE one.
+    const env = envOf(installDir);
+    expect(env).toMatch(new RegExp(`^WAYFLOW_BASE_URL=http://127\\.0\\.0\\.1:${EXPECTED_WAYFLOW_PORT}`, "m"));
+    expect(env).not.toMatch(new RegExp(`^WAYFLOW_BASE_URL=\\S*:${DEFAULT_WAYFLOW_PORT}`, "m"));
+
+    const runtimeLine = lines.find((l) => l.includes("Agent runtime:"));
+    expect(runtimeLine).toContain(`http://localhost:${EXPECTED_WAYFLOW_PORT}`);
+    const printedPort = Number(runtimeLine.match(/http:\/\/localhost:(\d+)/)[1]);
+    const recordedPort = Number(env.match(/^WAYFLOW_BASE_URL=http:\/\/127\.0\.0\.1:(\d+)/m)[1]);
+    expect(printedPort).toBe(recordedPort);
+  });
+
+  it("the shared services the legacy row DID record keep their exact host ports", async () => {
+    // The value of returning `effectivePorts` rests on it being the SAME band —
+    // an enlargement, never a relocation. If regeneration had moved a recorded
+    // service the determinism guard would have refused and `effectivePorts` would
+    // still be the recorded map; assert the enlargement actually happened AND
+    // that nothing already recorded moved.
+    const installDir = await installThenAgeRow("iso231-legacy-band");
+    const { lines } = await reconverge(installDir);
+
+    // The LAST such line is step 5b's re-point, which reads the map the
+    // re-converge handed back (the re-converge's own earlier line always reads
+    // `effectivePorts` directly and so proves nothing about what was returned).
+    const remapLines = lines.filter((l) => l.includes("infra URLs re-pointed"));
+    expect(remapLines.length).toBeGreaterThan(1);
+    const remapLine = remapLines[remapLines.length - 1];
+    expect(remapLine).toContain(`wayflow:${EXPECTED_WAYFLOW_PORT}`); // the enlargement
+    expect(remapLine).toContain(`db:${5434 + OFFSET}`); // recorded, unmoved
+    expect(remapLine).toContain(`nango:${3003 + OFFSET}`); // recorded, unmoved
+
+    const env = envOf(installDir);
+    expect(env).toMatch(new RegExp(`^NANGO_SERVER_URL=http://127\\.0\\.0\\.1:${3003 + OFFSET}`, "m"));
   });
 });

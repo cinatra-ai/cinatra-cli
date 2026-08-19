@@ -4727,7 +4727,17 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
       }
     });
   }
-  return { infraPlan: "isolated", instance: row, done: true };
+  // cinatra-cli#231: hand back the row carrying the EFFECTIVE port map, not the
+  // recorded one. `.env.local` was just re-pointed from `effectivePorts` above,
+  // and regeneration may have ENLARGED that map: a row recorded before the
+  // profile-gated services carries no `wayflow` entry at all (the determinism
+  // guard deliberately ignores services present only in the regenerated map), so
+  // returning the stale `row` would make the install tail print the DEFAULT
+  // :3010 while `.env.local` records the offset port — this issue's exact defect,
+  // surviving on the reconcile path. Under `--reset-env` it is worse: the tail's
+  // re-reset would be the last writer and the stale map never re-points it.
+  // Every reader of `instance.ports` downstream sees what was actually written.
+  return { infraPlan: "isolated", instance: { ...row, ports: effectivePorts }, done: true };
 }
 
 /**
@@ -6252,8 +6262,10 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   // cinatra-cli#231: name the endpoint THIS instance actually listens on. The
   // port comes from the same per-instance allocation `writeIsolatedAppEnv` writes
   // WAYFLOW_BASE_URL from (`ports.wayflow[0]`), so the printed URL and the
-  // `.env.local` value can never disagree. A default/attach install allocated no
-  // band, has no map, and correctly keeps the default port.
+  // `.env.local` value can never disagree. An attach/re-converge on a recorded
+  // ISOLATED row carries that row's map and prints its offset port; a DEFAULT or
+  // external install allocated no band, has no map, and correctly keeps the
+  // default port.
   for (const line of wayflowStatusLines(wayflowRuntimeMode, {
     endpoint: wayflowEndpointForPorts(resolution?.instance?.ports),
   })) {
