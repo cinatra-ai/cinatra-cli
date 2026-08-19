@@ -11691,7 +11691,18 @@ function readInstanceRegistrySafe() {
 
 function findInstanceRowByInstallDir(registry, installDir) {
   try {
-    return instanceRowByInstallDir(registry, installDir);
+    // UNWRAP (cinatra#2654 D1, round 4). `findInstanceByInstallDir` returns the
+    // registry's `{slug, slot}` envelope, but `resolveRecordedComposeContext`
+    // reads `composeProject` / `composeFiles` off the ROW — as this function's
+    // own name promises. Returning the envelope meant every field read as
+    // undefined, so a row that WAS found still fell back to the checkout
+    // basename and the base compose pair: `cinatra instance wayflow start`
+    // addressed a second, empty project instead of the instance's recorded
+    // (for an isolated install, GENERATED) compose — the exact failure the
+    // recorded-context lookup was added to prevent. It reported
+    // `source: "registry"` while doing it, which is why it went unseen; the
+    // unit tests inject a `findByInstallDir` that already returns a bare row.
+    return instanceRowByInstallDir(registry, installDir)?.slot ?? null;
   } catch {
     return null;
   }

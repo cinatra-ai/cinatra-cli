@@ -50,6 +50,8 @@ import path from "node:path";
 import process from "node:process";
 
 import { isValidSlug, withRegistryLock } from "./clone-registry.mjs";
+// Node-builtins-only module (no cycle: it imports nothing from here).
+import { canonicalPath } from "./install-isolation.mjs";
 
 const REGISTRY_VERSION = 1;
 
@@ -408,9 +410,17 @@ export function listInstances(registry) {
  *  (absolute-path compare). Returns { slug, slot } or null. */
 export function findInstanceByInstallDir(registry, installDir) {
   if (!registry || typeof installDir !== "string") return null;
-  const want = path.resolve(installDir);
+  // SAME DIRECTORY, not same spelling (cinatra#2654 D1, round 4). The recorded
+  // `installDir` is whatever `--dir` was given, while callers look up by
+  // `getRepoRoot()` — which resolves through `git rev-parse --show-toplevel` and
+  // so returns a REALPATH. On a checkout reached through a symlink those are two
+  // different strings for one directory and this lookup found nothing: `cinatra
+  // instance wayflow start` then fell back to the checkout BASENAME and the base
+  // compose files, forking a second, empty project instead of addressing the
+  // instance's recorded (for an isolated install, generated) compose.
+  const want = canonicalPath(installDir);
   for (const [slug, slot] of Object.entries(registry.instances)) {
-    if (typeof slot?.installDir === "string" && path.resolve(slot.installDir) === want) {
+    if (typeof slot?.installDir === "string" && canonicalPath(slot.installDir) === want) {
       return { slug, slot };
     }
   }

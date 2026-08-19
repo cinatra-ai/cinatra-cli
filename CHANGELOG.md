@@ -141,6 +141,21 @@ project adheres to [Semantic Versioning](https://semver.org/).
   command an operator runs to restart it. `stop` passes it too, so `rm` addresses
   an identically interpolated document.
 
+  Two things found while recording that command's real-run transcript, both of
+  which had to be fixed for it to reach the right stack at all. `cinatra instance
+  wayflow start` looks its instance up by install directory: the registry records
+  whatever `--dir` was given, while the lookup uses the checkout root — which
+  resolves through git and so is a realpath — so a checkout reached through a
+  symlink never matched itself. And the lookup's result was the registry's
+  `{slug, slot}` envelope while its caller read `composeProject` / `composeFiles`
+  off a bare row, so even a row that WAS found produced undefined fields and fell
+  back to the checkout basename and the base compose pair, while still reporting
+  that it had read the registry. Either one meant the command built a container
+  in a second, empty project rather than the instance's recorded — for an
+  isolated install, generated — compose. The same install-directory
+  canonicalisation is applied to the check that routes a plain re-run to its own
+  isolated stack, which a symlinked checkout had likewise failed.
+
   **Behaviour change beyond the isolated path.** Because `bringUpInfra` is the
   single seam every local bring-up uses, judging the bridge-token step by the
   file rather than the exit code also changes the DEFAULT install: a checkout

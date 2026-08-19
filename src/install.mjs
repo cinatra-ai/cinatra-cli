@@ -4954,7 +4954,13 @@ function composeProjectArgForRow(row) {
 function lookupOwnIsolatedRow(targetDir) {
   try {
     const reg = requireUsableInstanceRegistry(defaultInstanceRegistryPath());
-    const row = listInstances(reg).find((i) => path.resolve(i.installDir) === path.resolve(targetDir)) ?? null;
+    // Canonicalised (cinatra#2654 D1, round 4): the recorded `installDir` keeps
+    // the spelling `--dir` was given, and a checkout reached through a symlink
+    // otherwise failed to match itself — so a plain `cinatra install` never
+    // routed to the isolated re-converge at all and probed the DEFAULT band from
+    // an isolated checkout, which is the very thing this detection exists to
+    // prevent.
+    const row = listInstances(reg).find((i) => canonicalPath(i.installDir) === canonicalPath(targetDir)) ?? null;
     if (isIsolatedRow(row)) {
       return row;
     }
