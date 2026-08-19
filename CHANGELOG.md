@@ -131,6 +131,16 @@ project adheres to [Semantic Versioning](https://semver.org/).
   internal invariant violation; please report it" — which is kept as the last
   resort rather than the only one.
 
+  `cinatra instance wayflow start` now passes `--env-file .env.local` to the
+  `up`, like every other bring-up of a recorded stack. It ups the instance's
+  RECORDED compose file, and for an isolated instance rendered on a Compose that
+  could not preserve `env_file:` the bridge token in that file is a
+  `${CINATRA_BRIDGE_TOKEN}` placeholder only `.env.local` resolves — without the
+  flag compose substituted the empty string and the runtime came back up
+  tokenless, which is the crash loop this release fixes, re-introduced by the one
+  command an operator runs to restart it. `stop` passes it too, so `rm` addresses
+  an identically interpolated document.
+
   **Behaviour change beyond the isolated path.** Because `bringUpInfra` is the
   single seam every local bring-up uses, judging the bridge-token step by the
   file rather than the exit code also changes the DEFAULT install: a checkout

@@ -11697,11 +11697,31 @@ function findInstanceRowByInstallDir(registry, installDir) {
   }
 }
 
-function composeWayflowArgs(verb, { project = null, composeFiles = null } = {}) {
+// cinatra#2654 (round 4) — this `up` must be given the SAME `--env-file
+// .env.local` every other bring-up of a recorded stack passes. The compose file
+// it ups is the recorded one, and for an ISOLATED instance rendered on a Compose
+// that could not preserve `env_file:` (the documented FALLBACK route) the
+// wayflow service's bridge token is a `${CINATRA_BRIDGE_TOKEN}` placeholder that
+// only `.env.local` resolves. Without the flag compose interpolates it from the
+// ambient environment, finds nothing, substitutes the EMPTY STRING, and the
+// agent runtime starts tokenless — the exact crash loop this issue fixed,
+// re-introduced by the one command an operator runs to bring the runtime back.
+// The default (non-isolated) compose needs it for the same reason
+// (cinatra-cli#144: `${NANGO_ENCRYPTION_KEY}` and friends carry no default).
+// Passed on BOTH verbs so `rm` addresses a document interpolated identically to
+// the one `up` created.
+function composeWayflowArgs(verb, { project = null, composeFiles = null, envFile = null } = {}) {
   const files = composeFiles && composeFiles.length
     ? composeFiles
     : ["docker-compose.yml", "docker-compose.dev.yml"];
-  const base = ["compose", ...(project ? ["-p", project] : []), ...files.flatMap((f) => ["-f", f])];
+  // `--env-file`/`-p`/`-f`/`--profile` are top-level compose flags (before the
+  // subcommand), mirroring install.mjs' `composeArgsFor`.
+  const base = [
+    "compose",
+    ...(envFile ? ["--env-file", envFile] : []),
+    ...(project ? ["-p", project] : []),
+    ...files.flatMap((f) => ["-f", f]),
+  ];
   return verb === "start"
     ? [...base, "--profile", WAYFLOW_PROFILE, "up", "-d", "--build", WAYFLOW_SERVICE]
     : [...base, "rm", "-sf", WAYFLOW_SERVICE];
@@ -11776,7 +11796,11 @@ async function runDevWayflow(argv = []) {
     return;
   }
   const { project, composeFiles } = wayflowComposeContext(repoRoot);
-  const args = composeWayflowArgs(verb, { project, composeFiles });
+  // Relative, resolved against `cwd: repoRoot` below — which also keeps the
+  // echoed command copy-pasteable from the checkout. A checkout with no
+  // `.env.local` keeps compose's normal `.env` discovery (null envFile).
+  const envFile = existsSync(path.join(repoRoot, ".env.local")) ? ".env.local" : null;
+  const args = composeWayflowArgs(verb, { project, composeFiles, envFile });
   const shownCmd = `docker ${args.join(" ")}`;
   console.log(
     verb === "start"

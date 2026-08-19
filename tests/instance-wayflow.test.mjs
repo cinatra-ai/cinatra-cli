@@ -85,6 +85,40 @@ describe("composeWayflowArgs — recorded project + compose files", () => {
   });
 });
 
+// cinatra#2654 (round 4) — the `up` must carry `--env-file .env.local`. An
+// ISOLATED instance whose generated compose was rendered on a Compose that could
+// not preserve `env_file:` carries the bridge token as a `${CINATRA_BRIDGE_TOKEN}`
+// placeholder; without the flag compose finds nothing in the ambient environment,
+// substitutes the EMPTY STRING, and the runtime starts tokenless — the very crash
+// loop this issue fixed, re-introduced by the command that restarts the runtime.
+describe("composeWayflowArgs — the env file the placeholders resolve from", () => {
+  it("start passes --env-file as a TOP-LEVEL flag, before the subcommand", () => {
+    const args = composeWayflowArgs("start", {
+      project: "cinatra_demo",
+      composeFiles: ["docker-compose.cinatra-isolated.yml"],
+      envFile: ".env.local",
+    });
+    expect(args.slice(0, 3)).toEqual(["compose", "--env-file", ".env.local"]);
+    expect(args.indexOf("--env-file")).toBeLessThan(args.indexOf("up"));
+    // …and it did not displace the recorded project or files.
+    expect(args).toContain("cinatra_demo");
+    expect(args).toContain("docker-compose.cinatra-isolated.yml");
+  });
+
+  it("stop passes it too, so `rm` addresses an identically interpolated document", () => {
+    const args = composeWayflowArgs("stop", { project: "cinatra_demo", envFile: ".env.local" });
+    expect(args.slice(0, 3)).toEqual(["compose", "--env-file", ".env.local"]);
+    expect(args.indexOf("--env-file")).toBeLessThan(args.indexOf("rm"));
+  });
+
+  it("no env file → compose's normal `.env` discovery is left alone", () => {
+    expect(composeWayflowArgs("start", { envFile: null })).not.toContain("--env-file");
+    // The pre-existing default-argument shape is unchanged.
+    expect(composeWayflowArgs("start")[0]).toBe("compose");
+    expect(composeWayflowArgs("start")[1]).toBe("-f");
+  });
+});
+
 describe("wayflowComposeContext", () => {
   const ROW = {
     slug: "demo",
