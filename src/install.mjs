@@ -123,6 +123,7 @@ import {
   checkoutDeclaredEnvFiles,
   parseIsolatedComposeDoc,
   ISOLATED_COMPOSE_FILENAME,
+  WAYFLOW_TOKEN_KEY,
 } from "./install-isolation.mjs";
 import {
   A2A_PEERS_PROFILE,
@@ -3575,9 +3576,45 @@ function assertGeneratedEnvWiring({ doc, sourceDoc, targetDir, envFilesPreserved
   const gaps = isolatedEnvWiringGaps({ doc, sourceDoc, targetDir, envFilesPreserved, wayflow, deps });
   if (gaps.length === 0) return;
   throw new Error(
-    `Refusing to write the isolated compose — ${gaps.join("; ")} (cinatra#2654). ` +
-      "This is an internal invariant violation; please report it.",
+    `Refusing to write the isolated compose — ${gaps.join("; ")} (cinatra#2654).\n` +
+      envWiringRecovery({ targetDir, gaps, wayflow }),
   );
+}
+
+/** cinatra#2654 D1 (round 4) — what an OPERATOR can actually do about a wiring
+ *  refusal. The message used to end at "this is an internal invariant violation;
+ *  please report it", which is true of a generator regression but was NOT true of
+ *  the reachable case: a reconcile that re-rendered before the bridge-token env
+ *  file existed hit it on an inlining Compose, and "report it" is a dead end when
+ *  two ordinary commands fix it. The report-it line is kept as the LAST resort,
+ *  not the only one, so a genuine internal regression is still reported. */
+function envWiringRecovery({ targetDir, gaps, wayflow = true }) {
+  const dirArg = targetDir ? ` --dir ${targetDir}` : "";
+  const lines = ["  Recovery:"];
+  // The bridge-token arm is the one an operator can resolve on their own: the
+  // file is derived from `.env.local` by the checkout's own generator.
+  if (wayflow && gaps.some((g) => g.includes(WAYFLOW_TOKEN_KEY))) {
+    lines.push(
+      `    * Provision the WayFlow bridge-token env from this checkout's .env.local, then re-run the install:`,
+      `        (cd ${targetDir ?? "<checkout>"} && node scripts/gen-wayflow-env.mjs --require-bridge-token)`,
+      `        cinatra install${dirArg} --on-conflict=isolated`,
+      `      Check that .env.local supplies a non-empty ${WAYFLOW_TOKEN_KEY} — the generator derives the file from it.`,
+      `    * Or install WITHOUT the agent runtime (nothing else is affected):`,
+      `        cinatra install${dirArg} --on-conflict=isolated --no-wayflow`,
+    );
+  } else {
+    lines.push(
+      `    * Re-run the install so the checkout's own env files are re-provisioned and the compose re-derived:`,
+      `        cinatra install${dirArg} --on-conflict=isolated`,
+      `      The services named above take their host wiring from narrow env files this checkout generates`,
+      `      (\`npm run services\` / \`setup:dev\` / the plane provisioning script write them).`,
+    );
+  }
+  lines.push(
+    "    * If the file is present and correct and this still fails, it IS an internal invariant violation —",
+    "      please report it with the message above.",
+  );
+  return lines.join("\n");
 }
 
 // The infra-URL env keys an isolated install writes; an EXPORTED value for any
@@ -4952,6 +4989,23 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
   // not-re-derivable conditions are non-fatal, and they say so by name. On
   // success the (possibly enlarged) remapped-port map drives the env re-point +
   // Nango health probe below.
+  // cinatra#2654 D1 (round 4): PROVISION the bridge-token env file BEFORE the
+  // re-render, exactly as the first isolated install does at its own generator.
+  // The re-render resolves this checkout's compose, and on an INLINING Compose
+  // what that render inlines IS the wiring — so with the file absent the render
+  // carries no token, the wiring invariant refuses, and the very recovery every
+  // D1 failure message prescribes (`re-run cinatra install`) dead-ended on an
+  // "internal invariant violation; please report it". Provisioning here is cheap
+  // and idempotent: the bring-up below regenerates the file again after the
+  // isolated re-point, so its WAYFLOW_BASE_URL is still this instance's. Gated on
+  // the same `--no-wayflow` opt-out as everywhere else, and a failure aborts the
+  // reconcile attributably rather than re-rendering around a file it could not
+  // produce.
+  if (opts.wayflow !== false) {
+    const provisioned = (deps.generateWayflowEnv ?? generateWayflowEnv)({ targetDir, log });
+    if (!provisioned.ok) throw new Error(wayflowEnvFailureMessage(provisioned.reason));
+  }
+
   const regen = await regenerateIsolatedCompose({ targetDir, row, log, wayflow: opts.wayflow !== false, deps });
   const effectivePorts = regen.regenerated && regen.ports ? regen.ports : (row.ports ?? {});
 

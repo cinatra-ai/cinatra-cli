@@ -715,6 +715,162 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
     ).rejects.toThrow(/carries no non-empty CINATRA_BRIDGE_TOKEN/);
   });
 
+  // ── cinatra#2654 D1 (round 4) — the PLAIN reconcile provisions before it
+  //    re-renders. A plain `cinatra install` on a checkout recorded as isolated
+  //    re-derives the generated compose first. On an INLINING Compose what that
+  //    render inlines IS the wiring, so with `docker/wayflow/.wayflow.env` absent
+  //    the render carried no bridge token and the wiring invariant refused — and
+  //    the refusal is exactly the recovery ("re-run cinatra install") every D1
+  //    failure message prescribes, so it dead-ended. ──────────────────────────
+  const WAYFLOW_ENV_REL_PATH = path.join("docker", "wayflow", ".wayflow.env");
+
+  /** A `docker compose config` fake that behaves like a REAL inlining engine:
+   *  the wayflow service's env file is read off disk at render time, its content
+   *  copied into `environment:`, and the directive dropped. Whether the token is
+   *  in the rendered document therefore depends ENTIRELY on whether the file had
+   *  been provisioned before the render — which is the ordering under test. */
+  const inliningConfigFor = (installDir) => () => {
+    const envPath = path.join(installDir, WAYFLOW_ENV_REL_PATH);
+    const inlined = existsSync(envPath)
+      ? Object.fromEntries(
+          readFileSync(envPath, "utf8")
+            .split("\n")
+            .filter((l) => l.includes("="))
+            .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim()]),
+        )
+      : {};
+    return {
+      ...RESOLVED_CONFIG,
+      services: {
+        ...RESOLVED_CONFIG.services,
+        wayflow: {
+          image: "cinatra/wayflow",
+          profiles: ["wayflow"],
+          environment: { PORT: "3010", ...inlined },
+          ports: [{ published: "3010", target: 3010, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+        },
+      },
+    };
+  };
+
+  /** The preserving render a FIRST isolated install gets, so the fixture reaches
+   *  the reconcile with a recorded row and a generated compose. */
+  const preservingWayflowConfig = (installDir) => () => ({
+    ...RESOLVED_CONFIG,
+    services: {
+      ...RESOLVED_CONFIG.services,
+      wayflow: {
+        image: "cinatra/wayflow",
+        profiles: ["wayflow"],
+        environment: { PORT: "3010" },
+        env_file: [{ path: path.join(installDir, WAYFLOW_ENV_REL_PATH), required: false }],
+        ports: [{ published: "3010", target: 3010, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+      },
+    },
+  });
+
+  it("#2654 D1: a plain reconcile PROVISIONS the bridge-token env before it re-renders", async () => {
+    const installDir = path.join(sandbox, "iso-reconcile-order");
+    // (1) A first isolated install on a PRESERVING Compose — this is the recorded
+    //     instance the plain re-run then reconciles. Its `generateWayflowEnv` is
+    //     the flowDeps stub, so no `.wayflow.env` is left on disk.
+    const first = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "isorec",
+        "--port-offset", "auto",
+      ],
+      {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: conflictOnDefaultBand,
+          composeConfigForFiles: preservingWayflowConfig(installDir),
+        }),
+      },
+    );
+    expect(first.infraPlan).toBe("isolated");
+    expect(existsSync(path.join(installDir, WAYFLOW_ENV_REL_PATH))).toBe(false);
+
+    // (2) The plain re-run — no --on-conflict, so it routes to the isolated
+    //     re-converge — on an INLINING Compose. The generator RECORDS when it ran
+    //     and writes the file, exactly as the checkout's own script does.
+    const order = [];
+    const inlining = inliningConfigFor(installDir);
+    const res = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [],
+          composeSupportsNoEnvResolution: () => false,
+          composeVersionString: () => "2.38.2",
+          composeConfigForFiles: (...args) => {
+            order.push("render");
+            return inlining(...args);
+          },
+          generateWayflowEnv: ({ targetDir }) => {
+            order.push("provision");
+            mkdirSync(path.join(targetDir, "docker", "wayflow"), { recursive: true });
+            writeFileSync(
+              path.join(targetDir, WAYFLOW_ENV_REL_PATH),
+              "CINATRA_BRIDGE_TOKEN=reconciled-token\nCINATRA_CONTEXT_ATTEST_KEY=reconciled-attest\n",
+              { mode: 0o600 },
+            );
+            return { ok: true, skipped: false, reason: null };
+          },
+        }),
+      },
+    );
+
+    expect(res.infraPlan).toBe("isolated");
+    // THE ORDERING: provisioned first, and the render that follows saw the file.
+    expect(order[0]).toBe("provision");
+    expect(order).toContain("render");
+    // …and the re-derived compose carries the token route the reconcile exists
+    // to repair, rather than having refused to write at all.
+    const doc = parseIsolatedComposeDoc(
+      readFileSync(path.join(installDir, "docker-compose.cinatra-isolated.yml"), "utf8"),
+    );
+    expect(doc.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBe("${CINATRA_BRIDGE_TOKEN}");
+  });
+
+  it("#2654 D1: a wiring refusal names an operator RECOVERY, not only 'please report it'", async () => {
+    const installDir = path.join(sandbox, "iso-recovery-msg");
+    let thrown = null;
+    try {
+      await runInstall(
+        [
+          "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+          "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "isorecov",
+          "--port-offset", "auto",
+        ],
+        {
+          log: () => {},
+          deps: flowDeps({
+            detectPortConflicts: conflictOnDefaultBand,
+            composeSupportsNoEnvResolution: () => false,
+            composeConfigForFiles: inliningConfigFor(installDir),
+            // Reports success without producing the file — the generator-absent
+            // shape. The render then inlines nothing.
+            generateWayflowEnv: () => ({ ok: true, skipped: true, reason: "generator-absent" }),
+          }),
+        },
+      );
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeTruthy();
+    const msg = String(thrown.message);
+    expect(msg).toContain("carries no non-empty CINATRA_BRIDGE_TOKEN");
+    expect(msg).toContain("Recovery:");
+    expect(msg).toContain("gen-wayflow-env.mjs --require-bridge-token");
+    expect(msg).toContain("--on-conflict=isolated --no-wayflow");
+    expect(msg).toContain(installDir);
+    // The report-it line survives as the LAST resort, not the only one.
+    expect(msg).toContain("internal invariant violation");
+    expect(msg.indexOf("Recovery:")).toBeLessThan(msg.indexOf("internal invariant violation"));
+  });
+
   it("#147 AC1/AC6: --dry-run --on-conflict=isolated (--port-offset auto) previews the SAME app port/offset/remapped band the real isolated run allocates — advisory, writing nothing, no lock", async () => {
     const installDir = path.join(sandbox, "iso147-parity-auto");
     const upCalls = [];

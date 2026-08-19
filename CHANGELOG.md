@@ -120,6 +120,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
   paths too, including the validation of a recorded compose that cannot be
   re-derived in place.
 
+  The plain reconcile — a bare `cinatra install` on a checkout already recorded
+  as isolated — now provisions that env file BEFORE it re-renders, as the first
+  install does. On a Compose that inlines, what the render inlines *is* the
+  wiring, so with the file absent the re-derived compose carried no bridge token
+  and the wiring invariant refused — which dead-ended the recovery, because
+  re-running the install is exactly what every one of those failures prescribes.
+  And that refusal now names what an operator can do about it (provision the file
+  and re-run, or install with `--no-wayflow`) instead of ending at "this is an
+  internal invariant violation; please report it" — which is kept as the last
+  resort rather than the only one.
+
   **Behaviour change beyond the isolated path.** Because `bringUpInfra` is the
   single seam every local bring-up uses, judging the bridge-token step by the
   file rather than the exit code also changes the DEFAULT install: a checkout
