@@ -6962,7 +6962,7 @@ async function runDbUpgradePreflight(rest) {
   const { resolveComposeConfig, statefulServicesFromComposeConfig } = await import("./version-ledger-capture.mjs");
   const { imageParts } = await import("./upgrade-matrix.mjs");
   const { makeProbeVersion, makeMarkerReader, PG_MARKER_READ_MOUNT } = await import("./pg-adapters.mjs");
-  const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, findInstanceByInstallDir, getInstance } =
+  const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, getInstance } =
     await import("./instance-registry.mjs");
 
   const flagSlug = readOptionValue(rest, "--instance");
@@ -6977,7 +6977,12 @@ async function runDbUpgradePreflight(rest) {
   if (flagSlug) {
     row = getInstance(registry, flagSlug) ?? null;
   } else if (repoRoot) {
-    row = findInstanceByInstallDir(registry, repoRoot);
+    // cinatra-cli#230: the flat SLOT, never the `{ slug, slot }` envelope the
+    // registry finder returns — `row.installDir`/`row.composeFiles`/
+    // `row.composeProject` are read below, and on the envelope all three are
+    // `undefined`, which silently resolves the compose config for the DEFAULT
+    // project from the base compose pair instead of this instance's stack.
+    row = findInstanceRowByInstallDir(registry, repoRoot);
   }
   const slug = flagSlug ?? row?.slug ?? null;
   if (!slug) {
@@ -7188,7 +7193,7 @@ async function runDbUpgradeMajor(rest) {
   const { resolveComposeConfig, statefulServicesFromComposeConfig } = await import("./version-ledger-capture.mjs");
   const { imageParts, DEFAULT_UPGRADE_MATRIX } = await import("./upgrade-matrix.mjs");
   const { makeProbeVersion, makeMarkerReader, PG_MARKER_READ_MOUNT } = await import("./pg-adapters.mjs");
-  const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, findInstanceByInstallDir, getInstance } =
+  const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, getInstance } =
     await import("./instance-registry.mjs");
 
   const flagSlug = readOptionValue(rest, "--instance");
@@ -7202,7 +7207,8 @@ async function runDbUpgradeMajor(rest) {
   const registry = requireUsableInstanceRegistry(defaultInstanceRegistryPath());
   let row = null;
   if (flagSlug) row = getInstance(registry, flagSlug) ?? null;
-  else if (repoRoot) row = findInstanceByInstallDir(registry, repoRoot);
+  // cinatra-cli#230: unwrap to the flat slot — see the preflight handler above.
+  else if (repoRoot) row = findInstanceRowByInstallDir(registry, repoRoot);
   const slug = flagSlug ?? row?.slug ?? null;
   if (!slug) {
     console.error("upgrade-major: could not resolve an instance — pass --instance <slug> or run inside an install checkout.");
@@ -7843,9 +7849,16 @@ async function runDevRefresh(rest) {
       // Recorded against the SAME project this refresh upped (no -p above).
       try {
         const { captureDeployedVersions } = await import("./version-ledger-capture.mjs");
-        const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, findInstanceByInstallDir } =
+        const { requireUsableInstanceRegistry, defaultInstanceRegistryPath } =
           await import("./instance-registry.mjs");
-        const instRow = findInstanceByInstallDir(requireUsableInstanceRegistry(defaultInstanceRegistryPath()), repoRoot);
+        // cinatra-cli#230: the flat SLOT. On the `{ slug, slot }` envelope
+        // `instRow.composeProject` is `undefined`, so `requireProjectMatch`
+        // below went in as null and captureDeployedVersions' "do not record
+        // the wrong stack" guard never ran for ANY recorded instance.
+        const instRow = findInstanceRowByInstallDir(
+          requireUsableInstanceRegistry(defaultInstanceRegistryPath()),
+          repoRoot,
+        );
         if (instRow?.slug) {
           // This refresh upped the BARE project (no -p above); when the row
           // records a different explicit project, recording would bind another
@@ -11703,6 +11716,11 @@ function readInstanceRegistrySafe() {
 // fell back to the checkout basename while the resolution still reported
 // itself as registry-sourced. Unwrap to the flat slot here, keeping the slug
 // on it so callers can name the instance they resolved.
+//
+// This is the ONE unwrap every install-dir lookup in this file goes through —
+// doctor's compose context, the wayflow lifecycle, upgrade-preflight,
+// upgrade-major, and refresh's version-ledger capture. Calling the registry's
+// finder directly is the bug; call this instead.
 function findInstanceRowByInstallDir(registry, installDir) {
   try {
     const hit = instanceRowByInstallDir(registry, installDir);
@@ -14476,6 +14494,14 @@ export {
   effectiveComposeProjectName,
   wayflowComposeContext,
   wayflowHealthUrlFromEnv,
+  // cinatra-cli#230 — the ONE registry install-dir unwrap. Exported because the
+  // bug was invisible at every call seam: the sibling consumers (upgrade
+  // preflight/major, refresh's ledger capture) read `.installDir`,
+  // `.composeFiles` and `.composeProject` off whatever the finder returned, and
+  // on the `{ slug, slot }` envelope all three are `undefined` — a silent
+  // degrade to the DEFAULT project with no error anywhere. Tests pin the
+  // returned SHAPE directly so that cannot come back.
+  findInstanceRowByInstallDir,
   // cinatra-cli#105 — HEAD-stamped `.next` auto-clean (pure seams).
   cleanNextBuildCache,
   readNextBuildStamp,
