@@ -100,6 +100,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
   be parsed), the bring-up is REFUSED with the recovery named, rather than
   starting a runtime already known to have no bridge token.
 
+  An install directory reached through a SYMLINK no longer fails that invariant.
+  `docker compose config` emits every `env_file:` path as a realpath, while the
+  paths the check compares them against are built from the directory the operator
+  named — so a symlinked checkout (a linked home volume, a symlinked `TMPDIR`,
+  `~/src/app` pointing elsewhere) produced two different spellings of the same
+  file, and all four references read as missing. On the Compose versions that
+  keep the reference — the route this release adds — that aborted the install
+  outright. Both sides are now canonicalised by resolving symlinks, tolerating a
+  path whose file does not exist yet (the wayflow env file is compared before a
+  dry-run creates it) by canonicalising the nearest existing ancestor.
+
   **Behaviour change beyond the isolated path.** Because `bringUpInfra` is the
   single seam every local bring-up uses, judging the bridge-token step by the
   file rather than the exit code also changes the DEFAULT install: a checkout

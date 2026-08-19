@@ -37,7 +37,7 @@
 //   7. the generated file says, in itself, that it is CLI-owned.
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,6 +47,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import {
   CHECKOUT_ENV_FILE_SERVICES,
   ISOLATED_COMPOSE_FILENAME,
+  canonicalPath,
   checkoutDeclaredEnvFiles,
   composeEnvWiringGaps,
   generateIsolatedCompose,
@@ -613,6 +614,82 @@ describe("composeEnvWiringGaps — the generated document's token route", () => 
         }),
       ).toEqual([]);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3b. A SYMLINKED install directory (cinatra#2654 D1, round 4).
+//
+// `docker compose config` emits every `env_file:` path as a REALPATH. Every path
+// the CLI compares them against is built from the caller's `targetDir` — what
+// the operator typed, or what `getRepoRoot()` returned. Reach the checkout
+// through a symlink (`~/src/app` → `/data/checkouts/app`, a linked home volume,
+// a symlinked TMPDIR) and those are two different STRINGS for the same file, so
+// every env-file comparison read as a missing reference: four gaps, aborting the
+// install at the invariant — on the PRESERVING route, the one this PR adds.
+// ---------------------------------------------------------------------------
+
+describe("a SYMLINKED install directory compares by FILE IDENTITY, not by spelling (cinatra#2654 D1)", () => {
+  let real;
+  let link;
+
+  beforeEach(() => {
+    real = path.join(dir, "real-checkout");
+    link = path.join(dir, "linked-checkout");
+    mkdirSync(real, { recursive: true });
+    symlinkSync(real, link, "dir");
+    writeWayflowEnvFile(real);
+    writeSiblingEnvFiles(real);
+  });
+
+  /** The document as a PRESERVING engine emits it: every `env_file:` a realpath. */
+  const enginePaths = () => {
+    const doc = baseComposeDocWithSiblings(real);
+    doc.services.wayflow.env_file = [{ path: path.join(real, WAYFLOW_ENV_REL), required: false }];
+    doc.services.wayflow.build = { context: path.join(real, "docker", "wayflow") };
+    return doc;
+  };
+
+  /** …checked against expectations spelled through the SYMLINK, which is how the
+   *  CLI spells them (they all descend from `targetDir`). */
+  const gapsThroughLink = (doc, extra = {}) =>
+    composeEnvWiringGaps(doc, {
+      sourceDoc: JSON.parse(JSON.stringify(doc)),
+      wayflowEnvFilePath: path.join(link, WAYFLOW_ENV_REL),
+      declaredEnvFiles: checkoutDeclaredEnvFiles(link),
+      envFileKeysAt: (abs) => envFileSuppliedKeys(abs),
+      baseDir: link,
+      ...extra,
+    });
+
+  it("the preserving route's four references all hold through the link", () => {
+    // Before the fix this returned exactly four gaps — wayflow's bridge-token
+    // reference plus all three siblings — and aborted the install.
+    expect(gapsThroughLink(enginePaths())).toEqual([]);
+  });
+
+  it("tolerates a not-yet-created env file: the reference still matches", () => {
+    // The ordering this must survive: `.wayflow.env` is compared before a
+    // dry-run (or a first render) has created it. Only the symlinked DIRECTORY
+    // prefix needs canonicalising, and it is the only part that differs.
+    rmSync(path.join(real, WAYFLOW_ENV_REL), { force: true });
+    const found = gapsThroughLink(enginePaths()).filter((g) => g.includes("wayflow"));
+    expect(found).toEqual([]);
+  });
+
+  it("still catches a REAL mismatch — it did not just make every path equal", () => {
+    const doc = enginePaths();
+    doc.services.wayflow.env_file = [{ path: path.join(real, "docker", "wayflow", ".other.env"), required: false }];
+    expect(gapsThroughLink(doc).join(" ")).toContain("does not reference");
+  });
+
+  it("canonicalPath: an existing path realpaths; a wholly non-existent one resolves", () => {
+    expect(canonicalPath(path.join(link, WAYFLOW_ENV_REL))).toBe(path.join(realpathSync(real), WAYFLOW_ENV_REL));
+    // Nothing in the chain exists → the plain resolved spelling, never a throw.
+    const nowhere = path.join(dir, "no-such-dir", "deeper", ".env");
+    expect(canonicalPath(nowhere)).toBe(path.resolve(nowhere));
+    // Relative forms still resolve against the base first.
+    expect(canonicalPath(`./${WAYFLOW_ENV_REL}`, link)).toBe(path.join(realpathSync(real), WAYFLOW_ENV_REL));
   });
 });
 
@@ -1846,7 +1923,14 @@ function realComposeSuite(engine) {
 
     if (engine.preserves) {
       for (const [svc, rel] of Object.entries(FOUR)) {
-        expect(doc.services[svc].env_file.map((e) => e.path)).toContain(path.join(dir, rel));
+        // SAME FILE, not same string (cinatra#2654 D1, round 4): `compose config`
+        // emits REALPATHS, while the expected path keeps the caller's `dir`
+        // spelling — under a symlinked install directory (a symlinked TMPDIR is
+        // enough) those differ. Compared here through `realpathSync` DIRECTLY,
+        // not through the module's own canonicaliser, so this stays an
+        // independent check of the same property `composeEnvWiringGaps` asserts.
+        const want = realpathSync(path.join(dir, rel));
+        expect(doc.services[svc].env_file.map((e) => realpathSync(e.path))).toContain(want);
       }
       expect(doc.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBeUndefined();
     } else {

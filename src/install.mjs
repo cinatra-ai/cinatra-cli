@@ -119,6 +119,7 @@ import {
   renderIsolatedComposeYaml,
   assertComposeHostUrlsRemapped,
   composeEnvWiringGaps,
+  canonicalPath,
   checkoutDeclaredEnvFiles,
   parseIsolatedComposeDoc,
   ISOLATED_COMPOSE_FILENAME,
@@ -3537,8 +3538,13 @@ function isolatedEnvWiringGaps({ doc, sourceDoc, targetDir, envFilesPreserved, d
   // plane-mcp in production — their protection existed only in a unit test that
   // passed its own reader. wayflow still goes through the injectable
   // `wayflowEnvSuppliedKeys` seam so existing dep injection keeps working.
+  // Symlink-safe (cinatra#2654 D1, round 4): the paths this reader is handed come
+  // from a `docker compose config` document, which emits REALPATHS, while
+  // `wayflowEnvFilePath` keeps the caller's `targetDir` spelling. Under a
+  // symlinked install directory the two are different strings for the same file,
+  // which silently routed wayflow past its injectable seam.
   const keysByPath = (absPath) =>
-    path.resolve(absPath) === path.resolve(wayflowEnvFilePath)
+    canonicalPath(absPath) === canonicalPath(wayflowEnvFilePath)
       ? suppliedKeys({ targetDir })
       : readEnvFileKeys(absPath);
   return composeEnvWiringGaps(doc, {

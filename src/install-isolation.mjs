@@ -8,7 +8,7 @@
 // is fully hermetically testable.
 // ---------------------------------------------------------------------------
 
-import { writeFileSync, chmodSync, existsSync } from "node:fs";
+import { writeFileSync, chmodSync, existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
@@ -754,14 +754,58 @@ function serviceEnvFilePaths(svc) {
     .filter((p) => typeof p === "string" && p.length > 0);
 }
 
+/**
+ * Canonicalise a filesystem path the way the KERNEL identifies a file: resolve
+ * it to an absolute path, then resolve every SYMLINK in it.
+ *
+ * `path.resolve` alone is not enough (cinatra#2654 D1, round 4). `docker compose
+ * config` emits env-file paths as REALPATHS, while every path this module
+ * compares them against is built from the caller's `targetDir` — the spelling
+ * the operator typed, or that `getRepoRoot()` returned. An install directory
+ * reached through a symlink (`~/src/app` → `/data/checkouts/app`, a `/tmp` that
+ * is a symlink, a home on a linked volume) therefore produced two different
+ * strings for the SAME file, and every env-file comparison below read as a
+ * missing reference.
+ *
+ * NON-EXISTENT PATHS ARE TOLERATED, and they are the normal case, not an edge
+ * one: `<targetDir>/docker/wayflow/.wayflow.env` is compared before a dry-run
+ * has created it, and the sibling env files may legitimately be absent. So this
+ * realpaths the NEAREST EXISTING ANCESTOR and re-appends the segments below it —
+ * which canonicalises the symlinked directory prefix (the part that actually
+ * differs) without requiring the leaf to exist. If nothing in the chain resolves
+ * (an unreadable mount, a permission error, a synthetic path in a unit test), it
+ * falls back to the plain `path.resolve` spelling.
+ *
+ * The transform is a pure function of the resolved path, so it can only make
+ * MORE spellings compare equal, never fewer: two paths that were equal under
+ * `path.resolve` stay equal here.
+ */
+export function canonicalPath(p, baseDir = null) {
+  const resolved = baseDir ? path.resolve(baseDir, String(p)) : path.resolve(String(p));
+  const tail = [];
+  let probe = resolved;
+  for (;;) {
+    try {
+      return path.join(realpathSync(probe), ...tail);
+    } catch {
+      const parent = path.dirname(probe);
+      // Reached the filesystem root without finding anything that resolves.
+      if (parent === probe) return resolved;
+      tail.unshift(path.basename(probe));
+      probe = parent;
+    }
+  }
+}
+
 /** Compare two env-file paths the way the filesystem does. `docker compose
- *  config` emits ABSOLUTE `env_file` paths, but a compose document that was not
- *  produced by `config` (a hand-written override, a fixture) may carry the
- *  relative form the compose file itself uses — resolve both against the
- *  checkout root so the two spellings of the same file compare equal. */
+ *  config` emits ABSOLUTE, SYMLINK-RESOLVED `env_file` paths, but a compose
+ *  document that was not produced by `config` (a hand-written override, a
+ *  fixture) may carry the relative form the compose file itself uses, and the
+ *  expected paths keep the caller's directory spelling — so canonicalise BOTH
+ *  sides (resolve against the checkout root, then realpath) and the spellings of
+ *  the same file compare equal. */
 function samePath(a, b, baseDir) {
-  const resolve = (v) => (baseDir ? path.resolve(baseDir, String(v)) : path.resolve(String(v)));
-  return resolve(a) === resolve(b);
+  return canonicalPath(a, baseDir) === canonicalPath(b, baseDir);
 }
 
 /** `environment` as a plain key→value object, or null when the service has none
@@ -946,7 +990,7 @@ export function composeEnvWiringGaps(doc, {
       const env = serviceEnvObject(svc);
       if (!env) continue;
       for (const p of serviceEnvFilePaths(svc)) {
-        const keys = envFileKeysAt(baseDir ? path.resolve(baseDir, p) : path.resolve(p));
+        const keys = envFileKeysAt(canonicalPath(p, baseDir));
         if (!(keys instanceof Set)) continue;
         for (const key of keys) {
           const value = env[key];
