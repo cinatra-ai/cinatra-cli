@@ -3700,7 +3700,6 @@ export async function teardownInstance({
   const dirExists = deps.existsSync ?? existsSync;
 
   let outcome = { released: false, reason: "not-found", plan: null, downRan: false };
-  let cleanupTarget = null;
 
   await withAllocLock(lockPath, async () => {
     // A malformed registry THROWS here (requireUsableInstanceRegistry) rather
@@ -3828,27 +3827,33 @@ export async function teardownInstance({
     const { registry: next } = releaseInstance(reg, slug);
     writeInstanceRegistry(registryPath, next);
     outcome = { ...outcome, released: true, reason: "released", plan };
-    cleanupTarget = { installDir: row.installDir, composeFiles: row.composeFiles ?? [], present: checkoutPresent };
+
+    // Best-effort cleanup of the per-checkout HINTS, only after a real release.
+    // Never a reservation — a failure here cannot desynchronise anything.
+    //
+    // It runs INSIDE the lock. The moment the release write lands, the row is
+    // gone and a concurrent install may reserve the same band and write its OWN
+    // marker + generated compose into this very directory. Cleaning up after the
+    // lock dropped could therefore delete a LIVE install's marker and compose
+    // file rather than our leftovers. Two `rm`s under the lock close that window.
+    if (checkoutPresent) {
+      try {
+        const markerFile = path.join(row.installDir, ".cinatra", "instance.json");
+        if (existsSync(markerFile)) spawnSync("rm", ["-f", markerFile]);
+      } catch {
+        /* best-effort */
+      }
+      try {
+        for (const f of row.composeFiles ?? []) {
+          const generated = path.join(row.installDir, f);
+          if (f === ISOLATED_COMPOSE_FILENAME && existsSync(generated)) spawnSync("rm", ["-f", generated]);
+        }
+      } catch {
+        /* best-effort */
+      }
+    }
   });
 
-  // Best-effort cleanup of the per-checkout HINTS, only after a real release.
-  // Never a reservation — a failure here cannot desynchronise anything.
-  if (outcome.released && cleanupTarget?.present) {
-    try {
-      const markerFile = path.join(cleanupTarget.installDir, ".cinatra", "instance.json");
-      if (existsSync(markerFile)) spawnSync("rm", ["-f", markerFile]);
-    } catch {
-      /* best-effort */
-    }
-    try {
-      for (const f of cleanupTarget.composeFiles) {
-        const generated = path.join(cleanupTarget.installDir, f);
-        if (f === ISOLATED_COMPOSE_FILENAME && existsSync(generated)) spawnSync("rm", ["-f", generated]);
-      }
-    } catch {
-      /* best-effort */
-    }
-  }
   return outcome;
 }
 
