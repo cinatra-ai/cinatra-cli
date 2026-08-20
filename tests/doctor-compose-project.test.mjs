@@ -329,11 +329,65 @@ describe("doctor wayflow readiness — an unreadable registry is not a silent PA
     expect(a.detail).toContain(`compose project "${basenameProject}"`);
   });
 
-  it("the by-design opt-outs still win — they do not depend on project resolution", async () => {
-    // `off`/`external` are read from the install's own .env.local, so an
-    // unreadable registry must not convert a deliberate opt-out into a
-    // registry-repair SKIP that misdescribes it.
+  // cinatra-cli#234 review, item 2 — the opt-out modes are NOT exempt.
+  //
+  // This block previously asserted that `off`/`external` "do not depend on
+  // project resolution", because they are read from the install's own
+  // .env.local. That was false as implemented: their opt-out SKIPs live inside
+  // the `runningContainer === ""` branch, so excluding those two modes from the
+  // unreadable-registry SKIP did not route them to their opt-out — it routed
+  // them to the HEALTH PROBE whenever the guessed basename happened to have a
+  // container. Both modes then returned PASS "runtime up" on a container doctor
+  // had no basis to attribute to this instance. The two pins below execute that
+  // defect; they fail on the PASS if the mode exclusions come back.
+  for (const [mode, optOutPhrase] of [
+    ["off", "--no-wayflow"],
+    ["external", "owns no local compose stack"],
+  ]) {
+    it(`mode ${mode}: a container under the guessed basename is the unreadable-registry SKIP, never a PASS`, async () => {
+      writeUnreadableRegistry();
+      const basenameProject = effectiveComposeProjectName(installDir);
+      const a = await doctorAssertWayflowReadiness({
+        fetchImpl: healthyFetch(), // a healthy /.health — the PASS is one step away
+        dockerImpl: dockerWithWayflowIn(basenameProject),
+        repoRoot: installDir,
+        env: { CINATRA_WAYFLOW_RUNTIME: mode },
+      });
+      expect(a.verdict).not.toBe("pass");
+      expect(a.verdict).toBe("skip");
+      // ...and it is the REGISTRY skip, naming the container it refused to
+      // bless — not the opt-out, which says nothing about what was found.
+      expect(a.detail).toContain("the instance registry could not be read");
+      expect(a.detail).toContain("does NOT establish that it belongs to this instance");
+      expect(a.detail).toContain(`"${basenameProject}-wayflow-1"`);
+      expect(a.detail).not.toContain(optOutPhrase);
+      expect(a.remediation).toMatch(/registry/i);
+    });
+  }
+
+  it("the opt-out modes get the registry SKIP with no container either — the reason is the registry", async () => {
+    // Same rule with nothing running: whether a record exists is UNKNOWN, so
+    // the actionable finding is the unreadable registry, in every mode.
     writeUnreadableRegistry();
+    for (const mode of ["off", "external"]) {
+      const a = await doctorAssertWayflowReadiness({
+        fetchImpl: REFUSING_FETCH,
+        dockerImpl: dockerWithWayflowIn("anything-else"),
+        repoRoot: installDir,
+        env: { CINATRA_WAYFLOW_RUNTIME: mode },
+      });
+      expect(a.verdict).toBe("skip");
+      expect(a.detail).toContain("the instance registry could not be read");
+      expect(a.remediation).toMatch(/registry/i);
+    }
+  });
+
+  it("a READABLE registry leaves the opt-outs stated as opt-outs", async () => {
+    // The guard on the fix: where project resolution is sound (registry read,
+    // no record → the basename IS this unmanaged checkout's project), `off` and
+    // `external` still speak for themselves. The change is scoped to the case
+    // where the project is a guess.
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
     const off = await doctorAssertWayflowReadiness({
       fetchImpl: REFUSING_FETCH,
       dockerImpl: dockerWithWayflowIn("anything-else"),

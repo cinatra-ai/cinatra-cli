@@ -5215,13 +5215,20 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
   // other way), and one absent proves only that nothing runs under a name we
   // had to invent. So this is a SKIP — which the report footer already states
   // is NOT a pass — rather than a silent PASS on an unrelated container.
-  // The by-design opt-outs below are unaffected: `off`/`external` are read from
-  // the install's own .env.local and hold regardless of project resolution.
-  if (
-    projectReason === "registry-unreadable" &&
-    runtimeMode !== WAYFLOW_RUNTIME_OFF &&
-    runtimeMode !== WAYFLOW_RUNTIME_EXTERNAL
-  ) {
+  //
+  // cinatra-cli#234 review, item 2: this SKIP applies to EVERY runtime mode,
+  // `off`/`external` included. It used to exclude those two on the theory that
+  // the by-design opt-outs are read from the install's own .env.local and so
+  // "hold regardless of project resolution" — false, because their opt-out
+  // SKIPs below are inside the `runningContainer === ""` branch and therefore
+  // unreachable whenever the guessed basename happens to have a container. A
+  // malformed registry plus a container under the basename returned PASS
+  // "runtime up" for both modes, on a container that may be another instance's:
+  // the same mis-attribution, reached through the opt-out door. The registry
+  // still cannot be read in those modes either, and that is what doctor must
+  // say — the repair is the same and the opt-out is not evidence about which
+  // container was found.
+  if (projectReason === "registry-unreadable") {
     return makeAssertion(
       id,
       label,
