@@ -11766,7 +11766,72 @@ async function runDevCms(service, argv = []) {
 // (named volumes untouched; the service has none anyway; agents are a ro
 // bind-mount of ./extensions).
 const WAYFLOW_SERVICE = "wayflow";
-const WAYFLOW_LOCAL_URL = "http://localhost:3010";
+
+// cinatra-cli#240 — the endpoint this command PRINTS is DERIVED, never
+// hardcoded. `http://localhost:3010` is right for exactly ONE instance: the one
+// holding the default port. An isolated instance publishes its runtime on its
+// own offset port (the cinatra#2654 clean-install matrix observed `:13010`), so
+// the start line pointed that operator at a dead port — or, when a default
+// stack was also up, at ANOTHER instance's runtime, which is worse: that
+// endpoint answers, so the operator drives the wrong stack and nothing says so.
+//
+// The port comes from the instance's recorded per-service port map
+// (`ports.wayflow[0]`) — the SAME expression the isolated install path resolves
+// `WAYFLOW_BASE_URL` from (`install.mjs` `writeIsolatedAppEnv`'s
+// `first("wayflow")`), so the endpoint printed here and the endpoint the app
+// dials cannot disagree.
+const DEFAULT_WAYFLOW_HOST_PORT = 3010;
+
+/**
+ * The WayFlow host port a recorded per-service port map publishes, or null.
+ *
+ * A map that records no `wayflow` entry is NOT evidence of a remapped runtime:
+ * the default install's recorded band (`install.mjs` DEFAULT_DEV_HOST_PORTS)
+ * legitimately holds no entry for the profile-gated service, and that instance
+ * does serve the default port. Only an ALLOCATED band carries one, because only
+ * a generated isolated compose shifts it.
+ */
+function recordedWayflowHostPort(ports) {
+  const list = ports?.[WAYFLOW_SERVICE];
+  const raw = Array.isArray(list) && list.length > 0 ? list[0] : null;
+  const port = Number.parseInt(String(raw ?? ""), 10);
+  return Number.isInteger(port) && port > 0 ? port : null;
+}
+
+/** The endpoint an instance with this recorded port map serves WayFlow on.
+ *  Mirrors the resolution cinatra-cli#231 states on the install tail, so the two
+ *  surfaces can never name different endpoints for one instance. */
+function wayflowEndpointForRecordedPorts(ports) {
+  return `http://localhost:${recordedWayflowHostPort(ports) ?? DEFAULT_WAYFLOW_HOST_PORT}`;
+}
+
+/**
+ * The endpoint THIS checkout's recorded install publishes.
+ *
+ * Reads the row through the ONE registry install-dir unwrap (cinatra-cli#230) —
+ * the same lookup `wayflowComposeContext` performs, with the same injectable
+ * seams — so the command names the compose project it addressed and the
+ * endpoint that project serves from ONE recorded row. It is a second, cheap
+ * read of that small file rather than a widened `wayflowComposeContext` return,
+ * and best-effort by the same contract: a missing or malformed registry must
+ * never fail a lifecycle command, so every failure degrades to the default
+ * port. A checkout with no recorded install is an unmanaged default checkout
+ * and gets that port too — exactly what it got before this fix.
+ */
+function wayflowEndpointForCheckout(repoRoot, deps = {}) {
+  const readRegistry = deps.readRegistry ?? (() => readInstanceRegistrySafe().registry);
+  const findByInstallDir = deps.findByInstallDir ?? findInstanceRowByInstallDir;
+  let row = null;
+  try {
+    const registry = readRegistry();
+    if (registry && typeof registry === "object") {
+      row = findByInstallDir(registry, repoRoot) ?? null;
+    }
+  } catch {
+    row = null;
+  }
+  return wayflowEndpointForRecordedPorts(row?.ports);
+}
 
 // cinatra#2654 — the compose project + files THIS checkout's recorded install
 // actually uses. A `-p`-less invocation makes Docker derive the project from the
@@ -11925,7 +11990,7 @@ async function runDevWayflow(argv = []) {
   }
   console.log(
     verb === "start"
-      ? `WayFlow agent runtime started (${WAYFLOW_LOCAL_URL}; the loader mounts every ` +
+      ? `WayFlow agent runtime started (${wayflowEndpointForCheckout(repoRoot)}; the loader mounts every ` +
           `installed agent, allow up to ~2 min on cold start). Re-run \`cinatra doctor\` to verify readiness.`
       : `WayFlow agent runtime stopped (container removed). Agent runs will fail with ` +
           `ECONNREFUSED until it is started again (\`cinatra instance wayflow start\`).`,
@@ -14587,6 +14652,12 @@ export {
   effectiveComposeProjectName,
   wayflowComposeContext,
   wayflowHealthUrlFromEnv,
+  // cinatra-cli#240 — the printed start endpoint, derived from the instance's
+  // recorded port map instead of a hardcoded default.
+  recordedWayflowHostPort,
+  wayflowEndpointForRecordedPorts,
+  wayflowEndpointForCheckout,
+  DEFAULT_WAYFLOW_HOST_PORT,
   // cinatra-cli#230 — the ONE registry install-dir unwrap. Exported because the
   // bug was invisible at every call seam: the sibling consumers (upgrade
   // preflight/major, refresh's ledger capture) read `.installDir`,

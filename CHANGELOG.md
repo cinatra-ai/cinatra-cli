@@ -61,6 +61,19 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`cinatra instance wayflow start` now names the endpoint the instance it
+  started actually serves on.** The success line stated `http://localhost:3010`
+  for every instance, although only the one holding the default port answers
+  there. An instance installed in isolation runs its agent runtime on its own
+  allocated port, so its operator was sent to a port with nothing behind it —
+  and, on a machine that also runs a default instance, to a port with the WRONG
+  runtime behind it, which is worse, because that one answers and every agent
+  call made against it quietly drives the other instance's stack. The port is
+  now read from the instance's own recorded port map, the same record the
+  isolated install writes `WAYFLOW_BASE_URL` from, so the address printed here
+  and the address the app dials cannot disagree. An instance that was never
+  given its own ports still gets the default one.
+
 - **A preview no longer wires itself to another instance's services, and it can
   finally reach its own connection service.** The preview composition decided
   where this instance's services live by string manipulation: it swapped a
