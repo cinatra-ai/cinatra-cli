@@ -116,6 +116,7 @@ import {
   writeIsolatedComposeFile,
   assertComposeHostUrlsRemapped,
   assertComposeAppUrlsRemapped,
+  publishedPortsByService,
   ISOLATED_COMPOSE_FILENAME,
 } from "./install-isolation.mjs";
 import {
@@ -123,6 +124,7 @@ import {
   A2A_PEER_ENV_KEY,
   deriveA2aPeerServices,
   isolatedComposeHasA2aPeers,
+  missingIsolatedServices,
   a2aPeerUrlsFromServices,
   deriveBandOffsetFromRow,
   sharedServicePortsAgree,
@@ -4666,6 +4668,98 @@ function lookupOwnIsolatedRow(targetDir) {
   return null;
 }
 
+/**
+ * The port map a recorded ISOLATED checkout will ACTUALLY publish on this run:
+ * the recorded row's map brought up to date with the generated compose file the
+ * run is about to bring up.
+ *
+ * cinatra-cli#231 (round-2 review). `effectivePorts` used to mean "the recorded
+ * map, unless an in-place regeneration happened to run and enlarge it" — and a
+ * regeneration is NOT guaranteed to run. It is skipped whenever the file is
+ * already current (which the a2a-peers marker used to claim far too eagerly),
+ * and the explicit ATTACH path never regenerates at all. Meanwhile the recorded
+ * map can lag a file that is itself perfectly current: a row written before a
+ * service was baked in, whose file a sibling path has since regenerated. In
+ * every one of those states the run re-pointed `.env.local` and the install tail
+ * from a map with no `wayflow` entry, so the tail named the DEFAULT :3010 for a
+ * runtime listening on the offset port — this issue's own defect, on the routes
+ * the return-the-effective-map fix did not reach.
+ *
+ * The generated compose file is the AUTHORITY: it is the file the `up` runs, so
+ * what it publishes is what the operator can actually reach. The recorded map is
+ * kept UNDERNEATH it, so a service the file no longer publishes keeps whatever
+ * was recorded rather than dropping out of the env re-point — this is a repair,
+ * never a demotion. Best-effort and pure-ish: a missing or unparseable file
+ * (never clobbered, per `regenerateIsolatedComposeInPlace`) leaves the recorded
+ * map exactly as it was.
+ *
+ * @param {string} targetDir the checkout
+ * @param {Record<string, number[]>} [recordedPorts] the registry row's map
+ * @returns {Record<string, number[]>}
+ */
+function effectiveIsolatedPorts(targetDir, recordedPorts = {}) {
+  const base = recordedPorts && typeof recordedPorts === "object" ? recordedPorts : {};
+  const isoPath = path.join(targetDir, ISOLATED_COMPOSE_FILENAME);
+  if (!existsSync(isoPath)) return base;
+  try {
+    // The generated isolated compose is JSON rendered into a `.yml` (YAML 1.2 is
+    // a JSON superset), so it parses straight back — same read as the in-place
+    // regeneration performs.
+    return { ...base, ...publishedPortsByService(JSON.parse(readFileSync(isoPath, "utf8"))) };
+  } catch {
+    return base;
+  }
+}
+
+/** Deep-equality of two `{ service: [hostPort…] }` maps, order-insensitive across
+ *  services and order-sensitive within one (the generator emits a stable order).
+ *  Pure. */
+function samePortMaps(a, b) {
+  const ka = Object.keys(a ?? {}).sort();
+  const kb = Object.keys(b ?? {}).sort();
+  if (ka.length !== kb.length || ka.some((k, i) => k !== kb[i])) return false;
+  return ka.every((k) => JSON.stringify(a[k]) === JSON.stringify(b[k]));
+}
+
+/**
+ * Record a repaired isolated port map on the instance's row (best-effort).
+ *
+ * cinatra-cli#231 (round-2 review): the map this run speaks is the map the
+ * instance actually publishes, so a row that lagged it must be CORRECTED — a
+ * repair confined to `.env.local` and the install tail would leave every OTHER
+ * surface that reads the row still naming the port this run just proved wrong
+ * (`cinatra instance wayflow start` reads exactly this map — cinatra-cli#240).
+ * The in-place regeneration already persists its own enlargement; this covers
+ * the runs where no regeneration was needed because the FILE was current and
+ * only the ROW lagged it.
+ *
+ * Safety: refuses when the repair would MOVE a service both maps record — the
+ * same determinism guard the regeneration applies, so a corrupt or foreign
+ * compose file can never relocate a recorded (possibly running) service's port.
+ * Every failure is a warning: the run itself is already correct without it.
+ */
+async function persistIsolatedPortRepair({ slug, recordedPorts, ports, registryPath, lockPath, log = console.log }) {
+  if (!slug || !ports || samePortMaps(recordedPorts ?? {}, ports)) return;
+  if (!sharedServicePortsAgree(recordedPorts ?? {}, ports)) {
+    log(
+      `  ⚠ The generated compose publishes a different host port than instance "${slug}"'s recorded map for a ` +
+        `service both record; leaving the recorded map untouched.`,
+    );
+    return;
+  }
+  try {
+    await withAllocLock(lockPath, async () => {
+      const reg = requireUsableInstanceRegistry(registryPath);
+      if (getInstance(reg, slug)) writeInstanceRegistry(registryPath, updateInstance(reg, slug, { ports }));
+    });
+  } catch (err) {
+    log(
+      `  ⚠ Could not record instance "${slug}"'s effective port map (${err instanceof Error ? err.message : err}); ` +
+        `this run's endpoints and .env.local are unaffected.`,
+    );
+  }
+}
+
 /** Re-converge on a checkout's OWN recorded isolated stack: bring it up via the
  *  RECORDED compose files + project, re-point the env at its remapped ports, and
  *  return an "isolated" plan so the later steps treat it as isolated. */
@@ -4693,6 +4787,18 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
   } catch (err) {
     log(`  ⚠ Isolated compose regeneration skipped (${err instanceof Error ? err.message : err}); using the recorded compose.`);
   }
+  // cinatra-cli#231 (round-2 review): whether a regeneration ran, was skipped as
+  // unnecessary or failed, the ports this re-converge speaks are the ports the
+  // file it is about to bring up publishes — never a recorded map that lags it.
+  effectivePorts = effectiveIsolatedPorts(targetDir, effectivePorts);
+  await persistIsolatedPortRepair({
+    slug: row.slug,
+    recordedPorts: row.ports ?? {},
+    ports: effectivePorts,
+    registryPath,
+    lockPath,
+    log,
+  });
 
   // Re-point the env at the recorded remapped ports + bring up WITH
   // `--env-file .env.local` so the generated isolated compose's scrubbed
@@ -4747,15 +4853,17 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
 
 /**
  * cinatra-cli#113 — regenerate a recorded isolated stack's
- * `docker-compose.cinatra-isolated.yml` IN PLACE so it carries the profile-gated
- * services (a2a-peers / wordpress / drupal / twenty / plane). An instance
- * recorded BEFORE those services were baked into the isolated compose keeps a
- * profile-less file across every reconcile; this brings it up to parity without
- * a reset + reinstall.
+ * `docker-compose.cinatra-isolated.yml` IN PLACE so it carries every service the
+ * checkout declares (the profile-gated a2a-peers / wordpress / drupal / twenty /
+ * plane, and cinatra#2654's `wayflow`). An instance recorded BEFORE a service
+ * was baked into the isolated compose keeps a file without it across every
+ * reconcile; this brings it up to parity without a reset + reinstall.
  *
  * Idempotent and safe:
- *   - No-op when the file already carries an a2a-peers service with a published
- *     port (the specific marker that the profile-gated services are present), or
+ *   - No-op when the file already carries every service the checkout's resolved
+ *     config declares (cinatra-cli#231 round-2 review: the test used to be the
+ *     a2a-peers marker alone, which reported a compose generated in the a2a era
+ *     as current forever and so never let it gain a LATER-baked service), or
  *     when the file is missing/unparseable (best-effort — never clobber).
  *   - Regenerates at the instance's ORIGINAL band offset (persisted on the row
  *     for fresh installs; derived from the recorded ports vs the base band for a
@@ -4786,16 +4894,29 @@ async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.
     // An unparseable file is left untouched (never clobber an operator edit).
     return { regenerated: false };
   }
-  // Already carries the profile-gated peers → nothing to do (the common case: a
-  // fresh install, or an instance already regenerated once).
-  if (isolatedComposeHasA2aPeers(existingDoc)) return { regenerated: false };
-
   // Re-resolve the checkout's base config WITH every profile-gated service — the
-  // same resolution a fresh isolated install performs.
+  // same resolution a fresh isolated install performs. Resolved BEFORE the
+  // up-to-date test, because that test asks a question only the checkout can
+  // answer: WHICH services the isolated compose ought to carry.
   const resolvedConfig = getConfig(targetDir, ["docker-compose.yml", "docker-compose.dev.yml"], deps, { allProfiles: true });
   if (!resolvedConfig) {
+    // Currency is now UNKNOWABLE. Fall back to the historical a2a-peers marker so
+    // an unresolvable config never turns a previously silent no-op reconcile into
+    // a warning: a file carrying the peers is left alone exactly as before, and
+    // only the case that was already a hard failure stays one.
+    if (isolatedComposeHasA2aPeers(existingDoc)) return { regenerated: false };
     throw new Error("could not resolve `docker compose config` to regenerate the isolated compose");
   }
+
+  // Up to date → nothing to do (the common case: a fresh install, or an instance
+  // already regenerated once). cinatra-cli#231 (round-2 review): the test is
+  // "does the recorded file carry EVERY service the checkout declares", not the
+  // a2a-peers-only marker it replaces — that marker reported a compose generated
+  // in the a2a era as current forever, so it never gained a service baked in
+  // later (`wayflow`) and the reconcile went on to re-point `.env.local` from a
+  // map with no entry for it.
+  const missingServices = missingIsolatedServices(existingDoc, resolvedConfig);
+  if (missingServices.length === 0) return { regenerated: false };
   const baseBand = parseComposePublishedPorts(resolvedConfig);
   if (baseBand.length === 0) {
     throw new Error("the checkout's compose config publishes no host ports");
@@ -4846,8 +4967,8 @@ async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.
 
   writeIsolatedComposeFile(isoPath, doc);
   log(
-    `  ↻ Regenerated ${ISOLATED_COMPOSE_FILENAME} to include the profile-gated services ` +
-      `(a2a-peers + wordpress/drupal/twenty/plane) at the recorded band offset.`,
+    `  ↻ Regenerated ${ISOLATED_COMPOSE_FILENAME} at the recorded band offset to include ` +
+      `${missingServices.length} service(s) it did not carry: ${missingServices.join(", ")}.`,
   );
 
   // Persist the enlarged remapped-port map + the offset (so a legacy row's next
@@ -5048,6 +5169,15 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
   // Bring THIS checkout's recorded stack up idempotently (owned-port exemption
   // applies). Use the RECORDED compose files/project when known, else the base.
   let broughtUp = false;
+  // cinatra-cli#231 (round-2 review): an explicit ATTACH is the same shape as the
+  // re-converge — it re-points `.env.local` and hands its row to the install tail
+  // — but it never regenerates, so it had ONLY the recorded map to speak from. A
+  // row that predates a service being baked into the isolated compose therefore
+  // attached to a stack publishing the offset WayFlow port while both the env
+  // file and the printed endpoint named the default. Resolved below from the
+  // compose file the attach actually brings up; the recorded map stands until
+  // then (and for a dry run, which brings nothing up and writes nothing).
+  let attachPorts = row?.ports ?? {};
   if (!opts.dryRun) {
     const composeFiles = row?.composeFiles ?? null;
     // cinatra-cli#35(e): pass the recorded explicit `-p` (default OR isolated);
@@ -5063,7 +5193,16 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
     const attachingIsolated = isIsolatedRow(row);
     let attachEnvFile = null;
     if (attachingIsolated) {
-      ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: row.ports ?? {}, log });
+      attachPorts = effectiveIsolatedPorts(targetDir, attachPorts);
+      await persistIsolatedPortRepair({
+        slug: row.slug,
+        recordedPorts: row.ports ?? {},
+        ports: attachPorts,
+        registryPath,
+        lockPath,
+        log,
+      });
+      ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: attachPorts, log });
       const envCandidate = path.join(targetDir, ".env.local");
       attachEnvFile = existsSync(envCandidate) ? envCandidate : null;
     }
@@ -5073,7 +5212,7 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
       // row's slug, else the dir-derived slug (an unrecorded checkout still has a
       // deterministic slug; the gate then reads a missing/empty ledger and falls
       // to the live probe/marker rather than throwing on a null key).
-      startInfra({ slug: row?.slug ?? deriveInstanceSlug(targetDir), deps, targetDir, log, composeFiles, composeProject, envFile: attachEnvFile, nangoHealthUrl: nangoHealthUrlForPorts(row?.ports), wayflow: opts.wayflow !== false });
+      startInfra({ slug: row?.slug ?? deriveInstanceSlug(targetDir), deps, targetDir, log, composeFiles, composeProject, envFile: attachEnvFile, nangoHealthUrl: nangoHealthUrlForPorts(attachPorts), wayflow: opts.wayflow !== false });
       broughtUp = true;
       // cinatra-cli#128: an attach re-up deploys whatever the moved checkout
       // now pins — record it (best-effort).
@@ -5096,7 +5235,12 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
     }
   }
 
-  return { infraPlan: "attach", instance: row ?? undefined, done: true };
+  // cinatra-cli#231: hand back the row carrying the map this attach actually
+  // spoke, for the same reason the isolated re-converge does — the install tail
+  // names an endpoint from `instance.ports`, and it must be the one `.env.local`
+  // was just re-pointed from. A DEFAULT-stack attach never touched `attachPorts`,
+  // so it hands back its recorded map unchanged.
+  return { infraPlan: "attach", instance: row ? { ...row, ports: attachPorts } : undefined, done: true };
 }
 
 /** T11 — stop-existing: tear down the RECORDED PROJECT of the holder, then

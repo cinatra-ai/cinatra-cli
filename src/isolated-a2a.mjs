@@ -70,13 +70,52 @@ export function deriveA2aPeerServices(doc) {
 
 /**
  * Whether a compose doc already carries the a2a-peers services (at least one
- * a2a-peers-profiled service WITH a published port). Used to decide if a
- * recorded isolated compose predates the profile-baking change and needs an
- * in-place regeneration. Deliberately specific (not merely "has any profile")
- * so an unusual partial state still regenerates.
+ * a2a-peers-profiled service WITH a published port). Deliberately specific (not
+ * merely "has any profile") so an unusual partial state still regenerates.
+ *
+ * NOT the staleness test for an in-place regeneration any more — see
+ * `missingIsolatedServices`. Retained because `cinatra instance a2a` asks this
+ * exact question (it needs the PEERS specifically, not currency in general) and
+ * because it is the only staleness signal available when the checkout's own
+ * config cannot be resolved.
  */
 export function isolatedComposeHasA2aPeers(doc) {
   return deriveA2aPeerServices(doc).length > 0;
+}
+
+/**
+ * The services the checkout's resolved compose config declares that a recorded
+ * isolated compose does NOT carry, sorted. Empty ⇒ the recorded file is current.
+ *
+ * cinatra-cli#231 (round-2 review): the in-place regeneration used to decide
+ * "current" with `isolatedComposeHasA2aPeers` — a marker for ONE historical
+ * baking (cinatra-cli#113's a2a peers). A compose generated once the peers were
+ * baked in therefore reported itself current FOREVER and could never gain a
+ * service baked in later, and cinatra#2654's `wayflow` is exactly such a
+ * service. The recorded port map then kept no `wayflow` entry, so the reconcile
+ * had nothing to re-point `.env.local` with and the install tail named the
+ * DEFAULT :3010 for a runtime listening on the offset port — this issue's own
+ * defect, reached by the route the marker hid. Asking which services are MISSING
+ * is the question that marker was standing in for, and it needs no new marker
+ * for the next service baked in.
+ *
+ * Only ADDITIONS are reported. A service present in the recorded compose but
+ * absent from the checkout — one removed upstream, or an operator's own — is
+ * deliberately ignored: an in-place regeneration is a repair for a file that
+ * fell behind, never a reason to drop something already there. (It would be
+ * dropped anyway if a regeneration runs for another reason; that is the
+ * pre-existing "regenerate from the checkout" contract, not a new decision.)
+ *
+ * @param {object} existingDoc parsed recorded isolated compose
+ * @param {object} resolvedConfig parsed `docker compose config` of the checkout
+ * @returns {string[]} the missing service names
+ */
+export function missingIsolatedServices(existingDoc, resolvedConfig) {
+  const have = existingDoc?.services && typeof existingDoc.services === "object" ? existingDoc.services : {};
+  const want = resolvedConfig?.services && typeof resolvedConfig.services === "object" ? resolvedConfig.services : {};
+  return Object.keys(want)
+    .filter((name) => !Object.hasOwn(have, name))
+    .sort();
 }
 
 /** Build the peer base-URL list for the app env from the enumerated services.

@@ -36,7 +36,9 @@ import {
   assertComposeAppUrlsRemapped,
   assertComposeHostUrlsRemapped,
   generateIsolatedCompose,
+  publishedPortsByService,
 } from "../src/install-isolation.mjs";
+import { isolatedComposeHasA2aPeers, missingIsolatedServices } from "../src/isolated-a2a.mjs";
 import { DEFAULT_APP_PORT as ALLOCATOR_DEFAULT_APP_PORT } from "../src/instance-alloc.mjs";
 import {
   DEFAULT_WAYFLOW_PORT,
@@ -349,6 +351,24 @@ const RESOLVED_CONFIG = {
   volumes: { "cinatra-postgres": { name: "cinatra_cinatra-postgres" } },
 };
 
+// An `a2a-peers`-profiled service WITH a published host port — the exact marker
+// `isolatedComposeHasA2aPeers` looks for, and so the exact thing that used to
+// make a compose file claim to be current forever (cinatra-cli#231 round 2).
+const A2A_PEER_PORT = 3200;
+const A2A_PEER_SERVICE = {
+  image: "cinatra-a2a-peer",
+  profiles: ["a2a-peers"],
+  ports: [{ published: String(A2A_PEER_PORT), target: 3200, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+};
+
+/** The same checkout, in the a2a era: it declares the peers AND `wayflow`. */
+const RESOLVED_CONFIG_WITH_PEERS = {
+  ...RESOLVED_CONFIG,
+  services: { ...RESOLVED_CONFIG.services, "a2a-peer-alpha": A2A_PEER_SERVICE },
+};
+
+const DEFAULT_BAND_WITH_PEERS = [...DEFAULT_BAND, { service: "a2a-peer-alpha", host: "127.0.0.1", port: A2A_PEER_PORT }];
+
 function isolatedDeps() {
   return {
     runPreflight: () => ({ ok: true, failures: [], warnings: [], mode: "dev", infraWillStart: true }),
@@ -631,5 +651,278 @@ describe("cinatra-cli#231 — a LEGACY recorded row re-converges onto ITS OWN wa
 
     const env = envOf(installDir);
     expect(env).toMatch(new RegExp(`^NANGO_SERVER_URL=http://127\\.0\\.0\\.1:${3003 + OFFSET}`, "m"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cinatra-cli#231, round-2 review non-blocking: the two routes on which
+// `effectivePorts` could still be the STALE recorded map, so the tail printed
+// the default port for a runtime listening on the offset one.
+//
+//   (a) The in-place regeneration decided "this file is current" with a single
+//       a2a-peers marker. A compose generated once the peers were baked in
+//       reported itself current FOREVER, so it could never gain a service baked
+//       in LATER — `wayflow` is exactly such a service. Regeneration was skipped,
+//       the recorded map kept no `wayflow` entry, and the reconcile had nothing
+//       to re-point `.env.local` with.
+//
+//   (b) The explicit ATTACH path (`--on-conflict=attach`) never regenerates at
+//       all and spoke straight from the recorded map — the same defect shape,
+//       reached without any staleness in the compose FILE.
+//
+// Both now resolve the ports from the compose file the run actually brings up,
+// and record the repair on the row so `cinatra instance wayflow start`
+// (cinatra-cli#240) cannot name a different endpoint than the install tail did.
+// ---------------------------------------------------------------------------
+describe("cinatra-cli#231 — missingIsolatedServices (the regeneration's currency test)", () => {
+  const current = { services: { postgres: {}, wayflow: {}, "a2a-peer-alpha": {} } };
+
+  it("names a LATER-baked service an a2a-era compose never gained", () => {
+    const a2aEra = { services: { postgres: {}, "a2a-peer-alpha": {} } };
+    expect(missingIsolatedServices(a2aEra, current)).toEqual(["wayflow"]);
+    // The marker the test replaces would have called this file current, which is
+    // precisely how the defect survived.
+    expect(isolatedComposeHasA2aPeers({ services: { "a2a-peer-alpha": A2A_PEER_SERVICE } })).toBe(true);
+  });
+
+  it("is empty when the file carries every service the checkout declares", () => {
+    expect(missingIsolatedServices(current, current)).toEqual([]);
+  });
+
+  it("reports ADDITIONS only — a service the file has and the checkout does not is left alone", () => {
+    const withExtra = { services: { ...current.services, "operator-sidecar": {} } };
+    expect(missingIsolatedServices(withExtra, current)).toEqual([]);
+  });
+
+  it("sorts, so the regeneration message is stable", () => {
+    expect(missingIsolatedServices({ services: {} }, { services: { zeta: {}, alpha: {} } })).toEqual(["alpha", "zeta"]);
+  });
+
+  it("treats a malformed document as carrying nothing rather than throwing", () => {
+    expect(missingIsolatedServices(null, current)).toEqual(["a2a-peer-alpha", "postgres", "wayflow"]);
+    expect(missingIsolatedServices(current, null)).toEqual([]);
+  });
+});
+
+describe("cinatra-cli#231 — publishedPortsByService (reading the run's real ports back)", () => {
+  it("returns the SAME map the generator recorded, read back off its own output", () => {
+    const { doc, ports } = generateIsolatedCompose({
+      resolvedConfig: RESOLVED_CONFIG,
+      offset: OFFSET,
+      projectName: "cinatra_iso231",
+      slug: "iso231",
+      appPort: APP_PORT,
+    });
+    expect(publishedPortsByService(doc)).toEqual(ports);
+    expect(publishedPortsByService(doc).wayflow).toEqual([EXPECTED_WAYFLOW_PORT]);
+  });
+
+  it("omits a service that publishes nothing, as the generator does", () => {
+    expect(publishedPortsByService({ services: { worker: { image: "x" } } })).toEqual({});
+  });
+
+  it("IGNORES a short-syntax port entry — remapServicePorts leaves those UNSHIFTED", () => {
+    // Recording 5434 out of `"5434:5432"` would put a port the isolated stack
+    // never binds into the map, and `.env.local` would be pointed at the DONOR.
+    expect(publishedPortsByService({ services: { db: { ports: ["5434:5432"] } } })).toEqual({});
+  });
+});
+
+describe("cinatra-cli#231 — an A2A-ERA compose still gains a LATER-baked service", () => {
+  let sandbox;
+  let originRepo;
+
+  beforeAll(() => {
+    sandbox = mkdtempSync(path.join(os.tmpdir(), "cin-231-a2aera-"));
+    originRepo = buildFixtureOrigin(sandbox);
+  });
+  afterAll(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    const d = mkdtempSync(path.join(sandbox, "home-"));
+    process.env.CINATRA_INSTANCE_REGISTRY = path.join(d, "instances.json");
+    process.env.CINATRA_ALLOC_LOCK = path.join(d, "alloc.lock");
+  });
+
+  /** The checkout declares the a2a peers AND `wayflow` (the modern shape). */
+  function peerDeps() {
+    return {
+      ...isolatedDeps(),
+      composeConfigForFiles: () => RESOLVED_CONFIG_WITH_PEERS,
+      composePublishedPortsForTarget: () => DEFAULT_BAND_WITH_PEERS,
+      captureDeployedVersions: () => ({ ok: true, versions: {} }),
+    };
+  }
+
+  function registryRow(installDir) {
+    const reg = JSON.parse(readFileSync(process.env.CINATRA_INSTANCE_REGISTRY, "utf8"));
+    const slug = Object.keys(reg.instances).find(
+      (s) => path.resolve(reg.instances[s].installDir) === path.resolve(installDir),
+    );
+    return { reg, slug, row: reg.instances[slug] };
+  }
+
+  /**
+   * Install, then age BOTH halves back into the a2a era: strip `wayflow` from the
+   * generated compose file (a file written before cinatra#2654 baked the runtime
+   * in — but one that DOES carry the a2a peers, so the old marker calls it
+   * current) and from the recorded port map.
+   */
+  async function installThenAgeToA2aEra(name) {
+    const installDir = path.join(sandbox, name);
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", name,
+        "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ],
+      { log: () => {}, deps: peerDeps() },
+    );
+    expect(res.infraPlan).toBe("isolated");
+
+    const isoPath = path.join(installDir, "docker-compose.cinatra-isolated.yml");
+    const { doc } = readGeneratedCompose(installDir);
+    // Sanity: the FRESH file carries both, so the ageing below is what removes
+    // the runtime — this test can only pass for the intended reason.
+    expect(doc.services.wayflow).toBeDefined();
+    expect(isolatedComposeHasA2aPeers(doc)).toBe(true);
+    delete doc.services.wayflow;
+    writeFileSync(isoPath, JSON.stringify(doc, null, 2) + "\n");
+    // The aged file is EXACTLY the state the old marker mis-read as current.
+    expect(isolatedComposeHasA2aPeers(doc)).toBe(true);
+
+    const { reg, row } = registryRow(installDir);
+    expect(row.ports.wayflow).toEqual([EXPECTED_WAYFLOW_PORT]);
+    delete row.ports.wayflow;
+    delete row.offset;
+    writeFileSync(process.env.CINATRA_INSTANCE_REGISTRY, JSON.stringify(reg, null, 2) + "\n");
+
+    return installDir;
+  }
+
+  function reconverge(installDir, extraArgs = []) {
+    const lines = [];
+    return runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", ...extraArgs,
+      ],
+      { log: (l) => lines.push(String(l)), deps: peerDeps() },
+    ).then((res) => ({ res, lines }));
+  }
+
+  it("regenerates the file, and the tail names the OFFSET wayflow port", async () => {
+    const installDir = await installThenAgeToA2aEra("iso231-a2aera");
+    const { res, lines } = await reconverge(installDir);
+    expect(res.infraPlan).toBe("isolated");
+    expect(lines.join("\n")).toContain("converging on its own stack");
+
+    // The regeneration ran and SAID which service the file did not carry.
+    const regenLine = lines.find((l) => l.includes("Regenerated docker-compose.cinatra-isolated.yml"));
+    expect(regenLine).toBeDefined();
+    expect(regenLine).toContain("wayflow");
+
+    // The file gained the runtime, at the recorded band offset.
+    const { doc } = readGeneratedCompose(installDir);
+    expect(publishedPortsByService(doc).wayflow).toEqual([EXPECTED_WAYFLOW_PORT]);
+    // …and nothing the a2a-era file already published moved.
+    expect(publishedPortsByService(doc)["a2a-peer-alpha"]).toEqual([A2A_PEER_PORT + OFFSET]);
+
+    const runtimeLine = lines.find((l) => l.includes("Agent runtime:"));
+    expect(runtimeLine).toContain(`http://localhost:${EXPECTED_WAYFLOW_PORT}`);
+    expect(lines.join("\n")).not.toContain(`http://localhost:${DEFAULT_WAYFLOW_PORT}`);
+
+    const env = readFileSync(path.join(installDir, ".env.local"), "utf8");
+    expect(env).toMatch(new RegExp(`^WAYFLOW_BASE_URL=http://127\\.0\\.0\\.1:${EXPECTED_WAYFLOW_PORT}`, "m"));
+  });
+
+  it("records the repair on the row, so `instance wayflow start` cannot name a different port", async () => {
+    const installDir = await installThenAgeToA2aEra("iso231-a2aera-row");
+    await reconverge(installDir);
+    const { row } = registryRow(installDir);
+    expect(row.ports.wayflow).toEqual([EXPECTED_WAYFLOW_PORT]);
+    // The band the row already recorded is untouched — a repair, never a move.
+    expect(row.ports.postgres).toEqual([5434 + OFFSET]);
+    expect(row.ports["a2a-peer-alpha"]).toEqual([A2A_PEER_PORT + OFFSET]);
+  });
+
+  it("a row that lags a file which is ALREADY current is repaired without a regeneration", async () => {
+    // The other half of the same defect: nothing is wrong with the compose file,
+    // so no regeneration is due — but the recorded map still has no `wayflow`
+    // entry, and it was that map the tail printed from.
+    const installDir = path.join(sandbox, "iso231-rowlag");
+    await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso231rowlag",
+        "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ],
+      { log: () => {}, deps: peerDeps() },
+    );
+    const { reg, row } = registryRow(installDir);
+    delete row.ports.wayflow;
+    delete row.offset;
+    writeFileSync(process.env.CINATRA_INSTANCE_REGISTRY, JSON.stringify(reg, null, 2) + "\n");
+
+    const { lines } = await reconverge(installDir);
+    // No regeneration: the file was current, which is the whole point.
+    expect(lines.find((l) => l.includes("Regenerated docker-compose.cinatra-isolated.yml"))).toBeUndefined();
+
+    const runtimeLine = lines.find((l) => l.includes("Agent runtime:"));
+    expect(runtimeLine).toContain(`http://localhost:${EXPECTED_WAYFLOW_PORT}`);
+    const env = readFileSync(path.join(installDir, ".env.local"), "utf8");
+    expect(env).toMatch(new RegExp(`^WAYFLOW_BASE_URL=http://127\\.0\\.0\\.1:${EXPECTED_WAYFLOW_PORT}`, "m"));
+    expect(registryRow(installDir).row.ports.wayflow).toEqual([EXPECTED_WAYFLOW_PORT]);
+  });
+
+  it("an EXPLICIT attach states and provisions the endpoints its own stack publishes", async () => {
+    // `--on-conflict=attach` bypasses the re-converge entirely, so it had only
+    // the recorded map to speak from and never regenerated.
+    const installDir = path.join(sandbox, "iso231-attach");
+    await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso231attach",
+        "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ],
+      { log: () => {}, deps: peerDeps() },
+    );
+    const { reg, row } = registryRow(installDir);
+    delete row.ports.wayflow;
+    writeFileSync(process.env.CINATRA_INSTANCE_REGISTRY, JSON.stringify(reg, null, 2) + "\n");
+    // Point .env.local at the default, so "re-pointed" can only be satisfied by
+    // the attach actually doing it.
+    const envPath = path.join(installDir, ".env.local");
+    writeFileSync(
+      envPath,
+      readFileSync(envPath, "utf8").replace(
+        /^WAYFLOW_BASE_URL=.*$/m,
+        `WAYFLOW_BASE_URL=http://127.0.0.1:${DEFAULT_WAYFLOW_PORT}`,
+      ),
+    );
+
+    const lines = [];
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "attach",
+      ],
+      { log: (l) => lines.push(String(l)), deps: peerDeps() },
+    );
+    expect(res.infraPlan).toBe("attach");
+
+    const runtimeLine = lines.find((l) => l.includes("Agent runtime:"));
+    expect(runtimeLine).toBeDefined();
+    expect(runtimeLine).toContain(`http://localhost:${EXPECTED_WAYFLOW_PORT}`);
+    expect(lines.join("\n")).not.toContain(`http://localhost:${DEFAULT_WAYFLOW_PORT}`);
+
+    const env = readFileSync(envPath, "utf8");
+    expect(env).toMatch(new RegExp(`^WAYFLOW_BASE_URL=http://127\\.0\\.0\\.1:${EXPECTED_WAYFLOW_PORT}`, "m"));
+    const printedPort = Number(runtimeLine.match(/http:\/\/localhost:(\d+)/)[1]);
+    const recordedPort = Number(env.match(/^WAYFLOW_BASE_URL=http:\/\/127\.0\.0\.1:(\d+)/m)[1]);
+    expect(printedPort).toBe(recordedPort);
+    expect(registryRow(installDir).row.ports.wayflow).toEqual([EXPECTED_WAYFLOW_PORT]);
   });
 });

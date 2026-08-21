@@ -414,6 +414,46 @@ function remapServicePorts(ports, offset) {
   });
 }
 
+/** The published HOST ports one service declares, as integers, in declaration
+ *  order. Only the LONG form `{ published, … }` counts: a short-syntax entry
+ *  (`"5434:5432"`) is one `remapServicePorts` deliberately leaves UNSHIFTED, so
+ *  reading a port out of it would record a host port this stack does not bind.
+ *  Pure. */
+function publishedPortsOfService(svc) {
+  const out = [];
+  if (!svc || typeof svc !== "object" || !Array.isArray(svc.ports)) return out;
+  for (const p of svc.ports) {
+    const pub = p && typeof p === "object" ? p.published : undefined;
+    const n = Number.parseInt(String(pub ?? ""), 10);
+    if (Number.isFinite(n) && n > 0) out.push(n);
+  }
+  return out;
+}
+
+/**
+ * The `{ service: [hostPort…] }` map a compose document publishes — the exact
+ * shape `generateIsolatedCompose` returns as `ports` and the registry records
+ * (built from the same helper, so the two cannot drift). Services that publish
+ * nothing are omitted, as the generator omits them.
+ *
+ * cinatra-cli#231: read back off a GENERATED isolated compose, this is the map
+ * that file will actually bind when it is brought up — which is what an
+ * instance's `.env.local` must be pointed at and what the install tail must
+ * name. A recorded registry row is only a RECORD of that, and can lag it.
+ *
+ * @param {object} doc parsed compose document (`{ services: { … } }`)
+ * @returns {Record<string, number[]>}
+ */
+export function publishedPortsByService(doc) {
+  const services = doc?.services && typeof doc.services === "object" ? doc.services : {};
+  const out = {};
+  for (const [name, svc] of Object.entries(services)) {
+    const collected = publishedPortsOfService(svc);
+    if (collected.length > 0) out[name] = collected;
+  }
+  return out;
+}
+
 // ── cinatra-cli#97 — self-advertised host-URL remap ──────────────────────────
 //
 // Shifting a service's PUBLISHED host ports (remapServicePorts) is not enough: a
@@ -752,12 +792,10 @@ export function generateIsolatedCompose({
       // (1) Remap published host ports + collect them for the registry `ports`.
       if (Array.isArray(svc.ports)) {
         svc.ports = remapServicePorts(svc.ports, offset);
-        const collected = [];
-        for (const p of svc.ports) {
-          const pub = p && typeof p === "object" ? p.published : undefined;
-          const n = Number.parseInt(String(pub ?? ""), 10);
-          if (Number.isFinite(n) && n > 0) collected.push(n);
-        }
+        // The SAME collection `publishedPortsByService` performs, so the map
+        // recorded here and the map read back off the written file agree by
+        // construction (cinatra-cli#231).
+        const collected = publishedPortsOfService(svc);
         if (collected.length) remappedPorts[svcName] = collected;
       }
 
@@ -850,6 +888,8 @@ export const __test = {
   isSecretEnvKey,
   scrubServiceEnv,
   remapServicePorts,
+  publishedPortsOfService,
+  publishedPortsByService,
   remapEnvHostUrlPorts,
   findUnmappedComposeHostUrls,
   remapEnvAppPortUrls,

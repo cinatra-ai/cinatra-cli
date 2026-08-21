@@ -83,7 +83,20 @@ project adheres to [Semantic Versioning](https://semver.org/).
   and bare listen ports alone, and stands down when a compose service genuinely
   publishes the default app port, so it can never contend with the existing
   band remap. A new render invariant refuses to write a generated compose that
-  still dials the default app port while the instance runs on another.
+  still dials the default app port while the instance runs on another. The
+  same repair now reaches every route that re-converges on an instance rather
+  than installing one. A re-run and an explicit `--on-conflict=attach` both
+  read the ports from the generated compose file they are about to bring up,
+  so neither can speak from a registry row that has fallen behind it, and the
+  row is corrected when it has — otherwise `cinatra instance wayflow start`,
+  which reads that row, would keep naming the port the install tail just
+  disproved. Relatedly, the in-place regeneration that brings an older
+  instance's compose up to parity no longer decides it is current from the
+  presence of the a2a dev peers alone: a file generated once those were baked
+  in claimed to be current forever and so could never gain a service baked in
+  later, which is how an instance ended up with a runtime it never recorded a
+  port for. It now regenerates whenever the file is missing any service the
+  checkout declares, and says which ones.
 
 - **`cinatra instance wayflow start` now names the endpoint the instance it
   started actually serves on.** The success line stated `http://localhost:3010`
