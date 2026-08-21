@@ -1357,3 +1357,214 @@ describe("cinatra-cli#237 — a diverging or shrunk compose file is never blindl
     expect(registryRow(installDir).row.ports.postgres).toEqual([recordedPgPort]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// cinatra-cli#237 round 3. Three ways the convergence gate could still be
+// walked past, and one way the repair could clobber a concurrent writer.
+// ---------------------------------------------------------------------------
+
+describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or raced", () => {
+  let sandbox;
+  let originRepo;
+
+  beforeAll(() => {
+    sandbox = mkdtempSync(path.join(os.tmpdir(), "cin-237r3-"));
+    originRepo = buildFixtureOrigin(sandbox);
+  });
+  afterAll(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    const d = mkdtempSync(path.join(sandbox, "home-"));
+    process.env.CINATRA_INSTANCE_REGISTRY = path.join(d, "instances.json");
+    process.env.CINATRA_ALLOC_LOCK = path.join(d, "alloc.lock");
+  });
+
+  function registryRow(installDir) {
+    const reg = JSON.parse(readFileSync(process.env.CINATRA_INSTANCE_REGISTRY, "utf8"));
+    const slug = Object.keys(reg.instances).find(
+      (s) => path.resolve(reg.instances[s].installDir) === path.resolve(installDir),
+    );
+    return { reg, slug, row: reg.instances[slug] };
+  }
+
+  async function freshIsolatedInstall(name, deps = isolatedDeps()) {
+    const installDir = path.join(sandbox, name);
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", name,
+        "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ],
+      { log: () => {}, deps },
+    );
+    expect(res.infraPlan).toBe("isolated");
+    return installDir;
+  }
+
+  const isoPathOf = (installDir) => path.join(installDir, "docker-compose.cinatra-isolated.yml");
+  const writeCompose = (installDir, doc) =>
+    writeFileSync(isoPathOf(installDir), JSON.stringify(doc, null, 2) + "\n");
+
+  const RECORDED_REDIS = 6379 + OFFSET; // 26379
+
+  // ── finding 1 ──────────────────────────────────────────────────────────────
+  // The round-2 per-service fallback replaced a MIXED service's WHOLE list with
+  // the recorded ports the moment ANY entry was interpolated. A service that
+  // statically publishes a port OUTSIDE the allocated band therefore had that
+  // port erased before the gate ever saw it: the effective map equalled the
+  // recorded map, the gate passed, and Compose bound the out-of-band port.
+  it("finding 1: a MIXED service whose STATIC port the row does NOT hold aborts — the interpolated entry cannot launder it", async () => {
+    const installDir = await freshIsolatedInstall("iso237r3-launder");
+    const { doc } = readGeneratedCompose(installDir);
+
+    const divergedRedis = RECORDED_REDIS + 10000; // 36379 — outside this instance's band.
+    // The exact shape from the finding: one STATIC entry the record does not
+    // hold, one INTERPOLATED entry alongside it.
+    doc.services.redis.ports = [`${divergedRedis}:6379`, "${EXTRA}:9000"];
+    const wroteBody = JSON.stringify(doc, null, 2) + "\n";
+    writeFileSync(isoPathOf(installDir), wroteBody);
+
+    expect(registryRow(installDir).row.ports.redis).toEqual([RECORDED_REDIS]);
+    const rowBefore = JSON.stringify(registryRow(installDir).row);
+
+    let bringUpCalled = false;
+    const deps = { ...isolatedDeps(), bringUpInfra: () => { bringUpCalled = true; } };
+
+    // Re-converge route.
+    const err = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      { log: () => {}, deps },
+    ).then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/redis/);
+    // The abort names the STATIC port the file publishes, not the recorded one —
+    // that is the port Compose would actually bind.
+    expect(err.message).toContain(String(divergedRedis));
+    expect(bringUpCalled).toBe(false);
+    expect(readFileSync(isoPathOf(installDir), "utf8")).toBe(wroteBody);
+    expect(JSON.stringify(registryRow(installDir).row)).toBe(rowBefore);
+
+    // ...and the explicit attach route aborts identically.
+    await expect(
+      runInstall(
+        [
+          "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+          "--yes", "--no-install", "--on-conflict", "attach",
+        ],
+        { log: () => {}, deps },
+      ),
+    ).rejects.toThrow(/redis/);
+    expect(bringUpCalled).toBe(false);
+    expect(JSON.stringify(registryRow(installDir).row)).toBe(rowBefore);
+  });
+
+  // The other half of the same rule: the fallback still covers the INTERPOLATED
+  // remainder. A mixed service whose static half AGREES with the record is not a
+  // disagreement, and the recorded allocation must survive for the entry the
+  // file declines to state (round-2 finding 1 stays closed).
+  it("finding 1: a MIXED service whose static port the row DOES hold keeps its recorded allocation and launches", async () => {
+    const installDir = await freshIsolatedInstall("iso237r3-mixed-ok");
+    const { doc } = readGeneratedCompose(installDir);
+
+    doc.services.redis.ports = [`${RECORDED_REDIS}:6379`, "${EXTRA}:9000"];
+    writeCompose(installDir, doc);
+
+    let bringUpCalled = false;
+    const deps = { ...isolatedDeps(), bringUpInfra: () => { bringUpCalled = true; } };
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "attach",
+      ],
+      { log: () => {}, deps },
+    );
+    expect(res.infraPlan).toBe("attach");
+    expect(bringUpCalled).toBe(true);
+    // The recorded entry survives whole — the interpolated remainder is covered
+    // by the record, never deleted and never "repaired" to the static half only.
+    expect(registryRow(installDir).row.ports.redis).toEqual([RECORDED_REDIS]);
+  });
+
+  // ── finding 2 ──────────────────────────────────────────────────────────────
+  // The CLI writes its generated compose as JSON (a YAML subset), but an
+  // operator may legitimately rewrite it in ordinary YAML. Compose parses and
+  // launches that file; `JSON.parse` does not. Falling back to the recorded row
+  // there re-armed exactly the blanket overlay findings 1/2 removed: a removed
+  // service and a changed static port both become invisible.
+  const YAML_COMPOSE = [
+    "services:",
+    "  postgres: &pg",
+    "    image: postgres:16",
+    "    ports:",
+    '      - "25434:5432"',
+    "  redis:",
+    "    <<: *pg",
+    "    image: redis:7",
+    "    ports:",
+    '      - "26379:6379"',
+    "",
+  ].join("\n");
+
+  it("finding 2: a readable file the CLI cannot parse REFUSES to launch instead of falling back to the row", async () => {
+    const installDir = await freshIsolatedInstall("iso237r3-yaml");
+    writeFileSync(isoPathOf(installDir), YAML_COMPOSE);
+    const rowBefore = JSON.stringify(registryRow(installDir).row);
+
+    let bringUpCalled = false;
+    const deps = { ...isolatedDeps(), bringUpInfra: () => { bringUpCalled = true; } };
+
+    const err = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      { log: () => {}, deps },
+    ).then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(Error);
+    // Names the file it could not audit, and both ways out.
+    expect(err.message).toContain("docker-compose.cinatra-isolated.yml");
+    expect(err.message).toMatch(/cannot|could not/i);
+    expect(err.message).toMatch(/regenerat/i);
+    expect(bringUpCalled).toBe(false);
+
+    // Nothing was started and nothing was changed — including the operator's
+    // file, which is never clobbered.
+    expect(readFileSync(isoPathOf(installDir), "utf8")).toBe(YAML_COMPOSE);
+    expect(JSON.stringify(registryRow(installDir).row)).toBe(rowBefore);
+
+    // The attach route refuses the same way (it never regenerates, so it had
+    // only this unparseable file to speak from).
+    await expect(
+      runInstall(
+        [
+          "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+          "--yes", "--no-install", "--on-conflict", "attach",
+        ],
+        { log: () => {}, deps },
+      ),
+    ).rejects.toThrow(/docker-compose\.cinatra-isolated\.yml/);
+    expect(bringUpCalled).toBe(false);
+  });
+
+  it("finding 2: an ABSENT file still falls back to the recorded row (the round-1 ruling: only an unREADable file falls back)", async () => {
+    const installDir = await freshIsolatedInstall("iso237r3-absent");
+    const rowBefore = JSON.stringify(registryRow(installDir).row);
+    rmSync(isoPathOf(installDir));
+
+    let bringUpCalled = false;
+    const deps = { ...isolatedDeps(), bringUpInfra: () => { bringUpCalled = true; } };
+    const lines = [];
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "attach",
+      ],
+      { log: (l) => lines.push(String(l)), deps },
+    );
+    expect(res.infraPlan).toBe("attach");
+    expect(bringUpCalled).toBe(true);
+    // The row remains the best available source of truth, untouched.
+    expect(JSON.stringify(registryRow(installDir).row)).toBe(rowBefore);
+    // The endpoints still come from it.
+    expect(lines.find((l) => l.includes("Agent runtime:"))).toContain(`http://localhost:${EXPECTED_WAYFLOW_PORT}`);
+  });
+});

@@ -130,6 +130,7 @@ import {
   deriveBandOffsetFromRow,
   sharedServicePortsAgree,
   firstSharedServicePortMismatch,
+  normalisePortList,
   removeEnvKey,
 } from "./isolated-a2a.mjs";
 import { rejectTailscaleAuthkeyFlag } from "./clone-runtime.mjs";
@@ -4670,6 +4671,52 @@ function lookupOwnIsolatedRow(targetDir) {
   return null;
 }
 
+/** Is this parsed value the shape `generateIsolatedCompose` emits — a mapping
+ *  with a `services` mapping? Deliberately structural and shallow: the question
+ *  is only "did we get the CLI's generated document back", so that a `null`, an
+ *  array, a scalar or a YAML file that happened to parse as JSON is not read as
+ *  a compose document publishing nothing. Pure. */
+function isGeneratedComposeShape(doc) {
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) return false;
+  const services = doc.services;
+  return !!services && typeof services === "object" && !Array.isArray(services);
+}
+
+/**
+ * The refusal for a generated-compose file this CLI can READ but cannot PARSE
+ * (cinatra-cli#237 round-3 finding 2).
+ *
+ * We deliberately do NOT take on a YAML parser to widen what we accept. The
+ * value this gate provides is an AUDIT — proving that what Compose is about to
+ * bind matches the band this instance was allocated — and an audit we cannot
+ * perform is not one we may fake. The two alternatives are both worse than
+ * stopping: guessing at the file's ports would gate on a fiction, and falling
+ * back to the recorded row gates on a document nobody read, which is precisely
+ * how a removed service and a changed static port slipped through. So when the
+ * CLI cannot read the file it is about to hand to Compose, it says so and
+ * refuses to launch. Nothing is started, and the operator's file is never
+ * clobbered.
+ *
+ * @param {string} isoPath the file we could not parse
+ * @returns {Error}
+ */
+function unauditableIsolatedComposeError(isoPath) {
+  return new Error(
+    `Refusing to bring up this isolated instance: ${isoPath} could not be parsed as the document ` +
+      `cinatra generates (JSON rendered into a .yml). Docker Compose may still accept and launch this file — ` +
+      `YAML is a superset of JSON — but cinatra cannot then check WHICH host ports it would bind, so it cannot ` +
+      `confirm the stack stays inside this instance's allocated band rather than on a port another instance ` +
+      `owns. Nothing was started, and nothing was changed. Recover by one of:\n` +
+      `  (1) RESTORE the generated form — revert your edit so ${ISOLATED_COMPOSE_FILENAME} is again the JSON ` +
+      `document cinatra wrote (valid Compose YAML as-is), then re-run this command.\n` +
+      `  (2) REGENERATE it from scratch — bring the stack down (\`docker compose -f ${ISOLATED_COMPOSE_FILENAME} down\` ` +
+      `in this checkout, adding \`-p <project>\` if this instance records one), delete this instance's entry from ` +
+      `the instance registry and delete .cinatra/instance.json in this checkout, then run ` +
+      `\`cinatra install --on-conflict=isolated\`. Stop any other cinatra operations on this machine before ` +
+      `hand-editing the registry.`,
+  );
+}
+
 /**
  * The port map a recorded ISOLATED checkout will ACTUALLY publish on this run:
  * the recorded row's map brought up to date with the generated compose file the
@@ -4694,10 +4741,19 @@ function lookupOwnIsolatedRow(targetDir) {
  * published ports) must disappear from the effective map too — an overlay that
  * kept the recorded entry would still write `WAYFLOW_BASE_URL` and report the
  * service started for a stack that no longer contains it. So once the file
- * parses successfully, its map REPLACES the recorded one — the recorded map is
- * consulted when the whole file cannot be read/parsed (missing, or an operator
- * edit that broke it; never clobbered, per `regenerateIsolatedComposeInPlace`),
- * where it remains the best available source of truth.
+ * parses successfully, its map REPLACES the recorded one.
+ *
+ * THREE STATES, NOT TWO (cinatra-cli#237 round-3 finding 2). "Parsed" and
+ * "everything else" is the wrong split, because "everything else" quietly
+ * included a file that reads perfectly well and that Compose would happily
+ * launch — see `unauditableIsolatedComposeError` for why that one refuses
+ * instead of falling back:
+ *
+ *   (a) cannot be READ (absent, fs error) → the recorded map stands, as the
+ *       best available source of truth; there is no file to audit or launch.
+ *   (b) READ but not the generated shape  → REFUSE. We cannot audit what
+ *       Compose would bind, so we do not launch it.
+ *   (c) parsed                            → the per-service semantics below.
  *
  * THE ONE EXCEPTION, PER SERVICE (cinatra-cli#237 round-2 finding 1). "The file
  * replaces the row" is only sound where the file makes a STATEMENT. A published
@@ -4711,10 +4767,25 @@ function lookupOwnIsolatedRow(targetDir) {
  *
  *   absent from the file            → GONE (finding 1): the recorded entry dies.
  *   present, all ports static       → the FILE wins outright.
- *   present, any port interpolated  → the file states nothing static for it, so
- *                                     the RECORDED entry SURVIVES (falling back
- *                                     to whatever static ports the file does
- *                                     name only when the row has no entry).
+ *   present, any port interpolated  → the file states nothing static for THAT
+ *                                     entry, so the RECORDED entry answers for
+ *                                     it (falling back to whatever static ports
+ *                                     the file does name only when the row has
+ *                                     no entry).
+ *
+ * THE FALLBACK COVERS THE INTERPOLATED REMAINDER ONLY (cinatra-cli#237 round-3
+ * finding 1). "Any port interpolated" was read as "this service says nothing",
+ * and the recorded list replaced the WHOLE list — including the ports the file
+ * stated perfectly clearly. A service mixing the two (`["35434:5432",
+ * "${EXTRA}:9000"]` against a recorded `[25434]`) therefore had its static
+ * 35434 erased before the divergence gate ever ran: the effective map came out
+ * equal to the record, the gate passed, and Compose bound 35434 — a port
+ * outside this instance's allocated band, possibly inside another's. So a mixed
+ * service's STATIC ports are compared to the record FIRST: every one the record
+ * holds → the fallback stands in for the rest; ANY the record does not hold →
+ * that is a disagreement, the file's static ports stand, and the gate aborts on
+ * them. Containment is decided through `normalisePortList`, the same coercion
+ * the gate compares with, so the two answers cannot drift.
  *
  * Best-effort and pure-ish.
  *
@@ -4725,23 +4796,58 @@ function lookupOwnIsolatedRow(targetDir) {
 function effectiveIsolatedPorts(targetDir, recordedPorts = {}) {
   const base = recordedPorts && typeof recordedPorts === "object" ? recordedPorts : {};
   const isoPath = path.join(targetDir, ISOLATED_COMPOSE_FILENAME);
-  if (!existsSync(isoPath)) return base;
-  let doc;
+  // (a) The file cannot be READ at all — absent, or an fs error. There is no
+  // file to audit and none to launch from either, so the recorded row remains
+  // the best available source of truth (the round-1 ruling: falling back to the
+  // row is for a file that cannot be READ, and only that).
+  let raw;
   try {
-    // The generated isolated compose is JSON rendered into a `.yml` (YAML 1.2 is
-    // a JSON superset), so it parses straight back — same read as the in-place
-    // regeneration performs.
-    doc = JSON.parse(readFileSync(isoPath, "utf8"));
+    raw = readFileSync(isoPath, "utf8");
   } catch {
     return base;
   }
+  // The generated isolated compose is JSON rendered into a `.yml` (YAML 1.2 is
+  // a JSON superset), so it parses straight back — same read as the in-place
+  // regeneration performs.
+  let doc = null;
+  try {
+    doc = JSON.parse(raw);
+  } catch {
+    doc = null;
+  }
+  // (b) The file READS but is not the shape this CLI generates. It is still a
+  // file Compose may well parse and launch: JSON is only a SUBSET of YAML, and
+  // an operator can legitimately rewrite the compose in ordinary YAML (anchors,
+  // unquoted mappings, block scalars). Falling back to the recorded row here
+  // restored the exact blanket overlay findings 1 and 2 removed — a service
+  // deleted from the file and a static port changed in it both became
+  // invisible, and the gate passed on a map describing a file nobody had read.
+  if (!isGeneratedComposeShape(doc)) throw unauditableIsolatedComposeError(isoPath);
   const effective = publishedPortsByService(doc);
   // Per-service fallback for the services the file declines to speak for. NOT a
   // blanket overlay: a service ABSENT from the file is not listed here, so it
   // still drops out (finding 1's removed-service case stays intact).
   for (const svc of interpolatedPortServices(doc)) {
     const recorded = base[svc];
-    if (Array.isArray(recorded) && recorded.length > 0) effective[svc] = recorded;
+    if (!Array.isArray(recorded) || recorded.length === 0) continue;
+    // ...and NOT a blanket per-service overlay either (round-3 finding 1). A
+    // MIXED service states some of its ports statically; those ARE the file
+    // speaking, and they are checked against the record BEFORE the fallback is
+    // allowed to answer for the rest. Replacing the whole list on the strength
+    // of one interpolated entry ERASED the static half, so a service publishing
+    // a port outside this instance's band (`["35434:5432", "${EXTRA}:9000"]`
+    // against a recorded `[25434]`) produced an effective map identical to the
+    // record: the divergence gate saw no disagreement and Compose bound 35434.
+    const stated = normalisePortList(effective[svc]);
+    const held = new Set(normalisePortList(recorded));
+    // A static port the record does not hold is a DISAGREEMENT. Leave the file's
+    // static ports standing as the effective truth so `assertIsolatedPortsConverge`
+    // sees it and aborts, naming the port Compose would actually bind.
+    if (stated.some((p) => !held.has(p))) continue;
+    // Every static port is one this instance already holds, so the file and the
+    // record agree as far as the file speaks; the record answers for the
+    // interpolated remainder.
+    effective[svc] = recorded;
   }
   return effective;
 }

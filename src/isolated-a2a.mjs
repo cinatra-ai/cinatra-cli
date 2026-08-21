@@ -194,10 +194,16 @@ export function deriveBandOffsetFromRow(rowPorts, baseBand) {
  * sorted set states the real question ("does this service bind a DIFFERENT set
  * of host ports than we recorded?") and answers it correctly.
  *
+ * EXPORTED (cinatra-cli#237 round-3 finding 1) so that a caller deciding whether
+ * the file's STATIC ports are ones the record already holds coerces host-port
+ * values exactly as this comparison does. Two spellings of the same coercion
+ * would drift, and a drift there reads as a port disagreement — the one thing
+ * these helpers exist to answer correctly.
+ *
  * @param {unknown} v a `[hostPort…]` list (anything else reads as empty)
  * @returns {number[]} unique, ascending
  */
-function normalisePortList(v) {
+export function normalisePortList(v) {
   const seen = new Set();
   for (const raw of Array.isArray(v) ? v : []) {
     const n = Number.parseInt(String(raw), 10);
