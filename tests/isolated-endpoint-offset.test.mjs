@@ -30,7 +30,7 @@ import path from "node:path";
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { __test as installTest, runInstall } from "../src/install.mjs";
+import { __test as installTest, runInstall, runIsolatedA2aPeers } from "../src/install.mjs";
 import {
   __test as isoTest,
   assertComposeAppUrlsRemapped,
@@ -1816,6 +1816,11 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
     expect(err).toBeInstanceOf(Error);
     expect(err.message).toMatch(/another|concurrent/i);
     expect(err.message).toMatch(/chang|mov/i);
+    // round-4 non-blocking 2: `persistIsolatedPortRepair` throws BEFORE writing
+    // anything (unlike `regenerateIsolatedComposeInPlace`, which already wrote
+    // the compose file by the time ITS lock-compare can throw) — "nothing was
+    // changed" is literally true on THIS path, so it keeps saying so.
+    expect(err.message).toMatch(/nothing was started, and nothing was\s+changed/i);
     // The whole point: a run that lost the race must never reach `startInfra` —
     // that is the route that would advertise this run's stale port while the
     // registry holds the other writer's new one.
@@ -1905,11 +1910,135 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
     expect(err).toBeInstanceOf(Error);
     expect(err.message).toMatch(/another|concurrent/i);
     expect(err.message).toMatch(/chang|mov/i);
+    // round-4 non-blocking 2: on THIS path the compose FILE has already been
+    // rewritten by the time this abort fires (`writeIsolatedComposeFile` runs
+    // before the lock) — the message must say so honestly, rather than the
+    // "nothing was changed" claim that would be false here.
+    expect(err.message).toMatch(/may already be rewritten/i);
+    expect(err.message).not.toMatch(/nothing was started, and nothing was\s+changed/i);
     // The whole point: a run that lost the race must never reach `startInfra`.
     expect(bringUpCalled).toBe(false);
 
     // The other process's row STANDS — the regeneration's own write did not
     // clobber it with the ports this run derived from its stale snapshot.
+    expect(registryRow(installDir).row.ports).toEqual(concurrentPorts);
+  });
+
+  // ── round-4 non-blocking 3 ───────────────────────────────────────────────
+  // The locked write above persists `{ports, offset}`, but the comparison
+  // used to cover only `ports`. A concurrent writer that moves ONLY the row's
+  // OFFSET (leaving `ports` exactly as this run read them) would therefore
+  // read as agreement and be silently overwritten — a moved offset is a moved
+  // row exactly like a moved port. Same fixture/seam as the round-3 blocker
+  // above (age the FILE only, hook the regeneration's own log line), but the
+  // concurrent writer touches `offset` instead of `ports`.
+  it("round-4 NB3: a row whose OFFSET moved during the regeneration's own lock window aborts, even though ports alone still agree", async () => {
+    const installDir = await freshIsolatedInstall("iso237r4-offset-race");
+    const registryFile = process.env.CINATRA_INSTANCE_REGISTRY;
+    const { slug, row: fullRow } = registryRow(installDir);
+
+    const { doc } = readGeneratedCompose(installDir);
+    expect(doc.services.wayflow).toBeDefined();
+    delete doc.services.wayflow;
+    writeCompose(installDir, doc);
+    expect(fullRow.offset).toBe(OFFSET);
+
+    const writeRowOffset = (offset) => {
+      const reg = JSON.parse(readFileSync(registryFile, "utf8"));
+      reg.instances[slug].offset = offset;
+      writeFileSync(registryFile, JSON.stringify(reg, null, 2) + "\n");
+    };
+    const movedOffset = OFFSET + 10000;
+
+    let moved = false;
+    let bringUpCalled = false;
+    const deps = { ...isolatedDeps(), bringUpInfra: () => { bringUpCalled = true; } };
+    const log = (l) => {
+      if (!moved && String(l).includes("Regenerated docker-compose.cinatra-isolated.yml")) {
+        moved = true;
+        writeRowOffset(movedOffset);
+      }
+    };
+
+    const err = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      { log, deps },
+    ).then(() => null, (e) => e);
+    expect(moved).toBe(true);
+
+    // The abort, not a skip-and-continue — and it must be caught by the OFFSET
+    // comparison specifically: ports alone are unchanged from what this run
+    // read, so only comparing offset catches this move.
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/another|concurrent/i);
+    expect(err.message).toMatch(/offset/i);
+    expect(bringUpCalled).toBe(false);
+
+    // The other process's offset STANDS — this run's write did not clobber it.
+    expect(registryRow(installDir).row.offset).toBe(movedOffset);
+  });
+
+  // ── round-4 non-blocking 1 ───────────────────────────────────────────────
+  // `regenerateIsolatedComposeInPlace` has TWO callers: `reconvergeIsolated`
+  // (whose catch already rethrows a `CONCURRENT_ROW_MOVE` instead of treating
+  // it as a best-effort regeneration failure — round-3 finding 1 / round-4)
+  // and `runIsolatedA2aPeers`'s self-heal call, whose catch still swallowed it
+  // as a warning and carried on to try to start the a2a peers against a
+  // compose file that may already have been rewritten by the aborted
+  // regeneration. This is the same race as the "round-3 blocker" test above,
+  // exercised through the SECOND caller.
+  it("round-4 NB1: the a2a-peers caller rethrows a concurrent row move instead of swallowing it", async () => {
+    // Install WITHOUT the a2a-peers baked in (plain `isolatedDeps()`, exactly
+    // the legacy shape `runIsolatedA2aPeers`'s self-heal exists for), then
+    // drive it with peer-aware deps so the peers are genuinely MISSING and a
+    // real regeneration is due.
+    const installDir = await freshIsolatedInstall("iso237r4-a2a-race");
+    const registryFile = process.env.CINATRA_INSTANCE_REGISTRY;
+    const { slug, row: fullRow } = registryRow(installDir);
+    const writeRowPorts = (ports) => {
+      const reg = JSON.parse(readFileSync(registryFile, "utf8"));
+      reg.instances[slug].ports = ports;
+      writeFileSync(registryFile, JSON.stringify(reg, null, 2) + "\n");
+    };
+    const concurrentPorts = { ...fullRow.ports, sentinel: [19999] };
+
+    let moved = false;
+    const peerAwareDeps = {
+      ...isolatedDeps(),
+      composeConfigForFiles: () => RESOLVED_CONFIG_WITH_PEERS,
+      composePublishedPortsForTarget: () => DEFAULT_BAND_WITH_PEERS,
+      // `runIsolatedA2aPeers` checks `deps.isComposeAvailable` (NOT the
+      // `composeAvailable` key `isolatedDeps()` sets for the main install
+      // route) — without this the test falls through to a REAL `docker
+      // compose version` probe, which is non-hermetic (fails on a machine
+      // without Docker, or masks the race behind a slow real subprocess).
+      isComposeAvailable: () => true,
+      // Never actually reached on this path (the rethrow fires from inside
+      // the self-heal regeneration, before `runCompose` is called) — stubbed
+      // to fail loudly if that ever changes, rather than silently shelling
+      // out to `docker`.
+      runCompose: () => {
+        throw new Error("runCompose should not be reached: the concurrent row move must abort before bring-up");
+      },
+    };
+    const log = (l) => {
+      if (!moved && String(l).includes("Regenerated docker-compose.cinatra-isolated.yml")) {
+        moved = true;
+        writeRowPorts(concurrentPorts);
+      }
+    };
+
+    const err = await runIsolatedA2aPeers(["start"], { targetDir: installDir, log, deps: peerAwareDeps }).then(
+      () => null,
+      (e) => e,
+    );
+    expect(moved).toBe(true);
+    // The abort, not a skip-and-continue: this caller must not swallow the
+    // symbol and carry on trying to start the peers.
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/another|concurrent/i);
+    expect(err.message).toMatch(/chang|mov|rewritten/i);
+    // The other process's row STANDS.
     expect(registryRow(installDir).row.ports).toEqual(concurrentPorts);
   });
 

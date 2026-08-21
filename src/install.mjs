@@ -4694,13 +4694,41 @@ const CONCURRENT_ROW_MOVE = Symbol("cinatra.concurrentRowMove");
  *  the row they compare INSIDE their lock no longer matches the snapshot they
  *  reasoned from OUTSIDE it: one message shape, spelled out in one place, so
  *  the two writers can never drift apart on what they tell the operator
- *  (cinatra-cli#237 round 3). */
-function concurrentRowMoveError(slug, expectedPorts, currentPorts) {
+ *  (cinatra-cli#237 round 3). `expectedOffset`/`currentOffset` are optional
+ *  (cinatra-cli#237 round-4 non-blocking: an offset move is a row move too) —
+ *  named in the text only when either writer actually compares offsets.
+ *
+ *  `composeFileMayBeRewritten` (cinatra-cli#237 round-4 non-blocking): the two
+ *  callers are NOT symmetric on what "nothing was changed" means.
+ *  `persistIsolatedPortRepair` throws this BEFORE writing anything — the claim
+ *  is exactly true there. `regenerateIsolatedComposeInPlace` writes the
+ *  regenerated compose FILE, then takes its lock to persist the registry row
+ *  — so when ITS compare throws, the FILE already changed even though the
+ *  registry write was refused. Chose to make the message honest about that
+ *  rather than move the file write inside the lock: the file write's log line
+ *  is the seam the round-3 race tests hook to simulate a concurrent writer
+ *  landing in this exact window (see isolated-endpoint-offset.test.mjs's
+ *  "round-3 blocker" test), so moving it would collapse that window instead of
+ *  narrowing what is said about it. */
+function concurrentRowMoveError(
+  slug,
+  expectedPorts,
+  currentPorts,
+  { expectedOffset = undefined, currentOffset = undefined, composeFileMayBeRewritten = false } = {},
+) {
+  const offsetClause =
+    expectedOffset !== undefined && expectedOffset !== currentOffset
+      ? ` Its band offset also moved (this run read ${expectedOffset ?? "none"}; the registry now holds ${currentOffset ?? "none"}).`
+      : "";
+  const changedClause = composeFileMayBeRewritten
+    ? ` The regenerated ${ISOLATED_COMPOSE_FILENAME} may already be rewritten on disk, but the registry row was NOT — the row is the ` +
+      `authority to re-run against, and the next run reads the file back from it.`
+    : ` Nothing was started, and nothing was changed.`;
   const err = new Error(
     `Refusing to bring up isolated instance "${slug}": a concurrent cinatra operation moved its recorded ` +
       `ports while this repair was in flight (this run read ${JSON.stringify(expectedPorts ?? {})}; the ` +
-      `registry now holds ${JSON.stringify(currentPorts ?? {})}). Nothing was started, and nothing was ` +
-      `changed. Re-run this command to converge against the other operation's row.`,
+      `registry now holds ${JSON.stringify(currentPorts ?? {})}).${offsetClause}${changedClause} Re-run this ` +
+      `command to converge against the other operation's row.`,
   );
   err[CONCURRENT_ROW_MOVE] = true;
   return err;
@@ -5388,12 +5416,24 @@ async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.
   // `row.ports` snapshot this regeneration reasoned from, and abort instead of
   // overwriting on any difference.
   //
+  // cinatra-cli#237 round-4 non-blocking: the WRITE below persists `{ports,
+  // offset}`, but this comparison used to cover only `ports` — a concurrent
+  // writer that moved the row's OFFSET (re-deriving/re-recording a different
+  // band for this slug) while leaving `ports` looking equal-by-the-time-we-
+  // compare would still be silently overwritten. A moved offset is a moved
+  // row exactly like a moved port, so it is compared here too.
+  const preLockOffset = Number.isInteger(row.offset) && row.offset > 0 ? row.offset : null;
   await withAllocLock(lockPath, async () => {
     const reg = requireUsableInstanceRegistry(registryPath);
     const current = getInstance(reg, row.slug);
     if (!current) return;
-    if (!samePortMaps(current.ports ?? {}, row.ports ?? {})) {
-      throw concurrentRowMoveError(row.slug, row.ports, current.ports);
+    const currentOffset = Number.isInteger(current.offset) && current.offset > 0 ? current.offset : null;
+    if (!samePortMaps(current.ports ?? {}, row.ports ?? {}) || currentOffset !== preLockOffset) {
+      throw concurrentRowMoveError(row.slug, row.ports, current.ports, {
+        expectedOffset: preLockOffset,
+        currentOffset,
+        composeFileMayBeRewritten: true,
+      });
     }
     writeInstanceRegistry(registryPath, updateInstance(reg, row.slug, { ports, offset }));
   });
@@ -5478,6 +5518,15 @@ export async function runIsolatedA2aPeers(argv = [], { targetDir = null, log = c
       const regen = await regenerateIsolatedComposeInPlace({ targetDir: dir, row, log, deps });
       if (regen.regenerated) doc = readDoc();
     } catch (err) {
+      // cinatra-cli#237 round-4 non-blocking: this is the SECOND caller of
+      // `regenerateIsolatedComposeInPlace` — `reconvergeIsolated`'s catch
+      // already rethrows a concurrent row move rather than treating it as a
+      // best-effort regeneration failure to shrug off (round-3 finding 1 /
+      // round-4). This caller must not swallow it either: the compose FILE may
+      // already be rewritten even though the registry write aborted, so
+      // carrying on here would bring the a2a peers up against a file the
+      // registry no longer agrees this instance holds.
+      if (err?.[CONCURRENT_ROW_MOVE]) throw err;
       log(`  ⚠ Could not regenerate the isolated compose (${err instanceof Error ? err.message : err}).`);
     }
   }
