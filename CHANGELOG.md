@@ -61,6 +61,76 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **An isolated install now states and provisions the endpoints it actually
+  allocated.** Two endpoint defects shared one root cause: the per-instance port
+  allocation was not threaded through to every place a port is spoken. The
+  install success line hardcoded `http://localhost:3010` for the WayFlow agent
+  runtime, although an isolated instance's runtime listens on the offset port
+  (`3010 + offset`) — exactly what the same install had already written into
+  `.env.local` as `WAYFLOW_BASE_URL`. The operator was pointed at a dead port,
+  or at the *main* instance's runtime when one held the default. Separately, the
+  generated isolated compose kept `CINATRA_BASE_URL:
+  http://host.docker.internal:3000` on the `wayflow` service while the isolated
+  app runs on its own allocated port, so everything the runtime called back into
+  the app on reached the wrong app. The success line now reads the same
+  `ports.wayflow[0]` that `.env.local` is written from, so the printed endpoint
+  and the recorded one cannot disagree. The compose generator now substitutes
+  the instance's allocated app port into every app-facing container URL that
+  still names the default one. That is a substitution and not a port shift: the
+  app port is drawn from its own pool (3300..3399), not from the infra band, so
+  `3000 + offset` would have been wrong as well. The rewrite covers the Docker
+  host gateway and the loopback spellings, leaves in-network service-DNS URLs
+  and bare listen ports alone, and stands down when a compose service genuinely
+  publishes the default app port, so it can never contend with the existing
+  band remap. A new render invariant refuses to write a generated compose that
+  still dials the default app port while the instance runs on another. The
+  same repair now reaches every route that re-converges on an instance rather
+  than installing one. A re-run and an explicit `--on-conflict=attach` both
+  read the ports from the generated compose file they are about to bring up,
+  so neither can speak from a registry row that has fallen behind it, and the
+  row is corrected when it has — otherwise `cinatra instance wayflow start`,
+  which reads that row, would keep naming the port the install tail just
+  disproved. Relatedly, the in-place regeneration that brings an older
+  instance's compose up to parity no longer decides it is current from the
+  presence of the a2a dev peers alone: a file generated once those were baked
+  in claimed to be current forever and so could never gain a service baked in
+  later, which is how an instance ended up with a runtime it never recorded a
+  port for. It now regenerates whenever the file is missing any service the
+  checkout declares, and says which ones (this is an additions-only check — a
+  service the checkout has since REMOVED, still present in an older recorded
+  file, is not what it tests for). Two further hardenings on the same reads:
+  a service the generated compose no longer publishes at all now drops out of
+  the effective map instead of surviving from a stale recorded entry (it used
+  to overlay the file on top of the row, so a service removed from the compose
+  kept advertising its old port and could be reported started for a stack that
+  does not contain it); and a SHARED service whose recorded port disagrees with
+  what the file now publishes aborts the run with an error naming both ports
+  and the recovery options, rather than warning and bringing the divergent
+  stack up anyway on a port that may already belong to another instance's
+  allocation. A short-syntax `ports` entry (`"23010:3010"`) is now read as the
+  real host-port binding it is, rather than being silently skipped when
+  reading a generated compose back. A generated compose file that cannot be
+  PARSED at all — a hand-edit that breaks the JSON-rendered-into-YAML shape
+  this CLI writes — now refuses to bring the stack up instead of falling back
+  to the recorded row, which would gate on a document nobody actually read
+  (precisely how a removed service and a changed static port slipped through
+  before this fix). The refusal names the file, explains that Compose could
+  still accept and launch it while cinatra can no longer confirm which ports
+  it binds, and points at restoring or regenerating it; nothing is started and
+  nothing is changed. Two more refusals on the same converge path are now
+  stated rather than silent. A run that discovers, inside the allocation lock,
+  that another process has moved the instance's registry row since this run
+  read it (on either writer, the lagging-row repair or the in-place
+  regeneration) aborts with an error naming both port maps instead of
+  overwriting the other run's allocation; nothing is started, and re-running
+  converges on the row as it now stands. And a shared service that has GAINED
+  a port in the generated file is read as a row lagging the file and repaired
+  only when the gained port lies inside the instance's own remap band
+  (`offset` up to `offset + band step`); a gained port outside that band, or
+  on a legacy row whose band cannot be verified, aborts before anything
+  launches, because adopting it would annex a port from another instance's
+  allocation.
+
 - **A fresh install can now actually run an agent: the WayFlow runtime mounts
   the extension repos instead of starting before they exist.** The install
   brought the local stack up — the agent runtime with it — and cloned the

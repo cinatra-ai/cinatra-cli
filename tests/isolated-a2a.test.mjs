@@ -15,6 +15,7 @@ import {
   a2aPeerUrlsFromServices,
   deriveBandOffsetFromRow,
   sharedServicePortsAgree,
+  firstSharedServicePortMismatch,
   removeEnvKey,
 } from "../src/isolated-a2a.mjs";
 
@@ -183,6 +184,130 @@ describe("sharedServicePortsAgree", () => {
   it("treats an empty/absent recorded map as trivially agreeing", () => {
     expect(sharedServicePortsAgree({}, { postgres: [25434] })).toBe(true);
     expect(sharedServicePortsAgree(null, { postgres: [25434] })).toBe(true);
+  });
+
+  // cinatra-cli#237 round-2 finding 4: a DUPLICATED declaration is not an
+  // allocation disagreement. `ports: ["25434:5432", "25434:5432/tcp"]` (or a
+  // hand-edited duplicate entry) binds the single host port 25434 — exactly what
+  // the row records. Comparing raw lists made this a length mismatch, so a
+  // perfectly healthy install refused to come up at all.
+  it("finding 4: a DUPLICATE declaration of the recorded port still agrees", () => {
+    expect(sharedServicePortsAgree({ postgres: [25434] }, { postgres: [25434, 25434] })).toBe(true);
+    expect(sharedServicePortsAgree({ postgres: [25434, 25434] }, { postgres: [25434] })).toBe(true);
+    expect(sharedServicePortsAgree({ postgres: [25434, 26379] }, { postgres: [26379, 25434, 25434] })).toBe(true);
+  });
+
+  it("finding 4: a duplicate does not hide a genuinely DIFFERENT port", () => {
+    // Deduping must not collapse a real extra allocation into agreement.
+    expect(sharedServicePortsAgree({ postgres: [25434] }, { postgres: [25434, 35434] })).toBe(false);
+    expect(sharedServicePortsAgree({ postgres: [25434, 25434] }, { postgres: [35434] })).toBe(false);
+  });
+});
+
+describe("firstSharedServicePortMismatch", () => {
+  it("names the service and both port lists on a real disagreement", () => {
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [35434] })).toEqual({
+      service: "postgres",
+      recorded: [25434],
+      actual: [35434],
+    });
+  });
+
+  it("is null when the maps agree, and ignores one-sided services", () => {
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434] })).toBeNull();
+    expect(firstSharedServicePortMismatch({ postgres: [25434], gone: [9999] }, { postgres: [25434] })).toBeNull();
+  });
+
+  it("reports the FIRST disagreement by sorted service name (stable message)", () => {
+    expect(
+      firstSharedServicePortMismatch({ zeta: [1], alpha: [2] }, { zeta: [9], alpha: [8] })?.service,
+    ).toBe("alpha");
+  });
+
+  // cinatra-cli#237 round-2 finding 4, the abort side of the same defect: this
+  // map feeds the "refuse to bring the stack up" error. A duplicate declaration
+  // reported as a mismatch BRICKS a healthy install — nothing the operator can
+  // do short of hand-editing the compose file clears it.
+  it("finding 4: a DUPLICATE declaration is not a mismatch", () => {
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434, 25434] })).toBeNull();
+    expect(firstSharedServicePortMismatch({ postgres: [25434, 25434] }, { postgres: [25434] })).toBeNull();
+  });
+
+  it("finding 4: the reported lists are the DEDUPED sets, so the message reads truthfully", () => {
+    // "(25434) disagrees with what … publishes (35434)" — never "(35434, 35434)".
+    expect(firstSharedServicePortMismatch({ postgres: [25434, 25434] }, { postgres: [35434, 35434] })).toEqual({
+      service: "postgres",
+      recorded: [25434],
+      actual: [35434],
+    });
+  });
+
+  // cinatra-cli#237 round-3 non-blocking 1: length was the wrong test — a file
+  // where a shared service GAINED a port (kept every one the record already
+  // held, plus something new) is a row lagging a superset file, not a
+  // disagreement. That is exactly the state `persistIsolatedPortRepair` exists
+  // to repair; comparing lengths aborted it instead of letting the repair run.
+  //
+  // cinatra-cli#237 round-4 blocker: round-3's fix accepted ANY superset, so a
+  // gain OUTSIDE this instance's own allocated band no longer aborted at all —
+  // the run launched on (and the row adopted) a port that may already belong
+  // to another instance. A gain is the benign lagging-row case only when it is
+  // verifiably INSIDE this instance's own band (`offset` + `bandWidth`).
+  it("round-4 blocker: a file that GAINED an IN-BAND port for a shared service is a lagging row, not a mismatch", () => {
+    const band = { offset: 20000, bandWidth: 10000 };
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434, 25435] }, band)).toBeNull();
+    // Order of the gain doesn't matter — every recorded port is still there.
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25435, 25434] }, band)).toBeNull();
+  });
+
+  it("round-4 blocker: a file that GAINED an OUT-OF-BAND port for a shared service still disagrees", () => {
+    const band = { offset: 20000, bandWidth: 10000 }; // band is [20000, 30000)
+    // 35434 is a superset of the record but falls OUTSIDE this instance's band
+    // — it may already belong to another instance's allocation.
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434, 35434] }, band)).toEqual({
+      service: "postgres",
+      recorded: [25434],
+      actual: [25434, 35434],
+    });
+  });
+
+  it("round-4 blocker: a gain cannot be verified in-band when the band is UNKNOWN, so it disagrees (fail-closed)", () => {
+    // No offset/bandWidth supplied (a legacy row that never recorded one) —
+    // the safe default is the pre-round-3 strict behaviour, not a silently
+    // unverified adoption.
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434, 25435] })).toEqual({
+      service: "postgres",
+      recorded: [25434],
+      actual: [25434, 25435],
+    });
+    // Same with an offset but no bandWidth, or a bandWidth but no offset.
+    expect(
+      firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434, 25435] }, { offset: 20000 }),
+    ).not.toBeNull();
+    expect(
+      firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434, 25435] }, { bandWidth: 10000 }),
+    ).not.toBeNull();
+  });
+
+  it("round-3 NB1: a file that DROPPED a recorded port for a shared service still disagrees", () => {
+    // The reverse direction: the record holds a port the file no longer
+    // publishes at all — a genuine change, not merely lagging, so it must keep
+    // aborting.
+    expect(firstSharedServicePortMismatch({ postgres: [25434, 25435] }, { postgres: [25434] })).toEqual({
+      service: "postgres",
+      recorded: [25434, 25435],
+      actual: [25434],
+    });
+  });
+
+  it("round-3 NB1: a genuine move still disagrees even when the file also gained a port", () => {
+    // Superset-of-a-DIFFERENT-set is not the lagging case: the file must carry
+    // every port the record does for the extra port to read as benign.
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [35434, 25435] })).toEqual({
+      service: "postgres",
+      recorded: [25434],
+      actual: [25435, 35434],
+    });
   });
 });
 
