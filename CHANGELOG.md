@@ -117,7 +117,19 @@ project adheres to [Semantic Versioning](https://semver.org/).
   before this fix). The refusal names the file, explains that Compose could
   still accept and launch it while cinatra can no longer confirm which ports
   it binds, and points at restoring or regenerating it; nothing is started and
-  nothing is changed.
+  nothing is changed. Two more refusals on the same converge path are now
+  stated rather than silent. A run that discovers, inside the allocation lock,
+  that another process has moved the instance's registry row since this run
+  read it (on either writer, the lagging-row repair or the in-place
+  regeneration) aborts with an error naming both port maps instead of
+  overwriting the other run's allocation; nothing is started, and re-running
+  converges on the row as it now stands. And a shared service that has GAINED
+  a port in the generated file is read as a row lagging the file and repaired
+  only when the gained port lies inside the instance's own remap band
+  (`offset` up to `offset + band step`); a gained port outside that band, or
+  on a legacy row whose band cannot be verified, aborts before anything
+  launches, because adopting it would annex a port from another instance's
+  allocation.
 
 - **A fresh install can now actually run an agent: the WayFlow runtime mounts
   the extension repos instead of starting before they exist.** The install
