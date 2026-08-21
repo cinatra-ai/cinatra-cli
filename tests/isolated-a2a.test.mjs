@@ -247,10 +247,46 @@ describe("firstSharedServicePortMismatch", () => {
   // held, plus something new) is a row lagging a superset file, not a
   // disagreement. That is exactly the state `persistIsolatedPortRepair` exists
   // to repair; comparing lengths aborted it instead of letting the repair run.
-  it("round-3 NB1: a file that GAINED a port for a shared service is a lagging row, not a mismatch", () => {
-    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434, 25435] })).toBeNull();
+  //
+  // cinatra-cli#237 round-4 blocker: round-3's fix accepted ANY superset, so a
+  // gain OUTSIDE this instance's own allocated band no longer aborted at all —
+  // the run launched on (and the row adopted) a port that may already belong
+  // to another instance. A gain is the benign lagging-row case only when it is
+  // verifiably INSIDE this instance's own band (`offset` + `bandWidth`).
+  it("round-4 blocker: a file that GAINED an IN-BAND port for a shared service is a lagging row, not a mismatch", () => {
+    const band = { offset: 20000, bandWidth: 10000 };
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434, 25435] }, band)).toBeNull();
     // Order of the gain doesn't matter — every recorded port is still there.
-    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25435, 25434] })).toBeNull();
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25435, 25434] }, band)).toBeNull();
+  });
+
+  it("round-4 blocker: a file that GAINED an OUT-OF-BAND port for a shared service still disagrees", () => {
+    const band = { offset: 20000, bandWidth: 10000 }; // band is [20000, 30000)
+    // 35434 is a superset of the record but falls OUTSIDE this instance's band
+    // — it may already belong to another instance's allocation.
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434, 35434] }, band)).toEqual({
+      service: "postgres",
+      recorded: [25434],
+      actual: [25434, 35434],
+    });
+  });
+
+  it("round-4 blocker: a gain cannot be verified in-band when the band is UNKNOWN, so it disagrees (fail-closed)", () => {
+    // No offset/bandWidth supplied (a legacy row that never recorded one) —
+    // the safe default is the pre-round-3 strict behaviour, not a silently
+    // unverified adoption.
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434, 25435] })).toEqual({
+      service: "postgres",
+      recorded: [25434],
+      actual: [25434, 25435],
+    });
+    // Same with an offset but no bandWidth, or a bandWidth but no offset.
+    expect(
+      firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434, 25435] }, { offset: 20000 }),
+    ).not.toBeNull();
+    expect(
+      firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434, 25435] }, { bandWidth: 10000 }),
+    ).not.toBeNull();
   });
 
   it("round-3 NB1: a file that DROPPED a recorded port for a shared service still disagrees", () => {

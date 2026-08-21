@@ -1501,17 +1501,26 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
     expect(registryRow(installDir).row.ports.redis).toEqual([RECORDED_REDIS, extraRecorded]);
   });
 
-  // ── round-3 non-blocking 1 ───────────────────────────────────────────────
+  // ── round-3 non-blocking 1 / round-4 blocker ──────────────────────────────
   // `firstSharedServicePortMismatch` used to compare list LENGTHS, so a shared
   // service that GAINED a port in the file (every recorded port still
   // published, plus a new one) read as a "disagreement" and aborted — even
   // though the file is a strict superset of the record, which is the lagging
   // row `persistIsolatedPortRepair` exists to repair, not a divergence to
   // refuse.
-  it("round-3 NB1: a shared service that GAINS a port in the file repairs the row instead of aborting", async () => {
-    const installDir = await freshIsolatedInstall("iso237r3-gained-port");
+  //
+  // Round-4's fix over-corrected: it accepted ANY superset, so a shared
+  // service gaining a port OUTSIDE this instance's own recorded band no
+  // longer aborted at all — the run launched on the foreign port and the row
+  // silently ADOPTED it. The band-aware fix restores the abort for that case
+  // while keeping the repair for a genuinely IN-BAND gain (a lagging row).
+  it("round-4 blocker: a shared service that GAINS an IN-BAND port in the file repairs the row instead of aborting", async () => {
+    const installDir = await freshIsolatedInstall("iso237r4-gained-inband");
     const { doc } = readGeneratedCompose(installDir);
-    const extraPort = RECORDED_REDIS + 5000;
+    // OFFSET=20000, BAND_OFFSET_STEP=10000 → the instance's band is
+    // [20000, 30000). This stays well inside it.
+    const extraPort = RECORDED_REDIS + 100;
+    expect(extraPort).toBeLessThan(OFFSET + 10000);
     // Keeps the recorded port AND publishes a second one — a superset, not a
     // move.
     doc.services.redis.ports = [`${RECORDED_REDIS}:6379`, `${extraPort}:6380`];
@@ -1530,6 +1539,66 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
     expect(registryRow(installDir).row.ports.redis.slice().sort((a, b) => a - b)).toEqual(
       [RECORDED_REDIS, extraPort].sort((a, b) => a - b),
     );
+  });
+
+  // cinatra-cli#237 round-4 blocker (fail-first): on `c77c024`'s behavior this
+  // gain is accepted — the run launches on the out-of-band port and the row
+  // adopts it. The fix must abort instead, exactly as a genuine port MOVE
+  // does, because the gained port may already belong to another instance's
+  // allocation.
+  it("round-4 blocker: a shared service that GAINS an OUT-OF-BAND port in the file still aborts", async () => {
+    const installDir = await freshIsolatedInstall("iso237r4-gained-outband");
+    const { doc } = readGeneratedCompose(installDir);
+    // Outside [20000, 30000) — a plausible value for ANOTHER instance's band
+    // (e.g. offset 40000), not this one's.
+    const extraPort = RECORDED_REDIS + 5000;
+    expect(extraPort).toBeGreaterThanOrEqual(OFFSET + 10000);
+    doc.services.redis.ports = [`${RECORDED_REDIS}:6379`, `${extraPort}:6380`];
+    writeCompose(installDir, doc);
+
+    let bringUpCalled = false;
+    const deps = { ...isolatedDeps(), bringUpInfra: () => { bringUpCalled = true; } };
+    const err = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      { log: () => {}, deps },
+    ).then(() => null, (e) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/redis/);
+    expect(err.message).toContain(String(extraPort));
+    // The whole point: the out-of-band port was never brought up, and the row
+    // never adopted it.
+    expect(bringUpCalled).toBe(false);
+    expect(registryRow(installDir).row.ports.redis).toEqual([RECORDED_REDIS]);
+  });
+
+  // A legacy row that never recorded an `offset` cannot have a gain verified
+  // in-band at all — the safe default is to treat it as a disagreement
+  // (fail-closed) rather than silently adopt an unverifiable port.
+  it("round-4 blocker: a gained port on a row with NO recorded offset aborts (band unverifiable)", async () => {
+    const installDir = await freshIsolatedInstall("iso237r4-gained-nooffset");
+    const registryFile = process.env.CINATRA_INSTANCE_REGISTRY;
+    const { slug } = registryRow(installDir);
+    // Simulate a legacy row: strip the recorded offset.
+    const reg = JSON.parse(readFileSync(registryFile, "utf8"));
+    delete reg.instances[slug].offset;
+    writeFileSync(registryFile, JSON.stringify(reg, null, 2) + "\n");
+
+    const { doc } = readGeneratedCompose(installDir);
+    const extraPort = RECORDED_REDIS + 100; // in-band FOR THIS OFFSET, but the offset is now unrecorded
+    doc.services.redis.ports = [`${RECORDED_REDIS}:6379`, `${extraPort}:6380`];
+    writeCompose(installDir, doc);
+
+    let bringUpCalled = false;
+    const deps = { ...isolatedDeps(), bringUpInfra: () => { bringUpCalled = true; } };
+    const err = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      { log: () => {}, deps },
+    ).then(() => null, (e) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/redis/);
+    expect(bringUpCalled).toBe(false);
   });
 
   // ── finding 2 ──────────────────────────────────────────────────────────────

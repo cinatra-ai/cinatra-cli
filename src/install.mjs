@@ -109,6 +109,7 @@ import {
   reservedPorts,
   validatePortOffset,
   DEFAULT_APP_PORT,
+  BAND_OFFSET_STEP,
 } from "./instance-alloc.mjs";
 import {
   classifyPortHolder,
@@ -4928,6 +4929,13 @@ function samePortMaps(a, b) {
  * broke the "nothing was mutated" guarantee this abort promises AND could
  * rewrite the divergence away, so the abort never fired at all.
  *
+ * cinatra-cli#237 round-4 blocker: a shared service GAINING a port is only the
+ * benign lagging-row case (see `firstSharedServicePortMismatch`) when the
+ * gained port falls INSIDE this instance's own recorded band — `offset` is
+ * threaded through so a gain outside it still aborts here, rather than
+ * launching on (and the row silently adopting) a port that may already belong
+ * to another instance.
+ *
  * @param {object} args
  * @param {string} args.slug the instance
  * @param {Record<string, number[]>} args.recordedPorts the registry row's map
@@ -4935,11 +4943,14 @@ function samePortMaps(a, b) {
  * @param {string} [args.composeProject] the recorded `-p` (names an exact
  *   `docker compose … down` in the recovery text when known)
  * @param {string} [args.registryPath] where the row lives (named in the text)
+ * @param {number|null} [args.offset] this instance's recorded band offset —
+ *   null/absent (a legacy row) means a gain can never be verified in-band, so
+ *   it is treated as a disagreement (fail-closed).
  * @throws {Error} naming the service, both ports, and how to get out
  */
-function assertIsolatedPortsConverge({ slug, recordedPorts, ports, composeProject, registryPath }) {
+function assertIsolatedPortsConverge({ slug, recordedPorts, ports, composeProject, registryPath, offset = null }) {
   if (!slug || !ports) return;
-  const mismatch = firstSharedServicePortMismatch(recordedPorts ?? {}, ports);
+  const mismatch = firstSharedServicePortMismatch(recordedPorts ?? {}, ports, { offset, bandWidth: BAND_OFFSET_STEP });
   if (!mismatch) return;
   const recorded = mismatch.recorded.join(", ");
   const actual = mismatch.actual.join(", ");
@@ -5010,9 +5021,11 @@ function assertIsolatedPortsConverge({ slug, recordedPorts, ports, composeProjec
  * @param {Record<string, number[]>} args.ports the map this run is launching on
  * @param {string} [args.composeProject] the recorded `-p` (named in the text)
  * @param {string} [args.registryPath] where the row lives (named in the text)
+ * @param {number|null} [args.offset] this instance's recorded band offset
+ *   (see `assertIsolatedPortsConverge`)
  * @throws {Error} when the file no longer converges, or can no longer be parsed
  */
-function assertIsolatedPortsStillConverge({ slug, targetDir, ports, composeProject, registryPath }) {
+function assertIsolatedPortsStillConverge({ slug, targetDir, ports, composeProject, registryPath, offset = null }) {
   if (!slug) return;
   assertIsolatedPortsConverge({
     slug,
@@ -5020,6 +5033,7 @@ function assertIsolatedPortsStillConverge({ slug, targetDir, ports, composeProje
     ports: effectiveIsolatedPorts(targetDir, ports),
     composeProject,
     registryPath,
+    offset,
   });
 }
 
@@ -5051,9 +5065,10 @@ async function persistIsolatedPortRepair({
   registryPath,
   lockPath,
   log = console.log,
+  offset = null,
 }) {
   if (!slug || !ports || samePortMaps(recordedPorts ?? {}, ports)) return;
-  assertIsolatedPortsConverge({ slug, recordedPorts, ports, composeProject, registryPath });
+  assertIsolatedPortsConverge({ slug, recordedPorts, ports, composeProject, registryPath, offset });
   try {
     await withAllocLock(lockPath, async () => {
       const reg = requireUsableInstanceRegistry(registryPath);
@@ -5127,6 +5142,7 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     ports: effectiveIsolatedPorts(targetDir, row.ports ?? {}),
     composeProject: row.composeProject,
     registryPath,
+    offset: row.offset ?? null,
   });
   // cinatra-cli#113: an instance recorded BEFORE the profile-gated services were
   // baked into the isolated compose keeps a profile-less file across every
@@ -5139,9 +5155,15 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
   // enlarged remapped-port map drives the env re-point + Nango health probe
   // below.
   let effectivePorts = row.ports ?? {};
+  // cinatra-cli#237 round-4 blocker: the band-gating below needs the offset THIS
+  // run actually used — for a legacy row without one recorded, regeneration may
+  // have DERIVED it (and persisted it), and that derived value is what the
+  // in-band check must gate on, not the pre-regeneration `row.offset` (null).
+  let effectiveOffset = Number.isInteger(row.offset) && row.offset > 0 ? row.offset : null;
   try {
     const regen = await regenerateIsolatedComposeInPlace({ targetDir, row, log, deps });
     if (regen.regenerated && regen.ports) effectivePorts = regen.ports;
+    if (regen.regenerated && Number.isInteger(regen.offset) && regen.offset > 0) effectiveOffset = regen.offset;
   } catch (err) {
     // cinatra-cli#237 round-3 finding 1: a concurrent row move is not a
     // best-effort regeneration failure to shrug off and continue past — the
@@ -5164,6 +5186,7 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     registryPath,
     lockPath,
     log,
+    offset: effectiveOffset,
   });
 
   // Re-point the env at the recorded remapped ports + bring up WITH
@@ -5183,6 +5206,7 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     ports: effectivePorts,
     composeProject: row.composeProject,
     registryPath,
+    offset: effectiveOffset,
   });
   startInfra({
     slug: row.slug,
@@ -5252,7 +5276,7 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
  *     invariants the primary generator asserts.
  *   - On success updates the recorded `ports` (enlarged) + persists `offset`.
  *
- * @returns {Promise<{ regenerated: boolean, ports?: object }>}
+ * @returns {Promise<{ regenerated: boolean, ports?: object, offset?: number }>}
  */
 async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.log, deps = {} }) {
   const getConfig = deps.composeConfigForFiles ?? composeConfigForFiles;
@@ -5363,6 +5387,7 @@ async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.
   // that repair: compare the row locked just now against the pre-lock
   // `row.ports` snapshot this regeneration reasoned from, and abort instead of
   // overwriting on any difference.
+  //
   await withAllocLock(lockPath, async () => {
     const reg = requireUsableInstanceRegistry(registryPath);
     const current = getInstance(reg, row.slug);
@@ -5373,7 +5398,7 @@ async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.
     writeInstanceRegistry(registryPath, updateInstance(reg, row.slug, { ports, offset }));
   });
 
-  return { regenerated: true, ports };
+  return { regenerated: true, ports, offset };
 }
 
 /**
@@ -5599,6 +5624,7 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
         ports: attachPorts,
         composeProject: row.composeProject,
         registryPath,
+        offset: row.offset ?? null,
       });
       await persistIsolatedPortRepair({
         slug: row.slug,
@@ -5608,6 +5634,7 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
         registryPath,
         lockPath,
         log,
+        offset: row.offset ?? null,
       });
       ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: attachPorts, log });
       const envCandidate = path.join(targetDir, ".env.local");
@@ -5624,6 +5651,7 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
         ports: attachPorts,
         composeProject: row.composeProject,
         registryPath,
+        offset: row.offset ?? null,
       });
     }
     try {

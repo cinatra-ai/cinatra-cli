@@ -270,22 +270,51 @@ export function sharedServicePortsAgree(rowPorts, newPorts) {
  * publishes (whether the file lost it outright or swapped it for a different
  * one, in either direction) still disagrees and still aborts.
  *
+ * cinatra-cli#237 round-4 blocker: round-3's fix over-corrected — it accepted
+ * ANY superset, so a shared service GAINING a port OUTSIDE this instance's own
+ * allocated band no longer aborted at all: the run launched on the foreign
+ * port and the row silently ADOPTED it. A gain is only the benign "lagging
+ * row" case when it falls INSIDE the instance's band — a gain outside it is a
+ * port that may already belong to another instance's allocation, exactly what
+ * this gate exists to refuse. The band is `[offset, offset + bandWidth)`
+ * (mirrors `instance-alloc.mjs`'s `allocateBandOffset`: a single band offset
+ * shifts every default port, all of which sit well inside one
+ * `BAND_OFFSET_STEP`-wide stride). When the band is UNKNOWN (no offset, or no
+ * bandWidth, supplied) a gain can never be verified in-band, so it is treated
+ * as a disagreement — the safe, fail-closed default; callers with a legacy row
+ * that never recorded an offset get the strict (pre-round-3) behaviour rather
+ * than a silently unverified adoption.
+ *
  * @param {Record<string, number[]>} rowPorts recorded `{ service: [hostPort…] }`
  * @param {Record<string, number[]>} newPorts freshly-read `{ service: [hostPort…] }`
+ * @param {object} [band]
+ * @param {number|null} [band.offset] this instance's recorded band offset
+ * @param {number|null} [band.bandWidth] the band's width (the allocator's
+ *   `BAND_OFFSET_STEP`); a gained port `p` is in-band when
+ *   `offset <= p < offset + bandWidth`
  * @returns {{ service: string, recorded: number[], actual: number[] } | null}
  */
-export function firstSharedServicePortMismatch(rowPorts, newPorts) {
+export function firstSharedServicePortMismatch(rowPorts, newPorts, { offset = null, bandWidth = null } = {}) {
   if (!rowPorts || typeof rowPorts !== "object") return null;
   if (!newPorts || typeof newPorts !== "object") return null;
   const norm = normalisePortList;
+  const bandKnown = Number.isInteger(offset) && offset > 0 && Number.isInteger(bandWidth) && bandWidth > 0;
+  const inBand = (p) => bandKnown && p >= offset && p < offset + bandWidth;
   for (const svc of Object.keys(rowPorts).sort()) {
     if (!Object.prototype.hasOwnProperty.call(newPorts, svc)) continue;
     const recorded = norm(rowPorts[svc]);
     const actual = norm(newPorts[svc]);
     const actualSet = new Set(actual);
     // Every recorded port still published → the file only ADDED, never
-    // contradicted, the record: a lagging row, not a disagreement.
-    if (recorded.every((p) => actualSet.has(p))) continue;
+    // contradicted, the record. That addition is a lagging row — and not a
+    // disagreement — only when every gained port stays INSIDE this instance's
+    // own band; a gain outside it (or a band we cannot verify) falls through
+    // to the disagreement below.
+    if (recorded.every((p) => actualSet.has(p))) {
+      const recordedSet = new Set(recorded);
+      const gained = actual.filter((p) => !recordedSet.has(p));
+      if (gained.length === 0 || gained.every((p) => inBand(p))) continue;
+    }
     return { service: svc, recorded, actual };
   }
   return null;
