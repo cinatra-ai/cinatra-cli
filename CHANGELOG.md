@@ -8,6 +8,35 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The preview image build can finally be tuned for a many-core builder.** The
+  checkout's Dockerfile declares two build args as its documented remedy for a
+  constrained or many-core host, and no CLI surface could send either one: the
+  preview build assembled its `--build-arg` set from the memory ceiling and `CI`
+  alone. So the remedy was unreachable from `cinatra install --mode preview` and
+  from `cinatra instance preview create | refresh`, and the only ways through
+  were to keep adding memory to the Docker VM, to reconfigure the whole machine
+  down to fewer cores, or to bypass the CLI with a hand-run `docker build`. Two
+  environment levers now reach the build. `CINATRA_PREVIEW_BUILD_CPUS` (1 .. 256)
+  sets the build's page-data worker COUNT directly: `3` gives three workers, not
+  two. It matters because only the UNSET default is derived, as
+  `os.cpus().length - 1`, and a Docker `--cpus` or `--cpuset-cpus` cap does not
+  change what that call reports. So an untuned many-core builder keeps a wide
+  worker pool however narrow its CPU quota is. The count bounds what runs AFTER
+  compile, so it does not fix a death DURING compile.
+  `CINATRA_PREVIEW_BUILD_BUNDLER=turbopack|webpack` picks the bundler, which
+  decides whether the existing memory ceiling is a lever at all: the default
+  bundler dies on native memory, which `--max-old-space-size` does not bound,
+  and the other dies on the V8 heap, which it does. Both follow the levers that
+  came before them exactly: environment variables rather than flags, so one
+  setting covers all three entrypoints; unset means unset, so an untuned preview
+  still builds the resolved commit exactly as that commit's own Dockerfile
+  defines; a malformed value is a hard error raised before any state is claimed;
+  both are logged as part of the build's identity; and a commit whose Dockerfile
+  predates the args still builds, with a warning that the values are very likely
+  ignored. A failed build now names the lever that fits the death it died: on
+  the default bundler path a native out-of-memory kill points at the worker count
+  and the bundler, not only at the V8 old-space ceiling that cannot move it. Neither lever removes the builder-memory floor the checkout documents.
+
 - **`cinatra instance preview stop | start`, and a refresh that stops rebuilding
   what it already has.** Every way to change a preview container used to go
   through a full `docker build`: there was no verb to stop, start or
@@ -86,6 +115,19 @@ project adheres to [Semantic Versioning](https://semver.org/).
   publishes rather than falling back to a hardcoded `:3010` — on an isolated or
   attached instance that reported the default stack's readiness as this one's —
   and an endpoint it cannot determine is a SKIP, never a default.
+- **`cinatra instance wayflow start` now names the endpoint the instance it
+  started actually serves on.** The success line stated `http://localhost:3010`
+  for every instance, although only the one holding the default port answers
+  there. An instance installed in isolation runs its agent runtime on its own
+  allocated port, so its operator was sent to a port with nothing behind it —
+  and, on a machine that also runs a default instance, to a port with the WRONG
+  runtime behind it, which is worse, because that one answers and every agent
+  call made against it quietly drives the other instance's stack. The port is
+  now read from the instance's own recorded port map, the same record the
+  isolated install writes `WAYFLOW_BASE_URL` from, so the address printed here
+  and the address the app dials cannot disagree. An instance that was never
+  given its own ports still gets the default one.
+
 - **A preview no longer wires itself to another instance's services, and it can
   finally reach its own connection service.** The preview composition decided
   where this instance's services live by string manipulation: it swapped a

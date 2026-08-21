@@ -219,9 +219,63 @@ export const PREVIEW_BUILD_MEMORY_MAX_MB = 65_536;
 // a GENERIC signal: the checkout and its dependencies may key other behaviour
 // off it, so this switch is broader than "typecheck on/off" by nature.
 export const PREVIEW_BUILD_TYPECHECK_ENV = "CINATRA_PREVIEW_BUILD_TYPECHECK";
-// The build-arg NAMES the Dockerfile must declare for either lever to bite.
+
+// The NATIVE-memory levers. The memory ceiling above moves V8's old space, which
+// is the wrong wall for the failure an operator actually meets: the checkout's
+// Dockerfile declares two more build args precisely for it, and the CLI could
+// not send either one, so the remedy the Dockerfile documents was unreachable
+// from `install --mode preview` and from the `instance preview` verbs.
+//
+// WHAT THE CHECKOUT MEASURED, in one line each. The numbers live in the
+// checkout's Dockerfile and its constrained-host-builds document, never here,
+// because a copy would drift:
+//
+//   - `next build` runs page-data collection / static generation across a pool
+//     of worker processes, and `CINATRA_BUILD_CPUS=<n>` IS that worker count:
+//     it reaches next as `experimental.cpus`, which next assigns straight to the
+//     worker count, so `3` means three workers. Only the UNSET default is
+//     derived, as `os.cpus().length - 1`, and a `--cpus` or `--cpuset-cpus` cap
+//     does NOT change what that call reports, so an UNTUNED many-core builder
+//     keeps a wide pool however narrow its CPU quota is. Each worker is a whole
+//     extra node process with its own heap. Setting the worker count is
+//     therefore a real memory lever, and it is the one that a 16 GiB builder
+//     needed before it completed. It bounds work that happens AFTER compile
+//     (page-data collection / static generation); it does not fix a death
+//     DURING compile.
+//   - Turbopack (the default) dies on NATIVE memory, which `--max-old-space-size`
+//     does not bound at all. Webpack dies on the V8 heap, which it does. So the
+//     bundler choice decides whether the memory ceiling is a lever or a placebo.
+//
+// NEITHER IS A CURE, and this CLI must not sell them as one: the checkout is
+// explicit that a builder far below its documented floor fails on both bundler
+// paths. They make a build on a many-core host TUNABLE; they do not remove the
+// floor.
+//
+// UNSET MEANS UNSET, exactly as the memory ceiling is: with no override the CLI
+// passes no build-arg at all, so the resolved SHA's own Dockerfile default (an
+// empty ARG, i.e. today's build) stands. A preview builds an ARBITRARY SHA, and
+// pinning the CLI's idea of a good CPU count or bundler onto it would
+// silently override a checkout that chose otherwise.
+//
+// The operator-facing names carry the `CINATRA_PREVIEW_BUILD_` prefix the other
+// three levers established, so all four read as one family and none of them can
+// be confused with the checkout's own build-time variable of a similar name.
+export const PREVIEW_BUILD_CPUS_ENV = "CINATRA_PREVIEW_BUILD_CPUS";
+// The band the checkout's own knob accepts: one CPU at the floor, and a ceiling
+// well past any real builder. The CLI validates the same band so a value the
+// checkout would reject is caught before the build starts, not an hour in.
+export const PREVIEW_BUILD_CPUS_MIN = 1;
+export const PREVIEW_BUILD_CPUS_MAX = 256;
+export const PREVIEW_BUILD_BUNDLER_ENV = "CINATRA_PREVIEW_BUILD_BUNDLER";
+// The bundlers the checkout's build launcher accepts. Kept as an ordered list so
+// help and error text quote the same two names in the same order.
+export const PREVIEW_BUILD_BUNDLERS = ["turbopack", "webpack"];
+
+// The build-arg NAMES the Dockerfile must declare for a lever to bite.
 export const PREVIEW_BUILD_MEMORY_ARG = "NODE_OPTIONS";
 export const PREVIEW_BUILD_CI_ARG = "CI";
+export const PREVIEW_BUILD_CPUS_ARG = "CINATRA_BUILD_CPUS";
+export const PREVIEW_BUILD_BUNDLER_ARG = "CINATRA_BUILD_BUNDLER";
 
 export const PREVIEW_HEALTH_TIMEOUT_MS = 180_000; // 3m health-gate budget (mirrors prod-boot-e2e default)
 export const PREVIEW_HEALTH_POLL_INTERVAL_MS = 3_000; // 3s (mirrors prod-boot-e2e sleep 3)
@@ -1256,29 +1310,103 @@ export function resolveBuildTypecheck(env = {}) {
 }
 
 /**
- * Assemble the `--build-arg` pairs the preview image build passes to
- * `docker build` (cinatra-cli#210). This is the single env-assembly seam: both
- * levers are resolved here, from the OPERATOR's environment, and nowhere else.
+ * Resolve the number of page-data / static-generation WORKERS the image build
+ * runs, or `null` when the operator set nothing. The value IS the worker count:
+ * it reaches the build as `CINATRA_BUILD_CPUS=<n>`, which the checkout hands to
+ * next as `experimental.cpus`, and next assigns that straight to the worker
+ * count. `3` in means three workers, not two.
  *
- * Returns `{ args, memoryMb, typecheck }` — `args` is the flat argv fragment,
- * `memoryMb` is `null` when the operator set no ceiling, and the rest is what
- * the caller logs.
+ * This is the lever a many-core builder needs. Only the UNSET default is
+ * derived, as `os.cpus().length - 1`, and a docker `--cpus` or `--cpuset-cpus`
+ * cap does not change what that call reports, so an UNTUNED build keeps a wide
+ * worker pool however narrow the CPU quota is. Each worker is a whole extra node
+ * process with its own heap, so the count is a memory decision, not only a speed
+ * one.
+ *
+ * FAIL-CLOSED on a bad value, for the same reason the memory ceiling is: an
+ * operator reaching for this is already fighting a build that died, and silently
+ * ignoring their value would strand them on the setting that just failed.
+ */
+export function resolveBuildCpus(env = {}) {
+  const raw = env?.[PREVIEW_BUILD_CPUS_ENV];
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  const value = raw.trim();
+  const reject = (why) => {
+    throw new Error(
+      `${PREVIEW_BUILD_CPUS_ENV}=${JSON.stringify(raw)} is invalid: ${why}. ` +
+        `Set it to a whole number of BUILD WORKERS between ${PREVIEW_BUILD_CPUS_MIN} and ` +
+        `${PREVIEW_BUILD_CPUS_MAX}, or unset it to leave the checkout's own default worker count in place. ` +
+        `It becomes --build-arg ${PREVIEW_BUILD_CPUS_ARG}=<n> for the image build; the unit is a COUNT ` +
+        `of WORKERS — <n> IS how many page-data workers the build runs, so 3 means three (no "cores"/"%" ` +
+        `suffix). Only the UNSET default is derived, as os.cpus().length - 1.`,
+    );
+  };
+  // Digits only, mirroring the other numeric levers: rules out "4.5", "4e0",
+  // "4 cores", "0x4", "+4", "-1", "Infinity" in one predicate.
+  if (!/^\d+$/.test(value)) reject("it is not a whole number of build workers");
+  const cpus = Number(value);
+  if (!Number.isSafeInteger(cpus)) reject("it is not a representable whole number");
+  if (cpus < PREVIEW_BUILD_CPUS_MIN) reject(`it is below the ${PREVIEW_BUILD_CPUS_MIN} worker minimum`);
+  if (cpus > PREVIEW_BUILD_CPUS_MAX) reject(`it exceeds the ${PREVIEW_BUILD_CPUS_MAX} worker maximum`);
+  return cpus;
+}
+
+/**
+ * Resolve the BUNDLER the image build runs, or `null` when the operator set
+ * nothing (the resolved SHA keeps its own default).
+ *
+ * Why it is a lever at all: the default path fails on NATIVE memory, which
+ * `--max-old-space-size` does not bound; the other path fails on the V8 heap,
+ * which it does. Switching is how an operator makes the memory ceiling
+ * meaningful for their build.
+ *
+ * Case-insensitive and returned LOWERCASE, because the checkout's own build
+ * launcher lowercases before it matches. Anything outside the accepted set is a
+ * hard error. A typo that costs a long build and then reports the other bundler
+ * is worse than no lever at all.
+ */
+export function resolveBuildBundler(env = {}) {
+  const raw = env?.[PREVIEW_BUILD_BUNDLER_ENV];
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  const value = raw.trim().toLowerCase();
+  if (!PREVIEW_BUILD_BUNDLERS.includes(value)) {
+    throw new Error(
+      `${PREVIEW_BUILD_BUNDLER_ENV}=${JSON.stringify(raw)} is invalid: it is not a recognised bundler. ` +
+        `Accepted values: ${PREVIEW_BUILD_BUNDLERS.join(", ")}, or unset to leave the checkout's own default ` +
+        `in place. It becomes --build-arg ${PREVIEW_BUILD_BUNDLER_ARG}=<bundler> for the image build.`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Assemble the `--build-arg` pairs the preview image build passes to
+ * `docker build`. This is the single env-assembly seam: every lever is resolved
+ * here, from the OPERATOR's environment, and nowhere else.
+ *
+ * Returns `{ args, memoryMb, typecheck, cpus, bundler }`. `args` is the flat
+ * argv fragment, each value is `null` when the operator set nothing, and the
+ * rest is what the caller logs.
  *
  * `CI` is always passed EXPLICITLY, including in the typecheck-on case where it
  * is passed empty. Passing `CI=` empty is not the same as omitting it: it pins
  * the build to the Dockerfile's documented "no CI" behaviour instead of leaving
- * it to whatever that SHA's ARG default happens to be. `NODE_OPTIONS` is the
+ * it to whatever that SHA's ARG default happens to be. Every other arg is the
  * opposite by design: it is passed ONLY on an explicit override, so an untuned
- * preview never overrides the resolved SHA's own ceiling.
+ * preview never overrides the resolved SHA's own defaults.
  */
 export function buildPreviewBuildArgs(env = {}) {
   const memoryMb = resolveBuildMemoryMb(env);
   const typecheck = resolveBuildTypecheck(env);
+  const cpus = resolveBuildCpus(env);
+  const bundler = resolveBuildBundler(env);
   const args = ["--build-arg", `${PREVIEW_BUILD_CI_ARG}=${typecheck ? "" : "true"}`];
   if (memoryMb !== null) {
     args.push("--build-arg", `${PREVIEW_BUILD_MEMORY_ARG}=--max-old-space-size=${memoryMb}`);
   }
-  return { memoryMb, typecheck, args };
+  if (cpus !== null) args.push("--build-arg", `${PREVIEW_BUILD_CPUS_ARG}=${cpus}`);
+  if (bundler !== null) args.push("--build-arg", `${PREVIEW_BUILD_BUNDLER_ARG}=${bundler}`);
+  return { memoryMb, typecheck, cpus, bundler, args };
 }
 
 /**
@@ -1368,19 +1496,40 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
       ? `  build memory: the checkout's own Dockerfile ceiling (cinatra's bakes in ` +
         `--max-old-space-size=${PREVIEW_BUILD_MEMORY_CHECKOUT_DEFAULT_MB}); override the V8 old-space limit ` +
         `with ${PREVIEW_BUILD_MEMORY_ENV} (${PREVIEW_BUILD_MEMORY_MIN_MB}..${PREVIEW_BUILD_MEMORY_MAX_MB} MB) ` +
-        `if the build dies out of memory.`
+        `for a "JavaScript heap out of memory" death.`
       : `  build memory: --max-old-space-size=${build.memoryMb} (MB, ${PREVIEW_BUILD_MEMORY_ENV} override).`) +
       ` In-build tsc ${build.typecheck ? `ON (${PREVIEW_BUILD_TYPECHECK_ENV})` : `skipped (CI=true, as the CI image build does)`}.`,
+  );
+  // The native-memory levers are part of the build's identity too, so they are
+  // logged on EVERY build for the same reason the ceiling is: an operator reading
+  // a failed build must see what it actually ran with, and an operator whose
+  // build has not failed yet must be able to discover the levers without going
+  // back to the help.
+  deps.log?.(
+    `  build workers: ` +
+      (build.cpus === null
+        ? `the checkout's own default worker count, os.cpus().length - 1 (${PREVIEW_BUILD_CPUS_ENV} ` +
+          `sets it directly, ${PREVIEW_BUILD_CPUS_MIN}..${PREVIEW_BUILD_CPUS_MAX}).`
+        : `${build.cpus} (${PREVIEW_BUILD_CPUS_ENV} override).`) +
+      ` Bundler: ` +
+      (build.bundler === null
+        ? `the checkout's own default (${PREVIEW_BUILD_BUNDLER_ENV}=${PREVIEW_BUILD_BUNDLERS.join("|")} switches it).`
+        : `${build.bundler} (${PREVIEW_BUILD_BUNDLER_ENV} override).`),
   );
   // Warn — never block — when THIS SHA's Dockerfile does not declare an ARG a
   // lever is being passed for: docker drops an unconsumed --build-arg with only a
   // warning, so the lever would look set and do nothing. Only the args actually
-  // being PASSED are checked (`NODE_OPTIONS` is passed only on an override), and
-  // only a MISSING declaration is reported — see `dockerfileDeclaredBuildArgs`
+  // being PASSED are checked (every arg but `CI` is passed only on an override),
+  // and only a MISSING declaration is reported. See `dockerfileDeclaredBuildArgs`
   // for why the converse is not something this scan can honestly claim.
   const declared = dockerfileDeclaredBuildArgs(contextDir);
   if (declared) {
-    const passed = [PREVIEW_BUILD_CI_ARG, ...(build.memoryMb === null ? [] : [PREVIEW_BUILD_MEMORY_ARG])];
+    const passed = [
+      PREVIEW_BUILD_CI_ARG,
+      ...(build.memoryMb === null ? [] : [PREVIEW_BUILD_MEMORY_ARG]),
+      ...(build.cpus === null ? [] : [PREVIEW_BUILD_CPUS_ARG]),
+      ...(build.bundler === null ? [] : [PREVIEW_BUILD_BUNDLER_ARG]),
+    ];
     const inert = passed.filter((n) => !declared.has(n));
     if (inert.length > 0) {
       deps.log?.(
@@ -1407,9 +1556,12 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
         (r.stderr ? `: ${r.stderr.trim()}` : ".") +
         ` The build runs the checkout's own multi-stage Dockerfile (acquire-prod, required-OAS seed, ` +
         `manifest regen, next build); fix the underlying error and retry.` +
-        // cinatra-cli#210: an out-of-memory build is the one failure the timeout
-        // lever CANNOT fix, so name the memory lever on every non-timeout
-        // failure rather than leaving the operator to re-read the help.
+        // An out-of-memory build is the one failure the timeout lever CANNOT
+        // fix, so name the memory levers on every non-timeout failure rather
+        // than leaving the operator to re-read the help. Name the APPLICABLE
+        // one: the default bundler dies on native memory, which the V8 ceiling
+        // does not bound, so pointing only at that ceiling sends an operator to
+        // raise a limit that is not the binding constraint.
         (r.timedOut
           ? ""
           : ` If it died out of memory, that is a MEMORY failure and a larger build budget cannot fix it. ` +
@@ -1421,8 +1573,30 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
             `A NATIVE "cannot allocate memory" is NOT that limit, and an exit-code-137 kill only tells you ` +
             `something sent SIGKILL — neither identifies the cause, and ${PREVIEW_BUILD_MEMORY_ENV} does not ` +
             `bound native allocation. Check Docker/host memory pressure first; more VM RAM MAY help, but ` +
-            `cinatra-cli#210 measured a native wall that survived 4 GB to 14 GB, and clearing that needs the ` +
-            `checkout-side build-concurrency / bundler-fallback control that issue tracks.`) +
+            `a native wall has been measured that survived 4 GB to 14 GB. The build-concurrency / ` +
+            `bundler-fallback levers are what address it. Set the page-data worker COUNT with ` +
+            `${PREVIEW_BUILD_CPUS_ENV} (${PREVIEW_BUILD_CPUS_MIN}..${PREVIEW_BUILD_CPUS_MAX}; <n> IS the ` +
+            `worker count, so 3 means three — this build used ${
+              build.cpus === null ? `the checkout's own default worker count, os.cpus().length - 1` : `${build.cpus}`
+            }), which a docker --cpus cap does NOT do because an UNTUNED build derives that default from ` +
+            `os.cpus().length. Mind the PHASE: the worker count bounds what runs AFTER compile (page-data ` +
+            `collection / static generation), so it does not fix a death DURING compile — that is what the ` +
+            `bundler choice addresses. ` +
+            // Name the bundler advice that fits the bundler this build actually
+            // ran. Telling an operator who already pinned webpack to "switch
+            // bundler" is not actionable, and it hides the fact that on webpack
+            // the V8 ceiling IS the applicable lever.
+            (build.bundler === "webpack"
+              ? `This build already ran on webpack (${PREVIEW_BUILD_BUNDLER_ENV}), which fails on the V8 heap ` +
+                `rather than on native memory, so ${PREVIEW_BUILD_MEMORY_ENV} is the ceiling that applies here ` +
+                `and the bundler lever has nothing left to give. `
+              : (build.bundler === "turbopack"
+                  ? `This build pinned turbopack (${PREVIEW_BUILD_BUNDLER_ENV}), and on that path a native `
+                  : `This build pinned no bundler, so it ran whatever this SHA defaults to. If that is ` +
+                    `Turbopack, a native `) +
+                `death is the expected one and ${PREVIEW_BUILD_MEMORY_ENV} cannot move it: pin webpack with ` +
+                `${PREVIEW_BUILD_BUNDLER_ENV}=webpack, whose V8-heap ceiling it can. `) +
+            `Neither removes the checkout's documented builder-memory floor.`) +
         (r.timedOut
           ? ` If the build was still ADVANCING, this is a budget problem, not a hang: re-run with a larger ` +
             `${PREVIEW_BUILD_TIMEOUT_ENV} (milliseconds, max ${PREVIEW_BUILD_TIMEOUT_MAX_MS} = ` +
@@ -1816,9 +1990,10 @@ export async function runPreviewCreate(rest, injected = {}) {
   // probe — so a typo costs nothing to recover from. `buildPreviewImage`
   // re-resolves the same value at the build itself (single source of truth).
   resolveBuildTimeoutMs(deps.buildControlEnv ?? process.env);
-  // cinatra-cli#210: the two build levers get the same fail-fast treatment, for
-  // the same reason — a typo'd ceiling must cost nothing, not surface an hour
-  // into a build (or, worse, only after the slug/port/volume state was claimed).
+  // cinatra-cli#210: every build-arg lever gets the same fail-fast treatment,
+  // for the same reason: a typo'd ceiling, CPU count or bundler must cost
+  // nothing, not surface an hour into a build (or, worse, only after the
+  // slug/port/volume state was claimed).
   buildPreviewBuildArgs(deps.buildControlEnv ?? process.env);
   // cinatra-cli#219: the endpoint-ownership mode lever gets the SAME fail-fast
   // treatment — a typo'd value must be rejected before any state is claimed,
@@ -1992,7 +2167,7 @@ export async function runPreviewRefresh(rest, injected = {}) {
   // registry claim and the container replacement — a typo'd override must not
   // surface only after the old preview has been put into `provisioning`.
   resolveBuildTimeoutMs(deps.buildControlEnv ?? process.env);
-  buildPreviewBuildArgs(deps.buildControlEnv ?? process.env); // cinatra-cli#210 — same fail-fast for the build levers
+  buildPreviewBuildArgs(deps.buildControlEnv ?? process.env); // same fail-fast for every build-arg lever
   resolveEndpointOwnershipMode(deps.ownershipControlEnv ?? deps.env ?? process.env); // cinatra-cli#219
 
   // AC9: refuse a genuine `--mode prod` checkout up front — checkout-derived and
@@ -2625,8 +2800,15 @@ export const __test = {
   PREVIEW_BUILD_MEMORY_MIN_MB,
   PREVIEW_BUILD_MEMORY_MAX_MB,
   PREVIEW_BUILD_TYPECHECK_ENV,
+  PREVIEW_BUILD_CPUS_ENV,
+  PREVIEW_BUILD_CPUS_MIN,
+  PREVIEW_BUILD_CPUS_MAX,
+  PREVIEW_BUILD_BUNDLER_ENV,
+  PREVIEW_BUILD_BUNDLERS,
   PREVIEW_BUILD_MEMORY_ARG,
   PREVIEW_BUILD_CI_ARG,
+  PREVIEW_BUILD_CPUS_ARG,
+  PREVIEW_BUILD_BUNDLER_ARG,
   PREVIEW_STOP_TIMEOUT_MS,
   SUPERSEDED_CONTAINER_SUFFIX,
   // pure helpers
@@ -2665,6 +2847,8 @@ export const __test = {
   // docker steps
   resolveBuildMemoryMb,
   resolveBuildTypecheck,
+  resolveBuildCpus,
+  resolveBuildBundler,
   buildPreviewBuildArgs,
   dockerfileDeclaredBuildArgs,
   buildPreviewImage,
