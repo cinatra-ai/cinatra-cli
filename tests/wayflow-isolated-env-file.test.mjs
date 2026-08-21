@@ -1634,6 +1634,14 @@ export default () => ({
   ensureNangoSecretKey: () => null,
   buildWayflowImage: () => ({ ok: true, stderr: "", status: 0 }),
   runComposeDown: () => {},
+  // cinatra-cli#233 (merged after this fixture was written): the install tail
+  // now runs a real post-bring-up agent-mount verification for any install
+  // that owns a local runtime. \`bringUpInfra\` is stubbed to a no-op above, so
+  // there is no real container for that step to reach — stub it too, with a
+  // non-failing status, so these tests keep proving what THEY test (the D1
+  // generation-failure exit code) rather than tripping on an unrelated,
+  // separately-tested feature.
+  mountAgentSourcesAfterSync: () => ({ status: "already-mounted", mounted: [] }),
 });
 `;
 

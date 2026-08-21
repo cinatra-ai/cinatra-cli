@@ -70,13 +70,55 @@ export function deriveA2aPeerServices(doc) {
 
 /**
  * Whether a compose doc already carries the a2a-peers services (at least one
- * a2a-peers-profiled service WITH a published port). Used to decide if a
- * recorded isolated compose predates the profile-baking change and needs an
- * in-place regeneration. Deliberately specific (not merely "has any profile")
- * so an unusual partial state still regenerates.
+ * a2a-peers-profiled service WITH a published port). Deliberately specific (not
+ * merely "has any profile") so an unusual partial state still regenerates.
+ *
+ * NOT the staleness test for an in-place regeneration any more — see
+ * `missingIsolatedServices`. Retained because `cinatra instance a2a` asks this
+ * exact question (it needs the PEERS specifically, not currency in general) and
+ * because it is the only staleness signal available when the checkout's own
+ * config cannot be resolved.
  */
 export function isolatedComposeHasA2aPeers(doc) {
   return deriveA2aPeerServices(doc).length > 0;
+}
+
+/**
+ * The services the checkout's resolved compose config declares that a recorded
+ * isolated compose does NOT carry, sorted. Empty ⇒ the file is missing no
+ * service the checkout currently declares — NOT proof the file is "current" in
+ * general: this is an ADDITIONS-only test (see below), so a service the
+ * checkout REMOVED but the file still carries is invisible to it.
+ *
+ * cinatra-cli#231 (round-2 review): the in-place regeneration used to decide
+ * "current" with `isolatedComposeHasA2aPeers` — a marker for ONE historical
+ * baking (cinatra-cli#113's a2a peers). A compose generated once the peers were
+ * baked in therefore reported itself current FOREVER and could never gain a
+ * service baked in later, and cinatra#2654's `wayflow` is exactly such a
+ * service. The recorded port map then kept no `wayflow` entry, so the reconcile
+ * had nothing to re-point `.env.local` with and the install tail named the
+ * DEFAULT :3010 for a runtime listening on the offset port — this issue's own
+ * defect, reached by the route the marker hid. Asking which services are MISSING
+ * is the question that marker was standing in for, and it needs no new marker
+ * for the next service baked in.
+ *
+ * Only ADDITIONS are reported. A service present in the recorded compose but
+ * absent from the checkout — one removed upstream, or an operator's own — is
+ * deliberately ignored: an in-place regeneration is a repair for a file that
+ * fell behind, never a reason to drop something already there. (It would be
+ * dropped anyway if a regeneration runs for another reason; that is the
+ * pre-existing "regenerate from the checkout" contract, not a new decision.)
+ *
+ * @param {object} existingDoc parsed recorded isolated compose
+ * @param {object} resolvedConfig parsed `docker compose config` of the checkout
+ * @returns {string[]} the missing service names
+ */
+export function missingIsolatedServices(existingDoc, resolvedConfig) {
+  const have = existingDoc?.services && typeof existingDoc.services === "object" ? existingDoc.services : {};
+  const want = resolvedConfig?.services && typeof resolvedConfig.services === "object" ? resolvedConfig.services : {};
+  return Object.keys(want)
+    .filter((name) => !Object.hasOwn(have, name))
+    .sort();
 }
 
 /** Build the peer base-URL list for the app env from the enumerated services.
@@ -139,6 +181,38 @@ export function deriveBandOffsetFromRow(rowPorts, baseBand) {
 }
 
 /**
+ * The comparable form of one service's host-port list: parsed to integers,
+ * DEDUPED, sorted ascending.
+ *
+ * cinatra-cli#237 round-2 finding 4: the set of host ports a service binds is
+ * what the two sides are actually asserting about, and a port declared TWICE
+ * (`ports: ["25434:5432", "25434:5432/tcp"]`, or a hand-edited duplicate entry)
+ * binds the same single port — it is a redundant DECLARATION, not an allocation
+ * disagreement. Comparing raw lists made `[25434]` vs `[25434, 25434]` a
+ * length mismatch, which bricked a perfectly healthy install: the re-converge
+ * refused to bring the stack up at all. Normalising both sides to a unique
+ * sorted set states the real question ("does this service bind a DIFFERENT set
+ * of host ports than we recorded?") and answers it correctly.
+ *
+ * EXPORTED (cinatra-cli#237 round-3 finding 1) so that a caller deciding whether
+ * the file's STATIC ports are ones the record already holds coerces host-port
+ * values exactly as this comparison does. Two spellings of the same coercion
+ * would drift, and a drift there reads as a port disagreement — the one thing
+ * these helpers exist to answer correctly.
+ *
+ * @param {unknown} v a `[hostPort…]` list (anything else reads as empty)
+ * @returns {number[]} unique, ascending
+ */
+export function normalisePortList(v) {
+  const seen = new Set();
+  for (const raw of Array.isArray(v) ? v : []) {
+    const n = Number.parseInt(String(raw), 10);
+    if (Number.isInteger(n)) seen.add(n);
+  }
+  return [...seen].sort((a, b) => a - b);
+}
+
+/**
  * Whether every service present in BOTH a recorded remapped-port map and a
  * freshly generated one keeps the SAME host port(s). The determinism safety net
  * for an in-place regeneration: regenerating the isolated compose must never
@@ -151,6 +225,9 @@ export function deriveBandOffsetFromRow(rowPorts, baseBand) {
  * Services present on only ONE side are ignored: a new profile-gated service
  * (present only in the regenerated map) is the whole point, and a service that
  * dropped its published port (present only in the recorded map) cannot move.
+ * Both sides are compared as unique sorted SETS (`normalisePortList`), so a
+ * duplicated declaration never reads as a move (cinatra-cli#237 round-2
+ * finding 4).
  *
  * @param {Record<string, number[]>} rowPorts recorded `{ service: [hostPort…] }`
  * @param {Record<string, number[]>} newPorts regenerated `{ service: [hostPort…] }`
@@ -159,11 +236,7 @@ export function deriveBandOffsetFromRow(rowPorts, baseBand) {
 export function sharedServicePortsAgree(rowPorts, newPorts) {
   if (!rowPorts || typeof rowPorts !== "object") return true;
   if (!newPorts || typeof newPorts !== "object") return false;
-  const norm = (v) =>
-    (Array.isArray(v) ? v : [])
-      .map((n) => Number.parseInt(String(n), 10))
-      .filter((n) => Number.isInteger(n))
-      .sort((a, b) => a - b);
+  const norm = normalisePortList;
   for (const [svc, recorded] of Object.entries(rowPorts)) {
     if (!Object.prototype.hasOwnProperty.call(newPorts, svc)) continue;
     const a = norm(recorded);
@@ -174,6 +247,77 @@ export function sharedServicePortsAgree(rowPorts, newPorts) {
     }
   }
   return true;
+}
+
+/**
+ * The first (by service name, sorted — deterministic) shared-service host-port
+ * disagreement between a recorded map and a freshly-read one, or null when
+ * there is none. Same shared-only comparison and normalisation as
+ * `sharedServicePortsAgree` (unique sorted sets — a duplicated declaration is
+ * not an allocation disagreement, cinatra-cli#237 round-2 finding 4), kept as
+ * a separate function so that boolean gate stays a simple yes/no while a
+ * caller that must ABORT and NAME the disagreement (cinatra-cli#237 findings
+ * 2/4: a mismatch on a shared service must stop the run, not just skip a
+ * best-effort persist) can report the service plus both port lists in its
+ * error.
+ *
+ * cinatra-cli#237 round-3 non-blocking 1: this used to compare list LENGTHS,
+ * so a file where a shared service GAINED a port (every recorded port still
+ * published, plus a new one) read as a disagreement and aborted — even though
+ * it is not one: the row simply lags a file that is a strict superset of it,
+ * which is exactly the state `persistIsolatedPortRepair` exists to repair.
+ * Genuine-move semantics are unchanged: a recorded port the file no longer
+ * publishes (whether the file lost it outright or swapped it for a different
+ * one, in either direction) still disagrees and still aborts.
+ *
+ * cinatra-cli#237 round-4 blocker: round-3's fix over-corrected — it accepted
+ * ANY superset, so a shared service GAINING a port OUTSIDE this instance's own
+ * allocated band no longer aborted at all: the run launched on the foreign
+ * port and the row silently ADOPTED it. A gain is only the benign "lagging
+ * row" case when it falls INSIDE the instance's band — a gain outside it is a
+ * port that may already belong to another instance's allocation, exactly what
+ * this gate exists to refuse. The band is `[offset, offset + bandWidth)`
+ * (mirrors `instance-alloc.mjs`'s `allocateBandOffset`: a single band offset
+ * shifts every default port, all of which sit well inside one
+ * `BAND_OFFSET_STEP`-wide stride). When the band is UNKNOWN (no offset, or no
+ * bandWidth, supplied) a gain can never be verified in-band, so it is treated
+ * as a disagreement — the safe, fail-closed default; callers with a legacy row
+ * that never recorded an offset get the strict (pre-round-3) behaviour rather
+ * than a silently unverified adoption.
+ *
+ * @param {Record<string, number[]>} rowPorts recorded `{ service: [hostPort…] }`
+ * @param {Record<string, number[]>} newPorts freshly-read `{ service: [hostPort…] }`
+ * @param {object} [band]
+ * @param {number|null} [band.offset] this instance's recorded band offset
+ * @param {number|null} [band.bandWidth] the band's width (the allocator's
+ *   `BAND_OFFSET_STEP`); a gained port `p` is in-band when
+ *   `offset <= p < offset + bandWidth`
+ * @returns {{ service: string, recorded: number[], actual: number[] } | null}
+ */
+export function firstSharedServicePortMismatch(rowPorts, newPorts, { offset = null, bandWidth = null } = {}) {
+  if (!rowPorts || typeof rowPorts !== "object") return null;
+  if (!newPorts || typeof newPorts !== "object") return null;
+  const norm = normalisePortList;
+  const bandKnown = Number.isInteger(offset) && offset > 0 && Number.isInteger(bandWidth) && bandWidth > 0;
+  const inBand = (p) => bandKnown && p >= offset && p < offset + bandWidth;
+  for (const svc of Object.keys(rowPorts).sort()) {
+    if (!Object.prototype.hasOwnProperty.call(newPorts, svc)) continue;
+    const recorded = norm(rowPorts[svc]);
+    const actual = norm(newPorts[svc]);
+    const actualSet = new Set(actual);
+    // Every recorded port still published → the file only ADDED, never
+    // contradicted, the record. That addition is a lagging row — and not a
+    // disagreement — only when every gained port stays INSIDE this instance's
+    // own band; a gain outside it (or a band we cannot verify) falls through
+    // to the disagreement below.
+    if (recorded.every((p) => actualSet.has(p))) {
+      const recordedSet = new Set(recorded);
+      const gained = actual.filter((p) => !recordedSet.has(p));
+      if (gained.length === 0 || gained.every((p) => inBand(p))) continue;
+    }
+    return { service: svc, recorded, actual };
+  }
+  return null;
 }
 
 /**

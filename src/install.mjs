@@ -111,6 +111,8 @@ import {
   assertAppPortFree,
   reservedPorts,
   validatePortOffset,
+  DEFAULT_APP_PORT,
+  BAND_OFFSET_STEP,
 } from "./instance-alloc.mjs";
 import {
   classifyPortHolder,
@@ -122,6 +124,9 @@ import {
   canonicalPath,
   checkoutDeclaredEnvFiles,
   parseIsolatedComposeDoc,
+  assertComposeAppUrlsRemapped,
+  publishedPortsByService,
+  interpolatedPortServices,
   ISOLATED_COMPOSE_FILENAME,
   WAYFLOW_TOKEN_KEY,
 } from "./install-isolation.mjs";
@@ -133,6 +138,8 @@ import {
   a2aPeerUrlsFromServices,
   deriveBandOffsetFromRow,
   sharedServicePortsAgree,
+  firstSharedServicePortMismatch,
+  normalisePortList,
   removeEnvKey,
 } from "./isolated-a2a.mjs";
 import { rejectTailscaleAuthkeyFlag } from "./clone-runtime.mjs";
@@ -159,7 +166,7 @@ import {
 // cinatra-cli#194: the preview image-build budget lever. `preview.mjs` is plain
 // ESM over node builtins (importable from the light CLI core), and only the pure
 // validator is used here — the lifecycle itself stays lazy-imported below.
-import { resolveBuildTimeoutMs } from "./preview.mjs";
+import { resolveBuildTimeoutMs, buildPreviewBuildArgs } from "./preview.mjs";
 // cinatra#2654: the WayFlow agent runtime starts with every install-owned local
 // stack. The decision, the operator-facing status text, and the two pre-`up`
 // steps (bridge-token env, image build) live in their own builtins-only module
@@ -167,6 +174,7 @@ import { resolveBuildTimeoutMs } from "./preview.mjs";
 import {
   WAYFLOW_PROFILE,
   WAYFLOW_RUNTIME_KEY,
+  WAYFLOW_RUNTIME_LOCAL,
   buildWayflowImage,
   generateWayflowEnv,
   resolveWayflowRuntimeMode,
@@ -177,7 +185,18 @@ import {
   envFileSuppliedKeys,
   wayflowStatusLines,
   WAYFLOW_ENV_FILE,
+  wayflowEndpointForPorts,
 } from "./wayflow-runtime.mjs";
+// cinatra-cli#233 — the runtime is started with the rest of the stack, BEFORE
+// the extension sources it bind-mounts are on disk, so a fresh install mounts
+// 0 agents. This module makes the running runtime pick them up once the sync
+// has put them there (builtins-only, injectable, hermetically testable).
+import {
+  agentMountFailedClosed,
+  agentsUnavailableVerdictLines,
+  claimAgentsUnavailableExitCode,
+  mountAgentSourcesAfterSync,
+} from "./wayflow-agent-mount.mjs";
 import {
   deriveCoUseSlug,
   coUseDbName,
@@ -681,15 +700,20 @@ export function parseInstallArgs(argv = []) {
     );
   }
 
-  // cinatra-cli#194: validate the preview build-budget override HERE, in the
-  // same "before any side effect" position as the refusal above. The front door
-  // is a COMPOSITION — the whole dev install runs before the preview lifecycle
-  // is reached — so validating only at the preview stage would let a typo'd
-  // budget cost an operator a full install before surfacing. Preview-only: the
-  // variable has no meaning for a plain dev/prod/demo install, and rejecting it
-  // there would break an operator who simply exports it in their shell profile.
+  // cinatra-cli#194: validate the preview build levers HERE, in the same
+  // "before any side effect" position as the refusal above. The front door is a
+  // COMPOSITION: the whole dev install runs before the preview lifecycle is
+  // reached. Validating only at the preview stage would let a typo cost an
+  // operator a full install before surfacing. That argument covers the build
+  // budget and every `--build-arg` lever equally: the memory ceiling, the
+  // typecheck switch, the build worker count and the bundler are all read from
+  // the same operator environment and all reach the same build. Preview-only:
+  // these variables have no meaning for a plain dev/prod/demo install, and
+  // rejecting them there would break an operator who simply exports one in
+  // their shell profile.
   if (surfaceMode === PREVIEW_SURFACE_MODE_VALUE) {
     resolveBuildTimeoutMs(process.env);
+    buildPreviewBuildArgs(process.env);
   }
 
   return {
@@ -3244,6 +3268,10 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       projectName: composeProject,
       slug,
       appPort,
+      // cinatra-cli#231: the port the checkout's compose was written against, so
+      // every app-facing container URL still naming it is re-pointed at THIS
+      // instance's `appPort` (the runtime's CINATRA_BASE_URL callback).
+      defaultAppPort: DEFAULT_APP_PORT,
       envFileKeys,
     });
 
@@ -3282,6 +3310,17 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       envFilesPreserved,
       wayflow: opts.wayflow !== false,
       deps,
+    });
+
+    // cinatra-cli#231 invariant: NO generated service env may still dial the
+    // DEFAULT app port through the host gateway while this instance's app runs on
+    // its own allocated port — else the runtime's callback (wayflow's
+    // CINATRA_BASE_URL) reaches the MAIN instance's app, or nothing at all. Holds
+    // by construction; asserted defensively for the same reason as the #97 check.
+    assertComposeAppUrlsRemapped(doc, {
+      appPort,
+      defaultAppPort: DEFAULT_APP_PORT,
+      publishedPorts: new Set(baseBand.map((b) => b.port)),
     });
 
     // Persist the generated compose + provisioning row + marker (recording the
@@ -4970,6 +5009,465 @@ function lookupOwnIsolatedRow(targetDir) {
   return null;
 }
 
+/** Marks the one error `persistIsolatedPortRepair` and `regenerateIsolatedComposeInPlace`
+ *  raise deliberately — the row moved under the lock — so a catch can tell that
+ *  refusal apart from a genuine failure to write and report it as what it is
+ *  (cinatra-cli#237 round-3 findings 1 + 4). A symbol, so it can never collide
+ *  with an Error field. */
+const CONCURRENT_ROW_MOVE = Symbol("cinatra.concurrentRowMove");
+
+/** Build + tag the abort both of this instance's registry writers raise when
+ *  the row they compare INSIDE their lock no longer matches the snapshot they
+ *  reasoned from OUTSIDE it: one message shape, spelled out in one place, so
+ *  the two writers can never drift apart on what they tell the operator
+ *  (cinatra-cli#237 round 3). `expectedOffset`/`currentOffset` are optional
+ *  (cinatra-cli#237 round-4 non-blocking: an offset move is a row move too) —
+ *  named in the text only when either writer actually compares offsets.
+ *
+ *  `composeFileMayBeRewritten` (cinatra-cli#237 round-4 non-blocking): the two
+ *  callers are NOT symmetric on what "nothing was changed" means.
+ *  `persistIsolatedPortRepair` throws this BEFORE writing anything — the claim
+ *  is exactly true there. `regenerateIsolatedComposeInPlace` writes the
+ *  regenerated compose FILE, then takes its lock to persist the registry row
+ *  — so when ITS compare throws, the FILE already changed even though the
+ *  registry write was refused. Chose to make the message honest about that
+ *  rather than move the file write inside the lock: the file write's log line
+ *  is the seam the round-3 race tests hook to simulate a concurrent writer
+ *  landing in this exact window (see isolated-endpoint-offset.test.mjs's
+ *  "round-3 blocker" test), so moving it would collapse that window instead of
+ *  narrowing what is said about it. */
+function concurrentRowMoveError(
+  slug,
+  expectedPorts,
+  currentPorts,
+  { expectedOffset = undefined, currentOffset = undefined, composeFileMayBeRewritten = false } = {},
+) {
+  const offsetClause =
+    expectedOffset !== undefined && expectedOffset !== currentOffset
+      ? ` Its band offset also moved (this run read ${expectedOffset ?? "none"}; the registry now holds ${currentOffset ?? "none"}).`
+      : "";
+  const changedClause = composeFileMayBeRewritten
+    ? ` The regenerated ${ISOLATED_COMPOSE_FILENAME} may already be rewritten on disk, but the registry row was NOT — the row is the ` +
+      `authority to re-run against, and the next run reads the file back from it.`
+    : ` Nothing was started, and nothing was changed.`;
+  const err = new Error(
+    `Refusing to bring up isolated instance "${slug}": a concurrent cinatra operation moved its recorded ` +
+      `ports while this repair was in flight (this run read ${JSON.stringify(expectedPorts ?? {})}; the ` +
+      `registry now holds ${JSON.stringify(currentPorts ?? {})}).${offsetClause}${changedClause} Re-run this ` +
+      `command to converge against the other operation's row.`,
+  );
+  err[CONCURRENT_ROW_MOVE] = true;
+  return err;
+}
+
+/** Is this parsed value the shape `generateIsolatedCompose` emits — a mapping
+ *  with a `services` mapping? Deliberately structural and shallow: the question
+ *  is only "did we get the CLI's generated document back", so that a `null`, an
+ *  array, a scalar or a YAML file that happened to parse as JSON is not read as
+ *  a compose document publishing nothing. Pure. */
+function isGeneratedComposeShape(doc) {
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) return false;
+  const services = doc.services;
+  return !!services && typeof services === "object" && !Array.isArray(services);
+}
+
+/**
+ * The refusal for a generated-compose file this CLI can READ but cannot PARSE
+ * (cinatra-cli#237 round-3 finding 2).
+ *
+ * We deliberately do NOT take on a YAML parser to widen what we accept. The
+ * value this gate provides is an AUDIT — proving that what Compose is about to
+ * bind matches the band this instance was allocated — and an audit we cannot
+ * perform is not one we may fake. The two alternatives are both worse than
+ * stopping: guessing at the file's ports would gate on a fiction, and falling
+ * back to the recorded row gates on a document nobody read, which is precisely
+ * how a removed service and a changed static port slipped through. So when the
+ * CLI cannot read the file it is about to hand to Compose, it says so and
+ * refuses to launch. Nothing is started, and the operator's file is never
+ * clobbered.
+ *
+ * @param {string} isoPath the file we could not parse
+ * @returns {Error}
+ */
+function unauditableIsolatedComposeError(isoPath) {
+  return new Error(
+    `Refusing to bring up this isolated instance: ${isoPath} could not be parsed as the document ` +
+      `cinatra generates (JSON rendered into a .yml). Docker Compose may still accept and launch this file — ` +
+      `YAML is a superset of JSON — but cinatra cannot then check WHICH host ports it would bind, so it cannot ` +
+      `confirm the stack stays inside this instance's allocated band rather than on a port another instance ` +
+      `owns. Nothing was started, and nothing was changed. Recover by one of:\n` +
+      `  (1) RESTORE the generated form — revert your edit so ${ISOLATED_COMPOSE_FILENAME} is again the JSON ` +
+      `document cinatra wrote (valid Compose YAML as-is), then re-run this command.\n` +
+      `  (2) REGENERATE it from scratch — bring the stack down (\`docker compose -f ${ISOLATED_COMPOSE_FILENAME} down\` ` +
+      `in this checkout, adding \`-p <project>\` if this instance records one), delete this instance's entry from ` +
+      `the instance registry and delete .cinatra/instance.json in this checkout, then run ` +
+      `\`cinatra install --on-conflict=isolated\`. Stop any other cinatra operations on this machine before ` +
+      `hand-editing the registry.`,
+  );
+}
+
+/**
+ * The port map a recorded ISOLATED checkout will ACTUALLY publish on this run:
+ * the recorded row's map brought up to date with the generated compose file the
+ * run is about to bring up.
+ *
+ * cinatra-cli#231 (round-2 review). `effectivePorts` used to mean "the recorded
+ * map, unless an in-place regeneration happened to run and enlarge it" — and a
+ * regeneration is NOT guaranteed to run. It is skipped whenever the file is
+ * already current (which the a2a-peers marker used to claim far too eagerly),
+ * and the explicit ATTACH path never regenerates at all. Meanwhile the recorded
+ * map can lag a file that is itself perfectly current: a row written before a
+ * service was baked in, whose file a sibling path has since regenerated. In
+ * every one of those states the run re-pointed `.env.local` and the install tail
+ * from a map with no `wayflow` entry, so the tail named the DEFAULT :3010 for a
+ * runtime listening on the offset port — this issue's own defect, on the routes
+ * the return-the-effective-map fix did not reach.
+ *
+ * The generated compose file is the AUTHORITY: it is the file the `up` runs, so
+ * what it publishes is what the operator can actually reach. cinatra-cli#237
+ * finding 1: a recorded row is only a RECORD of a past run, and a service that
+ * DISAPPEARED from the file (removed from the compose, or left with no
+ * published ports) must disappear from the effective map too — an overlay that
+ * kept the recorded entry would still write `WAYFLOW_BASE_URL` and report the
+ * service started for a stack that no longer contains it. So once the file
+ * parses successfully, its map REPLACES the recorded one.
+ *
+ * THREE STATES, NOT TWO (cinatra-cli#237 round-3 finding 2). "Parsed" and
+ * "everything else" is the wrong split, because "everything else" quietly
+ * included a file that reads perfectly well and that Compose would happily
+ * launch — see `unauditableIsolatedComposeError` for why that one refuses
+ * instead of falling back:
+ *
+ *   (a) cannot be READ (absent, fs error) → the recorded map stands, as the
+ *       best available source of truth; there is no file to audit or launch.
+ *   (b) READ but not the generated shape  → REFUSE. We cannot audit what
+ *       Compose would bind, so we do not launch it.
+ *   (c) parsed                            → the per-service semantics below.
+ *
+ * THE ONE EXCEPTION, PER SERVICE (cinatra-cli#237 round-2 finding 1). "The file
+ * replaces the row" is only sound where the file makes a STATEMENT. A published
+ * port left to interpolation — `{ published: "${POSTGRES_PORT}", target: 5432 }`
+ * or `"${WAYFLOW_PORT}:3010"` — is valid Compose that binds a real host port at
+ * `up` time; the file simply DECLINES to state which. Read as a wholesale
+ * replacement, such a service looked identical to a REMOVED one, so a
+ * parse-success file whose bindings are variable-backed deleted a legitimate
+ * recorded allocation, rewrote `.env.local` without that endpoint, and launched
+ * anyway. So the two cases are told apart, per service:
+ *
+ *   absent from the file            → GONE (finding 1): the recorded entry dies.
+ *   present, all ports static       → the FILE wins outright.
+ *   present, any port interpolated  → the file states nothing static for THAT
+ *                                     entry, so the RECORDED entry answers for
+ *                                     it (falling back to whatever static ports
+ *                                     the file does name only when the row has
+ *                                     no entry).
+ *
+ * THE FALLBACK COVERS THE INTERPOLATED REMAINDER ONLY (cinatra-cli#237 round-3
+ * finding 1). "Any port interpolated" was read as "this service says nothing",
+ * and the recorded list replaced the WHOLE list — including the ports the file
+ * stated perfectly clearly. A service mixing the two (`["35434:5432",
+ * "${EXTRA}:9000"]` against a recorded `[25434]`) therefore had its static
+ * 35434 erased before the divergence gate ever ran: the effective map came out
+ * equal to the record, the gate passed, and Compose bound 35434 — a port
+ * outside this instance's allocated band, possibly inside another's. So a mixed
+ * service's STATIC ports are compared to the record FIRST: every one the record
+ * holds → the fallback stands in for the rest; ANY the record does not hold →
+ * that is a disagreement, the file's static ports stand, and the gate aborts on
+ * them. Containment is decided through `normalisePortList`, the same coercion
+ * the gate compares with, so the two answers cannot drift.
+ *
+ * Best-effort and pure-ish.
+ *
+ * @param {string} targetDir the checkout
+ * @param {Record<string, number[]>} [recordedPorts] the registry row's map
+ * @returns {Record<string, number[]>}
+ */
+function effectiveIsolatedPorts(targetDir, recordedPorts = {}) {
+  const base = recordedPorts && typeof recordedPorts === "object" ? recordedPorts : {};
+  const isoPath = path.join(targetDir, ISOLATED_COMPOSE_FILENAME);
+  // (a) The file cannot be READ at all — absent, or an fs error. There is no
+  // file to audit and none to launch from either, so the recorded row remains
+  // the best available source of truth (the round-1 ruling: falling back to the
+  // row is for a file that cannot be READ, and only that).
+  let raw;
+  try {
+    raw = readFileSync(isoPath, "utf8");
+  } catch {
+    return base;
+  }
+  // The generated isolated compose is JSON rendered into a `.yml` under a
+  // `# GENERATED FILE — DO NOT EDIT.` header comment (cinatra#2654 D1) — YAML
+  // 1.2 is a JSON superset, so it parses straight back once that header is
+  // skipped. `parseIsolatedComposeDoc` is the SAME reader the in-place
+  // regeneration uses; a plain `JSON.parse` of the raw text chokes on the
+  // header line and reads every CLI-generated file as unparseable.
+  const doc = parseIsolatedComposeDoc(raw);
+  // (b) The file READS but is not the shape this CLI generates. It is still a
+  // file Compose may well parse and launch: JSON is only a SUBSET of YAML, and
+  // an operator can legitimately rewrite the compose in ordinary YAML (anchors,
+  // unquoted mappings, block scalars). Falling back to the recorded row here
+  // restored the exact blanket overlay findings 1 and 2 removed — a service
+  // deleted from the file and a static port changed in it both became
+  // invisible, and the gate passed on a map describing a file nobody had read.
+  if (!isGeneratedComposeShape(doc)) throw unauditableIsolatedComposeError(isoPath);
+  const effective = publishedPortsByService(doc);
+  // Per-service fallback for the services the file declines to speak for. NOT a
+  // blanket overlay: a service ABSENT from the file is not listed here, so it
+  // still drops out (finding 1's removed-service case stays intact).
+  for (const svc of interpolatedPortServices(doc)) {
+    const recorded = base[svc];
+    if (!Array.isArray(recorded) || recorded.length === 0) continue;
+    // ...and NOT a blanket per-service overlay either (round-3 finding 1). A
+    // MIXED service states some of its ports statically; those ARE the file
+    // speaking, and they are checked against the record BEFORE the fallback is
+    // allowed to answer for the rest. Replacing the whole list on the strength
+    // of one interpolated entry ERASED the static half, so a service publishing
+    // a port outside this instance's band (`["35434:5432", "${EXTRA}:9000"]`
+    // against a recorded `[25434]`) produced an effective map identical to the
+    // record: the divergence gate saw no disagreement and Compose bound 35434.
+    const stated = normalisePortList(effective[svc]);
+    const held = new Set(normalisePortList(recorded));
+    // A static port the record does not hold is a DISAGREEMENT. Leave the file's
+    // static ports standing as the effective truth so `assertIsolatedPortsConverge`
+    // sees it and aborts, naming the port Compose would actually bind.
+    if (stated.some((p) => !held.has(p))) continue;
+    // Every static port is one this instance already holds, so the file and the
+    // record agree as far as the file speaks; the record answers for the
+    // interpolated remainder.
+    effective[svc] = recorded;
+  }
+  return effective;
+}
+
+/** Equality of two `{ service: [hostPort…] }` maps, order-insensitive across
+ *  services AND within one service's list (cinatra-cli#237 round-4: comparing
+ *  the raw arrays read `[25434,26379]` vs `[26379,25434]` — or `[25434]` vs
+ *  `["25434"]` — as a concurrent move and aborted a legitimate repair, since
+ *  neither the caller's map construction nor a hand-edited registry row
+ *  guarantees a stable order or a numeric type. Each side is coerced through
+ *  the shared `normalisePortList` — the same coercion `firstSharedServicePortMismatch`
+ *  compares with — so a benign spelling difference can never read as a port
+ *  disagreement here while a genuine one does there. Pure. */
+function samePortMaps(a, b) {
+  const ka = Object.keys(a ?? {}).sort();
+  const kb = Object.keys(b ?? {}).sort();
+  if (ka.length !== kb.length || ka.some((k, i) => k !== kb[i])) return false;
+  return ka.every((k) => {
+    const na = normalisePortList((a ?? {})[k]);
+    const nb = normalisePortList((b ?? {})[k]);
+    return na.length === nb.length && na.every((p, i) => p === nb[i]);
+  });
+}
+
+/**
+ * ABORT when a SHARED service's host port actually DISAGREES between the
+ * recorded row and the compose file this run is about to bring up.
+ *
+ * cinatra-cli#237 findings 2/4: a disagreement (not a mere absence from one
+ * side) is not a lagging record to repair — it is the checkout's own compose
+ * diverging from the allocation the registry (and the allocator) believe this
+ * instance holds. The port the file now publishes may already belong to another
+ * instance's band. THROWS instead of warning-and-continuing: the caller must
+ * never bring that divergent stack up (a warning that lets `startInfra` run
+ * anyway is exactly how the split-brain happened — the tail would advertise the
+ * file's port while the registry, and any OTHER surface that reads it such as
+ * `cinatra instance wayflow start`, keep naming the recorded one).
+ *
+ * cinatra-cli#237 round-2 finding 3: this is a PRE-MUTATION gate, so it is its
+ * own function rather than the first statement of `persistIsolatedPortRepair`.
+ * Every isolated route must run it against the file AS IT STANDS, BEFORE
+ * anything (registry row, compose file, `.env.local`) is written — on the
+ * re-converge route the in-place regeneration used to run first, which both
+ * broke the "nothing was mutated" guarantee this abort promises AND could
+ * rewrite the divergence away, so the abort never fired at all.
+ *
+ * cinatra-cli#237 round-4 blocker: a shared service GAINING a port is only the
+ * benign lagging-row case (see `firstSharedServicePortMismatch`) when the
+ * gained port falls INSIDE this instance's own recorded band — `offset` is
+ * threaded through so a gain outside it still aborts here, rather than
+ * launching on (and the row silently adopting) a port that may already belong
+ * to another instance.
+ *
+ * @param {object} args
+ * @param {string} args.slug the instance
+ * @param {Record<string, number[]>} args.recordedPorts the registry row's map
+ * @param {Record<string, number[]>} args.ports what the file publishes now
+ * @param {string} [args.composeProject] the recorded `-p` (names an exact
+ *   `docker compose … down` in the recovery text when known)
+ * @param {string} [args.registryPath] where the row lives (named in the text)
+ * @param {number|null} [args.offset] this instance's recorded band offset —
+ *   null/absent (a legacy row) means a gain can never be verified in-band, so
+ *   it is treated as a disagreement (fail-closed).
+ * @throws {Error} naming the service, both ports, and how to get out
+ */
+function assertIsolatedPortsConverge({ slug, recordedPorts, ports, composeProject, registryPath, offset = null }) {
+  if (!slug || !ports) return;
+  const mismatch = firstSharedServicePortMismatch(recordedPorts ?? {}, ports, { offset, bandWidth: BAND_OFFSET_STEP });
+  if (!mismatch) return;
+  const recorded = mismatch.recorded.join(", ");
+  const actual = mismatch.actual.join(", ");
+  // cinatra-cli#237 round-2 finding 5: every step below must actually CHANGE
+  // the state this abort is reacting to. The previous text's second path
+  // (`cinatra instance reset --yes`, then `cinatra install
+  // --on-conflict=isolated`) did not: `instance reset` resets the dev DATABASE
+  // and never touches the instance registry, and a re-install routes straight
+  // back through this same convergence and throws again. The row's `ports` map
+  // is the thing that disagrees, so adopting the file's port means REWRITING
+  // (or dropping) that row — there is no CLI verb that removes an instance
+  // record, so the sequence is spelled out literally.
+  const regFile = registryPath ?? defaultInstanceRegistryPath();
+  const downCmd = composeProject
+    ? `docker compose -p ${composeProject} -f ${ISOLATED_COMPOSE_FILENAME} down`
+    : `docker compose -f ${ISOLATED_COMPOSE_FILENAME} down`;
+  throw new Error(
+    `Refusing to bring up isolated instance "${slug}": its recorded port for "${mismatch.service}" ` +
+      `(${recorded}) disagrees with what ${ISOLATED_COMPOSE_FILENAME} now publishes ` +
+      `(${actual}). Bringing the stack up on the diverging file could launch it OUTSIDE ` +
+      `this instance's allocated band, onto a port another instance may already own. Nothing was started, ` +
+      `and nothing was changed. Options 2 and 3 below hand-edit ${regFile}: stop any other cinatra ` +
+      `operations on this machine first, or a concurrent run can rewrite that row underneath your edit. ` +
+      `Recover by one of:\n` +
+      `  (1) KEEP the recorded allocation — edit ${ISOLATED_COMPOSE_FILENAME} so "${mismatch.service}" ` +
+      `publishes ${recorded} again, then re-run this command.\n` +
+      `  (2) ADOPT ${actual} for this instance — first make sure no other instance holds it ` +
+      `(\`cinatra doctor\`, or check the other rows in ${regFile}), then run \`${downCmd}\` in this ` +
+      `checkout, set instances["${slug}"].ports["${mismatch.service}"] to [${actual}] in ${regFile}, and ` +
+      `re-run this command. The record and the file now agree, so this abort does not fire again.\n` +
+      `  (3) START OVER on a freshly allocated band — run \`${downCmd} -v\` (this DELETES that stack's ` +
+      `volumes), delete the "${slug}" entry from ${regFile}, delete .cinatra/instance.json in this ` +
+      `checkout, then run \`cinatra install --on-conflict=isolated\`, which allocates a new band and ` +
+      `regenerates ${ISOLATED_COMPOSE_FILENAME} from scratch.`,
+  );
+}
+
+/**
+ * Re-run the divergence gate against the compose file AS IT STANDS RIGHT NOW,
+ * immediately before the launch (cinatra-cli#237 round-3 finding 3).
+ *
+ * The gate ran once, early, against a SNAPSHOT of the file — and then the run
+ * did real work with that verdict in hand (repairing the row, regenerating the
+ * compose, rewriting `.env.local`) before finally handing the file to Compose.
+ * Everything in that window is time in which the file can change: a sibling
+ * cinatra process, an editor writing out a buffer, a regeneration in another
+ * checkout. `startInfra` then brought up whatever the file said at THAT moment,
+ * which nothing had checked — the classic check-then-use gap, and the port it
+ * binds is exactly what the gate exists to keep inside this instance's band.
+ *
+ * Closing it costs one re-read of one small file, so it is not worth being
+ * clever about: read the file again, recompute the effective map, and demand
+ * the same convergence. A file that changed under us aborts with the same error
+ * and the same recovery steps as the first gate. This narrows the window to the
+ * few statements between here and the `up`; it cannot close it completely
+ * (nothing short of Compose itself reporting its bindings could), and it does
+ * not need to — the point is that a launch is never authorised by a reading of
+ * the file that a whole install phase has since had time to invalidate.
+ *
+ * `ports` is what this run BELIEVES the instance holds at this point: the
+ * effective map it has already gated on and (where warranted) persisted to the
+ * row. Comparing the freshly-read file against that is the same question the
+ * first gate asked, so an unchanged file always passes.
+ *
+ * @param {object} args
+ * @param {string} args.slug the instance
+ * @param {string} args.targetDir the checkout holding the generated compose
+ * @param {Record<string, number[]>} args.ports the map this run is launching on
+ * @param {string} [args.composeProject] the recorded `-p` (named in the text)
+ * @param {string} [args.registryPath] where the row lives (named in the text)
+ * @param {number|null} [args.offset] this instance's recorded band offset
+ *   (see `assertIsolatedPortsConverge`)
+ * @throws {Error} when the file no longer converges, or can no longer be parsed
+ */
+function assertIsolatedPortsStillConverge({ slug, targetDir, ports, composeProject, registryPath, offset = null }) {
+  if (!slug) return;
+  assertIsolatedPortsConverge({
+    slug,
+    recordedPorts: ports,
+    ports: effectiveIsolatedPorts(targetDir, ports),
+    composeProject,
+    registryPath,
+    offset,
+  });
+}
+
+/**
+ * Record a repaired isolated port map on the instance's row. Best-effort for a
+ * genuine write failure (corrupt registry, disk error) — this run's endpoints
+ * and `.env.local` stand regardless. NOT best-effort for a concurrent row move
+ * (cinatra-cli#237 round 4): that ABORTS the whole run, since carrying on would
+ * mean launching against ports the registry no longer agrees this run holds.
+ *
+ * cinatra-cli#231 (round-2 review): the map this run speaks is the map the
+ * instance actually publishes, so a row that lagged it must be CORRECTED — a
+ * repair confined to `.env.local` and the install tail would leave every OTHER
+ * surface that reads the row still naming the port this run just proved wrong
+ * (`cinatra instance wayflow start` reads exactly this map — cinatra-cli#240).
+ * The in-place regeneration already persists its own enlargement; this covers
+ * the runs where no regeneration was needed because the FILE was current and
+ * only the ROW lagged it.
+ *
+ * Re-runs `assertIsolatedPortsConverge` first as a belt-and-braces gate: every
+ * caller must ALREADY have run it before mutating anything (round-2 finding 3),
+ * so reaching a mismatch here means a route skipped its pre-mutation check.
+ */
+async function persistIsolatedPortRepair({
+  slug,
+  recordedPorts,
+  ports,
+  composeProject,
+  registryPath,
+  lockPath,
+  log = console.log,
+  offset = null,
+}) {
+  if (!slug || !ports || samePortMaps(recordedPorts ?? {}, ports)) return;
+  assertIsolatedPortsConverge({ slug, recordedPorts, ports, composeProject, registryPath, offset });
+  try {
+    await withAllocLock(lockPath, async () => {
+      const reg = requireUsableInstanceRegistry(registryPath);
+      const current = getInstance(reg, slug);
+      if (!current) return;
+      // Already converged: the row under the lock already holds exactly what
+      // this run is about to write — most often THIS SAME run's own earlier
+      // `regenerateIsolatedComposeInPlace` persisting its enlargement before
+      // this repair ever took the lock. That is not a concurrent move to
+      // detect, just this write turning out to be redundant; writing again
+      // would be a same-value no-op, so skip it without comparing against the
+      // (now stale) `recordedPorts` snapshot below.
+      if (samePortMaps(current.ports ?? {}, ports)) return;
+      // cinatra-cli#237 round-3 finding 4: taking the lock is not the same as
+      // having read the row under it. Everything this repair is justified by —
+      // the caller's `recordedPorts`, the convergence checked against them —
+      // was decided OUTSIDE the lock, and the write then went in on the
+      // strength of that stale snapshot. Any other cinatra process that
+      // legitimately moved this row in between (a sibling install repairing it,
+      // an allocation being re-recorded) had its update silently overwritten by
+      // a decision made before it existed. So the row is re-read here and
+      // compared to what the caller believed it was: a difference means the row
+      // is no longer the one this repair reasoned about, and the honest answer
+      // is to ABORT the run rather than either overwrite the other process's
+      // write or launch on top of it (see the throw below).
+      if (!samePortMaps(current.ports ?? {}, recordedPorts ?? {})) {
+        throw concurrentRowMoveError(slug, recordedPorts, current.ports);
+      }
+      writeInstanceRegistry(registryPath, updateInstance(reg, slug, { ports }));
+    });
+  } catch (err) {
+    if (err?.[CONCURRENT_ROW_MOVE]) {
+      // cinatra-cli#237 round-4: this used to be swallowed here — logged as a
+      // skipped best-effort repair — and the caller then rewrote `.env.local`
+      // and launched anyway, advertising THIS run's stale port while the
+      // registry held the other operation's new one (the exact split-brain
+      // finding 4 exists to close). Abort must reach neither route's
+      // `startInfra` call, so the same convergence-abort THROWS here instead.
+      throw err;
+    }
+    log(
+      `  ⚠ Could not record instance "${slug}"'s effective port map (${err instanceof Error ? err.message : err}); ` +
+        `this run's endpoints and .env.local are unaffected.`,
+    );
+  }
+}
+
 /** Re-converge on a checkout's OWN recorded isolated stack: bring it up via the
  *  RECORDED compose files + project, re-point the env at its remapped ports, and
  *  return an "isolated" plan so the later steps treat it as isolated. */
@@ -4981,20 +5479,23 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     log(`  [dry-run] would bring up isolated project ${row.composeProject} from ${(row.composeFiles ?? []).join(", ")}`);
     return { infraPlan: "isolated", instance: row, done: false, dryRun: true };
   }
-  // cinatra-cli#113 / cinatra#2654 D1: the generated isolated compose is a
-  // DERIVED artifact of the checkout's compose at this instance's recorded band
-  // offset, and it is the only file this stack's `up` reads. Re-render it FIRST
-  // on every reconcile, so an instance whose file was written by an older (or
-  // broken) generator is repaired by the very `cinatra install` re-run the
-  // failure messages and the doctor prescribe — that recovery used to be a
-  // no-op, which is how a wayflow service with no bridge token survived.
-  // A regeneration FAILURE aborts the reconcile (cinatra#2654 D1): it used to be
-  // caught and logged, after which the reconcile brought the stack up from the
-  // OLD, unrepaired compose and reported success — so the one recovery the
-  // failure messages prescribe silently did nothing. Only the two
-  // not-re-derivable conditions are non-fatal, and they say so by name. On
-  // success the (possibly enlarged) remapped-port map drives the env re-point +
-  // Nango health probe below.
+  // cinatra-cli#237 round-2 finding 3: the divergence gate runs FIRST, on the
+  // file EXACTLY as it stands, BEFORE any mutation. Both of the mutations below
+  // used to precede it and each defeated it in its own way: the in-place
+  // regeneration rewrites the compose file AND the registry row, so the "nothing
+  // was started, nothing was changed" the abort promises was false on this
+  // route; and because regeneration re-derives the ports from the checkout at
+  // the RECORDED offset, it could rewrite the operator's divergent port away
+  // entirely — masking the disagreement so the abort never fired at all and the
+  // stack came up on a silently clobbered file.
+  assertIsolatedPortsConverge({
+    slug: row.slug,
+    recordedPorts: row.ports ?? {},
+    ports: effectiveIsolatedPorts(targetDir, row.ports ?? {}),
+    composeProject: row.composeProject,
+    registryPath,
+    offset: row.offset ?? null,
+  });
   // cinatra#2654 D1 (round 4): PROVISION the bridge-token env file BEFORE the
   // re-render, exactly as the first isolated install does at its own generator.
   // The re-render resolves this checkout's compose, and on an INLINING Compose
@@ -5002,7 +5503,8 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
   // carries no token, the wiring invariant refuses, and the very recovery every
   // D1 failure message prescribes (`re-run cinatra install`) dead-ended on an
   // "internal invariant violation; please report it". Provisioning here is cheap
-  // and idempotent: the bring-up below regenerates the file again after the
+  // and idempotent (it does not touch ports, so it cannot perturb the gate just
+  // run above), and the bring-up below regenerates the file again after the
   // isolated re-point, so its WAYFLOW_BASE_URL is still this instance's. Gated on
   // the same `--no-wayflow` opt-out as everywhere else, and a failure aborts the
   // reconcile attributably rather than re-rendering around a file it could not
@@ -5011,9 +5513,39 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     const provisioned = (deps.generateWayflowEnv ?? generateWayflowEnv)({ targetDir, log });
     if (!provisioned.ok) throw new Error(wayflowEnvFailureMessage(provisioned.reason));
   }
-
+  // cinatra-cli#113 / cinatra#2654 D1: the generated isolated compose is a
+  // DERIVED artifact of the checkout's compose at this instance's recorded band
+  // offset, and it is the only file this stack's `up` reads. Re-render it FIRST
+  // on every reconcile, so an instance whose file was written by an older (or
+  // broken) generator is repaired by the very `cinatra install` re-run the
+  // failure messages and the doctor prescribe — that recovery used to be a
+  // no-op, which is how a wayflow service with no bridge token survived.
+  // A regeneration FAILURE aborts the reconcile (cinatra#2654 D1): catching it
+  // here and falling back to the OLD, unrepaired compose (as this route used to)
+  // is exactly the swallow that let a wayflow service with no bridge token
+  // report success. `regenerateIsolatedCompose` already turns the two
+  // not-re-derivable conditions into a VALIDATED skip rather than a throw (D1
+  // round 3) — anything that still throws past it, including cinatra-cli#237's
+  // CONCURRENT_ROW_MOVE, is a genuine failure this reconcile must not paper
+  // over, so it propagates uncaught.
+  let effectiveOffset = Number.isInteger(row.offset) && row.offset > 0 ? row.offset : null;
   const regen = await regenerateIsolatedCompose({ targetDir, row, log, wayflow: opts.wayflow !== false, deps });
-  const effectivePorts = regen.regenerated && regen.ports ? regen.ports : (row.ports ?? {});
+  let effectivePorts = regen.regenerated && regen.ports ? regen.ports : (row.ports ?? {});
+  if (regen.regenerated && Number.isInteger(regen.offset) && regen.offset > 0) effectiveOffset = regen.offset;
+  // cinatra-cli#231 (round-2 review): whether a regeneration ran or was skipped
+  // (validated), the ports this re-converge speaks are the ports the file it is
+  // about to bring up publishes — never a recorded map that lags it.
+  effectivePorts = effectiveIsolatedPorts(targetDir, effectivePorts);
+  await persistIsolatedPortRepair({
+    slug: row.slug,
+    recordedPorts: row.ports ?? {},
+    ports: effectivePorts,
+    composeProject: row.composeProject,
+    registryPath,
+    lockPath,
+    log,
+    offset: effectiveOffset,
+  });
 
   // Re-point the env at the recorded remapped ports + bring up WITH
   // `--env-file .env.local` so the generated isolated compose's scrubbed
@@ -5022,6 +5554,18 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
   // a stopped isolated stack would start with empty secrets/wrong URLs.
   ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: effectivePorts, log });
   const reconvEnvFile = path.join(targetDir, ".env.local");
+  // cinatra-cli#237 round-3 finding 3: the gate above cleared a snapshot taken
+  // before the regeneration, the row repair and the env re-point. Re-read the
+  // file and re-gate on it HERE, with nothing left between this check and the
+  // `up` that could invalidate it.
+  assertIsolatedPortsStillConverge({
+    slug: row.slug,
+    targetDir,
+    ports: effectivePorts,
+    composeProject: row.composeProject,
+    registryPath,
+    offset: effectiveOffset,
+  });
   startInfra({
     slug: row.slug,
     deps,
@@ -5053,7 +5597,17 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
       }
     });
   }
-  return { infraPlan: "isolated", instance: row, done: true };
+  // cinatra-cli#231: hand back the row carrying the EFFECTIVE port map, not the
+  // recorded one. `.env.local` was just re-pointed from `effectivePorts` above,
+  // and regeneration may have ENLARGED that map: a row recorded before the
+  // profile-gated services carries no `wayflow` entry at all (the determinism
+  // guard deliberately ignores services present only in the regenerated map), so
+  // returning the stale `row` would make the install tail print the DEFAULT
+  // :3010 while `.env.local` records the offset port — this issue's exact defect,
+  // surviving on the reconcile path. Under `--reset-env` it is worse: the tail's
+  // re-reset would be the last writer and the stale map never re-points it.
+  // Every reader of `instance.ports` downstream sees what was actually written.
+  return { infraPlan: "isolated", instance: { ...row, ports: effectivePorts }, done: true };
 }
 
 /** cinatra#2654 D1 — the ONE reconcile-facing wrapper around
@@ -5154,7 +5708,9 @@ function assertRecordedIsolatedComposeUsable({ targetDir, row, skipped, recorded
  * re-run the failure message and the doctor both prescribe. A reconcile now
  * ALWAYS re-renders: the generated file is a derived artifact of the checkout's
  * compose at a fixed offset, so re-deriving it is how a fixed generator reaches
- * an existing instance.
+ * an existing instance — the cinatra-cli#231 "no-op when nothing is missing"
+ * optimisation is gone for exactly this reason: a file with every service
+ * already present is precisely the shape a stale/defective wiring survives in.
  *
  * Idempotent and safe:
  *   - No-op only when the file is ABSENT (there is nothing to re-derive in
@@ -5166,8 +5722,11 @@ function assertRecordedIsolatedComposeUsable({ targetDir, row, skipped, recorded
  *     host port. A determinism guard re-checks that no shared service's port
  *     moved before overwriting.
  *   - Runs the same #57 (scrubbed-key resolution) + #97 (self-URL remap) +
- *     #2654 (env-file wiring) invariants the primary generator asserts.
- *   - On success updates the recorded `ports` (enlarged) + persists `offset`.
+ *     #231 (app-URL remap) + #2654 (env-file wiring) invariants the primary
+ *     generator asserts.
+ *   - On success updates the recorded `ports` (enlarged) + persists `offset`,
+ *     aborting instead of overwriting a row a concurrent writer already moved
+ *     (cinatra-cli#237 round-3/4 — see the persist step below).
  *
  * SKIP vs FAILURE (cinatra#2654 D1). Two conditions mean the file CANNOT be
  * re-derived safely and never could be — an ambiguous legacy band offset, and a
@@ -5182,7 +5741,7 @@ function assertRecordedIsolatedComposeUsable({ targetDir, row, skipped, recorded
  * would start the old, defective compose while printing success, which is the
  * defect this whole change exists to remove.
  *
- * @returns {Promise<{ regenerated: boolean, ports?: object, skipped?: string }>}
+ * @returns {Promise<{ regenerated: boolean, ports?: object, offset?: number, skipped?: string }>}
  */
 export async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.log, wayflow = true, deps = {} }) {
   const registryPath = deps.instanceRegistryPath ?? defaultInstanceRegistryPath();
@@ -5211,9 +5770,25 @@ export async function regenerateIsolatedComposeInPlace({ targetDir, row, log = c
   // fresh isolated install performs, including the same fallback when this
   // Compose cannot do it (cinatra#2654 D1).
   const { config: resolvedConfig, envFilesPreserved } = resolveIsolatedComposeConfig({ targetDir, deps, log });
+  // cinatra#2654 D1: an unresolvable `docker compose config` THROWS rather than
+  // falling back to "the recorded file already carries the a2a-peers marker, so
+  // leave it be" — cinatra-cli#231's own version of that leniency is exactly the
+  // kind of silent no-op that let a defective compose survive a reconcile. The
+  // old file's currency is unknowable either way; starting it unchecked is the
+  // failure this whole change removes, so this propagates like any other
+  // regeneration failure (see the comment on the caller in `reconvergeIsolated`).
   if (!resolvedConfig) {
     throw new Error("could not resolve `docker compose config` to regenerate the isolated compose");
   }
+
+  // cinatra#2654 D1: no "up to date, nothing to do" short-circuit here on
+  // purpose. cinatra-cli#231 (round-2 review) had this stop as soon as the file
+  // carried every service the checkout declares — but a FIRST install already
+  // writes every profile-gated service, so a compose baking in a stale/broken
+  // env wiring read as "current" forever and no documented recovery ever
+  // touched it again (D1's root cause). This reconcile ALWAYS re-renders; the
+  // `changed` check below (comparing the re-derived document to the previous
+  // one) still reports a true no-op accurately in the log line.
   const baseBand = parseComposePublishedPorts(resolvedConfig);
   if (baseBand.length === 0) {
     throw new Error("the checkout's compose config publishes no host ports");
@@ -5248,6 +5823,7 @@ export async function regenerateIsolatedComposeInPlace({ targetDir, row, log = c
     projectName: row.composeProject,
     slug: row.slug,
     appPort: row.appPort ?? null,
+    defaultAppPort: DEFAULT_APP_PORT,
     envFileKeys,
   });
 
@@ -5272,6 +5848,11 @@ export async function regenerateIsolatedComposeInPlace({ targetDir, row, log = c
   assertScrubbedKeysSupplied(targetDir, scrubbedKeys);
   assertComposeHostUrlsRemapped(doc, new Set(baseBand.map((b) => b.port)));
   assertGeneratedEnvWiring({ doc, sourceDoc: resolvedConfig, targetDir, envFilesPreserved, wayflow, deps });
+  assertComposeAppUrlsRemapped(doc, {
+    appPort: row.appPort ?? null,
+    defaultAppPort: DEFAULT_APP_PORT,
+    publishedPorts: new Set(baseBand.map((b) => b.port)),
+  });
 
   const changed = existingDoc === null || renderIsolatedComposeYaml(doc) !== renderIsolatedComposeYaml(existingDoc);
   writeIsolatedComposeFile(isoPath, doc);
@@ -5282,14 +5863,43 @@ export async function regenerateIsolatedComposeInPlace({ targetDir, row, log = c
 
   // Persist the enlarged remapped-port map + the offset (so a legacy row's next
   // regeneration is a cheap no-op that never re-derives).
+  //
+  // cinatra-cli#237 round-3 finding 1: this is the re-converge route's SECOND
+  // registry writer, and it used to check only that the row still EXISTS, then
+  // write `{ports, offset}` derived from the `row` snapshot read OUTSIDE this
+  // lock — a concurrent move in that window (a sibling install repairing this
+  // row, an allocation re-recorded) was silently clobbered, the exact case the
+  // abort below refuses. It was not catchable afterwards either:
+  // `persistIsolatedPortRepair` runs next with `ports` already equal to what
+  // THIS write just made the row hold, so its own same-value early return fires
+  // before it ever compares against `recordedPorts`. Guarded the same way as
+  // that repair: compare the row locked just now against the pre-lock
+  // `row.ports` snapshot this regeneration reasoned from, and abort instead of
+  // overwriting on any difference.
+  //
+  // cinatra-cli#237 round-4 non-blocking: the WRITE below persists `{ports,
+  // offset}`, but this comparison used to cover only `ports` — a concurrent
+  // writer that moved the row's OFFSET (re-deriving/re-recording a different
+  // band for this slug) while leaving `ports` looking equal-by-the-time-we-
+  // compare would still be silently overwritten. A moved offset is a moved
+  // row exactly like a moved port, so it is compared here too.
+  const preLockOffset = Number.isInteger(row.offset) && row.offset > 0 ? row.offset : null;
   await withAllocLock(lockPath, async () => {
     const reg = requireUsableInstanceRegistry(registryPath);
-    if (getInstance(reg, row.slug)) {
-      writeInstanceRegistry(registryPath, updateInstance(reg, row.slug, { ports, offset }));
+    const current = getInstance(reg, row.slug);
+    if (!current) return;
+    const currentOffset = Number.isInteger(current.offset) && current.offset > 0 ? current.offset : null;
+    if (!samePortMaps(current.ports ?? {}, row.ports ?? {}) || currentOffset !== preLockOffset) {
+      throw concurrentRowMoveError(row.slug, row.ports, current.ports, {
+        expectedOffset: preLockOffset,
+        currentOffset,
+        composeFileMayBeRewritten: true,
+      });
     }
+    writeInstanceRegistry(registryPath, updateInstance(reg, row.slug, { ports, offset }));
   });
 
-  return { regenerated: true, ports };
+  return { regenerated: true, ports, offset };
 }
 
 /**
@@ -5369,6 +5979,15 @@ export async function runIsolatedA2aPeers(argv = [], { targetDir = null, log = c
       const regen = await regenerateIsolatedComposeInPlace({ targetDir: dir, row, log, deps });
       if (regen.regenerated) doc = readDoc();
     } catch (err) {
+      // cinatra-cli#237 round-4 non-blocking: this is the SECOND caller of
+      // `regenerateIsolatedComposeInPlace` — `reconvergeIsolated`'s catch
+      // already rethrows a concurrent row move rather than treating it as a
+      // best-effort regeneration failure to shrug off (round-3 finding 1 /
+      // round-4). This caller must not swallow it either: the compose FILE may
+      // already be rewritten even though the registry write aborted, so
+      // carrying on here would bring the a2a peers up against a file the
+      // registry no longer agrees this instance holds.
+      if (err?.[CONCURRENT_ROW_MOVE]) throw err;
       log(`  ⚠ Could not regenerate the isolated compose (${err instanceof Error ? err.message : err}).`);
     }
   }
@@ -5478,6 +6097,15 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
   // Bring THIS checkout's recorded stack up idempotently (owned-port exemption
   // applies). Use the RECORDED compose files/project when known, else the base.
   let broughtUp = false;
+  // cinatra-cli#231 (round-2 review): an explicit ATTACH is the same shape as the
+  // re-converge — it re-points `.env.local` and hands its row to the install tail
+  // — but it never regenerates, so it had ONLY the recorded map to speak from. A
+  // row that predates a service being baked into the isolated compose therefore
+  // attached to a stack publishing the offset WayFlow port while both the env
+  // file and the printed endpoint named the default. Resolved below from the
+  // compose file the attach actually brings up; the recorded map stands until
+  // then (and for a dry run, which brings nothing up and writes nothing).
+  let attachPorts = row?.ports ?? {};
   if (!opts.dryRun) {
     const composeFiles = row?.composeFiles ?? null;
     // cinatra-cli#35(e): pass the recorded explicit `-p` (default OR isolated);
@@ -5493,9 +6121,48 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
     const attachingIsolated = isIsolatedRow(row);
     let attachEnvFile = null;
     if (attachingIsolated) {
-      ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: row.ports ?? {}, log });
+      attachPorts = effectiveIsolatedPorts(targetDir, attachPorts);
+      // cinatra-cli#237 round-2 finding 3: the gate runs BEFORE any mutation on
+      // this route too. `effectiveIsolatedPorts` is a pure read, so the first
+      // write on the attach path is `persistIsolatedPortRepair`/
+      // `ensureIsolatedEnv` below — both after this line. Stated explicitly
+      // rather than relied upon, so inserting a mutation above it is a visible
+      // change to the gate's position, not an invisible regression.
+      assertIsolatedPortsConverge({
+        slug: row.slug,
+        recordedPorts: row.ports ?? {},
+        ports: attachPorts,
+        composeProject: row.composeProject,
+        registryPath,
+        offset: row.offset ?? null,
+      });
+      await persistIsolatedPortRepair({
+        slug: row.slug,
+        recordedPorts: row.ports ?? {},
+        ports: attachPorts,
+        composeProject: row.composeProject,
+        registryPath,
+        lockPath,
+        log,
+        offset: row.offset ?? null,
+      });
+      ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: attachPorts, log });
       const envCandidate = path.join(targetDir, ".env.local");
       attachEnvFile = existsSync(envCandidate) ? envCandidate : null;
+      // cinatra-cli#237 round-3 finding 3: the gate above cleared a snapshot
+      // taken before the row repair and the env re-point. Re-read the file and
+      // re-gate on it HERE — OUTSIDE the bring-up `try` below, whose catch
+      // deliberately tolerates infra failures and would otherwise downgrade this
+      // abort to a warning and attach anyway, which is the very outcome the gate
+      // exists to prevent.
+      assertIsolatedPortsStillConverge({
+        slug: row.slug,
+        targetDir,
+        ports: attachPorts,
+        composeProject: row.composeProject,
+        registryPath,
+        offset: row.offset ?? null,
+      });
     }
     try {
       log("- Ensuring this checkout's own infra is up (attach)…");
@@ -5503,7 +6170,7 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
       // row's slug, else the dir-derived slug (an unrecorded checkout still has a
       // deterministic slug; the gate then reads a missing/empty ledger and falls
       // to the live probe/marker rather than throwing on a null key).
-      startInfra({ slug: row?.slug ?? deriveInstanceSlug(targetDir), deps, targetDir, log, composeFiles, composeProject, envFile: attachEnvFile, nangoHealthUrl: nangoHealthUrlForPorts(row?.ports), wayflow: opts.wayflow !== false });
+      startInfra({ slug: row?.slug ?? deriveInstanceSlug(targetDir), deps, targetDir, log, composeFiles, composeProject, envFile: attachEnvFile, nangoHealthUrl: nangoHealthUrlForPorts(attachPorts), wayflow: opts.wayflow !== false });
       broughtUp = true;
       // cinatra-cli#128: an attach re-up deploys whatever the moved checkout
       // now pins — record it (best-effort).
@@ -5526,7 +6193,12 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
     }
   }
 
-  return { infraPlan: "attach", instance: row ?? undefined, done: true };
+  // cinatra-cli#231: hand back the row carrying the map this attach actually
+  // spoke, for the same reason the isolated re-converge does — the install tail
+  // names an endpoint from `instance.ports`, and it must be the one `.env.local`
+  // was just re-pointed from. A DEFAULT-stack attach never touched `attachPorts`,
+  // so it hands back its recorded map unchanged.
+  return { infraPlan: "attach", instance: row ? { ...row, ports: attachPorts } : undefined, done: true };
 }
 
 /** T11 — stop-existing: tear down the RECORDED PROJECT of the holder, then
@@ -6634,6 +7306,61 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     }
   }
 
+  // 7a1. cinatra-cli#233 — MOUNT the agent sources the runtime was started
+  //      before. Steps 4b/6 bring the local stack up, WayFlow included; step 7
+  //      (above) is what puts the agent sources on disk — the dev clone of the
+  //      declared extension repos, or the prod acquisition. The runtime
+  //      bind-mounts `./extensions:/agents:ro` and walks it ONCE at boot, so on
+  //      a FRESH install it walked an empty directory: 0 agents mounted, every
+  //      `/agents/<vendor>/<slug>/` route HTTP 404 — while `/.health` still
+  //      answers `ok` and the compose healthcheck passes, so nothing surfaced
+  //      it (cinatra#2654 row 7). This step is the ordering fix the runtime's
+  //      own hot-reload route exists for: it runs AFTER the sources exist, and
+  //      makes the runtime re-read them (reload, or a service restart when the
+  //      route is unavailable), then VERIFIES against `/.health` + a real agent
+  //      route.
+  //
+  //      Only for an install that OWNS a local runtime (`local` — not
+  //      `--no-wayflow`, not external/co-use), and never on a checkout-only run
+  //      that started no stack. Non-fatal by contract, like the health wait it
+  //      complements: the instance is already provisioned here, so a failure is
+  //      reported loudly and by name (and `cinatra doctor`'s agent-availability
+  //      probe fails on the same state) rather than rolling back a working
+  //      install. But it does NOT let the install exit 0 either: the tail
+  //      restates the outcome and claims the typed exit code
+  //      INSTALL_EXIT_AGENTS_UNAVAILABLE (21), the same shape cinatra-cli#200
+  //      uses for a completed-with-a-named-defect install. "Exited 0 and
+  //      recorded ready" is exactly the lie this issue is about.
+  //      `deps.mountAgentSourcesAfterSync` is the test seam.
+  let agentMountResult = null;
+  //
+  //      The compose project is what proves a bring-up actually happened on
+  //      this run: `defaultProject` is set only inside the default bring-up
+  //      block, and the isolated/attach plans carry the project they started.
+  //      Without one there is no runtime of ours to address, so the step does
+  //      not run (and never warns about a runtime nobody started).
+  const mountComposeProject =
+    infraPlan === "isolated" || infraPlan === "attach"
+      ? (resolution?.instance?.composeProject ?? null)
+      : defaultProject;
+  if (wayflowRuntimeMode === WAYFLOW_RUNTIME_LOCAL && mountComposeProject) {
+    const mountComposeFiles =
+      infraPlan === "isolated" || infraPlan === "attach" ? (resolution?.instance?.composeFiles ?? null) : null;
+    const mountEnvFile = path.join(targetDir, ".env.local");
+    const mount = deps.mountAgentSourcesAfterSync ?? mountAgentSourcesAfterSync;
+    agentMountResult = await mount({
+      targetDir,
+      composeArgs: composeArgsFor({
+        composeFiles: mountComposeFiles,
+        composeProject: mountComposeProject,
+        envFile: existsSync(mountEnvFile) ? mountEnvFile : null,
+        profiles: [WAYFLOW_PROFILE],
+      }),
+      log,
+      deps: { spawnSync, ...(deps.wayflowMountDeps ?? {}) },
+    });
+  }
+
   // 7a2. Execution plane (cinatra-cli#160): the install-time execution-mode choice
   //      + first-class L0 image acquisition. Gated to the full provision path —
   //      --dry-run returns long before here; --no-install / --no-setup skip it
@@ -6725,9 +7452,35 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     process.exitCode = claimRegistrySkewExitCode(process.exitCode);
   }
 
+  // 8c-bis. cinatra-cli#233 — the deferred AGENT-AVAILABILITY verdict. The
+  //     instance is provisioned, so this is not a rollback; but a runtime that
+  //     cannot serve its agents must not be reported as a clean success, which
+  //     is precisely the "exited 0, recorded ready, cannot run an agent" state
+  //     this issue exists to remove. Stated at the tail, with the typed code.
+  //      Fail CLOSED on `no-sources` too: this step runs only for an install
+  //      that OWNS a local runtime, so "nothing on disk to mount" describes a
+  //      runtime serving ZERO agents — the dev sync reporting `skipped` (step 7
+  //      above) or a prod acquisition that placed nothing — which is the same
+  //      state the doctor FAILs on, not a benign nothing-to-do.
+  if (agentMountFailedClosed(agentMountResult)) {
+    for (const line of agentsUnavailableVerdictLines(agentMountResult)) log(line);
+    process.exitCode = claimAgentsUnavailableExitCode(process.exitCode);
+  }
+
   // cinatra#2654: state the agent-runtime outcome in the summary — started,
   // deliberately opted out, or not owned by this install.
-  for (const line of wayflowStatusLines(wayflowRuntimeMode)) log(line);
+  // cinatra-cli#231: name the endpoint THIS instance actually listens on. The
+  // port comes from the same per-instance allocation `writeIsolatedAppEnv` writes
+  // WAYFLOW_BASE_URL from (`ports.wayflow[0]`), so the printed URL and the
+  // `.env.local` value can never disagree. An attach/re-converge on a recorded
+  // ISOLATED row carries that row's map and prints its offset port; a DEFAULT or
+  // external install allocated no band, has no map, and correctly keeps the
+  // default port.
+  for (const line of wayflowStatusLines(wayflowRuntimeMode, {
+    endpoint: wayflowEndpointForPorts(resolution?.instance?.ports),
+  })) {
+    log(line);
+  }
 
   log("");
   log("  Next:");
@@ -7165,3 +7918,8 @@ export function moveExistingCheckoutToRef({
   if (!sha) throw new Error(`Could not resolve the checked-out commit in ${targetDir}.`);
   return sha;
 }
+
+// Test-only seam onto otherwise-private pure helpers (cinatra-cli#237 round 4:
+// `samePortMaps` has no other caller-visible surface to assert its comparison
+// semantics against directly).
+export const __test = { samePortMaps };

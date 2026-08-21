@@ -27,6 +27,12 @@ import { existsSync as nodeExistsSync, readFileSync as nodeReadFileSync } from "
 export const WAYFLOW_SERVICE = "wayflow";
 export const WAYFLOW_PROFILE = "wayflow";
 
+/** WayFlow's DEFAULT published host port — where an install that allocated no
+ *  band (the default plan) reaches its runtime. Mirrors instance-alloc.mjs
+ *  DEFAULT_WAYFLOW_PORT; this module stays import-light (node builtins only) by
+ *  design, so the value is restated rather than imported. */
+export const DEFAULT_WAYFLOW_PORT = 3010;
+
 /** The `.env.local` key that records what THIS install decided about the
  *  WayFlow runtime, so `cinatra doctor` can tell an intentional opt-out apart
  *  from a runtime that should be up and is not. */
@@ -78,7 +84,7 @@ export function normalizeWayflowRuntimeMode(raw) {
  *
  * @returns {string[]}
  */
-export function wayflowStatusLines(mode, { endpoint = "http://localhost:3010" } = {}) {
+export function wayflowStatusLines(mode, { endpoint = `http://localhost:${DEFAULT_WAYFLOW_PORT}` } = {}) {
   if (mode === WAYFLOW_RUNTIME_OFF) {
     return [
       "  Agent runtime: NOT started — intentional opt-out (--no-wayflow).",
@@ -192,6 +198,29 @@ export function inspectWayflowEnvFile({ targetDir, readImpl = nodeReadFileSync }
 export function wayflowEnvSuppliedKeys({ targetDir, readImpl = nodeReadFileSync } = {}) {
   const seen = inspectWayflowEnvFile({ targetDir, readImpl });
   return seen.exists ? seen.supplied : null;
+}
+
+/**
+ * The WayFlow endpoint THIS install's operator must actually open, derived from
+ * the SAME per-instance port allocation that `.env.local`'s `WAYFLOW_BASE_URL` is
+ * written from: `ports.wayflow[0]`, the generated isolated compose's remapped
+ * published host port (install.mjs `writeIsolatedAppEnv` reads the identical
+ * expression). An install that allocated no band passes no map and gets the
+ * default port.
+ *
+ * cinatra-cli#231: the success line used to state the hardcoded default while the
+ * instance ran on the offset port — pointing the operator at a dead port, or at
+ * the MAIN instance's runtime when one held the default.
+ *
+ * @param {Record<string, number[]>} [ports] the per-service remapped host-port map
+ * @returns {string}
+ */
+export function wayflowEndpointForPorts(ports) {
+  const list = ports?.[WAYFLOW_SERVICE];
+  const raw = Array.isArray(list) && list.length > 0 ? list[0] : null;
+  const port = Number.parseInt(String(raw ?? ""), 10);
+  const resolved = Number.isInteger(port) && port > 0 ? port : DEFAULT_WAYFLOW_PORT;
+  return `http://localhost:${resolved}`;
 }
 
 /**
@@ -374,6 +403,32 @@ export function waitForWayflowHealth({
 }
 
 /**
+ * Unwrap whatever a registry finder hands back into the flat instance slot.
+ *
+ * cinatra-cli#230: `findInstanceByInstallDir` returns the `{ slug, slot }`
+ * ENVELOPE, not the row. Reading `.composeProject` straight off the envelope
+ * yields `undefined`, so the resolution below silently degraded to the
+ * basename WHILE REPORTING `source: "registry"` — a healthy isolated runtime
+ * recorded as `cinatra_x2654_row1` was diagnosed against `row1-dev`. The
+ * envelope is the production shape, so accept both here rather than trust
+ * every call site to unwrap; a shape mismatch must never resolve silently.
+ *
+ * @returns {{ slot: object, slug: string|null }|null}
+ */
+function unwrapRegistryRow(row) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+  const isEnvelope = row.slot && typeof row.slot === "object" && !Array.isArray(row.slot);
+  const slot = isEnvelope ? row.slot : row;
+  const slug =
+    typeof slot.slug === "string" && slot.slug.trim() !== ""
+      ? slot.slug.trim()
+      : typeof row.slug === "string" && row.slug.trim() !== ""
+        ? row.slug.trim()
+        : null;
+  return { slot, slug };
+}
+
+/**
  * Resolve the compose project + files a checkout's RECORDED install actually
  * uses, so a lifecycle command never assumes the checkout basename. A default
  * install now records an explicit instance-scoped project, and an isolated
@@ -385,7 +440,31 @@ export function waitForWayflowHealth({
  * tests and free of a hard import cycle. Falls back to the caller-supplied
  * `fallbackProject` and the base compose pair when nothing is recorded.
  *
- * @returns {{ project: string, composeFiles: string[], source: "registry"|"fallback" }}
+ * `source` describes where the returned PROJECT came from, and nothing else:
+ * it is `"registry"` only when the recorded row actually supplied the name.
+ * A found-but-unusable row reports `"fallback"`, because that is what the
+ * caller is about to address. `slug` names the instance when one was found,
+ * so a caller can say WHICH install it is talking about (cinatra-cli#230).
+ *
+ * `reason` says WHY the fallback was taken, because the three ways of getting
+ * there are NOT the same claim (cinatra-cli#230 review):
+ *
+ *   * `"no-record"`           — the registry was read and holds no row for this
+ *                               checkout. The basename is the right answer;
+ *                               this is an unmanaged checkout.
+ *   * `"registry-unreadable"` — the registry could not be read or parsed, so
+ *                               whether a row exists is UNKNOWN. The basename
+ *                               is a guess, and a container found under it may
+ *                               belong to an entirely different instance. A
+ *                               caller must not report this as "no record".
+ *   * `"row-without-project"` — a row for this checkout exists but records no
+ *                               compose project.
+ *
+ * `reason` is null when `source` is `"registry"`.
+ *
+ * @returns {{ project: string, composeFiles: string[], source: "registry"|"fallback",
+ *             slug: string|null,
+ *             reason: null|"no-record"|"registry-unreadable"|"row-without-project" }}
  */
 export function resolveRecordedComposeContext({
   repoRoot,
@@ -394,24 +473,47 @@ export function resolveRecordedComposeContext({
   findByInstallDir,
   baseComposeFiles = ["docker-compose.yml", "docker-compose.dev.yml"],
 } = {}) {
-  const fallback = {
+  const fallbackWith = (reason, composeFiles = baseComposeFiles, slug = null) => ({
     project: fallbackProject,
-    composeFiles: baseComposeFiles,
+    composeFiles,
     source: "fallback",
-  };
-  if (typeof readRegistry !== "function" || typeof findByInstallDir !== "function") return fallback;
+    slug,
+    reason,
+  });
+  // No usable seam at all: the caller cannot consult a registry, so it cannot
+  // know whether one records this checkout — same epistemic state as a
+  // registry it failed to read.
+  if (typeof readRegistry !== "function" || typeof findByInstallDir !== "function") {
+    return fallbackWith("registry-unreadable");
+  }
   let row = null;
   try {
-    row = findByInstallDir(readRegistry(), repoRoot) ?? null;
+    // A registry that is present-but-broken reads back as a NON-object here
+    // (the reader returns `registry: null` for a malformed file). Distinguish
+    // that from a readable registry with no matching row: only the latter
+    // licenses "there is no record for this checkout".
+    const registry = readRegistry();
+    if (!registry || typeof registry !== "object") return fallbackWith("registry-unreadable");
+    row = findByInstallDir(registry, repoRoot) ?? null;
   } catch {
-    return fallback; // a missing/malformed registry never breaks a lifecycle command
+    // a missing/malformed registry never breaks a lifecycle command
+    return fallbackWith("registry-unreadable");
   }
-  if (!row) return fallback;
-  const project =
-    typeof row.composeProject === "string" && row.composeProject.trim() !== ""
-      ? row.composeProject.trim()
-      : fallbackProject;
+  const found = unwrapRegistryRow(row);
+  if (!found) return fallbackWith("no-record");
+  const { slot, slug } = found;
+  const recordedProject =
+    typeof slot.composeProject === "string" && slot.composeProject.trim() !== ""
+      ? slot.composeProject.trim()
+      : null;
   const composeFiles =
-    Array.isArray(row.composeFiles) && row.composeFiles.length > 0 ? row.composeFiles : baseComposeFiles;
-  return { project, composeFiles, source: "registry" };
+    Array.isArray(slot.composeFiles) && slot.composeFiles.length > 0 ? slot.composeFiles : baseComposeFiles;
+  if (recordedProject === null) {
+    // The row exists but records no project. Say "fallback" — claiming
+    // "registry" here is exactly the lie that hid cinatra-cli#230 — and name
+    // the distinct reason, so a caller does not report this as "no record"
+    // either: a record DOES exist, it just carries no project.
+    return fallbackWith("row-without-project", composeFiles, slug);
+  }
+  return { project: recordedProject, composeFiles, source: "registry", slug, reason: null };
 }

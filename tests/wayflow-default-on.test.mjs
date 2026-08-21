@@ -523,10 +523,15 @@ describe("resolveRecordedComposeContext — never the checkout basename by accid
       project: "cinatra",
       composeFiles: ["docker-compose.yml", "docker-compose.dev.yml"],
       source: "fallback",
+      // cinatra-cli#230: no row found, so there is no instance to name.
+      slug: null,
+      // cinatra-cli#230 review: the registry WAS read and holds no row for this
+      // checkout — a settled fact, distinct from having failed to read it.
+      reason: "no-record",
     });
   });
 
-  it("a broken registry never breaks the lifecycle command", () => {
+  it("a broken registry never breaks the lifecycle command — and says it was unreadable", () => {
     const ctx = resolveRecordedComposeContext({
       repoRoot: "/home/dev/cinatra",
       fallbackProject: "cinatra",
@@ -537,5 +542,46 @@ describe("resolveRecordedComposeContext — never the checkout basename by accid
     });
     expect(ctx.source).toBe("fallback");
     expect(ctx.project).toBe("cinatra");
+    // cinatra-cli#230 review: NOT "no-record". Whether a row exists is unknown,
+    // and a caller that conflates the two states it as fact that this checkout
+    // is unmanaged.
+    expect(ctx.reason).toBe("registry-unreadable");
+  });
+
+  it("a registry that reads back as null is unreadable, not an empty registry", () => {
+    // The production reader returns `registry: null` for a malformed FILE
+    // (rather than throwing), so this is the shape the doctor actually sees.
+    const ctx = resolveRecordedComposeContext({
+      repoRoot: "/home/dev/cinatra",
+      fallbackProject: "cinatra",
+      readRegistry: () => null,
+      findByInstallDir,
+    });
+    expect(ctx.source).toBe("fallback");
+    expect(ctx.reason).toBe("registry-unreadable");
+  });
+
+  it("a row that records no project reports its own distinct reason", () => {
+    const ctx = resolveRecordedComposeContext({
+      repoRoot: "/home/dev/cinatra",
+      fallbackProject: "cinatra",
+      readRegistry: () => ({ instances: { demo: { slug: "demo", installDir: "/home/dev/cinatra" } } }),
+      findByInstallDir,
+    });
+    expect(ctx.source).toBe("fallback");
+    // A record EXISTS — reporting "no-record" here would be false too.
+    expect(ctx.reason).toBe("row-without-project");
+    expect(ctx.slug).toBe("demo");
+  });
+
+  it("reason is null when the project really came from the registry", () => {
+    const ctx = resolveRecordedComposeContext({
+      repoRoot: "/home/dev/cinatra",
+      fallbackProject: "cinatra",
+      readRegistry,
+      findByInstallDir,
+    });
+    expect(ctx.source).toBe("registry");
+    expect(ctx.reason).toBe(null);
   });
 });

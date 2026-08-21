@@ -8,6 +8,35 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The preview image build can finally be tuned for a many-core builder.** The
+  checkout's Dockerfile declares two build args as its documented remedy for a
+  constrained or many-core host, and no CLI surface could send either one: the
+  preview build assembled its `--build-arg` set from the memory ceiling and `CI`
+  alone. So the remedy was unreachable from `cinatra install --mode preview` and
+  from `cinatra instance preview create | refresh`, and the only ways through
+  were to keep adding memory to the Docker VM, to reconfigure the whole machine
+  down to fewer cores, or to bypass the CLI with a hand-run `docker build`. Two
+  environment levers now reach the build. `CINATRA_PREVIEW_BUILD_CPUS` (1 .. 256)
+  sets the build's page-data worker COUNT directly: `3` gives three workers, not
+  two. It matters because only the UNSET default is derived, as
+  `os.cpus().length - 1`, and a Docker `--cpus` or `--cpuset-cpus` cap does not
+  change what that call reports. So an untuned many-core builder keeps a wide
+  worker pool however narrow its CPU quota is. The count bounds what runs AFTER
+  compile, so it does not fix a death DURING compile.
+  `CINATRA_PREVIEW_BUILD_BUNDLER=turbopack|webpack` picks the bundler, which
+  decides whether the existing memory ceiling is a lever at all: the default
+  bundler dies on native memory, which `--max-old-space-size` does not bound,
+  and the other dies on the V8 heap, which it does. Both follow the levers that
+  came before them exactly: environment variables rather than flags, so one
+  setting covers all three entrypoints; unset means unset, so an untuned preview
+  still builds the resolved commit exactly as that commit's own Dockerfile
+  defines; a malformed value is a hard error raised before any state is claimed;
+  both are logged as part of the build's identity; and a commit whose Dockerfile
+  predates the args still builds, with a warning that the values are very likely
+  ignored. A failed build now names the lever that fits the death it died: on
+  the default bundler path a native out-of-memory kill points at the worker count
+  and the bundler, not only at the V8 old-space ceiling that cannot move it. Neither lever removes the builder-memory floor the checkout documents.
+
 - **`cinatra instance preview stop | start`, and a refresh that stops rebuilding
   what it already has.** Every way to change a preview container used to go
   through a full `docker build`: there was no verb to stop, start or
@@ -169,6 +198,143 @@ project adheres to [Semantic Versioning](https://semver.org/).
   real `bin/cinatra.mjs` as a subprocess against a fixture checkout whose
   generator breaks, and reading its actual exit status, the rollback it logged
   and the ready marker it did not write.
+
+- **An isolated install now states and provisions the endpoints it actually
+  allocated.** Two endpoint defects shared one root cause: the per-instance port
+  allocation was not threaded through to every place a port is spoken. The
+  install success line hardcoded `http://localhost:3010` for the WayFlow agent
+  runtime, although an isolated instance's runtime listens on the offset port
+  (`3010 + offset`) — exactly what the same install had already written into
+  `.env.local` as `WAYFLOW_BASE_URL`. The operator was pointed at a dead port,
+  or at the *main* instance's runtime when one held the default. Separately, the
+  generated isolated compose kept `CINATRA_BASE_URL:
+  http://host.docker.internal:3000` on the `wayflow` service while the isolated
+  app runs on its own allocated port, so everything the runtime called back into
+  the app on reached the wrong app. The success line now reads the same
+  `ports.wayflow[0]` that `.env.local` is written from, so the printed endpoint
+  and the recorded one cannot disagree. The compose generator now substitutes
+  the instance's allocated app port into every app-facing container URL that
+  still names the default one. That is a substitution and not a port shift: the
+  app port is drawn from its own pool (3300..3399), not from the infra band, so
+  `3000 + offset` would have been wrong as well. The rewrite covers the Docker
+  host gateway and the loopback spellings, leaves in-network service-DNS URLs
+  and bare listen ports alone, and stands down when a compose service genuinely
+  publishes the default app port, so it can never contend with the existing
+  band remap. A new render invariant refuses to write a generated compose that
+  still dials the default app port while the instance runs on another. The
+  same repair now reaches every route that re-converges on an instance rather
+  than installing one. A re-run and an explicit `--on-conflict=attach` both
+  read the ports from the generated compose file they are about to bring up,
+  so neither can speak from a registry row that has fallen behind it, and the
+  row is corrected when it has — otherwise `cinatra instance wayflow start`,
+  which reads that row, would keep naming the port the install tail just
+  disproved. Relatedly, the in-place regeneration that brings an older
+  instance's compose up to parity no longer decides it is current from the
+  presence of the a2a dev peers alone: a file generated once those were baked
+  in claimed to be current forever and so could never gain a service baked in
+  later, which is how an instance ended up with a runtime it never recorded a
+  port for. It now regenerates whenever the file is missing any service the
+  checkout declares, and says which ones (this is an additions-only check — a
+  service the checkout has since REMOVED, still present in an older recorded
+  file, is not what it tests for). Two further hardenings on the same reads:
+  a service the generated compose no longer publishes at all now drops out of
+  the effective map instead of surviving from a stale recorded entry (it used
+  to overlay the file on top of the row, so a service removed from the compose
+  kept advertising its old port and could be reported started for a stack that
+  does not contain it); and a SHARED service whose recorded port disagrees with
+  what the file now publishes aborts the run with an error naming both ports
+  and the recovery options, rather than warning and bringing the divergent
+  stack up anyway on a port that may already belong to another instance's
+  allocation. A short-syntax `ports` entry (`"23010:3010"`) is now read as the
+  real host-port binding it is, rather than being silently skipped when
+  reading a generated compose back. A generated compose file that cannot be
+  PARSED at all — a hand-edit that breaks the JSON-rendered-into-YAML shape
+  this CLI writes — now refuses to bring the stack up instead of falling back
+  to the recorded row, which would gate on a document nobody actually read
+  (precisely how a removed service and a changed static port slipped through
+  before this fix). The refusal names the file, explains that Compose could
+  still accept and launch it while cinatra can no longer confirm which ports
+  it binds, and points at restoring or regenerating it; nothing is started and
+  nothing is changed. Two more refusals on the same converge path are now
+  stated rather than silent. A run that discovers, inside the allocation lock,
+  that another process has moved the instance's registry row since this run
+  read it (on either writer, the lagging-row repair or the in-place
+  regeneration) aborts with an error naming both port maps instead of
+  overwriting the other run's allocation; nothing is started, and re-running
+  converges on the row as it now stands. And a shared service that has GAINED
+  a port in the generated file is read as a row lagging the file and repaired
+  only when the gained port lies inside the instance's own remap band
+  (`offset` up to `offset + band step`); a gained port outside that band, or
+  on a legacy row whose band cannot be verified, aborts before anything
+  launches, because adopting it would annex a port from another instance's
+  allocation.
+
+- **A fresh install can now actually run an agent: the WayFlow runtime mounts
+  the extension repos instead of starting before they exist.** The install
+  brought the local stack up — the agent runtime with it — and cloned the
+  declared extension repos afterwards. The runtime bind-mounts the checkout's
+  `extensions/` directory and walks it once, at boot, so a first install walked
+  an empty directory: it mounted **0 agents** and every
+  `/agents/<vendor>/<slug>/` route answered HTTP 404. Nothing surfaced it —
+  `/.health` still answered `ok`, the compose healthcheck passed, and
+  `cinatra doctor` reported the runtime ready — so an install that exited 0 and
+  recorded the instance ready could not run a single agent. The install now
+  makes the runtime re-read the directory **after** the agent sources are on
+  disk, through the loader's own hot-reload route (a restart of the one service
+  when that route is unavailable), and verifies the outcome against `/.health`
+  plus a real agent route rather than assuming it. The step runs only for an
+  install that owns a local runtime, addresses only this host's loopback
+  runtime with the bridge token, and judges availability per agent route rather
+  than on the runtime's aggregate agent count.
+
+  **Behaviour change.** An install whose runtime cannot serve its agents no
+  longer exits 0. The instance is still provisioned (nothing is rolled back at
+  that point), so the tail states the condition, names both recoveries, and the
+  process claims the typed exit code **21** — the same
+  completed-with-a-named-defect shape the local-registry skew verdict uses. A
+  clean exit over a runtime that cannot run an agent is exactly the failure
+  this change removes. That includes an install that put **no** agent source on
+  disk at all — the declared-extension sync reporting `skipped`, or a prod
+  acquisition that placed nothing: the runtime it started serves zero agents,
+  which is the state `cinatra doctor` already fails on, so it is reported and
+  typed rather than passed over as nothing-to-do.
+
+  The runtime is addressed at the endpoint **this** instance publishes, which
+  is read from the compose project the install brought up rather than assumed.
+  An isolated or attached instance remaps the WayFlow host port, and one whose
+  `.env.local` was never re-pointed still carries the default stack's `:3010` —
+  so a hardcoded fallback reloaded and verified **another** instance's runtime,
+  and reported this one already-mounted when that runtime happened to serve the
+  same labels. The published host port now wins over any recorded value, and an
+  endpoint that cannot be determined is refused (and reported) rather than
+  defaulted.
+- **`cinatra doctor` checks agent AVAILABILITY, not only the health endpoint.**
+  The WayFlow readiness probe passed on any runtime answering `/.health` with
+  `ok` or `degraded`, which is exactly what a runtime that mounted nothing
+  answers. It now compares the agent sources on disk against what the runtime
+  serves and probes **every** on-disk agent's own route: any 404 is a FAIL that
+  names the missing routes and the recovery, any 5xx is a FAIL (mounted, not
+  serving), and a route that gives no answer at all is a SKIP — an
+  indeterminate probe is never reported as readiness. A route answering 405
+  (the route exists, GET is not its method) is the healthy signal. Coverage
+  must be proven, not assumed: a mounted count below the number of sources
+  fails, and a runtime that reports no count at all is a SKIP rather than a
+  pass. The probe addresses the host port this instance's own container
+  publishes rather than falling back to a hardcoded `:3010` — on an isolated or
+  attached instance that reported the default stack's readiness as this one's —
+  and an endpoint it cannot determine is a SKIP, never a default.
+- **`cinatra instance wayflow start` now names the endpoint the instance it
+  started actually serves on.** The success line stated `http://localhost:3010`
+  for every instance, although only the one holding the default port answers
+  there. An instance installed in isolation runs its agent runtime on its own
+  allocated port, so its operator was sent to a port with nothing behind it —
+  and, on a machine that also runs a default instance, to a port with the WRONG
+  runtime behind it, which is worse, because that one answers and every agent
+  call made against it quietly drives the other instance's stack. The port is
+  now read from the instance's own recorded port map, the same record the
+  isolated install writes `WAYFLOW_BASE_URL` from, so the address printed here
+  and the address the app dials cannot disagree. An instance that was never
+  given its own ports still gets the default one.
 
 - **A preview no longer wires itself to another instance's services, and it can
   finally reach its own connection service.** The preview composition decided
