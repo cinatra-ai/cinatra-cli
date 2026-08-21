@@ -109,7 +109,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
   stack up anyway on a port that may already belong to another instance's
   allocation. A short-syntax `ports` entry (`"23010:3010"`) is now read as the
   real host-port binding it is, rather than being silently skipped when
-  reading a generated compose back.
+  reading a generated compose back. A generated compose file that cannot be
+  PARSED at all — a hand-edit that breaks the JSON-rendered-into-YAML shape
+  this CLI writes — now refuses to bring the stack up instead of falling back
+  to the recorded row, which would gate on a document nobody actually read
+  (precisely how a removed service and a changed static port slipped through
+  before this fix). The refusal names the file, explains that Compose could
+  still accept and launch it while cinatra can no longer confirm which ports
+  it binds, and points at restoring or regenerating it; nothing is started and
+  nothing is changed.
 
 - **`cinatra instance wayflow start` now names the endpoint the instance it
   started actually serves on.** The success line stated `http://localhost:3010`
