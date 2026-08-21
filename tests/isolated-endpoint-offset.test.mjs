@@ -1742,6 +1742,77 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
     expect(err.message).toMatch(/stop .*cinatra|no other cinatra|concurrent cinatra/i);
   });
 
+  // ── round-3 blocker ──────────────────────────────────────────────────────
+  // `regenerateIsolatedComposeInPlace` is the re-converge route's SECOND
+  // registry writer (`persistIsolatedPortRepair`, covered by finding 4 above,
+  // is the first). It takes the alloc lock, re-reads the row, but used to
+  // check only that the row still EXISTS, then write `{ports, offset}` derived
+  // from the `row` snapshot read OUTSIDE the lock — a concurrent move in that
+  // window was silently overwritten. Nor was it catchable afterwards: once
+  // this write lands, `persistIsolatedPortRepair` runs with `ports` already
+  // equal to what THIS write just made the row hold, so its own same-value
+  // early return fires before it ever compares against `recordedPorts` — the
+  // divergence that write caused is invisible downstream.
+  //
+  // The regeneration's own log line — emitted right after it writes the
+  // compose FILE, right before it takes its OWN lock to write the registry —
+  // is the seam: a concurrent writer landing there lands in exactly the
+  // window between regeneration's outside read of `row.ports` and its lock.
+  // A genuine regeneration (not a no-op) is needed to exercise this SECOND
+  // writer at all, so only the FILE is aged (the row keeps its `wayflow`
+  // entry) — the opposite of finding 4's fixture, which aged the ROW so the
+  // first writer's window was the one under test.
+  it("round-3 blocker: a row moved during the REGENERATION's own lock window aborts, not silently overwritten", async () => {
+    const installDir = await freshIsolatedInstall("iso237r3-regen-race");
+    const registryFile = process.env.CINATRA_INSTANCE_REGISTRY;
+    const { slug, row: fullRow } = registryRow(installDir);
+
+    // Age the FILE only: strip `wayflow` so the checkout's compose lags and a
+    // real regeneration write is due. The row is untouched, so the write this
+    // regeneration performs is the one under test, not a no-op.
+    const { doc } = readGeneratedCompose(installDir);
+    expect(doc.services.wayflow).toBeDefined();
+    delete doc.services.wayflow;
+    writeCompose(installDir, doc);
+    expect(fullRow.ports.wayflow).toEqual([EXPECTED_WAYFLOW_PORT]);
+
+    const writeRowPorts = (ports) => {
+      const reg = JSON.parse(readFileSync(registryFile, "utf8"));
+      reg.instances[slug].ports = ports;
+      writeFileSync(registryFile, JSON.stringify(reg, null, 2) + "\n");
+    };
+    // What the "other process" writes DURING regeneration's own window.
+    // Distinct from the row this run read, so overwriting it is detectable.
+    const concurrentPorts = { ...fullRow.ports, sentinel: [19999] };
+
+    let moved = false;
+    let bringUpCalled = false;
+    const deps = { ...isolatedDeps(), bringUpInfra: () => { bringUpCalled = true; } };
+    const log = (l) => {
+      if (!moved && String(l).includes(`Regenerated ${"docker-compose.cinatra-isolated.yml"}`)) {
+        moved = true;
+        writeRowPorts(concurrentPorts);
+      }
+    };
+
+    const err = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      { log, deps },
+    ).then(() => null, (e) => e);
+    expect(moved).toBe(true);
+
+    // The abort, not a skip-and-continue: the run rejects instead of finishing.
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/another|concurrent/i);
+    expect(err.message).toMatch(/chang|mov/i);
+    // The whole point: a run that lost the race must never reach `startInfra`.
+    expect(bringUpCalled).toBe(false);
+
+    // The other process's row STANDS — the regeneration's own write did not
+    // clobber it with the ports this run derived from its stale snapshot.
+    expect(registryRow(installDir).row.ports).toEqual(concurrentPorts);
+  });
+
   // ── round 4 — samePortMaps compares normalised sets ─────────────────────────
   // The re-read comparison finding 4 relies on (`samePortMaps`) used to compare
   // the raw arrays with `JSON.stringify`: order, duplicates and string/number

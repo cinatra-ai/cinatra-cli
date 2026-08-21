@@ -4671,11 +4671,28 @@ function lookupOwnIsolatedRow(targetDir) {
   return null;
 }
 
-/** Marks the one error `persistIsolatedPortRepair` raises deliberately — the
- *  row moved under the lock — so its catch can tell that refusal apart from a
- *  genuine failure to write and report it as what it is (cinatra-cli#237
- *  round-3 finding 4). A symbol, so it can never collide with an Error field. */
+/** Marks the one error `persistIsolatedPortRepair` and `regenerateIsolatedComposeInPlace`
+ *  raise deliberately — the row moved under the lock — so a catch can tell that
+ *  refusal apart from a genuine failure to write and report it as what it is
+ *  (cinatra-cli#237 round-3 findings 1 + 4). A symbol, so it can never collide
+ *  with an Error field. */
 const CONCURRENT_ROW_MOVE = Symbol("cinatra.concurrentRowMove");
+
+/** Build + tag the abort both of this instance's registry writers raise when
+ *  the row they compare INSIDE their lock no longer matches the snapshot they
+ *  reasoned from OUTSIDE it: one message shape, spelled out in one place, so
+ *  the two writers can never drift apart on what they tell the operator
+ *  (cinatra-cli#237 round 3). */
+function concurrentRowMoveError(slug, expectedPorts, currentPorts) {
+  const err = new Error(
+    `Refusing to bring up isolated instance "${slug}": a concurrent cinatra operation moved its recorded ` +
+      `ports while this repair was in flight (this run read ${JSON.stringify(expectedPorts ?? {})}; the ` +
+      `registry now holds ${JSON.stringify(currentPorts ?? {})}). Nothing was started, and nothing was ` +
+      `changed. Re-run this command to converge against the other operation's row.`,
+  );
+  err[CONCURRENT_ROW_MOVE] = true;
+  return err;
+}
 
 /** Is this parsed value the shape `generateIsolatedCompose` emits — a mapping
  *  with a `services` mapping? Deliberately structural and shallow: the question
@@ -5052,14 +5069,7 @@ async function persistIsolatedPortRepair({
       // is to ABORT the run rather than either overwrite the other process's
       // write or launch on top of it (see the throw below).
       if (!samePortMaps(current.ports ?? {}, recordedPorts ?? {})) {
-        const err = new Error(
-          `Refusing to bring up isolated instance "${slug}": a concurrent cinatra operation moved its recorded ` +
-            `ports while this repair was in flight (this run read ${JSON.stringify(recordedPorts ?? {})}; the ` +
-            `registry now holds ${JSON.stringify(current.ports ?? {})}). Nothing was started, and nothing was ` +
-            `changed. Re-run this command to converge against the other operation's row.`,
-        );
-        err[CONCURRENT_ROW_MOVE] = true;
-        throw err;
+        throw concurrentRowMoveError(slug, recordedPorts, current.ports);
       }
       writeInstanceRegistry(registryPath, updateInstance(reg, slug, { ports }));
     });
@@ -5122,6 +5132,13 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     const regen = await regenerateIsolatedComposeInPlace({ targetDir, row, log, deps });
     if (regen.regenerated && regen.ports) effectivePorts = regen.ports;
   } catch (err) {
+    // cinatra-cli#237 round-3 finding 1: a concurrent row move is not a
+    // best-effort regeneration failure to shrug off and continue past — the
+    // registry no longer holds what this run believes it does, and the
+    // `.env.local` re-point + launch below must never run on that belief. Same
+    // rethrow `persistIsolatedPortRepair`'s own catch performs for the same
+    // symbol (round-4).
+    if (err?.[CONCURRENT_ROW_MOVE]) throw err;
     log(`  ⚠ Isolated compose regeneration skipped (${err instanceof Error ? err.message : err}); using the recorded compose.`);
   }
   // cinatra-cli#231 (round-2 review): whether a regeneration ran, was skipped as
@@ -5322,11 +5339,27 @@ async function regenerateIsolatedComposeInPlace({ targetDir, row, log = console.
 
   // Persist the enlarged remapped-port map + the offset (so a legacy row's next
   // regeneration is a cheap no-op that never re-derives).
+  //
+  // cinatra-cli#237 round-3 finding 1: this is the re-converge route's SECOND
+  // registry writer, and it used to check only that the row still EXISTS, then
+  // write `{ports, offset}` derived from the `row` snapshot read OUTSIDE this
+  // lock — a concurrent move in that window (a sibling install repairing this
+  // row, an allocation re-recorded) was silently clobbered, the exact case the
+  // abort below refuses. It was not catchable afterwards either:
+  // `persistIsolatedPortRepair` runs next with `ports` already equal to what
+  // THIS write just made the row hold, so its own same-value early return fires
+  // before it ever compares against `recordedPorts`. Guarded the same way as
+  // that repair: compare the row locked just now against the pre-lock
+  // `row.ports` snapshot this regeneration reasoned from, and abort instead of
+  // overwriting on any difference.
   await withAllocLock(lockPath, async () => {
     const reg = requireUsableInstanceRegistry(registryPath);
-    if (getInstance(reg, row.slug)) {
-      writeInstanceRegistry(registryPath, updateInstance(reg, row.slug, { ports, offset }));
+    const current = getInstance(reg, row.slug);
+    if (!current) return;
+    if (!samePortMaps(current.ports ?? {}, row.ports ?? {})) {
+      throw concurrentRowMoveError(row.slug, row.ports, current.ports);
     }
+    writeInstanceRegistry(registryPath, updateInstance(reg, row.slug, { ports, offset }));
   });
 
   return { regenerated: true, ports };
