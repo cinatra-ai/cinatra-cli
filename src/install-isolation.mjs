@@ -414,6 +414,39 @@ function remapServicePorts(ports, offset) {
   });
 }
 
+/** The ONE strict reading of a published HOST-port scalar, shared by BOTH the
+ *  short-syntax and long-form branches (cinatra-cli#237 round-2 finding 2: the
+ *  long form used a permissive `Number.parseInt`, so a legitimate long-form
+ *  RANGE `{ published: "23010-23015" }` was recorded as the single port 23010 —
+ *  a port the stack never binds — while the short form deliberately declined
+ *  the very same input. One helper, so the two branches cannot drift again).
+ *
+ *  A host port is a run of DIGITS and nothing else. A RANGE, a `${VAR}`, a
+ *  trailing-garbage prefix (`"23010x"`) or an empty value all yield null →
+ *  NOTHING is recorded for that entry.
+ *
+ *  Leading zeros are ACCEPTED and normalised to the integer (round-2 finding
+ *  6): Compose reads `"023010:3010"` as host port 23010 and binds it, so
+ *  rejecting the spelling would silently drop a real binding.
+ *
+ *  Pure. */
+function strictHostPort(raw) {
+  const s = String(raw ?? "").trim();
+  if (!/^\d+$/.test(s)) return null; // range, `${VAR}`, non-numeric or empty.
+  const n = Number.parseInt(s, 10);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/** Does this raw published-port spelling DEFER to an environment variable
+ *  (`"${WAYFLOW_PORT}"`, `"$WAYFLOW_PORT"`, `"${PG_PORT}:5432"`)? Compose
+ *  resolves such a value at `up` time, so the FILE states no static host port
+ *  for it — which is a different answer from "this entry publishes nothing".
+ *  See `publishedPortsByService` / `interpolatedPortServices` for what the
+ *  distinction buys (cinatra-cli#237 round-2 finding 1). Pure. */
+function isInterpolatedPortSpec(raw) {
+  return String(raw ?? "").includes("$");
+}
+
 /** Parse the fixed HOST port out of a short-syntax `ports` string entry
  *  (`"[host_ip:]hostPort:containerPort[/protocol]"`). cinatra-cli#237 finding
  *  3: `remapServicePorts` deliberately leaves a short-syntax entry UNSHIFTED
@@ -422,43 +455,76 @@ function remapServicePorts(ports, offset) {
  *  so reading it back as truth is correct regardless of whether generation
  *  ever learns to remap it. Returns the host port as an integer, or null for
  *  a bare `"containerPort"` form (no fixed host port — docker assigns an
- *  ephemeral one at `up` time, so there is nothing fixed to record) or a
+ *  ephemeral one at `up` time, so there is nothing fixed to record), a
  *  port RANGE (`"23010-23015:3010-3015"`, ambiguous which single port to
- *  record). Pure. */
+ *  record) or an interpolated host port (`"${WAYFLOW_PORT}:3010"` — see
+ *  `shortSyntaxHostPortIsInterpolated`). Pure. */
 function shortSyntaxHostPort(entry) {
+  const hostPortRaw = shortSyntaxHostPortRaw(entry);
+  if (hostPortRaw == null) return null;
+  return strictHostPort(hostPortRaw);
+}
+
+/** The raw `hostPort` segment of a short-syntax entry, before any validation —
+ *  null for a bare `"containerPort"` form (no host segment at all). Split out
+ *  so the "is it a number" and "does it defer to a variable" questions read the
+ *  SAME segment. Pure. */
+function shortSyntaxHostPortRaw(entry) {
   if (typeof entry !== "string") return null;
   const withoutProto = entry.replace(/\/(tcp|udp)$/i, "");
   const parts = withoutProto.split(":");
   if (parts.length < 2) return null; // bare "containerPort" — ephemeral host port.
   // Drop the trailing container-port segment; what remains is `[host_ip:]hostPort`.
   const hostPart = parts.slice(0, -1).join(":");
-  const hostPortRaw = hostPart.includes(":") ? hostPart.slice(hostPart.lastIndexOf(":") + 1) : hostPart;
-  if (hostPortRaw.includes("-")) return null; // a range — ambiguous, see above.
-  const n = Number.parseInt(hostPortRaw, 10);
-  return Number.isFinite(n) && n > 0 && String(n) === hostPortRaw.trim() ? n : null;
+  return hostPart.includes(":") ? hostPart.slice(hostPart.lastIndexOf(":") + 1) : hostPart;
+}
+
+/** Does a short-syntax entry leave its HOST port to interpolation? True for
+ *  `"${WAYFLOW_PORT}:3010"` and for a whole-entry variable (`"${PORT_SPEC}"`,
+ *  which may expand to `"23010:3010"`); false for `"23010:${TARGET}"`, whose
+ *  host port IS stated — only the container port defers, and that is not a
+ *  published-host-port truth. Pure. */
+function shortSyntaxHostPortIsInterpolated(entry) {
+  if (typeof entry !== "string") return false;
+  const hostPortRaw = shortSyntaxHostPortRaw(entry);
+  // A whole-entry variable has no host segment to inspect; treat it as deferred
+  // (it can expand to a `host:container` pair) rather than as an ephemeral bind.
+  if (hostPortRaw == null) return isInterpolatedPortSpec(entry);
+  return isInterpolatedPortSpec(hostPortRaw);
 }
 
 /** The published HOST ports one service declares, as integers, in declaration
- *  order. The LONG form `{ published, … }` is read from `.published`; a
- *  short-syntax STRING entry (`"23010:3010"`) is parsed by
- *  `shortSyntaxHostPort` — it is a real binding this stack publishes RIGHT
- *  NOW (cinatra-cli#237 finding 3), even though `remapServicePorts` leaves it
- *  unshifted (reading published truth and writing a remap are different
- *  concerns). Pure. */
-function publishedPortsOfService(svc) {
-  const out = [];
-  if (!svc || typeof svc !== "object" || !Array.isArray(svc.ports)) return out;
+ *  order, PLUS whether any entry left its host port to interpolation.
+ *
+ *  The LONG form `{ published, … }` is read from `.published`; a short-syntax
+ *  STRING entry (`"23010:3010"`) is parsed by `shortSyntaxHostPort` — it is a
+ *  real binding this stack publishes RIGHT NOW (cinatra-cli#237 finding 3),
+ *  even though `remapServicePorts` leaves it unshifted (reading published truth
+ *  and writing a remap are different concerns). BOTH branches validate through
+ *  `strictHostPort` (round-2 finding 2). Pure. */
+function readServicePublishedPorts(svc) {
+  const ports = [];
+  let interpolated = false;
+  if (!svc || typeof svc !== "object" || !Array.isArray(svc.ports)) return { ports, interpolated };
   for (const p of svc.ports) {
     if (typeof p === "string") {
+      if (shortSyntaxHostPortIsInterpolated(p)) interpolated = true;
       const hostPort = shortSyntaxHostPort(p);
-      if (hostPort != null) out.push(hostPort);
+      if (hostPort != null) ports.push(hostPort);
       continue;
     }
     const pub = p && typeof p === "object" ? p.published : undefined;
-    const n = Number.parseInt(String(pub ?? ""), 10);
-    if (Number.isFinite(n) && n > 0) out.push(n);
+    if (isInterpolatedPortSpec(pub)) interpolated = true;
+    const n = strictHostPort(pub);
+    if (n != null) ports.push(n);
   }
-  return out;
+  return { ports, interpolated };
+}
+
+/** The published HOST ports one service declares, as integers, in declaration
+ *  order. The static-truth half of `readServicePublishedPorts`. Pure. */
+function publishedPortsOfService(svc) {
+  return readServicePublishedPorts(svc).ports;
 }
 
 /**
@@ -472,6 +538,14 @@ function publishedPortsOfService(svc) {
  * instance's `.env.local` must be pointed at and what the install tail must
  * name. A recorded registry row is only a RECORD of that, and can lag it.
  *
+ * This is STATIC truth only. A service whose published port is INTERPOLATED
+ * (`{ published: "${POSTGRES_PORT}" }`, `"${WAYFLOW_PORT}:3010"` — valid
+ * Compose, resolved at `up` time) is omitted here exactly like one that
+ * publishes nothing, because this map cannot say what it will bind. Those two
+ * cases are NOT interchangeable for a caller that overlays this map onto a
+ * recorded one — ask `interpolatedPortServices` to tell them apart
+ * (cinatra-cli#237 round-2 finding 1).
+ *
  * @param {object} doc parsed compose document (`{ services: { … } }`)
  * @returns {Record<string, number[]>}
  */
@@ -483,6 +557,46 @@ export function publishedPortsByService(doc) {
     if (collected.length > 0) out[name] = collected;
   }
   return out;
+}
+
+/**
+ * The services this document declares whose published host port DEFERS to an
+ * environment variable — the services for which the file declines to state a
+ * static truth (cinatra-cli#237 round-2 finding 1).
+ *
+ * The rule this enables, for any caller that treats a parsed compose file as
+ * the authority over a recorded port map:
+ *
+ *   - service ABSENT from the file            → it is GONE. Its recorded entry
+ *                                               must NOT survive (round-1
+ *                                               finding 1: an entry kept for a
+ *                                               service the stack no longer
+ *                                               contains advertises a dead — or
+ *                                               another instance's live — port).
+ *   - service PRESENT, ports fully static     → the FILE wins outright.
+ *   - service PRESENT, any port interpolated  → the file states no static truth
+ *                                               for it, so the RECORDED entry
+ *                                               SURVIVES. Replacing it would
+ *                                               delete a legitimate allocation,
+ *                                               rewrite `.env.local` without
+ *                                               that endpoint, and still launch
+ *                                               a stack that binds the port.
+ *
+ * Reported PER SERVICE (not per entry) and sorted, so the answer is stable. A
+ * service mixing a static and an interpolated entry is listed: its static half
+ * is a PARTIAL statement, and a partial list overlaid on a complete recorded
+ * one would read as a disagreement.
+ *
+ * @param {object} doc parsed compose document (`{ services: { … } }`)
+ * @returns {string[]} service names, sorted
+ */
+export function interpolatedPortServices(doc) {
+  const services = doc?.services && typeof doc.services === "object" ? doc.services : {};
+  const out = [];
+  for (const [name, svc] of Object.entries(services)) {
+    if (readServicePublishedPorts(svc).interpolated) out.push(name);
+  }
+  return out.sort();
 }
 
 // ── cinatra-cli#97 — self-advertised host-URL remap ──────────────────────────
@@ -919,9 +1033,13 @@ export const __test = {
   isSecretEnvKey,
   scrubServiceEnv,
   remapServicePorts,
+  strictHostPort,
   shortSyntaxHostPort,
+  shortSyntaxHostPortIsInterpolated,
   publishedPortsOfService,
+  readServicePublishedPorts,
   publishedPortsByService,
+  interpolatedPortServices,
   remapEnvHostUrlPorts,
   findUnmappedComposeHostUrls,
   remapEnvAppPortUrls,
