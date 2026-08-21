@@ -4671,6 +4671,12 @@ function lookupOwnIsolatedRow(targetDir) {
   return null;
 }
 
+/** Marks the one error `persistIsolatedPortRepair` raises deliberately — the
+ *  row moved under the lock — so its catch can tell that refusal apart from a
+ *  genuine failure to write and report it as what it is (cinatra-cli#237
+ *  round-3 finding 4). A symbol, so it can never collide with an Error field. */
+const CONCURRENT_ROW_MOVE = Symbol("cinatra.concurrentRowMove");
+
 /** Is this parsed value the shape `generateIsolatedCompose` emits — a mapping
  *  with a `services` mapping? Deliberately structural and shallow: the question
  *  is only "did we get the CLI's generated document back", so that a `null`, an
@@ -4917,7 +4923,9 @@ function assertIsolatedPortsConverge({ slug, recordedPorts, ports, composeProjec
       `(${recorded}) disagrees with what ${ISOLATED_COMPOSE_FILENAME} now publishes ` +
       `(${actual}). Bringing the stack up on the diverging file could launch it OUTSIDE ` +
       `this instance's allocated band, onto a port another instance may already own. Nothing was started, ` +
-      `and nothing was changed. Recover by one of:\n` +
+      `and nothing was changed. Options 2 and 3 below hand-edit ${regFile}: stop any other cinatra ` +
+      `operations on this machine first, or a concurrent run can rewrite that row underneath your edit. ` +
+      `Recover by one of:\n` +
       `  (1) KEEP the recorded allocation — edit ${ISOLATED_COMPOSE_FILENAME} so "${mismatch.service}" ` +
       `publishes ${recorded} again, then re-run this command.\n` +
       `  (2) ADOPT ${actual} for this instance — first make sure no other instance holds it ` +
@@ -4929,6 +4937,52 @@ function assertIsolatedPortsConverge({ slug, recordedPorts, ports, composeProjec
       `checkout, then run \`cinatra install --on-conflict=isolated\`, which allocates a new band and ` +
       `regenerates ${ISOLATED_COMPOSE_FILENAME} from scratch.`,
   );
+}
+
+/**
+ * Re-run the divergence gate against the compose file AS IT STANDS RIGHT NOW,
+ * immediately before the launch (cinatra-cli#237 round-3 finding 3).
+ *
+ * The gate ran once, early, against a SNAPSHOT of the file — and then the run
+ * did real work with that verdict in hand (repairing the row, regenerating the
+ * compose, rewriting `.env.local`) before finally handing the file to Compose.
+ * Everything in that window is time in which the file can change: a sibling
+ * cinatra process, an editor writing out a buffer, a regeneration in another
+ * checkout. `startInfra` then brought up whatever the file said at THAT moment,
+ * which nothing had checked — the classic check-then-use gap, and the port it
+ * binds is exactly what the gate exists to keep inside this instance's band.
+ *
+ * Closing it costs one re-read of one small file, so it is not worth being
+ * clever about: read the file again, recompute the effective map, and demand
+ * the same convergence. A file that changed under us aborts with the same error
+ * and the same recovery steps as the first gate. This narrows the window to the
+ * few statements between here and the `up`; it cannot close it completely
+ * (nothing short of Compose itself reporting its bindings could), and it does
+ * not need to — the point is that a launch is never authorised by a reading of
+ * the file that a whole install phase has since had time to invalidate.
+ *
+ * `ports` is what this run BELIEVES the instance holds at this point: the
+ * effective map it has already gated on and (where warranted) persisted to the
+ * row. Comparing the freshly-read file against that is the same question the
+ * first gate asked, so an unchanged file always passes.
+ *
+ * @param {object} args
+ * @param {string} args.slug the instance
+ * @param {string} args.targetDir the checkout holding the generated compose
+ * @param {Record<string, number[]>} args.ports the map this run is launching on
+ * @param {string} [args.composeProject] the recorded `-p` (named in the text)
+ * @param {string} [args.registryPath] where the row lives (named in the text)
+ * @throws {Error} when the file no longer converges, or can no longer be parsed
+ */
+function assertIsolatedPortsStillConverge({ slug, targetDir, ports, composeProject, registryPath }) {
+  if (!slug) return;
+  assertIsolatedPortsConverge({
+    slug,
+    recordedPorts: ports,
+    ports: effectiveIsolatedPorts(targetDir, ports),
+    composeProject,
+    registryPath,
+  });
 }
 
 /**
@@ -4961,9 +5015,37 @@ async function persistIsolatedPortRepair({
   try {
     await withAllocLock(lockPath, async () => {
       const reg = requireUsableInstanceRegistry(registryPath);
-      if (getInstance(reg, slug)) writeInstanceRegistry(registryPath, updateInstance(reg, slug, { ports }));
+      const current = getInstance(reg, slug);
+      if (!current) return;
+      // cinatra-cli#237 round-3 finding 4: taking the lock is not the same as
+      // having read the row under it. Everything this repair is justified by —
+      // the caller's `recordedPorts`, the convergence checked against them —
+      // was decided OUTSIDE the lock, and the write then went in on the
+      // strength of that stale snapshot. Any other cinatra process that
+      // legitimately moved this row in between (a sibling install repairing it,
+      // an allocation being re-recorded) had its update silently overwritten by
+      // a decision made before it existed. So the row is re-read here and
+      // compared to what the caller believed it was: a difference means the row
+      // is no longer the one this repair reasoned about, and the honest answer
+      // is to leave the other process's write alone and say so. This run's own
+      // endpoints and `.env.local` already reflect the file and are unaffected.
+      if (!samePortMaps(current.ports ?? {}, recordedPorts ?? {})) {
+        const err = new Error(
+          `another cinatra process changed instance "${slug}"'s recorded ports while this repair was in ` +
+            `flight (this run read ${JSON.stringify(recordedPorts ?? {})}; the registry now holds ` +
+            `${JSON.stringify(current.ports ?? {})}), so this run's repair is based on a row that no longer ` +
+            `exists — refusing to overwrite the newer update`,
+        );
+        err[CONCURRENT_ROW_MOVE] = true;
+        throw err;
+      }
+      writeInstanceRegistry(registryPath, updateInstance(reg, slug, { ports }));
     });
   } catch (err) {
+    if (err?.[CONCURRENT_ROW_MOVE]) {
+      log(`  ⚠ Skipped the recorded-port repair: ${err.message}. This run's endpoints and .env.local are unaffected.`);
+      return;
+    }
     log(
       `  ⚠ Could not record instance "${slug}"'s effective port map (${err instanceof Error ? err.message : err}); ` +
         `this run's endpoints and .env.local are unaffected.`,
@@ -5036,6 +5118,17 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
   // a stopped isolated stack would start with empty secrets/wrong URLs.
   ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: effectivePorts, log });
   const reconvEnvFile = path.join(targetDir, ".env.local");
+  // cinatra-cli#237 round-3 finding 3: the gate above cleared a snapshot taken
+  // before the regeneration, the row repair and the env re-point. Re-read the
+  // file and re-gate on it HERE, with nothing left between this check and the
+  // `up` that could invalidate it.
+  assertIsolatedPortsStillConverge({
+    slug: row.slug,
+    targetDir,
+    ports: effectivePorts,
+    composeProject: row.composeProject,
+    registryPath,
+  });
   startInfra({
     slug: row.slug,
     deps,
@@ -5448,6 +5541,19 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
       ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: row.appPort, ports: attachPorts, log });
       const envCandidate = path.join(targetDir, ".env.local");
       attachEnvFile = existsSync(envCandidate) ? envCandidate : null;
+      // cinatra-cli#237 round-3 finding 3: the gate above cleared a snapshot
+      // taken before the row repair and the env re-point. Re-read the file and
+      // re-gate on it HERE — OUTSIDE the bring-up `try` below, whose catch
+      // deliberately tolerates infra failures and would otherwise downgrade this
+      // abort to a warning and attach anyway, which is the very outcome the gate
+      // exists to prevent.
+      assertIsolatedPortsStillConverge({
+        slug: row.slug,
+        targetDir,
+        ports: attachPorts,
+        composeProject: row.composeProject,
+        registryPath,
+      });
     }
     try {
       log("- Ensuring this checkout's own infra is up (attach)…");

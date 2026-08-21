@@ -1567,4 +1567,150 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
     // The endpoints still come from it.
     expect(lines.find((l) => l.includes("Agent runtime:"))).toContain(`http://localhost:${EXPECTED_WAYFLOW_PORT}`);
   });
+
+  // ── finding 3 ──────────────────────────────────────────────────────────────
+  // The gate validated a SNAPSHOT of the file and the launch used the file as it
+  // stood later. `writeIsolatedAppEnv`'s "infra URLs re-pointed" line lands in
+  // exactly that window (after the gate and the repair, before `startInfra`), so
+  // hooking it reproduces the race deterministically.
+  const REPOINT_LINE = "infra URLs re-pointed";
+
+  it("finding 3: a file changed BETWEEN the gate and the launch aborts (attach)", async () => {
+    const installDir = await freshIsolatedInstall("iso237r3-toctou-attach");
+    const recordedPg = 5434 + OFFSET;
+    const divergedPg = recordedPg + 1000;
+
+    let bringUpCalled = false;
+    let swapped = false;
+    const deps = { ...isolatedDeps(), bringUpInfra: () => { bringUpCalled = true; } };
+    // The concurrent writer: it lands after the gate has already passed on the
+    // pristine file.
+    const log = (l) => {
+      if (!swapped && String(l).includes(REPOINT_LINE)) {
+        swapped = true;
+        const { doc } = readGeneratedCompose(installDir);
+        doc.services.postgres.ports[0].published = String(divergedPg);
+        writeCompose(installDir, doc);
+      }
+    };
+
+    const err = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "attach",
+      ],
+      { log, deps },
+    ).then(() => null, (e) => e);
+
+    expect(swapped).toBe(true);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/postgres/);
+    expect(err.message).toContain(String(divergedPg));
+    // The whole point: the divergent stack was never brought up.
+    expect(bringUpCalled).toBe(false);
+  });
+
+  it("finding 3: a file changed BETWEEN the gate and the launch aborts (re-converge)", async () => {
+    const installDir = await freshIsolatedInstall("iso237r3-toctou-reconv");
+    const recordedPg = 5434 + OFFSET;
+    const divergedPg = recordedPg + 1000;
+
+    let bringUpCalled = false;
+    let swapped = false;
+    const deps = { ...isolatedDeps(), bringUpInfra: () => { bringUpCalled = true; } };
+    const log = (l) => {
+      if (!swapped && String(l).includes(REPOINT_LINE)) {
+        swapped = true;
+        const { doc } = readGeneratedCompose(installDir);
+        doc.services.postgres.ports[0].published = String(divergedPg);
+        writeCompose(installDir, doc);
+      }
+    };
+
+    const err = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      { log, deps },
+    ).then(() => null, (e) => e);
+
+    expect(swapped).toBe(true);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/postgres/);
+    expect(bringUpCalled).toBe(false);
+  });
+
+  // ── finding 4 ──────────────────────────────────────────────────────────────
+  // `persistIsolatedPortRepair` validated against the CALLER's snapshot of the
+  // row, then re-read the registry inside the lock and wrote `ports` without
+  // comparing. A concurrent process that legitimately moved the row in that
+  // window had its update silently overwritten by this run's stale-based repair.
+  it("finding 4: a row moved by another process in the repair window aborts the repair instead of overwriting it", async () => {
+    const installDir = await freshIsolatedInstall("iso237r3-race");
+    const registryFile = process.env.CINATRA_INSTANCE_REGISTRY;
+    const { slug, row: fullRow } = registryRow(installDir);
+
+    const writeRowPorts = (ports) => {
+      const reg = JSON.parse(readFileSync(registryFile, "utf8"));
+      reg.instances[slug].ports = ports;
+      writeFileSync(registryFile, JSON.stringify(reg, null, 2) + "\n");
+    };
+
+    // Make a repair genuinely WARRANTED, without touching the compose file: the
+    // ROW lags it by one service. That is an absence on the recorded side, not a
+    // disagreement, so the gate passes and the repair wants to add the entry
+    // back — and the regeneration stays a no-op, since the file is complete.
+    const laggingPorts = { ...fullRow.ports };
+    delete laggingPorts.wayflow;
+    writeRowPorts(laggingPorts);
+
+    // What the "other process" writes while this run's repair is in flight.
+    // Distinct from both the lagging row this run read and the map it derived.
+    const concurrentPorts = { ...fullRow.ports, sentinel: [19999] };
+
+    // `regenerateIsolatedComposeInPlace` resolves the checkout's compose config
+    // AFTER this run has read its row and BEFORE `persistIsolatedPortRepair`
+    // takes the allocation lock — i.e. exactly the window the finding is about.
+    let moved = false;
+    const deps = {
+      ...isolatedDeps(),
+      bringUpInfra: () => {},
+      composeConfigForFiles: (...args) => {
+        if (!moved) {
+          moved = true;
+          writeRowPorts(concurrentPorts);
+        }
+        return isolatedDeps().composeConfigForFiles(...args);
+      },
+    };
+
+    const lines = [];
+    await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      { log: (l) => lines.push(String(l)), deps },
+    );
+    expect(moved).toBe(true);
+
+    // The other process's row STANDS — this run's stale-based repair did not
+    // overwrite it, and in particular did not drop the entry it never saw.
+    expect(registryRow(installDir).row.ports).toEqual(concurrentPorts);
+    // ...and it said so, rather than failing silently.
+    const warn = lines.find((l) => /another|concurrent/i.test(l) && l.includes(slug));
+    expect(warn).toBeDefined();
+    expect(warn).toMatch(/chang|mov/i);
+  });
+
+  it("finding 4: the hand-edit recovery tells the operator to stop concurrent cinatra operations first", async () => {
+    const installDir = await freshIsolatedInstall("iso237r3-recovery-text");
+    const { doc } = readGeneratedCompose(installDir);
+    doc.services.postgres.ports[0].published = String(5434 + OFFSET + 1000);
+    writeCompose(installDir, doc);
+
+    const err = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      { log: () => {}, deps: { ...isolatedDeps(), bringUpInfra: () => {} } },
+    ).then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(Error);
+    // The recovery steps hand-edit the registry file; doing that while another
+    // cinatra process holds the row is the race finding 4 closes in code.
+    expect(err.message).toMatch(/stop .*cinatra|no other cinatra|concurrent cinatra/i);
+  });
 });
