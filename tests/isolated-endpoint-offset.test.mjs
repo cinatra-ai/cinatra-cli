@@ -30,7 +30,7 @@ import path from "node:path";
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { runInstall } from "../src/install.mjs";
+import { __test as installTest, runInstall } from "../src/install.mjs";
 import {
   __test as isoTest,
   assertComposeAppUrlsRemapped,
@@ -1657,7 +1657,15 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
   // row, then re-read the registry inside the lock and wrote `ports` without
   // comparing. A concurrent process that legitimately moved the row in that
   // window had its update silently overwritten by this run's stale-based repair.
-  it("finding 4: a row moved by another process in the repair window aborts the repair instead of overwriting it", async () => {
+  //
+  // round 4: detecting the move used to be the end of it — the abandon path
+  // logged a warning and RETURNED, and the caller carried on to rewrite
+  // `.env.local` against this run's STALE ports and launch anyway. That
+  // re-opened the exact split-brain finding 4 exists to close: this run would
+  // advertise the old port while the registry held the mover's new one. The
+  // abandon path must ABORT the whole run instead — neither the re-converge
+  // nor the attach route may reach `startInfra` on a row it knows it lost.
+  it("finding 4: a row moved by another process in the repair window aborts the run instead of skip-and-launch", async () => {
     const installDir = await freshIsolatedInstall("iso237r3-race");
     const registryFile = process.env.CINATRA_INSTANCE_REGISTRY;
     const { slug, row: fullRow } = registryRow(installDir);
@@ -1684,9 +1692,10 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
     // AFTER this run has read its row and BEFORE `persistIsolatedPortRepair`
     // takes the allocation lock — i.e. exactly the window the finding is about.
     let moved = false;
+    let bringUpCalled = false;
     const deps = {
       ...isolatedDeps(),
-      bringUpInfra: () => {},
+      bringUpInfra: () => { bringUpCalled = true; },
       composeConfigForFiles: (...args) => {
         if (!moved) {
           moved = true;
@@ -1697,19 +1706,24 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
     };
 
     const lines = [];
-    await runInstall(
+    const err = await runInstall(
       ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
       { log: (l) => lines.push(String(l)), deps },
-    );
+    ).then(() => null, (e) => e);
     expect(moved).toBe(true);
+
+    // The abort, not a skip-and-continue: the run rejects instead of finishing.
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/another|concurrent/i);
+    expect(err.message).toMatch(/chang|mov/i);
+    // The whole point: a run that lost the race must never reach `startInfra` —
+    // that is the route that would advertise this run's stale port while the
+    // registry holds the other writer's new one.
+    expect(bringUpCalled).toBe(false);
 
     // The other process's row STANDS — this run's stale-based repair did not
     // overwrite it, and in particular did not drop the entry it never saw.
     expect(registryRow(installDir).row.ports).toEqual(concurrentPorts);
-    // ...and it said so, rather than failing silently.
-    const warn = lines.find((l) => /another|concurrent/i.test(l) && l.includes(slug));
-    expect(warn).toBeDefined();
-    expect(warn).toMatch(/chang|mov/i);
   });
 
   it("finding 4: the hand-edit recovery tells the operator to stop concurrent cinatra operations first", async () => {
@@ -1726,5 +1740,43 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
     // The recovery steps hand-edit the registry file; doing that while another
     // cinatra process holds the row is the race finding 4 closes in code.
     expect(err.message).toMatch(/stop .*cinatra|no other cinatra|concurrent cinatra/i);
+  });
+
+  // ── round 4 — samePortMaps compares normalised sets ─────────────────────────
+  // The re-read comparison finding 4 relies on (`samePortMaps`) used to compare
+  // the raw arrays with `JSON.stringify`: order, duplicates and string/number
+  // spelling all then read as a disagreement, so a caller that legitimately
+  // holds the SAME ports in a differently-shaped map (order not guaranteed, a
+  // redundant declaration, a hand-edited registry row's port as a string) would
+  // read as a concurrent move and abort a repair finding 4 needs to proceed.
+  // `samePortMaps` has no other seam, so it is asserted directly via the
+  // `__test` export rather than through the whole install pipeline.
+  describe("round 4: samePortMaps compares normalised sets, not raw arrays", () => {
+    const { samePortMaps } = installTest;
+
+    it("a service's ports in a different ORDER read as the same map", () => {
+      expect(samePortMaps({ postgres: [25434, 26379] }, { postgres: [26379, 25434] })).toBe(true);
+    });
+
+    it("a redundant DUPLICATE declaration reads as the same map", () => {
+      expect(samePortMaps({ redis: [26379] }, { redis: [26379, 26379] })).toBe(true);
+    });
+
+    it("a STRING vs number spelling of the same port reads as the same map", () => {
+      expect(samePortMaps({ postgres: [25434] }, { postgres: ["25434"] })).toBe(true);
+    });
+
+    it("a GENUINE port change still reads as a different map", () => {
+      expect(samePortMaps({ postgres: [25434] }, { postgres: [35434] })).toBe(false);
+    });
+
+    it("a genuine move on ONE service still differs even when other services and the ordering are benign", () => {
+      expect(
+        samePortMaps(
+          { postgres: [25434, 26379], redis: [6379] },
+          { postgres: [26379, 25434], redis: [6380] },
+        ),
+      ).toBe(false);
+    });
   });
 });

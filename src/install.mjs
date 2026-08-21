@@ -4858,14 +4858,24 @@ function effectiveIsolatedPorts(targetDir, recordedPorts = {}) {
   return effective;
 }
 
-/** Deep-equality of two `{ service: [hostPort…] }` maps, order-insensitive across
- *  services and order-sensitive within one (the generator emits a stable order).
- *  Pure. */
+/** Equality of two `{ service: [hostPort…] }` maps, order-insensitive across
+ *  services AND within one service's list (cinatra-cli#237 round-4: comparing
+ *  the raw arrays read `[25434,26379]` vs `[26379,25434]` — or `[25434]` vs
+ *  `["25434"]` — as a concurrent move and aborted a legitimate repair, since
+ *  neither the caller's map construction nor a hand-edited registry row
+ *  guarantees a stable order or a numeric type. Each side is coerced through
+ *  the shared `normalisePortList` — the same coercion `firstSharedServicePortMismatch`
+ *  compares with — so a benign spelling difference can never read as a port
+ *  disagreement here while a genuine one does there. Pure. */
 function samePortMaps(a, b) {
   const ka = Object.keys(a ?? {}).sort();
   const kb = Object.keys(b ?? {}).sort();
   if (ka.length !== kb.length || ka.some((k, i) => k !== kb[i])) return false;
-  return ka.every((k) => JSON.stringify(a[k]) === JSON.stringify(b[k]));
+  return ka.every((k) => {
+    const na = normalisePortList((a ?? {})[k]);
+    const nb = normalisePortList((b ?? {})[k]);
+    return na.length === nb.length && na.every((p, i) => p === nb[i]);
+  });
 }
 
 /**
@@ -4986,7 +4996,11 @@ function assertIsolatedPortsStillConverge({ slug, targetDir, ports, composeProje
 }
 
 /**
- * Record a repaired isolated port map on the instance's row (best-effort).
+ * Record a repaired isolated port map on the instance's row. Best-effort for a
+ * genuine write failure (corrupt registry, disk error) — this run's endpoints
+ * and `.env.local` stand regardless. NOT best-effort for a concurrent row move
+ * (cinatra-cli#237 round 4): that ABORTS the whole run, since carrying on would
+ * mean launching against ports the registry no longer agrees this run holds.
  *
  * cinatra-cli#231 (round-2 review): the map this run speaks is the map the
  * instance actually publishes, so a row that lagged it must be CORRECTED — a
@@ -5017,6 +5031,14 @@ async function persistIsolatedPortRepair({
       const reg = requireUsableInstanceRegistry(registryPath);
       const current = getInstance(reg, slug);
       if (!current) return;
+      // Already converged: the row under the lock already holds exactly what
+      // this run is about to write — most often THIS SAME run's own earlier
+      // `regenerateIsolatedComposeInPlace` persisting its enlargement before
+      // this repair ever took the lock. That is not a concurrent move to
+      // detect, just this write turning out to be redundant; writing again
+      // would be a same-value no-op, so skip it without comparing against the
+      // (now stale) `recordedPorts` snapshot below.
+      if (samePortMaps(current.ports ?? {}, ports)) return;
       // cinatra-cli#237 round-3 finding 4: taking the lock is not the same as
       // having read the row under it. Everything this repair is justified by —
       // the caller's `recordedPorts`, the convergence checked against them —
@@ -5027,14 +5049,14 @@ async function persistIsolatedPortRepair({
       // a decision made before it existed. So the row is re-read here and
       // compared to what the caller believed it was: a difference means the row
       // is no longer the one this repair reasoned about, and the honest answer
-      // is to leave the other process's write alone and say so. This run's own
-      // endpoints and `.env.local` already reflect the file and are unaffected.
+      // is to ABORT the run rather than either overwrite the other process's
+      // write or launch on top of it (see the throw below).
       if (!samePortMaps(current.ports ?? {}, recordedPorts ?? {})) {
         const err = new Error(
-          `another cinatra process changed instance "${slug}"'s recorded ports while this repair was in ` +
-            `flight (this run read ${JSON.stringify(recordedPorts ?? {})}; the registry now holds ` +
-            `${JSON.stringify(current.ports ?? {})}), so this run's repair is based on a row that no longer ` +
-            `exists — refusing to overwrite the newer update`,
+          `Refusing to bring up isolated instance "${slug}": a concurrent cinatra operation moved its recorded ` +
+            `ports while this repair was in flight (this run read ${JSON.stringify(recordedPorts ?? {})}; the ` +
+            `registry now holds ${JSON.stringify(current.ports ?? {})}). Nothing was started, and nothing was ` +
+            `changed. Re-run this command to converge against the other operation's row.`,
         );
         err[CONCURRENT_ROW_MOVE] = true;
         throw err;
@@ -5043,8 +5065,13 @@ async function persistIsolatedPortRepair({
     });
   } catch (err) {
     if (err?.[CONCURRENT_ROW_MOVE]) {
-      log(`  ⚠ Skipped the recorded-port repair: ${err.message}. This run's endpoints and .env.local are unaffected.`);
-      return;
+      // cinatra-cli#237 round-4: this used to be swallowed here — logged as a
+      // skipped best-effort repair — and the caller then rewrote `.env.local`
+      // and launched anyway, advertising THIS run's stale port while the
+      // registry held the other operation's new one (the exact split-brain
+      // finding 4 exists to close). Abort must reach neither route's
+      // `startInfra` call, so the same convergence-abort THROWS here instead.
+      throw err;
     }
     log(
       `  ⚠ Could not record instance "${slug}"'s effective port map (${err instanceof Error ? err.message : err}); ` +
@@ -7206,3 +7233,8 @@ export function moveExistingCheckoutToRef({
   if (!sha) throw new Error(`Could not resolve the checked-out commit in ${targetDir}.`);
   return sha;
 }
+
+// Test-only seam onto otherwise-private pure helpers (cinatra-cli#237 round 4:
+// `samePortMaps` has no other caller-visible surface to assert its comparison
+// semantics against directly).
+export const __test = { samePortMaps };
