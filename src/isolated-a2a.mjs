@@ -252,14 +252,23 @@ export function sharedServicePortsAgree(rowPorts, newPorts) {
 /**
  * The first (by service name, sorted — deterministic) shared-service host-port
  * disagreement between a recorded map and a freshly-read one, or null when
- * `sharedServicePortsAgree` would return true. Same shared-only comparison and
- * normalisation as `sharedServicePortsAgree` (unique sorted sets — a duplicated
- * declaration is not an allocation disagreement, cinatra-cli#237 round-2
- * finding 4), kept as a separate function so
- * that boolean gate stays a simple yes/no while a caller that must ABORT and
- * NAME the disagreement (cinatra-cli#237 findings 2/4: a mismatch on a shared
- * service must stop the run, not just skip a best-effort persist) can report
- * the service plus both port lists in its error.
+ * there is none. Same shared-only comparison and normalisation as
+ * `sharedServicePortsAgree` (unique sorted sets — a duplicated declaration is
+ * not an allocation disagreement, cinatra-cli#237 round-2 finding 4), kept as
+ * a separate function so that boolean gate stays a simple yes/no while a
+ * caller that must ABORT and NAME the disagreement (cinatra-cli#237 findings
+ * 2/4: a mismatch on a shared service must stop the run, not just skip a
+ * best-effort persist) can report the service plus both port lists in its
+ * error.
+ *
+ * cinatra-cli#237 round-3 non-blocking 1: this used to compare list LENGTHS,
+ * so a file where a shared service GAINED a port (every recorded port still
+ * published, plus a new one) read as a disagreement and aborted — even though
+ * it is not one: the row simply lags a file that is a strict superset of it,
+ * which is exactly the state `persistIsolatedPortRepair` exists to repair.
+ * Genuine-move semantics are unchanged: a recorded port the file no longer
+ * publishes (whether the file lost it outright or swapped it for a different
+ * one, in either direction) still disagrees and still aborts.
  *
  * @param {Record<string, number[]>} rowPorts recorded `{ service: [hostPort…] }`
  * @param {Record<string, number[]>} newPorts freshly-read `{ service: [hostPort…] }`
@@ -273,9 +282,11 @@ export function firstSharedServicePortMismatch(rowPorts, newPorts) {
     if (!Object.prototype.hasOwnProperty.call(newPorts, svc)) continue;
     const recorded = norm(rowPorts[svc]);
     const actual = norm(newPorts[svc]);
-    if (recorded.length !== actual.length || recorded.some((n, i) => n !== actual[i])) {
-      return { service: svc, recorded, actual };
-    }
+    const actualSet = new Set(actual);
+    // Every recorded port still published → the file only ADDED, never
+    // contradicted, the record: a lagging row, not a disagreement.
+    if (recorded.every((p) => actualSet.has(p))) continue;
+    return { service: svc, recorded, actual };
   }
   return null;
 }

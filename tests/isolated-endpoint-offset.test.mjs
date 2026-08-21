@@ -1501,6 +1501,37 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
     expect(registryRow(installDir).row.ports.redis).toEqual([RECORDED_REDIS, extraRecorded]);
   });
 
+  // ── round-3 non-blocking 1 ───────────────────────────────────────────────
+  // `firstSharedServicePortMismatch` used to compare list LENGTHS, so a shared
+  // service that GAINED a port in the file (every recorded port still
+  // published, plus a new one) read as a "disagreement" and aborted — even
+  // though the file is a strict superset of the record, which is the lagging
+  // row `persistIsolatedPortRepair` exists to repair, not a divergence to
+  // refuse.
+  it("round-3 NB1: a shared service that GAINS a port in the file repairs the row instead of aborting", async () => {
+    const installDir = await freshIsolatedInstall("iso237r3-gained-port");
+    const { doc } = readGeneratedCompose(installDir);
+    const extraPort = RECORDED_REDIS + 5000;
+    // Keeps the recorded port AND publishes a second one — a superset, not a
+    // move.
+    doc.services.redis.ports = [`${RECORDED_REDIS}:6379`, `${extraPort}:6380`];
+    writeCompose(installDir, doc);
+
+    let bringUpCalled = false;
+    const deps = { ...isolatedDeps(), bringUpInfra: () => { bringUpCalled = true; } };
+    const res = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      { log: () => {}, deps },
+    );
+    // Not an abort — the run proceeds and brings the stack up.
+    expect(res.infraPlan).toBe("isolated");
+    expect(bringUpCalled).toBe(true);
+    // The row picks up the gained port; the recorded one is not disturbed.
+    expect(registryRow(installDir).row.ports.redis.slice().sort((a, b) => a - b)).toEqual(
+      [RECORDED_REDIS, extraPort].sort((a, b) => a - b),
+    );
+  });
+
   // ── finding 2 ──────────────────────────────────────────────────────────────
   // The CLI writes its generated compose as JSON (a YAML subset), but an
   // operator may legitimately rewrite it in ordinary YAML. Compose parses and

@@ -241,6 +241,38 @@ describe("firstSharedServicePortMismatch", () => {
       actual: [35434],
     });
   });
+
+  // cinatra-cli#237 round-3 non-blocking 1: length was the wrong test — a file
+  // where a shared service GAINED a port (kept every one the record already
+  // held, plus something new) is a row lagging a superset file, not a
+  // disagreement. That is exactly the state `persistIsolatedPortRepair` exists
+  // to repair; comparing lengths aborted it instead of letting the repair run.
+  it("round-3 NB1: a file that GAINED a port for a shared service is a lagging row, not a mismatch", () => {
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434, 25435] })).toBeNull();
+    // Order of the gain doesn't matter — every recorded port is still there.
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25435, 25434] })).toBeNull();
+  });
+
+  it("round-3 NB1: a file that DROPPED a recorded port for a shared service still disagrees", () => {
+    // The reverse direction: the record holds a port the file no longer
+    // publishes at all — a genuine change, not merely lagging, so it must keep
+    // aborting.
+    expect(firstSharedServicePortMismatch({ postgres: [25434, 25435] }, { postgres: [25434] })).toEqual({
+      service: "postgres",
+      recorded: [25434, 25435],
+      actual: [25434],
+    });
+  });
+
+  it("round-3 NB1: a genuine move still disagrees even when the file also gained a port", () => {
+    // Superset-of-a-DIFFERENT-set is not the lagging case: the file must carry
+    // every port the record does for the extra port to read as benign.
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [35434, 25435] })).toEqual({
+      service: "postgres",
+      recorded: [25434],
+      actual: [25435, 35434],
+    });
+  });
 });
 
 describe("removeEnvKey", () => {
