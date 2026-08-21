@@ -414,15 +414,46 @@ function remapServicePorts(ports, offset) {
   });
 }
 
+/** Parse the fixed HOST port out of a short-syntax `ports` string entry
+ *  (`"[host_ip:]hostPort:containerPort[/protocol]"`). cinatra-cli#237 finding
+ *  3: `remapServicePorts` deliberately leaves a short-syntax entry UNSHIFTED
+ *  (writing a remap for it is a separate, still-open concern — see its
+ *  comment), but the entry still PUBLISHES that literal host port RIGHT NOW,
+ *  so reading it back as truth is correct regardless of whether generation
+ *  ever learns to remap it. Returns the host port as an integer, or null for
+ *  a bare `"containerPort"` form (no fixed host port — docker assigns an
+ *  ephemeral one at `up` time, so there is nothing fixed to record) or a
+ *  port RANGE (`"23010-23015:3010-3015"`, ambiguous which single port to
+ *  record). Pure. */
+function shortSyntaxHostPort(entry) {
+  if (typeof entry !== "string") return null;
+  const withoutProto = entry.replace(/\/(tcp|udp)$/i, "");
+  const parts = withoutProto.split(":");
+  if (parts.length < 2) return null; // bare "containerPort" — ephemeral host port.
+  // Drop the trailing container-port segment; what remains is `[host_ip:]hostPort`.
+  const hostPart = parts.slice(0, -1).join(":");
+  const hostPortRaw = hostPart.includes(":") ? hostPart.slice(hostPart.lastIndexOf(":") + 1) : hostPart;
+  if (hostPortRaw.includes("-")) return null; // a range — ambiguous, see above.
+  const n = Number.parseInt(hostPortRaw, 10);
+  return Number.isFinite(n) && n > 0 && String(n) === hostPortRaw.trim() ? n : null;
+}
+
 /** The published HOST ports one service declares, as integers, in declaration
- *  order. Only the LONG form `{ published, … }` counts: a short-syntax entry
- *  (`"5434:5432"`) is one `remapServicePorts` deliberately leaves UNSHIFTED, so
- *  reading a port out of it would record a host port this stack does not bind.
- *  Pure. */
+ *  order. The LONG form `{ published, … }` is read from `.published`; a
+ *  short-syntax STRING entry (`"23010:3010"`) is parsed by
+ *  `shortSyntaxHostPort` — it is a real binding this stack publishes RIGHT
+ *  NOW (cinatra-cli#237 finding 3), even though `remapServicePorts` leaves it
+ *  unshifted (reading published truth and writing a remap are different
+ *  concerns). Pure. */
 function publishedPortsOfService(svc) {
   const out = [];
   if (!svc || typeof svc !== "object" || !Array.isArray(svc.ports)) return out;
   for (const p of svc.ports) {
+    if (typeof p === "string") {
+      const hostPort = shortSyntaxHostPort(p);
+      if (hostPort != null) out.push(hostPort);
+      continue;
+    }
     const pub = p && typeof p === "object" ? p.published : undefined;
     const n = Number.parseInt(String(pub ?? ""), 10);
     if (Number.isFinite(n) && n > 0) out.push(n);
@@ -888,6 +919,7 @@ export const __test = {
   isSecretEnvKey,
   scrubServiceEnv,
   remapServicePorts,
+  shortSyntaxHostPort,
   publishedPortsOfService,
   publishedPortsByService,
   remapEnvHostUrlPorts,

@@ -721,10 +721,31 @@ describe("cinatra-cli#231 — publishedPortsByService (reading the run's real po
     expect(publishedPortsByService({ services: { worker: { image: "x" } } })).toEqual({});
   });
 
-  it("IGNORES a short-syntax port entry — remapServicePorts leaves those UNSHIFTED", () => {
-    // Recording 5434 out of `"5434:5432"` would put a port the isolated stack
-    // never binds into the map, and `.env.local` would be pointed at the DONOR.
-    expect(publishedPortsByService({ services: { db: { ports: ["5434:5432"] } } })).toEqual({});
+  // cinatra-cli#237 finding 3: a short-syntax entry ("23010:3010") IS a real
+  // host-port binding — `remapServicePorts` leaving it unshifted (a separate,
+  // still-open write-side concern) does not make it any less true RIGHT NOW.
+  // Recording nothing for it left a missing row entry falling back to the
+  // container port (3010, wrong) and let a stale row entry survive the overlay
+  // unchallenged (finding 1's exact hazard, reached a second way).
+  it("parses a short-syntax HOST:CONTAINER entry as the published host port", () => {
+    expect(publishedPortsByService({ services: { db: { ports: ["23010:3010"] } } })).toEqual({ db: [23010] });
+  });
+
+  it("parses a short-syntax entry carrying an explicit host IP or protocol", () => {
+    expect(publishedPortsByService({ services: { db: { ports: ["127.0.0.1:23010:3010"] } } })).toEqual({
+      db: [23010],
+    });
+    expect(publishedPortsByService({ services: { db: { ports: ["23010:3010/tcp"] } } })).toEqual({ db: [23010] });
+  });
+
+  it("a bare container-port short-syntax entry publishes no FIXED host port", () => {
+    // `"3010"` alone binds an EPHEMERAL host port docker assigns at `up` time —
+    // there is nothing fixed to record.
+    expect(publishedPortsByService({ services: { db: { ports: ["3010"] } } })).toEqual({});
+  });
+
+  it("a short-syntax port RANGE is ambiguous and is not recorded", () => {
+    expect(publishedPortsByService({ services: { db: { ports: ["23010-23015:3010-3015"] } } })).toEqual({});
   });
 });
 
