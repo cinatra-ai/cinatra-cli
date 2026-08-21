@@ -56,6 +56,8 @@ const {
   buildPreviewImage,
   resolveBuildMemoryMb,
   resolveBuildTypecheck,
+  resolveBuildCpus,
+  resolveBuildBundler,
   buildPreviewBuildArgs,
   dockerfileDeclaredBuildArgs,
   PREVIEW_BUILD_TIMEOUT_DEFAULT_MS,
@@ -67,6 +69,13 @@ const {
   PREVIEW_BUILD_MEMORY_MIN_MB,
   PREVIEW_BUILD_MEMORY_MAX_MB,
   PREVIEW_BUILD_TYPECHECK_ENV,
+  PREVIEW_BUILD_CPUS_ENV,
+  PREVIEW_BUILD_CPUS_MIN,
+  PREVIEW_BUILD_CPUS_MAX,
+  PREVIEW_BUILD_BUNDLER_ENV,
+  PREVIEW_BUILD_BUNDLERS,
+  PREVIEW_BUILD_CPUS_ARG,
+  PREVIEW_BUILD_BUNDLER_ARG,
   PREVIEW_IMAGE_TAG_PREFIX,
   PREVIEW_RUNTIME_MODE,
   PREVIEW_HOST_PORT_MIN,
@@ -1539,6 +1548,373 @@ describe("preview build levers — memory ceiling + CI forward (#210)", () => {
     );
     await expect(runPreviewRefresh(["--slug", "main"], bad)).rejects.toThrow(new RegExp(PREVIEW_BUILD_TYPECHECK_ENV));
     expect(badFake.calls.find((c) => c[0] === "build")).toBeUndefined();
+    const row = getPreview(readRegistry(registryPath).registry, "main");
+    expect(row.sha).toBe(SHA_A);
+    expect(row.state).toBe("ready");
+  });
+});
+
+// The image build's NATIVE-memory levers: the build worker COUNT and the
+// bundler selection.
+//
+// The bug these cover is the same shape as the memory lever's was. The
+// checkout's Dockerfile declared both ARGs as its documented remedy for a
+// constrained or many-core builder, and no CLI surface could send either one, so
+// the remedy was unreachable from `install --mode preview` and from the
+// `instance preview` verbs. The decisive assertions are therefore at the
+// `docker build` ARGV level, not at the resolver: values that exist in principle
+// and never reach the subprocess are exactly what failed before.
+describe("preview build levers: worker count + bundler selection", () => {
+  const withCpus = (v) => ({ [PREVIEW_BUILD_CPUS_ENV]: v });
+  const withBundler = (v) => ({ [PREVIEW_BUILD_BUNDLER_ENV]: v });
+  const buildArgv = (fake) => fake.calls.find((c) => c[0] === "build");
+  const argFor = (argv, name) => {
+    const out = [];
+    for (let i = 0; i < argv.length - 1; i += 1) {
+      if (argv[i] === "--build-arg" && String(argv[i + 1]).startsWith(`${name}=`)) {
+        out.push(String(argv[i + 1]).slice(name.length + 1));
+      }
+    }
+    return out;
+  };
+
+  it("names the build-args the checkout's Dockerfile actually declares", () => {
+    // A mismatch here is silent: docker drops an unconsumed --build-arg with only
+    // a warning, so a renamed arg would look set and do nothing.
+    expect(PREVIEW_BUILD_CPUS_ARG).toBe("CINATRA_BUILD_CPUS");
+    expect(PREVIEW_BUILD_BUNDLER_ARG).toBe("CINATRA_BUILD_BUNDLER");
+    // The operator-facing names join the family the other levers established.
+    expect(PREVIEW_BUILD_CPUS_ENV).toBe("CINATRA_PREVIEW_BUILD_CPUS");
+    expect(PREVIEW_BUILD_BUNDLER_ENV).toBe("CINATRA_PREVIEW_BUILD_BUNDLER");
+    expect(PREVIEW_BUILD_BUNDLERS).toEqual(["turbopack", "webpack"]);
+  });
+
+  it("UNSET means unset: the resolved SHA keeps its own worker count and bundler", () => {
+    // A preview builds an ARBITRARY SHA. Asserting the CLI's idea of a good
+    // worker count or bundler onto it would silently override a checkout that
+    // chose otherwise, and the two would drift on the next change.
+    expect(resolveBuildCpus({})).toBeNull();
+    expect(resolveBuildCpus(withCpus(""))).toBeNull();
+    expect(resolveBuildCpus(withCpus("   "))).toBeNull();
+    expect(resolveBuildCpus({ [PREVIEW_BUILD_CPUS_ENV]: 4 })).toBeNull(); // non-string is "not set"
+    expect(resolveBuildBundler({})).toBeNull();
+    expect(resolveBuildBundler(withBundler(""))).toBeNull();
+    expect(resolveBuildBundler(withBundler("   "))).toBeNull();
+    const { args, cpus, bundler } = buildPreviewBuildArgs({});
+    expect(cpus).toBeNull();
+    expect(bundler).toBeNull();
+    expect(args.join(" ")).not.toContain(PREVIEW_BUILD_CPUS_ARG);
+    expect(args.join(" ")).not.toContain(PREVIEW_BUILD_BUNDLER_ARG);
+  });
+
+  it("a valid worker count wins, at both ends of the accepted band", () => {
+    expect(resolveBuildCpus(withCpus("3"))).toBe(3);
+    expect(resolveBuildCpus(withCpus(" 4 "))).toBe(4);
+    expect(resolveBuildCpus(withCpus(String(PREVIEW_BUILD_CPUS_MIN)))).toBe(PREVIEW_BUILD_CPUS_MIN);
+    expect(resolveBuildCpus(withCpus(String(PREVIEW_BUILD_CPUS_MAX)))).toBe(PREVIEW_BUILD_CPUS_MAX);
+  });
+
+  it("a malformed or out-of-range worker count is a HARD error, never ignored or clamped", () => {
+    for (const v of ["0", "-1", "1.5", "4 cores", "1e1", "Infinity", "auto", "0x4", "+4"]) {
+      let err;
+      try {
+        resolveBuildCpus(withCpus(v));
+      } catch (e) {
+        err = e;
+      }
+      expect(err, `expected ${v} to be rejected`).toBeTruthy();
+      expect(err.message).toContain(PREVIEW_BUILD_CPUS_ENV);
+      expect(err.message).toContain(JSON.stringify(v)); // the offending value is quoted back
+      expect(err.message).toContain(String(PREVIEW_BUILD_CPUS_MAX)); // the accepted range
+      // The UNIT is workers, and <n> IS the worker count (cinatra-cli#229
+      // review): an operator told the value becomes "one fewer worker" sets 4
+      // to get 3 and gets 4 — the over-fan-out #228 exists to stop.
+      expect(err.message).toMatch(/COUNT of WORKERS/);
+      expect(err.message).toMatch(/3 means three/);
+      expect(err.message).not.toMatch(/one fewer|process fewer|fewer page-data/);
+    }
+    expect(() => resolveBuildCpus(withCpus(String(PREVIEW_BUILD_CPUS_MAX + 1)))).toThrow(/exceeds/);
+  });
+
+  it("only the accepted bundlers are taken, case-insensitively, and a typo is refused", () => {
+    // The checkout's own launcher lowercases before it matches, so the CLI must
+    // not reject a spelling the build would have accepted.
+    for (const v of PREVIEW_BUILD_BUNDLERS) {
+      expect(resolveBuildBundler(withBundler(v))).toBe(v);
+      expect(resolveBuildBundler(withBundler(v.toUpperCase()))).toBe(v);
+      expect(resolveBuildBundler(withBundler(` ${v} `))).toBe(v);
+    }
+    // A near-miss must never be silently read as one of the two: a typo that
+    // costs a long build and then reports the OTHER bundler is worse than no
+    // lever at all.
+    for (const v of ["turbo", "webpack5", "rspack", "none", "1"]) {
+      let err;
+      try {
+        resolveBuildBundler(withBundler(v));
+      } catch (e) {
+        err = e;
+      }
+      expect(err, `expected ${v} to be rejected`).toBeTruthy();
+      expect(err.message).toContain(PREVIEW_BUILD_BUNDLER_ENV);
+      expect(err.message).toContain(JSON.stringify(v));
+      expect(err.message).toContain(PREVIEW_BUILD_BUNDLERS.join(", "));
+    }
+  });
+
+  it("assembles each build-arg only on an explicit override", () => {
+    const tuned = buildPreviewBuildArgs({ ...withCpus("3"), ...withBundler("WEBPACK") });
+    expect(tuned.cpus).toBe(3);
+    expect(tuned.bundler).toBe("webpack");
+    expect(argFor(tuned.args, PREVIEW_BUILD_CPUS_ARG)).toEqual(["3"]);
+    expect(argFor(tuned.args, PREVIEW_BUILD_BUNDLER_ARG)).toEqual(["webpack"]); // lowercased for the build
+    // Independently settable: one lever must not require the other.
+    expect(argFor(buildPreviewBuildArgs(withCpus("3")).args, PREVIEW_BUILD_BUNDLER_ARG)).toEqual([]);
+    expect(argFor(buildPreviewBuildArgs(withBundler("webpack")).args, PREVIEW_BUILD_CPUS_ARG)).toEqual([]);
+    // And they never disturb the levers that were already there.
+    expect(argFor(tuned.args, "CI")).toEqual(["true"]);
+    expect(argFor(tuned.args, "NODE_OPTIONS")).toEqual([]);
+  });
+
+  it("the levers REACH the real `docker build` argv: the actual regression", () => {
+    const fake = makeFakeDocker({});
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: "/ctx",
+      deps: { runDocker: fake.runDocker, buildControlEnv: {} },
+    });
+    // Untuned: nothing is sent, so the resolved SHA's own Dockerfile decides.
+    expect(argFor(buildArgv(fake), PREVIEW_BUILD_CPUS_ARG)).toEqual([]);
+    expect(argFor(buildArgv(fake), PREVIEW_BUILD_BUNDLER_ARG)).toEqual([]);
+
+    const fake2 = makeFakeDocker({});
+    buildPreviewImage({
+      tag: previewImageTag(SHA_B),
+      contextDir: "/ctx",
+      deps: {
+        runDocker: fake2.runDocker,
+        buildControlEnv: { ...withCpus("3"), ...withBundler("webpack") },
+      },
+    });
+    const argv = buildArgv(fake2);
+    expect(argFor(argv, PREVIEW_BUILD_CPUS_ARG)).toEqual(["3"]);
+    expect(argFor(argv, PREVIEW_BUILD_BUNDLER_ARG)).toEqual(["webpack"]);
+    // docker treats the LAST positional as the context; a flag after it would be
+    // parsed as a second positional and the build would fail.
+    expect(argv[argv.length - 1]).toBe("/ctx");
+  });
+
+  it("reaches the build through BOTH preview verbs, from the operator env", async () => {
+    // The container env contract is a decoy: `install --mode preview` replaces it
+    // with a fresh object composed from the install's .env.local, so a lever read
+    // from there is silently inert on exactly that front door.
+    const { deps, fake } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' } },
+      {
+        env: { [ENCRYPTION_KEY_ENV]: KEY_64, [PREVIEW_BUILD_CPUS_ENV]: "99" },
+        buildControlEnv: { ...withCpus("3"), ...withBundler("webpack") },
+      },
+    );
+    await runPreviewCreate(["--slug", "main"], deps);
+    expect(argFor(buildArgv(fake), PREVIEW_BUILD_CPUS_ARG)).toEqual(["3"]);
+    expect(argFor(buildArgv(fake), PREVIEW_BUILD_BUNDLER_ARG)).toEqual(["webpack"]);
+    // Neither lever is forwarded INTO the container. They are build-time only.
+    const run = fake.calls.find((c) => c[0] === "run");
+    expect(run.join(" ")).not.toContain(PREVIEW_BUILD_CPUS_ENV);
+    expect(run.join(" ")).not.toContain(PREVIEW_BUILD_BUNDLER_ENV);
+
+    const { deps: rdeps, fake: rfake } = makeDeps(
+      { sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' } },
+      { buildControlEnv: withCpus("2") },
+    );
+    await runPreviewRefresh(["--slug", "main"], rdeps);
+    expect(argFor(buildArgv(rfake), PREVIEW_BUILD_CPUS_ARG)).toEqual(["2"]);
+  });
+
+  it("logs both as part of the build's identity, tuned or not", () => {
+    const lines = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: "/ctx",
+      deps: { runDocker: makeFakeDocker({}).runDocker, buildControlEnv: {}, log: (m) => lines.push(m) },
+    });
+    const out = lines.join("\n");
+    // Untuned: says the checkout owns both, and still names the levers so they
+    // are discoverable BEFORE an operator needs them.
+    expect(out).toMatch(/build workers: the checkout's own default worker count/);
+    expect(out).toContain(PREVIEW_BUILD_CPUS_ENV);
+    expect(out).toContain(PREVIEW_BUILD_BUNDLER_ENV);
+
+    const lines2 = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: "/ctx",
+      deps: {
+        runDocker: makeFakeDocker({}).runDocker,
+        buildControlEnv: { ...withCpus("3"), ...withBundler("webpack") },
+        log: (m) => lines2.push(m),
+      },
+    });
+    const out2 = lines2.join("\n");
+    // The identity line is labelled WORKERS and reports the value verbatim:
+    // 3 in, "3" logged — never "2" (cinatra-cli#229 review).
+    expect(out2).toMatch(/build workers: 3/);
+    expect(out2).not.toMatch(/build workers: 2\b/);
+    expect(out2).not.toMatch(/build CPUs/);
+    expect(out2).toMatch(/Bundler: webpack/);
+  });
+
+  it("a FAILED build names the lever that applies to a NATIVE death, not only the V8 ceiling", () => {
+    let err;
+    try {
+      buildPreviewImage({
+        tag: previewImageTag(SHA_A),
+        contextDir: "/ctx",
+        deps: { runDocker: makeFakeDocker({ buildFails: true }).runDocker, buildControlEnv: {} },
+      });
+    } catch (e) {
+      err = e;
+    }
+    // The secondary defect: advising only the V8 old-space ceiling sends an
+    // operator on the DEFAULT bundler path to raise a limit that is not the
+    // binding constraint, and the build fails again the same way.
+    expect(err.message).toContain(PREVIEW_BUILD_CPUS_ENV);
+    expect(err.message).toContain(PREVIEW_BUILD_BUNDLER_ENV);
+    expect(err.message).toMatch(/pinned no bundler, so it ran whatever this SHA defaults to/);
+    expect(err.message).toMatch(/If that is Turbopack, a native death is the expected one/);
+    expect(err.message).toMatch(/os\.cpus\(\)\.length/); // WHY a docker --cpus cap does not help
+    expect(err.message).toMatch(/docker --cpus cap does NOT do/);
+    // Honest about the bound: neither lever is sold as removing the floor.
+    expect(err.message).toMatch(/Neither removes the checkout's documented builder-memory floor/);
+    // And the build's own settings are quoted back, so the operator is not told
+    // to set something they already set.
+    expect(err.message).toMatch(/this build used the checkout's own default worker count/);
+    // The lever is named in its true unit, and the PHASE it acts in is stated:
+    // it bounds page-data/static generation AFTER compile, and cannot rescue a
+    // death DURING compile (cinatra-cli#229 review, non-blocking note).
+    expect(err.message).toMatch(/<n> IS the worker count, so 3 means three/);
+    expect(err.message).toMatch(/does not fix a death DURING compile/);
+    expect(err.message).not.toMatch(/one fewer|process fewer|fewer page-data/);
+
+    const failWith = (buildControlEnv) => {
+      try {
+        buildPreviewImage({
+          tag: previewImageTag(SHA_A),
+          contextDir: "/ctx",
+          deps: { runDocker: makeFakeDocker({ buildFails: true }).runDocker, buildControlEnv },
+        });
+      } catch (e) {
+        return e;
+      }
+      throw new Error("expected the build to fail");
+    };
+
+    // The advice FITS the bundler this build actually ran. Telling an operator
+    // who already pinned webpack to switch bundler is not actionable, and it
+    // hides that on webpack the V8 ceiling IS the applicable lever.
+    const onWebpack = failWith({ ...withCpus("3"), ...withBundler("webpack") });
+    expect(onWebpack.message).toMatch(/this build used 3/); // the worker count is a lever on both paths
+    expect(onWebpack.message).toMatch(/already ran on webpack/);
+    expect(onWebpack.message).toMatch(new RegExp(`${PREVIEW_BUILD_MEMORY_ENV} is the ceiling that applies here`));
+    expect(onWebpack.message).not.toMatch(/pin webpack with/);
+    expect(onWebpack.message).not.toMatch(/If that is Turbopack/);
+
+    const onTurbopack = failWith(withBundler("turbopack"));
+    expect(onTurbopack.message).toMatch(/pinned turbopack/);
+    expect(onTurbopack.message).toMatch(new RegExp(`pin webpack with ${PREVIEW_BUILD_BUNDLER_ENV}=webpack`));
+    // The unset wording must not leak into a build that DID pin a bundler.
+    expect(onTurbopack.message).not.toMatch(/whatever this SHA defaults to/);
+
+    // A TIMEOUT is a budget failure, not a memory one, so it must not be
+    // answered with memory levers.
+    let timedOut;
+    try {
+      buildPreviewImage({
+        tag: previewImageTag(SHA_A),
+        contextDir: "/ctx",
+        deps: { runDocker: makeFakeDocker({ buildTimesOut: true }).runDocker, buildControlEnv: {} },
+      });
+    } catch (e) {
+      timedOut = e;
+    }
+    expect(timedOut.message).not.toContain(PREVIEW_BUILD_CPUS_ENV);
+    expect(timedOut.message).not.toContain(PREVIEW_BUILD_BUNDLER_ENV);
+  });
+
+  it("an old SHA that declares neither ARG still BUILDS: it is warned about, never blocked", () => {
+    const ctx = path.join(tmp, "ctx-no-native-args");
+    mkdirSync(ctx, { recursive: true });
+    // A Dockerfile that predates both ARGs: docker would drop the build-args with
+    // only a warning, so the build must say it out loud and carry on.
+    writeFileSync(path.join(ctx, "Dockerfile"), "FROM node:24-alpine\nARG CI=\nRUN echo hi\n");
+    const lines = [];
+    expect(() =>
+      buildPreviewImage({
+        tag: previewImageTag(SHA_A),
+        contextDir: ctx,
+        deps: {
+          runDocker: makeFakeDocker({}).runDocker,
+          buildControlEnv: { ...withCpus("3"), ...withBundler("webpack") },
+          log: (m) => lines.push(m),
+        },
+      }),
+    ).not.toThrow();
+    const out = lines.join("\n");
+    expect(out).toMatch(new RegExp(`ARG ${PREVIEW_BUILD_CPUS_ARG}`));
+    expect(out).toMatch(new RegExp(`ARG ${PREVIEW_BUILD_BUNDLER_ARG}`));
+    expect(out).toMatch(/very likely ignored by THIS build/);
+    expect(out).not.toMatch(/ARG CI\b(?![_A-Z])/); // CI IS declared here, so no false alarm
+
+    // Only args actually PASSED are reported: untuned, neither is sent, so
+    // warning about them would be noise on every build of an older SHA.
+    const untuned = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: ctx,
+      deps: { runDocker: makeFakeDocker({}).runDocker, buildControlEnv: {}, log: (m) => untuned.push(m) },
+    });
+    expect(untuned.join("\n")).not.toMatch(/very likely ignored by THIS build/);
+
+    // A modern context declares both, so no warning, and the build is unchanged.
+    const ok = path.join(tmp, "ctx-native-args");
+    mkdirSync(ok, { recursive: true });
+    writeFileSync(
+      path.join(ok, "Dockerfile"),
+      `FROM node:24-alpine\nARG CI=\nARG ${PREVIEW_BUILD_BUNDLER_ARG}=\nARG ${PREVIEW_BUILD_CPUS_ARG}=\nRUN echo hi\n`,
+    );
+    const lines2 = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: ok,
+      deps: {
+        runDocker: makeFakeDocker({}).runDocker,
+        buildControlEnv: { ...withCpus("3"), ...withBundler("webpack") },
+        log: (m) => lines2.push(m),
+      },
+    });
+    expect(lines2.join("\n")).not.toMatch(/very likely ignored by THIS build/);
+  });
+
+  it("create and refresh FAIL FAST on a typo, before a slug is claimed or a preview is touched", async () => {
+    const { deps: bad, fake: badFake } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' } },
+      { buildControlEnv: withCpus("auto") },
+    );
+    await expect(runPreviewCreate(["--slug", "other"], bad)).rejects.toThrow(new RegExp(PREVIEW_BUILD_CPUS_ENV));
+    expect(badFake.calls.find((c) => c[0] === "build")).toBeUndefined();
+    expect(getPreview(readRegistry(registryPath).registry ?? { previews: {} }, "other")).toBeFalsy();
+
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+    });
+    const { deps: badRefresh, fake: badRefreshFake } = makeDeps(
+      { sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' } },
+      { buildControlEnv: withBundler("turbo") },
+    );
+    await expect(runPreviewRefresh(["--slug", "main"], badRefresh)).rejects.toThrow(
+      new RegExp(PREVIEW_BUILD_BUNDLER_ENV),
+    );
+    expect(badRefreshFake.calls.find((c) => c[0] === "build")).toBeUndefined();
     const row = getPreview(readRegistry(registryPath).registry, "main");
     expect(row.sha).toBe(SHA_A);
     expect(row.state).toBe("ready");

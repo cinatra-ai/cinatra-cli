@@ -837,6 +837,14 @@ Usage:
                                # limit in MB (256 .. 65536; unset keeps the checkout's own).
                                # CINATRA_PREVIEW_BUILD_TYPECHECK=1 restores the in-build tsc
                                # (skipped by default, as the CI image build does).
+                               # CINATRA_PREVIEW_BUILD_CPUS sets the build's page-data WORKER
+                               # COUNT directly — 3 means three workers (1 .. 256). A MANY-CORE
+                               # builder needs it: unset, the build defaults to
+                               # os.cpus().length - 1 workers, and a docker --cpus cap does not
+                               # change what that call reports.
+                               # CINATRA_PREVIEW_BUILD_BUNDLER=turbopack|webpack picks the
+                               # bundler; webpack fails on the V8 heap the MEMORY_MB lever moves,
+                               # the default fails on native memory it does not.
                                # Env-only so they apply to \`install --mode preview\` too.
   cinatra instance preview status [--slug <slug>]
   cinatra instance preview list
@@ -942,10 +950,43 @@ Commands:
                       different failure, and an exit-code-137 kill only says
                       something sent SIGKILL — neither names its own cause.
                       Check Docker/host memory pressure first; more VM RAM may
-                      help, but cinatra-cli#210 measured a native wall that
-                      survived 4 GB to 14 GB, and clearing that needs the
-                      checkout-side concurrency / bundler-fallback control that
-                      issue tracks.
+                      help, but a native wall has been measured that survived
+                      4 GB to 14 GB. The two levers below are what address it.
+                      Mind the PHASE: the worker count bounds what runs AFTER
+                      compile (page-data collection / static generation), so it
+                      does not fix a death DURING compile — that is what the
+                      bundler choice addresses.
+
+                      BUILD WORKERS: the build runs page-data collection across
+                      a pool of worker processes, and this lever IS that count —
+                      <n> in means exactly <n> workers, not one fewer. Only the
+                      UNSET default is derived, as os.cpus().length - 1, and a
+                      docker --cpus or --cpuset-cpus cap does NOT change what
+                      that call reports. So an UNTUNED many-core builder keeps a
+                      wide worker pool however narrow its CPU quota is, and each
+                      worker is a whole extra node process with its own heap.
+                      Set the count with
+
+                        CINATRA_PREVIEW_BUILD_CPUS=<workers>
+
+                      accepted range 1 .. 256; 3 gives three workers. It becomes
+                      the build-arg CINATRA_BUILD_CPUS=<n>. UNSET passes nothing,
+                      so the resolved SHA keeps its own default worker count.
+
+                      BUILD BUNDLER: the default bundler dies on NATIVE memory,
+                      which no NODE_OPTIONS value bounds. The other one dies on
+                      the V8 heap, which CINATRA_PREVIEW_BUILD_MEMORY_MB does
+                      move. Switch with
+
+                        CINATRA_PREVIEW_BUILD_BUNDLER=turbopack|webpack
+
+                      which becomes the build-arg CINATRA_BUILD_BUNDLER. UNSET
+                      passes nothing and the resolved SHA keeps its own choice.
+
+                      Neither is a cure. The checkout documents a builder-memory
+                      floor, and a builder far below it fails on both bundler
+                      paths. These levers make a many-core build TUNABLE from the
+                      CLI; they do not remove that floor.
 
                       IN-BUILD TYPECHECK: preview forwards CI=true to the image
                       build, matching how the CI image is built — it skips the
@@ -961,12 +1002,13 @@ Commands:
                       generic signal, so this switch can affect more than the
                       typecheck alone.
 
-                      Both are env-only (not flags), like the budget, so the same
-                      levers apply to create, refresh AND \`install --mode
-                      preview\`; both are hard errors on a malformed value. They
-                      reach the build as --build-arg, so they only bite on a SHA
-                      whose Dockerfile declares the matching ARG — the build says
-                      so out loud when it does not.
+                      All four are env-only (not flags), like the budget, so the
+                      same levers apply to create, refresh AND \`install --mode
+                      preview\`; all four are hard errors on a malformed value,
+                      raised before any state is claimed. They reach the build as
+                      --build-arg, so they only bite on a SHA whose Dockerfile
+                      declares the matching ARG. The build says so out loud when
+                      it does not, and it builds anyway.
   instance preview status|list
                       Show a preview's (or all previews') resolved SHA, built
                       image tag, provenance, durable volume, and state.
@@ -5172,7 +5214,31 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
   // Label-scoped lookup (project + service) against the install's RECORDED
   // compose project, not the checkout basename — a default install records an
   // explicit instance-scoped project and an isolated one records its own.
-  const { project } = wayflowComposeContext(repoRoot);
+  // cinatra-cli#230: the verdict names WHERE the project came from, so a wrong
+  // project is diagnosable from the doctor line alone instead of needing a
+  // registry dump to tell a real "no container" from a mis-addressed one.
+  const {
+    project,
+    source: projectSource,
+    slug: instanceSlug,
+    reason: projectReason,
+  } = wayflowComposeContext(repoRoot);
+  // cinatra-cli#230 review, item 3: the fallback note used to claim "no
+  // instance registry record for this checkout" for EVERY fallback — including
+  // one taken because the registry could not be READ, where whether a record
+  // exists is unknown. That reads as a settled fact ("this checkout is
+  // unmanaged") when the truth is that doctor is guessing. Name the actual
+  // reason instead.
+  const fallbackWhy =
+    projectReason === "registry-unreadable"
+      ? "the instance registry could not be read, so this checkout's recorded project is UNKNOWN"
+      : projectReason === "row-without-project"
+        ? "this checkout has an instance registry record, but it records no compose project"
+        : "no instance registry record for this checkout";
+  const projectNote =
+    projectSource === "registry"
+      ? `compose project "${project}" (recorded in the instance registry${instanceSlug ? ` for instance "${instanceSlug}"` : ""})`
+      : `compose project "${project}" (derived from the checkout directory name — ${fallbackWhy})`;
   const healthUrl = wayflowHealthUrlFromEnv(env);
   const ps = doctorDockerRun(dockerImpl, [
     "ps",
@@ -5184,6 +5250,40 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
     "{{.Names}}",
   ]);
   const runningContainer = ps.ok ? (ps.stdout.trim().split("\n")[0] ?? "").trim() : "";
+  // cinatra-cli#230 review, item 3: with an UNREADABLE registry the project
+  // above is a GUESS, so neither direction of the lookup is an authoritative
+  // verdict about THIS instance — a container found under the basename may be
+  // another instance's (the exact mis-attribution #230 is about, pointing the
+  // other way), and one absent proves only that nothing runs under a name we
+  // had to invent. So this is a SKIP — which the report footer already states
+  // is NOT a pass — rather than a silent PASS on an unrelated container.
+  //
+  // cinatra-cli#234 review, item 2: this SKIP applies to EVERY runtime mode,
+  // `off`/`external` included. It used to exclude those two on the theory that
+  // the by-design opt-outs are read from the install's own .env.local and so
+  // "hold regardless of project resolution" — false, because their opt-out
+  // SKIPs below are inside the `runningContainer === ""` branch and therefore
+  // unreachable whenever the guessed basename happens to have a container. A
+  // malformed registry plus a container under the basename returned PASS
+  // "runtime up" for both modes, on a container that may be another instance's:
+  // the same mis-attribution, reached through the opt-out door. The registry
+  // still cannot be read in those modes either, and that is what doctor must
+  // say — the repair is the same and the opt-out is not evidence about which
+  // container was found.
+  if (projectReason === "registry-unreadable") {
+    return makeAssertion(
+      id,
+      label,
+      "skip",
+      `cannot verify this instance's runtime: ${fallbackWhy}. The check fell back to compose project ` +
+        `"${project}" (derived from the checkout directory name)` +
+        (runningContainer === ""
+          ? " and found no container there — which does NOT establish that this instance's runtime is down"
+          : `, where container "${runningContainer}" is running — which does NOT establish that it belongs to this instance`),
+      `Repair or remove the instance registry at ${instanceRegistryDefaultPath()} (it exists but could not be ` +
+        "read/parsed), then re-run `cinatra doctor` so the recorded compose project can be resolved.",
+    );
+  }
   if (runningContainer === "") {
     if (runtimeMode === WAYFLOW_RUNTIME_OFF) {
       return makeAssertion(
@@ -5207,7 +5307,7 @@ async function doctorAssertWayflowReadiness({ fetchImpl, dockerImpl, repoRoot, e
       id,
       label,
       "fail",
-      `no running ${DOCTOR_WAYFLOW.service} container in compose project "${project}"; every agent run fails with ECONNREFUSED`,
+      `no running ${DOCTOR_WAYFLOW.service} container in ${projectNote}; every agent run fails with ECONNREFUSED`,
       "Start the WayFlow agent runtime (`cinatra instance wayflow start`), or re-run `cinatra install` to reconcile this instance. " +
         "If this instance is meant to be lean, re-install with `--no-wayflow` so the opt-out is recorded.",
     );
@@ -6955,7 +7055,7 @@ async function runDbUpgradePreflight(rest) {
   const { resolveComposeConfig, statefulServicesFromComposeConfig } = await import("./version-ledger-capture.mjs");
   const { imageParts } = await import("./upgrade-matrix.mjs");
   const { makeProbeVersion, makeMarkerReader, PG_MARKER_READ_MOUNT } = await import("./pg-adapters.mjs");
-  const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, findInstanceByInstallDir, getInstance } =
+  const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, getInstance } =
     await import("./instance-registry.mjs");
 
   const flagSlug = readOptionValue(rest, "--instance");
@@ -6970,7 +7070,12 @@ async function runDbUpgradePreflight(rest) {
   if (flagSlug) {
     row = getInstance(registry, flagSlug) ?? null;
   } else if (repoRoot) {
-    row = findInstanceByInstallDir(registry, repoRoot);
+    // cinatra-cli#230: the flat SLOT, never the `{ slug, slot }` envelope the
+    // registry finder returns — `row.installDir`/`row.composeFiles`/
+    // `row.composeProject` are read below, and on the envelope all three are
+    // `undefined`, which silently resolves the compose config for the DEFAULT
+    // project from the base compose pair instead of this instance's stack.
+    row = findInstanceRowByInstallDir(registry, repoRoot);
   }
   const slug = flagSlug ?? row?.slug ?? null;
   if (!slug) {
@@ -7181,7 +7286,7 @@ async function runDbUpgradeMajor(rest) {
   const { resolveComposeConfig, statefulServicesFromComposeConfig } = await import("./version-ledger-capture.mjs");
   const { imageParts, DEFAULT_UPGRADE_MATRIX } = await import("./upgrade-matrix.mjs");
   const { makeProbeVersion, makeMarkerReader, PG_MARKER_READ_MOUNT } = await import("./pg-adapters.mjs");
-  const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, findInstanceByInstallDir, getInstance } =
+  const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, getInstance } =
     await import("./instance-registry.mjs");
 
   const flagSlug = readOptionValue(rest, "--instance");
@@ -7195,7 +7300,8 @@ async function runDbUpgradeMajor(rest) {
   const registry = requireUsableInstanceRegistry(defaultInstanceRegistryPath());
   let row = null;
   if (flagSlug) row = getInstance(registry, flagSlug) ?? null;
-  else if (repoRoot) row = findInstanceByInstallDir(registry, repoRoot);
+  // cinatra-cli#230: unwrap to the flat slot — see the preflight handler above.
+  else if (repoRoot) row = findInstanceRowByInstallDir(registry, repoRoot);
   const slug = flagSlug ?? row?.slug ?? null;
   if (!slug) {
     console.error("upgrade-major: could not resolve an instance — pass --instance <slug> or run inside an install checkout.");
@@ -7836,9 +7942,16 @@ async function runDevRefresh(rest) {
       // Recorded against the SAME project this refresh upped (no -p above).
       try {
         const { captureDeployedVersions } = await import("./version-ledger-capture.mjs");
-        const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, findInstanceByInstallDir } =
+        const { requireUsableInstanceRegistry, defaultInstanceRegistryPath } =
           await import("./instance-registry.mjs");
-        const instRow = findInstanceByInstallDir(requireUsableInstanceRegistry(defaultInstanceRegistryPath()), repoRoot);
+        // cinatra-cli#230: the flat SLOT. On the `{ slug, slot }` envelope
+        // `instRow.composeProject` is `undefined`, so `requireProjectMatch`
+        // below went in as null and captureDeployedVersions' "do not record
+        // the wrong stack" guard never ran for ANY recorded instance.
+        const instRow = findInstanceRowByInstallDir(
+          requireUsableInstanceRegistry(defaultInstanceRegistryPath()),
+          repoRoot,
+        );
         if (instRow?.slug) {
           // This refresh upped the BARE project (no -p above); when the row
           // records a different explicit project, recording would bind another
@@ -11653,7 +11766,72 @@ async function runDevCms(service, argv = []) {
 // (named volumes untouched; the service has none anyway; agents are a ro
 // bind-mount of ./extensions).
 const WAYFLOW_SERVICE = "wayflow";
-const WAYFLOW_LOCAL_URL = "http://localhost:3010";
+
+// cinatra-cli#240 — the endpoint this command PRINTS is DERIVED, never
+// hardcoded. `http://localhost:3010` is right for exactly ONE instance: the one
+// holding the default port. An isolated instance publishes its runtime on its
+// own offset port (the cinatra#2654 clean-install matrix observed `:13010`), so
+// the start line pointed that operator at a dead port — or, when a default
+// stack was also up, at ANOTHER instance's runtime, which is worse: that
+// endpoint answers, so the operator drives the wrong stack and nothing says so.
+//
+// The port comes from the instance's recorded per-service port map
+// (`ports.wayflow[0]`) — the SAME expression the isolated install path resolves
+// `WAYFLOW_BASE_URL` from (`install.mjs` `writeIsolatedAppEnv`'s
+// `first("wayflow")`), so the endpoint printed here and the endpoint the app
+// dials cannot disagree.
+const DEFAULT_WAYFLOW_HOST_PORT = 3010;
+
+/**
+ * The WayFlow host port a recorded per-service port map publishes, or null.
+ *
+ * A map that records no `wayflow` entry is NOT evidence of a remapped runtime:
+ * the default install's recorded band (`install.mjs` DEFAULT_DEV_HOST_PORTS)
+ * legitimately holds no entry for the profile-gated service, and that instance
+ * does serve the default port. Only an ALLOCATED band carries one, because only
+ * a generated isolated compose shifts it.
+ */
+function recordedWayflowHostPort(ports) {
+  const list = ports?.[WAYFLOW_SERVICE];
+  const raw = Array.isArray(list) && list.length > 0 ? list[0] : null;
+  const port = Number.parseInt(String(raw ?? ""), 10);
+  return Number.isInteger(port) && port > 0 ? port : null;
+}
+
+/** The endpoint an instance with this recorded port map serves WayFlow on.
+ *  Mirrors the resolution cinatra-cli#231 states on the install tail, so the two
+ *  surfaces can never name different endpoints for one instance. */
+function wayflowEndpointForRecordedPorts(ports) {
+  return `http://localhost:${recordedWayflowHostPort(ports) ?? DEFAULT_WAYFLOW_HOST_PORT}`;
+}
+
+/**
+ * The endpoint THIS checkout's recorded install publishes.
+ *
+ * Reads the row through the ONE registry install-dir unwrap (cinatra-cli#230) —
+ * the same lookup `wayflowComposeContext` performs, with the same injectable
+ * seams — so the command names the compose project it addressed and the
+ * endpoint that project serves from ONE recorded row. It is a second, cheap
+ * read of that small file rather than a widened `wayflowComposeContext` return,
+ * and best-effort by the same contract: a missing or malformed registry must
+ * never fail a lifecycle command, so every failure degrades to the default
+ * port. A checkout with no recorded install is an unmanaged default checkout
+ * and gets that port too — exactly what it got before this fix.
+ */
+function wayflowEndpointForCheckout(repoRoot, deps = {}) {
+  const readRegistry = deps.readRegistry ?? (() => readInstanceRegistrySafe().registry);
+  const findByInstallDir = deps.findByInstallDir ?? findInstanceRowByInstallDir;
+  let row = null;
+  try {
+    const registry = readRegistry();
+    if (registry && typeof registry === "object") {
+      row = findByInstallDir(registry, repoRoot) ?? null;
+    }
+  } catch {
+    row = null;
+  }
+  return wayflowEndpointForRecordedPorts(row?.ports);
+}
 
 // cinatra#2654 — the compose project + files THIS checkout's recorded install
 // actually uses. A `-p`-less invocation makes Docker derive the project from the
@@ -11689,9 +11867,24 @@ function readInstanceRegistrySafe() {
   }
 }
 
+// cinatra-cli#230 — `findInstanceByInstallDir` returns the `{ slug, slot }`
+// ENVELOPE, not the instance row. #227 wired this adapter straight into
+// `resolveRecordedComposeContext`, which reads `.composeProject` off the value
+// it receives: on the envelope that is `undefined`, so EVERY recorded install
+// fell back to the checkout basename while the resolution still reported
+// itself as registry-sourced. Unwrap to the flat slot here, keeping the slug
+// on it so callers can name the instance they resolved.
+//
+// This is the ONE unwrap every install-dir lookup in this file goes through —
+// doctor's compose context, the wayflow lifecycle, upgrade-preflight,
+// upgrade-major, and refresh's version-ledger capture. Calling the registry's
+// finder directly is the bug; call this instead.
 function findInstanceRowByInstallDir(registry, installDir) {
   try {
-    return instanceRowByInstallDir(registry, installDir);
+    const hit = instanceRowByInstallDir(registry, installDir);
+    if (!hit || typeof hit !== "object") return null;
+    const slot = hit.slot && typeof hit.slot === "object" ? hit.slot : hit;
+    return { ...slot, slug: slot.slug ?? hit.slug ?? null };
   } catch {
     return null;
   }
@@ -11797,7 +11990,7 @@ async function runDevWayflow(argv = []) {
   }
   console.log(
     verb === "start"
-      ? `WayFlow agent runtime started (${WAYFLOW_LOCAL_URL}; the loader mounts every ` +
+      ? `WayFlow agent runtime started (${wayflowEndpointForCheckout(repoRoot)}; the loader mounts every ` +
           `installed agent, allow up to ~2 min on cold start). Re-run \`cinatra doctor\` to verify readiness.`
       : `WayFlow agent runtime stopped (container removed). Agent runs will fail with ` +
           `ECONNREFUSED until it is started again (\`cinatra instance wayflow start\`).`,
@@ -14459,6 +14652,20 @@ export {
   effectiveComposeProjectName,
   wayflowComposeContext,
   wayflowHealthUrlFromEnv,
+  // cinatra-cli#240 — the printed start endpoint, derived from the instance's
+  // recorded port map instead of a hardcoded default.
+  recordedWayflowHostPort,
+  wayflowEndpointForRecordedPorts,
+  wayflowEndpointForCheckout,
+  DEFAULT_WAYFLOW_HOST_PORT,
+  // cinatra-cli#230 — the ONE registry install-dir unwrap. Exported because the
+  // bug was invisible at every call seam: the sibling consumers (upgrade
+  // preflight/major, refresh's ledger capture) read `.installDir`,
+  // `.composeFiles` and `.composeProject` off whatever the finder returned, and
+  // on the `{ slug, slot }` envelope all three are `undefined` — a silent
+  // degrade to the DEFAULT project with no error anywhere. Tests pin the
+  // returned SHAPE directly so that cannot come back.
+  findInstanceRowByInstallDir,
   // cinatra-cli#105 — HEAD-stamped `.next` auto-clean (pure seams).
   cleanNextBuildCache,
   readNextBuildStamp,
