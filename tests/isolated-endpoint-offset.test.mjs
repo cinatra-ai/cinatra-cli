@@ -947,3 +947,154 @@ describe("cinatra-cli#231 — an A2A-ERA compose still gains a LATER-baked servi
     expect(registryRow(installDir).row.ports.wayflow).toEqual([EXPECTED_WAYFLOW_PORT]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// cinatra-cli#237 — the coordinator's adversarial convergence pass on #231's
+// PR found a parseable generated compose is not automatically AUTHORITATIVE
+// over the recorded row: a service the file no longer publishes must not
+// survive from a stale row entry (finding 1), and a SHARED service whose port
+// genuinely diverges between the two must abort the run rather than launch
+// outside the recorded allocation (findings 2 + 4).
+// ---------------------------------------------------------------------------
+describe("cinatra-cli#237 — a diverging or shrunk compose file is never blindly trusted through the row", () => {
+  let sandbox;
+  let originRepo;
+
+  beforeAll(() => {
+    sandbox = mkdtempSync(path.join(os.tmpdir(), "cin-237-"));
+    originRepo = buildFixtureOrigin(sandbox);
+  });
+  afterAll(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    const d = mkdtempSync(path.join(sandbox, "home-"));
+    process.env.CINATRA_INSTANCE_REGISTRY = path.join(d, "instances.json");
+    process.env.CINATRA_ALLOC_LOCK = path.join(d, "alloc.lock");
+  });
+
+  function registryRow(installDir) {
+    const reg = JSON.parse(readFileSync(process.env.CINATRA_INSTANCE_REGISTRY, "utf8"));
+    const slug = Object.keys(reg.instances).find(
+      (s) => path.resolve(reg.instances[s].installDir) === path.resolve(installDir),
+    );
+    return { reg, slug, row: reg.instances[slug] };
+  }
+
+  async function freshIsolatedInstall(name, deps = isolatedDeps()) {
+    const installDir = path.join(sandbox, name);
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", name,
+        "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ],
+      { log: () => {}, deps },
+    );
+    expect(res.infraPlan).toBe("isolated");
+    return installDir;
+  }
+
+  it("finding 1: a service the FILE no longer publishes drops out of the effective map, even though the row still records it", async () => {
+    const installDir = await freshIsolatedInstall("iso237-gone");
+
+    // The service genuinely disappears from the generated compose (removed from
+    // the checkout's own compose, or an operator edit) — the row still carries
+    // its old (now stale) port.
+    const isoPath = path.join(installDir, "docker-compose.cinatra-isolated.yml");
+    const { doc } = readGeneratedCompose(installDir);
+    expect(doc.services.wayflow).toBeDefined();
+    delete doc.services.wayflow;
+    writeFileSync(isoPath, JSON.stringify(doc, null, 2) + "\n");
+
+    const { row: freshRow } = registryRow(installDir);
+    expect(freshRow.ports.wayflow).toEqual([EXPECTED_WAYFLOW_PORT]);
+
+    // Point .env.local at the DEFAULT port first: `writeIsolatedAppEnv` only
+    // re-points WAYFLOW_BASE_URL when `ports.wayflow` is present, so this value
+    // is what would catch a regression that starts rewriting it from a phantom
+    // recorded entry again.
+    const envPath = path.join(installDir, ".env.local");
+    writeFileSync(
+      envPath,
+      readFileSync(envPath, "utf8").replace(
+        /^WAYFLOW_BASE_URL=.*$/m,
+        `WAYFLOW_BASE_URL=http://127.0.0.1:${DEFAULT_WAYFLOW_PORT}`,
+      ),
+    );
+
+    const lines = [];
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "attach",
+      ],
+      { log: (l) => lines.push(String(l)), deps: isolatedDeps() },
+    );
+    expect(res.infraPlan).toBe("attach");
+
+    // The tail must NOT advertise the stale recorded port for a service the
+    // stack does not contain — it falls back to the default, the honest
+    // "this instance has no wayflow port of its own" answer, rather than a
+    // dead (or worse, another instance's live) port.
+    const runtimeLine = lines.find((l) => l.includes("Agent runtime:"));
+    expect(runtimeLine).toBeDefined();
+    expect(runtimeLine).not.toContain(`http://localhost:${EXPECTED_WAYFLOW_PORT}`);
+    expect(runtimeLine).toContain(`http://localhost:${DEFAULT_WAYFLOW_PORT}`);
+
+    // .env.local must not be (re-)pointed at the phantom port either.
+    const env = readFileSync(envPath, "utf8");
+    expect(env).not.toMatch(new RegExp(`WAYFLOW_BASE_URL=\\S*:${EXPECTED_WAYFLOW_PORT}\\b`));
+
+    // The row is corrected — the stale entry does not survive to mislead
+    // `cinatra instance wayflow start` (cinatra-cli#240) into naming a port the
+    // stack does not bind.
+    expect(registryRow(installDir).row.ports.wayflow).toBeUndefined();
+    // What the file DOES still publish is untouched — a repair, never a wipe.
+    expect(registryRow(installDir).row.ports.postgres).toEqual([5434 + OFFSET]);
+  });
+
+  it("findings 2 & 4: a SHARED service's port disagreeing between the row and the file ABORTS instead of launching the divergent stack", async () => {
+    const installDir = await freshIsolatedInstall("iso237-diverge");
+
+    const isoPath = path.join(installDir, "docker-compose.cinatra-isolated.yml");
+    const { doc } = readGeneratedCompose(installDir);
+    const recordedPgPort = 5434 + OFFSET;
+    const divergedPgPort = recordedPgPort + 1000;
+    expect(String(doc.services.postgres.ports[0].published)).toBe(String(recordedPgPort));
+    doc.services.postgres.ports[0].published = String(divergedPgPort);
+    writeFileSync(isoPath, JSON.stringify(doc, null, 2) + "\n");
+
+    let bringUpCalled = false;
+    const deps = { ...isolatedDeps(), bringUpInfra: () => { bringUpCalled = true; } };
+
+    // A plain re-run routes through the isolated re-converge.
+    await expect(
+      runInstall(
+        ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+        { log: () => {}, deps },
+      ),
+    ).rejects.toThrow(/postgres/);
+    expect(bringUpCalled).toBe(false);
+
+    // Nothing was started, so the registry row is left exactly as recorded —
+    // never a row and a (unlaunched) file quietly disagreeing (the split-brain
+    // finding 4 closes the loop on).
+    expect(registryRow(installDir).row.ports.postgres).toEqual([recordedPgPort]);
+
+    // The explicit attach path aborts the same way — it never regenerates, so
+    // it too had only the diverging file to speak from.
+    await expect(
+      runInstall(
+        [
+          "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+          "--yes", "--no-install", "--on-conflict", "attach",
+        ],
+        { log: () => {}, deps },
+      ),
+    ).rejects.toThrow(/postgres/);
+    expect(bringUpCalled).toBe(false);
+    expect(registryRow(installDir).row.ports.postgres).toEqual([recordedPgPort]);
+  });
+});

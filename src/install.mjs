@@ -128,6 +128,7 @@ import {
   a2aPeerUrlsFromServices,
   deriveBandOffsetFromRow,
   sharedServicePortsAgree,
+  firstSharedServicePortMismatch,
   removeEnvKey,
 } from "./isolated-a2a.mjs";
 import { rejectTailscaleAuthkeyFlag } from "./clone-runtime.mjs";
@@ -4686,12 +4687,17 @@ function lookupOwnIsolatedRow(targetDir) {
  * the return-the-effective-map fix did not reach.
  *
  * The generated compose file is the AUTHORITY: it is the file the `up` runs, so
- * what it publishes is what the operator can actually reach. The recorded map is
- * kept UNDERNEATH it, so a service the file no longer publishes keeps whatever
- * was recorded rather than dropping out of the env re-point — this is a repair,
- * never a demotion. Best-effort and pure-ish: a missing or unparseable file
- * (never clobbered, per `regenerateIsolatedComposeInPlace`) leaves the recorded
- * map exactly as it was.
+ * what it publishes is what the operator can actually reach. cinatra-cli#237
+ * finding 1: a recorded row is only a RECORD of a past run, and a service that
+ * DISAPPEARED from the file (removed from the compose, or left with no
+ * published ports) must disappear from the effective map too — an overlay that
+ * kept the recorded entry would still write `WAYFLOW_BASE_URL` and report the
+ * service started for a stack that no longer contains it. So once the file
+ * parses successfully, its map REPLACES the recorded one wholesale — the
+ * recorded map is consulted ONLY when the whole file cannot be read/parsed
+ * (missing, or an operator edit that broke it; never clobbered, per
+ * `regenerateIsolatedComposeInPlace`), where it remains the best available
+ * source of truth. Best-effort and pure-ish.
  *
  * @param {string} targetDir the checkout
  * @param {Record<string, number[]>} [recordedPorts] the registry row's map
@@ -4704,8 +4710,10 @@ function effectiveIsolatedPorts(targetDir, recordedPorts = {}) {
   try {
     // The generated isolated compose is JSON rendered into a `.yml` (YAML 1.2 is
     // a JSON superset), so it parses straight back — same read as the in-place
-    // regeneration performs.
-    return { ...base, ...publishedPortsByService(JSON.parse(readFileSync(isoPath, "utf8"))) };
+    // regeneration performs. The parsed file REPLACES the recorded map (finding
+    // 1): a service the file no longer publishes must not survive as a stale
+    // recorded entry.
+    return publishedPortsByService(JSON.parse(readFileSync(isoPath, "utf8")));
   } catch {
     return base;
   }
@@ -4733,19 +4741,34 @@ function samePortMaps(a, b) {
  * the runs where no regeneration was needed because the FILE was current and
  * only the ROW lagged it.
  *
- * Safety: refuses when the repair would MOVE a service both maps record — the
- * same determinism guard the regeneration applies, so a corrupt or foreign
- * compose file can never relocate a recorded (possibly running) service's port.
- * Every failure is a warning: the run itself is already correct without it.
+ * cinatra-cli#237 findings 2/4: when a SHARED service's port actually
+ * DISAGREES between the two maps (not merely absent from one), that is not a
+ * lagging record to repair — it is the checkout's own compose diverging from
+ * the allocation the registry (and the allocator) believe this instance holds.
+ * The port the file now publishes may already belong to another instance's
+ * band. THROWS instead of warning-and-continuing: the caller must never bring
+ * that divergent stack up (a warning that lets `startInfra` run anyway is
+ * exactly how the split-brain happened — the tail would advertise the file's
+ * port while the registry, and any OTHER surface that reads it such as
+ * `cinatra instance wayflow start`, keep naming the recorded one). The thrown
+ * message names the service, BOTH ports, and the two ways out: restore the
+ * file's port to what is recorded, or deliberately re-point the record (reset
+ * / reinstall) once the new port is confirmed safe.
  */
 async function persistIsolatedPortRepair({ slug, recordedPorts, ports, registryPath, lockPath, log = console.log }) {
   if (!slug || !ports || samePortMaps(recordedPorts ?? {}, ports)) return;
-  if (!sharedServicePortsAgree(recordedPorts ?? {}, ports)) {
-    log(
-      `  ⚠ The generated compose publishes a different host port than instance "${slug}"'s recorded map for a ` +
-        `service both record; leaving the recorded map untouched.`,
+  const mismatch = firstSharedServicePortMismatch(recordedPorts ?? {}, ports);
+  if (mismatch) {
+    throw new Error(
+      `Refusing to bring up isolated instance "${slug}": its recorded port for "${mismatch.service}" ` +
+        `(${mismatch.recorded.join(", ")}) disagrees with what ${ISOLATED_COMPOSE_FILENAME} now publishes ` +
+        `(${mismatch.actual.join(", ")}). Bringing the stack up on the diverging file could launch it OUTSIDE ` +
+        `this instance's allocated band, onto a port another instance may already own. Nothing was started. ` +
+        `Recover by either: (1) restoring "${mismatch.service}" to port ${mismatch.recorded.join(", ")} in ` +
+        `${ISOLATED_COMPOSE_FILENAME} and re-running, or (2) if ${mismatch.actual.join(", ")} is the port you ` +
+        `actually want, run \`cinatra instance reset --yes\` from this checkout, or re-run ` +
+        `\`cinatra install --on-conflict=isolated\` so its recorded ports are re-derived from the current file.`,
     );
-    return;
   }
   try {
     await withAllocLock(lockPath, async () => {

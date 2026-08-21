@@ -85,7 +85,10 @@ export function isolatedComposeHasA2aPeers(doc) {
 
 /**
  * The services the checkout's resolved compose config declares that a recorded
- * isolated compose does NOT carry, sorted. Empty ⇒ the recorded file is current.
+ * isolated compose does NOT carry, sorted. Empty ⇒ the file is missing no
+ * service the checkout currently declares — NOT proof the file is "current" in
+ * general: this is an ADDITIONS-only test (see below), so a service the
+ * checkout REMOVED but the file still carries is invisible to it.
  *
  * cinatra-cli#231 (round-2 review): the in-place regeneration used to decide
  * "current" with `isolatedComposeHasA2aPeers` — a marker for ONE historical
@@ -213,6 +216,39 @@ export function sharedServicePortsAgree(rowPorts, newPorts) {
     }
   }
   return true;
+}
+
+/**
+ * The first (by service name, sorted — deterministic) shared-service host-port
+ * disagreement between a recorded map and a freshly-read one, or null when
+ * `sharedServicePortsAgree` would return true. Same shared-only comparison and
+ * normalisation as `sharedServicePortsAgree`, kept as a separate function so
+ * that boolean gate stays a simple yes/no while a caller that must ABORT and
+ * NAME the disagreement (cinatra-cli#237 findings 2/4: a mismatch on a shared
+ * service must stop the run, not just skip a best-effort persist) can report
+ * the service plus both port lists in its error.
+ *
+ * @param {Record<string, number[]>} rowPorts recorded `{ service: [hostPort…] }`
+ * @param {Record<string, number[]>} newPorts freshly-read `{ service: [hostPort…] }`
+ * @returns {{ service: string, recorded: number[], actual: number[] } | null}
+ */
+export function firstSharedServicePortMismatch(rowPorts, newPorts) {
+  if (!rowPorts || typeof rowPorts !== "object") return null;
+  if (!newPorts || typeof newPorts !== "object") return null;
+  const norm = (v) =>
+    (Array.isArray(v) ? v : [])
+      .map((n) => Number.parseInt(String(n), 10))
+      .filter((n) => Number.isInteger(n))
+      .sort((a, b) => a - b);
+  for (const svc of Object.keys(rowPorts).sort()) {
+    if (!Object.prototype.hasOwnProperty.call(newPorts, svc)) continue;
+    const recorded = norm(rowPorts[svc]);
+    const actual = norm(newPorts[svc]);
+    if (recorded.length !== actual.length || recorded.some((n, i) => n !== actual[i])) {
+      return { service: svc, recorded, actual };
+    }
+  }
+  return null;
 }
 
 /**

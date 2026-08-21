@@ -96,7 +96,20 @@ project adheres to [Semantic Versioning](https://semver.org/).
   in claimed to be current forever and so could never gain a service baked in
   later, which is how an instance ended up with a runtime it never recorded a
   port for. It now regenerates whenever the file is missing any service the
-  checkout declares, and says which ones.
+  checkout declares, and says which ones (this is an additions-only check — a
+  service the checkout has since REMOVED, still present in an older recorded
+  file, is not what it tests for). Two further hardenings on the same reads:
+  a service the generated compose no longer publishes at all now drops out of
+  the effective map instead of surviving from a stale recorded entry (it used
+  to overlay the file on top of the row, so a service removed from the compose
+  kept advertising its old port and could be reported started for a stack that
+  does not contain it); and a SHARED service whose recorded port disagrees with
+  what the file now publishes aborts the run with an error naming both ports
+  and the recovery options, rather than warning and bringing the divergent
+  stack up anyway on a port that may already belong to another instance's
+  allocation. A short-syntax `ports` entry (`"23010:3010"`) is now read as the
+  real host-port binding it is, rather than being silently skipped when
+  reading a generated compose back.
 
 - **`cinatra instance wayflow start` now names the endpoint the instance it
   started actually serves on.** The success line stated `http://localhost:3010`
