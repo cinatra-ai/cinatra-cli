@@ -113,22 +113,47 @@ function dockerWithWayflowIn(project) {
   };
 }
 
-/** The healthy runtime from the row-7 evidence: HTTP 200, status ok. */
-function healthyFetch(expectedUrl = null) {
+/**
+ * The healthy runtime from the row-7 evidence: HTTP 200, status ok.
+ * `agents` mirrors what the loader's `/.health` reports mounted — cinatra-cli#233's
+ * availability check compares this against the agent sources found on disk, so a
+ * fixture claiming a healthy runtime must report as many agents as it provisions.
+ * An agent-route probe (`/agents/<vendor>/<slug>/`) is allowed through the
+ * `expectedUrl` restriction too, since #233 probes those routes as part of the
+ * same readiness check.
+ */
+function healthyFetch(expectedUrl = null, agents = 0) {
   const seen = [];
   const fetchImpl = async (url) => {
     seen.push(String(url));
-    if (expectedUrl && String(url) !== expectedUrl) throw new Error("ECONNREFUSED");
+    if (expectedUrl && String(url) !== expectedUrl && !String(url).includes("/agents/")) {
+      throw new Error("ECONNREFUSED");
+    }
     return {
       ok: true,
       status: 200,
       async json() {
-        return { status: "ok", agents: 0, failed: 0, failed_agents: [], last_reload_at: null };
+        return { status: "ok", agents, failed: 0, failed_agents: [], last_reload_at: null };
       },
     };
   };
   fetchImpl.seen = seen;
   return fetchImpl;
+}
+
+/**
+ * Provision one agent source on disk the way cinatra-cli#233's own tests do
+ * (`discoverAgentSources` / `wayflow-agent-mount.test.mjs`'s `makeCheckout`):
+ * `extensions/<vendor>/<slug>/cinatra/oas.json`. A fixture asserting a PASS
+ * readiness verdict must satisfy both features' contracts — a healthy runtime
+ * (#234) AND agent sources actually present and mounted (#233) — rather than
+ * the pre-#233 contract of health alone.
+ */
+function provisionAgentSource(dir, label = "acme/demo-agent") {
+  const [vendor, slug] = label.split("/");
+  mkdirSync(path.join(dir, "extensions", vendor, slug, "cinatra"), { recursive: true });
+  writeFileSync(path.join(dir, "extensions", vendor, slug, "cinatra", "oas.json"), "{}");
+  return label;
 }
 
 const REFUSING_FETCH = async () => {
@@ -141,8 +166,9 @@ const REFUSING_FETCH = async () => {
 describe("doctor wayflow readiness — the compose project comes from the registry record", () => {
   it("a healthy runtime under the RECORDED project is a PASS, not the basename false negative", async () => {
     recordInstance();
+    provisionAgentSource(installDir);
     const a = await doctorAssertWayflowReadiness({
-      fetchImpl: healthyFetch(),
+      fetchImpl: healthyFetch(null, 1),
       dockerImpl: dockerWithWayflowIn(RECORDED_PROJECT),
       repoRoot: installDir,
       env: { WAYFLOW_BASE_URL: "http://localhost:13010/" },
@@ -236,11 +262,15 @@ describe("doctor wayflow readiness — the basename fallback", () => {
 
   it("no registry record + a container under the basename project → PASS (unchanged behaviour)", async () => {
     const basenameProject = effectiveComposeProjectName(installDir);
+    provisionAgentSource(installDir);
     const a = await doctorAssertWayflowReadiness({
-      fetchImpl: healthyFetch(),
+      fetchImpl: healthyFetch(null, 1),
       dockerImpl: dockerWithWayflowIn(basenameProject),
       repoRoot: installDir,
-      env: {},
+      // The docker stub here (unlike doctor-step5's `makeDocker`) does not answer
+      // `port`, so the endpoint must come from the record the way #233 requires —
+      // an explicit WAYFLOW_BASE_URL, never a hardcoded default.
+      env: { WAYFLOW_BASE_URL: "http://localhost:13010/" },
     });
     expect(a.verdict).toBe("pass");
   });
@@ -409,11 +439,14 @@ describe("doctor wayflow readiness — an unreadable registry is not a silent PA
 
   it("a readable registry recording the project is unaffected — still an authoritative PASS", async () => {
     recordInstance();
+    provisionAgentSource(installDir);
     const a = await doctorAssertWayflowReadiness({
-      fetchImpl: healthyFetch(),
+      fetchImpl: healthyFetch(null, 1),
       dockerImpl: dockerWithWayflowIn(RECORDED_PROJECT),
       repoRoot: installDir,
-      env: {},
+      // As above: the docker stub does not answer `port`, so the endpoint must
+      // come from an explicit WAYFLOW_BASE_URL under #233's contract.
+      env: { WAYFLOW_BASE_URL: "http://localhost:13010/" },
     });
     expect(a.verdict).toBe("pass");
   });
@@ -517,6 +550,7 @@ describe("gatherDoctorReport — the wayflow row follows the registry record", (
 
   it("a healthy runtime in the recorded project passes the wayflow assertion", async () => {
     recordInstance();
+    provisionAgentSource(installDir);
     const report = await gatherDoctorReport({
       client: metadataClient({
         [LLM_MCP_SETTINGS_KEY]: { providers: { openai: { clientId: "x", clientSecret: "y" } } },
@@ -525,7 +559,7 @@ describe("gatherDoctorReport — the wayflow row follows the registry record", (
       schemaName: "cinatra",
       env: { BETTER_AUTH_URL: "http://localhost:13300", WAYFLOW_BASE_URL: "http://localhost:13010/" },
       repoRoot: installDir,
-      fetchImpl: healthyFetch("http://localhost:13010/.health"),
+      fetchImpl: healthyFetch("http://localhost:13010/.health", 1),
       dockerImpl: dockerWithWayflowIn(RECORDED_PROJECT),
     });
     const a = report.assertions.find((x) => x.id === "wayflow-readiness");

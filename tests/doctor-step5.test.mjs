@@ -101,8 +101,16 @@ function throwingFetch() {
 // answers the label-scoped lookups (com.docker.compose.project + .service)
 // the wayflow assertion uses; `running` answers the fixed-name lookups of the
 // CMS assertions.
-function makeDocker({ running = [], plugins = [], modules = [], composeRunning = [] } = {}) {
+function makeDocker({ running = [], plugins = [], modules = [], composeRunning = [], published = "127.0.0.1:3010" } = {}) {
   return function dockerImpl(args) {
+    // cinatra-cli#233 — `docker port <container> 3010`: the host address THIS
+    // instance published, which is what the doctor derives its endpoint from
+    // (a hardcoded :3010 would probe the default stack). `published: null`
+    // models a container that publishes nothing.
+    if (args[0] === "port") {
+      const known = composeRunning.some((c) => c.name === args[1]) || running.includes(args[1]);
+      return known && published ? { status: 0, stdout: `${published}\n` } : { status: 1, stdout: "" };
+    }
     if (args[0] === "ps") {
       const labelFilters = args
         .filter((a) => typeof a === "string" && a.startsWith("label=com.docker.compose."))
@@ -937,7 +945,7 @@ describe("gatherDoctorReport: wayflow-readiness", () => {
 
   it("container up + /.health ok → PASS with the mounted agent count", async () => {
     const fetchImpl = makeFetch({
-      "GET http://localhost:3010/.health": () => jsonResponse(200, { status: "ok", agents: 3 }),
+      "GET http://127.0.0.1:3010/.health": () => jsonResponse(200, { status: "ok", agents: 3 }),
       __default: () => {
         throw new Error("ECONNREFUSED");
       },
@@ -952,7 +960,7 @@ describe("gatherDoctorReport: wayflow-readiness", () => {
 
   it("container up + /.health degraded → PASS (per-agent failures never condemn the runtime), detail names the failures", async () => {
     const fetchImpl = makeFetch({
-      "GET http://localhost:3010/.health": () =>
+      "GET http://127.0.0.1:3010/.health": () =>
         jsonResponse(200, { status: "degraded", agents: 2, failed_agents: ["@acme/broken"] }),
       __default: () => {
         throw new Error("ECONNREFUSED");
@@ -976,7 +984,7 @@ describe("gatherDoctorReport: wayflow-readiness", () => {
 
   it("container up + /.health non-200 → FAIL with the restart remediation", async () => {
     const fetchImpl = makeFetch({
-      "GET http://localhost:3010/.health": () => jsonResponse(500, { error: "boom" }),
+      "GET http://127.0.0.1:3010/.health": () => jsonResponse(500, { error: "boom" }),
       __default: () => {
         throw new Error("ECONNREFUSED");
       },
@@ -999,7 +1007,34 @@ describe("gatherDoctorReport: wayflow-readiness", () => {
     expect(a.remediation).toContain("cinatra instance wayflow start");
   });
 
-  it("the health probe follows this instance's WAYFLOW_BASE_URL, not a hardcoded :3010", async () => {
+  it("the probe follows the port THIS instance PUBLISHED, even when .env.local still names the default stack", async () => {
+    // cinatra-cli#233 — the isolated/attached instance whose `.env.local` was
+    // never re-pointed. The record says :3010 (the DEFAULT stack); the container
+    // resolved by this project's labels publishes :13010. Trusting the record
+    // would report the default stack's readiness as this instance's — and if
+    // that one serves the same labels, PASS over an empty instance.
+    const seen = [];
+    const fetchImpl = async (url) => {
+      seen.push(String(url));
+      return jsonResponse(200, { status: "ok", agents: 1 });
+    };
+    const report = await gatherDoctorReport({
+      client: createMetadataClient(baseStore()),
+      schemaName: SCHEMA,
+      env: { ...ENV, WAYFLOW_BASE_URL: "http://localhost:3010" },
+      repoRoot: process.cwd(),
+      fetchImpl,
+      dockerImpl: makeDocker({
+        composeRunning: [{ project: PROJECT, service: "wayflow", name: `${PROJECT}-wayflow-1` }],
+        published: "127.0.0.1:13010",
+      }),
+    });
+    expect(byId(report, "wayflow-readiness").verdict).toBe("pass");
+    expect(seen).toContain("http://127.0.0.1:13010/.health");
+    expect(seen.some((u) => u.startsWith("http://localhost:3010"))).toBe(false);
+  });
+
+  it("nothing published falls back to the RECORDED endpoint (never a hardcoded :3010)", async () => {
     const seen = [];
     const fetchImpl = async (url) => {
       seen.push(String(url));
@@ -1011,15 +1046,43 @@ describe("gatherDoctorReport: wayflow-readiness", () => {
       env: { ...ENV, WAYFLOW_BASE_URL: "http://localhost:13010" },
       repoRoot: process.cwd(),
       fetchImpl,
-      dockerImpl: WAYFLOW_UP,
+      dockerImpl: makeDocker({
+        composeRunning: [{ project: PROJECT, service: "wayflow", name: `${PROJECT}-wayflow-1` }],
+        published: null,
+      }),
     });
     expect(byId(report, "wayflow-readiness").verdict).toBe("pass");
     expect(seen).toContain("http://localhost:13010/.health");
   });
 
+  it("container up, nothing published and nothing recorded → SKIP: it REFUSES to probe the default stack", async () => {
+    const seen = [];
+    const fetchImpl = async (url) => {
+      seen.push(String(url));
+      return jsonResponse(200, { status: "ok", agents: 1 });
+    };
+    const report = await gatherDoctorReport({
+      client: createMetadataClient(baseStore()),
+      schemaName: SCHEMA,
+      env: ENV,
+      repoRoot: process.cwd(),
+      fetchImpl,
+      dockerImpl: makeDocker({
+        composeRunning: [{ project: PROJECT, service: "wayflow", name: `${PROJECT}-wayflow-1` }],
+        published: null,
+      }),
+    });
+    const a = byId(report, "wayflow-readiness");
+    expect(a.verdict).toBe("skip");
+    expect(a.detail).toContain("could not be determined");
+    // The decisive part: no probe was sent ANYWHERE, least of all to :3010.
+    expect(seen.some((u) => u.includes("/.health"))).toBe(false);
+    expect(a.remediation).toContain("WAYFLOW_BASE_URL");
+  });
+
   it("container up + 200 but an unknown status value → FAIL (only ok|degraded are healthy)", async () => {
     const fetchImpl = makeFetch({
-      "GET http://localhost:3010/.health": () => jsonResponse(200, { status: "error" }),
+      "GET http://127.0.0.1:3010/.health": () => jsonResponse(200, { status: "error" }),
       __default: () => {
         throw new Error("ECONNREFUSED");
       },
