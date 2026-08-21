@@ -181,6 +181,32 @@ export function deriveBandOffsetFromRow(rowPorts, baseBand) {
 }
 
 /**
+ * The comparable form of one service's host-port list: parsed to integers,
+ * DEDUPED, sorted ascending.
+ *
+ * cinatra-cli#237 round-2 finding 4: the set of host ports a service binds is
+ * what the two sides are actually asserting about, and a port declared TWICE
+ * (`ports: ["25434:5432", "25434:5432/tcp"]`, or a hand-edited duplicate entry)
+ * binds the same single port — it is a redundant DECLARATION, not an allocation
+ * disagreement. Comparing raw lists made `[25434]` vs `[25434, 25434]` a
+ * length mismatch, which bricked a perfectly healthy install: the re-converge
+ * refused to bring the stack up at all. Normalising both sides to a unique
+ * sorted set states the real question ("does this service bind a DIFFERENT set
+ * of host ports than we recorded?") and answers it correctly.
+ *
+ * @param {unknown} v a `[hostPort…]` list (anything else reads as empty)
+ * @returns {number[]} unique, ascending
+ */
+function normalisePortList(v) {
+  const seen = new Set();
+  for (const raw of Array.isArray(v) ? v : []) {
+    const n = Number.parseInt(String(raw), 10);
+    if (Number.isInteger(n)) seen.add(n);
+  }
+  return [...seen].sort((a, b) => a - b);
+}
+
+/**
  * Whether every service present in BOTH a recorded remapped-port map and a
  * freshly generated one keeps the SAME host port(s). The determinism safety net
  * for an in-place regeneration: regenerating the isolated compose must never
@@ -193,6 +219,9 @@ export function deriveBandOffsetFromRow(rowPorts, baseBand) {
  * Services present on only ONE side are ignored: a new profile-gated service
  * (present only in the regenerated map) is the whole point, and a service that
  * dropped its published port (present only in the recorded map) cannot move.
+ * Both sides are compared as unique sorted SETS (`normalisePortList`), so a
+ * duplicated declaration never reads as a move (cinatra-cli#237 round-2
+ * finding 4).
  *
  * @param {Record<string, number[]>} rowPorts recorded `{ service: [hostPort…] }`
  * @param {Record<string, number[]>} newPorts regenerated `{ service: [hostPort…] }`
@@ -201,11 +230,7 @@ export function deriveBandOffsetFromRow(rowPorts, baseBand) {
 export function sharedServicePortsAgree(rowPorts, newPorts) {
   if (!rowPorts || typeof rowPorts !== "object") return true;
   if (!newPorts || typeof newPorts !== "object") return false;
-  const norm = (v) =>
-    (Array.isArray(v) ? v : [])
-      .map((n) => Number.parseInt(String(n), 10))
-      .filter((n) => Number.isInteger(n))
-      .sort((a, b) => a - b);
+  const norm = normalisePortList;
   for (const [svc, recorded] of Object.entries(rowPorts)) {
     if (!Object.prototype.hasOwnProperty.call(newPorts, svc)) continue;
     const a = norm(recorded);
@@ -222,7 +247,9 @@ export function sharedServicePortsAgree(rowPorts, newPorts) {
  * The first (by service name, sorted — deterministic) shared-service host-port
  * disagreement between a recorded map and a freshly-read one, or null when
  * `sharedServicePortsAgree` would return true. Same shared-only comparison and
- * normalisation as `sharedServicePortsAgree`, kept as a separate function so
+ * normalisation as `sharedServicePortsAgree` (unique sorted sets — a duplicated
+ * declaration is not an allocation disagreement, cinatra-cli#237 round-2
+ * finding 4), kept as a separate function so
  * that boolean gate stays a simple yes/no while a caller that must ABORT and
  * NAME the disagreement (cinatra-cli#237 findings 2/4: a mismatch on a shared
  * service must stop the run, not just skip a best-effort persist) can report
@@ -235,11 +262,7 @@ export function sharedServicePortsAgree(rowPorts, newPorts) {
 export function firstSharedServicePortMismatch(rowPorts, newPorts) {
   if (!rowPorts || typeof rowPorts !== "object") return null;
   if (!newPorts || typeof newPorts !== "object") return null;
-  const norm = (v) =>
-    (Array.isArray(v) ? v : [])
-      .map((n) => Number.parseInt(String(n), 10))
-      .filter((n) => Number.isInteger(n))
-      .sort((a, b) => a - b);
+  const norm = normalisePortList;
   for (const svc of Object.keys(rowPorts).sort()) {
     if (!Object.prototype.hasOwnProperty.call(newPorts, svc)) continue;
     const recorded = norm(rowPorts[svc]);

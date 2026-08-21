@@ -15,6 +15,7 @@ import {
   a2aPeerUrlsFromServices,
   deriveBandOffsetFromRow,
   sharedServicePortsAgree,
+  firstSharedServicePortMismatch,
   removeEnvKey,
 } from "../src/isolated-a2a.mjs";
 
@@ -183,6 +184,62 @@ describe("sharedServicePortsAgree", () => {
   it("treats an empty/absent recorded map as trivially agreeing", () => {
     expect(sharedServicePortsAgree({}, { postgres: [25434] })).toBe(true);
     expect(sharedServicePortsAgree(null, { postgres: [25434] })).toBe(true);
+  });
+
+  // cinatra-cli#237 round-2 finding 4: a DUPLICATED declaration is not an
+  // allocation disagreement. `ports: ["25434:5432", "25434:5432/tcp"]` (or a
+  // hand-edited duplicate entry) binds the single host port 25434 — exactly what
+  // the row records. Comparing raw lists made this a length mismatch, so a
+  // perfectly healthy install refused to come up at all.
+  it("finding 4: a DUPLICATE declaration of the recorded port still agrees", () => {
+    expect(sharedServicePortsAgree({ postgres: [25434] }, { postgres: [25434, 25434] })).toBe(true);
+    expect(sharedServicePortsAgree({ postgres: [25434, 25434] }, { postgres: [25434] })).toBe(true);
+    expect(sharedServicePortsAgree({ postgres: [25434, 26379] }, { postgres: [26379, 25434, 25434] })).toBe(true);
+  });
+
+  it("finding 4: a duplicate does not hide a genuinely DIFFERENT port", () => {
+    // Deduping must not collapse a real extra allocation into agreement.
+    expect(sharedServicePortsAgree({ postgres: [25434] }, { postgres: [25434, 35434] })).toBe(false);
+    expect(sharedServicePortsAgree({ postgres: [25434, 25434] }, { postgres: [35434] })).toBe(false);
+  });
+});
+
+describe("firstSharedServicePortMismatch", () => {
+  it("names the service and both port lists on a real disagreement", () => {
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [35434] })).toEqual({
+      service: "postgres",
+      recorded: [25434],
+      actual: [35434],
+    });
+  });
+
+  it("is null when the maps agree, and ignores one-sided services", () => {
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434] })).toBeNull();
+    expect(firstSharedServicePortMismatch({ postgres: [25434], gone: [9999] }, { postgres: [25434] })).toBeNull();
+  });
+
+  it("reports the FIRST disagreement by sorted service name (stable message)", () => {
+    expect(
+      firstSharedServicePortMismatch({ zeta: [1], alpha: [2] }, { zeta: [9], alpha: [8] })?.service,
+    ).toBe("alpha");
+  });
+
+  // cinatra-cli#237 round-2 finding 4, the abort side of the same defect: this
+  // map feeds the "refuse to bring the stack up" error. A duplicate declaration
+  // reported as a mismatch BRICKS a healthy install — nothing the operator can
+  // do short of hand-editing the compose file clears it.
+  it("finding 4: a DUPLICATE declaration is not a mismatch", () => {
+    expect(firstSharedServicePortMismatch({ postgres: [25434] }, { postgres: [25434, 25434] })).toBeNull();
+    expect(firstSharedServicePortMismatch({ postgres: [25434, 25434] }, { postgres: [25434] })).toBeNull();
+  });
+
+  it("finding 4: the reported lists are the DEDUPED sets, so the message reads truthfully", () => {
+    // "(25434) disagrees with what … publishes (35434)" — never "(35434, 35434)".
+    expect(firstSharedServicePortMismatch({ postgres: [25434, 25434] }, { postgres: [35434, 35434] })).toEqual({
+      service: "postgres",
+      recorded: [25434],
+      actual: [35434],
+    });
   });
 });
 
