@@ -36,6 +36,7 @@ import {
   assertComposeAppUrlsRemapped,
   assertComposeHostUrlsRemapped,
   generateIsolatedCompose,
+  interpolatedPortServices,
   publishedPortsByService,
 } from "../src/install-isolation.mjs";
 import { isolatedComposeHasA2aPeers, missingIsolatedServices } from "../src/isolated-a2a.mjs";
@@ -747,6 +748,99 @@ describe("cinatra-cli#231 — publishedPortsByService (reading the run's real po
   it("a short-syntax port RANGE is ambiguous and is not recorded", () => {
     expect(publishedPortsByService({ services: { db: { ports: ["23010-23015:3010-3015"] } } })).toEqual({});
   });
+
+  // ── cinatra-cli#237 round-2 finding 2 ───────────────────────────────────────
+  // The LONG form used a permissive `Number.parseInt`, so a legitimate long-form
+  // range came back as its FIRST port — a number the stack never binds — while
+  // the short form deliberately declined the very same input. Both branches now
+  // validate through one strict reader.
+  it("finding 2: a LONG-FORM port RANGE is declined exactly like the short form", () => {
+    expect(publishedPortsByService({ services: { db: { ports: [{ published: "23010-23015", target: 3010 }] } } })).toEqual(
+      {},
+    );
+    // The short form's answer for the same declaration, for direct comparison.
+    expect(publishedPortsByService({ services: { db: { ports: ["23010-23015:3010-3015"] } } })).toEqual({});
+  });
+
+  it("finding 2: a NON-NUMERIC long-form published value records nothing", () => {
+    for (const published of ["", "  ", "abc", "23010abc", "0", "-5", "2.5"]) {
+      expect(publishedPortsByService({ services: { db: { ports: [{ published, target: 3010 }] } } })).toEqual({});
+    }
+  });
+
+  it("finding 2: a valid sibling entry still records when one entry is declined", () => {
+    expect(
+      publishedPortsByService({
+        services: { db: { ports: [{ published: "23010-23015", target: 3010 }, { published: "25434", target: 5432 }] } },
+      }),
+    ).toEqual({ db: [25434] });
+  });
+
+  // ── cinatra-cli#237 round-2 finding 6 ───────────────────────────────────────
+  // Compose accepts a zero-padded host port and binds the integer; rejecting the
+  // spelling silently dropped a REAL binding from the effective map.
+  it("finding 6: a ZERO-PADDED host port is accepted and normalised to the integer", () => {
+    expect(publishedPortsByService({ services: { db: { ports: ["023010:3010"] } } })).toEqual({ db: [23010] });
+    expect(publishedPortsByService({ services: { db: { ports: ["127.0.0.1:023010:3010/tcp"] } } })).toEqual({
+      db: [23010],
+    });
+    expect(publishedPortsByService({ services: { db: { ports: [{ published: "023010", target: 3010 }] } } })).toEqual({
+      db: [23010],
+    });
+  });
+});
+
+// ── cinatra-cli#237 round-2 finding 1 ────────────────────────────────────────
+// `{ published: "${POSTGRES_PORT}" }` and `"${WAYFLOW_PORT}:3010"` are valid
+// Compose that binds a real host port at `up` time — the file simply DECLINES to
+// say which. Read as "publishes nothing", such a service was indistinguishable
+// from a REMOVED one, so the wholesale replacement deleted a legitimate recorded
+// allocation. These two answers must be tellable apart.
+describe("cinatra-cli#237 — interpolatedPortServices (the file declines to state a truth)", () => {
+  it("names a service whose LONG-FORM published port defers to a variable", () => {
+    const doc = { services: { postgres: { ports: [{ published: "${POSTGRES_PORT}", target: 5432 }] } } };
+    expect(interpolatedPortServices(doc)).toEqual(["postgres"]);
+    // ...and it is NOT in the static map, which is exactly why the two answers
+    // must be read together.
+    expect(publishedPortsByService(doc)).toEqual({});
+  });
+
+  it("names a service whose SHORT-FORM host port defers to a variable", () => {
+    expect(interpolatedPortServices({ services: { wayflow: { ports: ["${WAYFLOW_PORT}:3010"] } } })).toEqual(["wayflow"]);
+    // The bare `$VAR` spelling Compose also accepts.
+    expect(interpolatedPortServices({ services: { wayflow: { ports: ["$WAYFLOW_PORT:3010"] } } })).toEqual(["wayflow"]);
+    // A whole-entry variable can expand to a `host:container` pair — deferred,
+    // not an ephemeral bind.
+    expect(interpolatedPortServices({ services: { wayflow: { ports: ["${WAYFLOW_PORT_SPEC}"] } } })).toEqual(["wayflow"]);
+  });
+
+  it("does NOT name a service whose host port is stated and only the CONTAINER port defers", () => {
+    // "23010:${TARGET}" states host port 23010; the container port is not a
+    // published-host-port truth.
+    const doc = { services: { db: { ports: ["23010:${TARGET}"] } } };
+    expect(interpolatedPortServices(doc)).toEqual([]);
+    expect(publishedPortsByService(doc)).toEqual({ db: [23010] });
+  });
+
+  it("does NOT name a service that simply publishes nothing, or an ephemeral bind", () => {
+    expect(interpolatedPortServices({ services: { worker: { image: "x" } } })).toEqual([]);
+    expect(interpolatedPortServices({ services: { db: { ports: ["3010"] } } })).toEqual([]);
+    expect(interpolatedPortServices({ services: { db: { ports: ["23010:3010"] } } })).toEqual([]);
+  });
+
+  it("names a service that MIXES a static and an interpolated entry (a partial statement)", () => {
+    const doc = { services: { db: { ports: ["25434:5432", "${EXTRA_PORT}:9000"] } } };
+    expect(interpolatedPortServices(doc)).toEqual(["db"]);
+    expect(publishedPortsByService(doc)).toEqual({ db: [25434] });
+  });
+
+  it("is sorted and tolerates a malformed document", () => {
+    expect(
+      interpolatedPortServices({ services: { zeta: { ports: ["${Z}:1"] }, alpha: { ports: ["${A}:1"] } } }),
+    ).toEqual(["alpha", "zeta"]);
+    expect(interpolatedPortServices(null)).toEqual([]);
+    expect(interpolatedPortServices({ services: null })).toEqual([]);
+  });
 });
 
 describe("cinatra-cli#231 — an A2A-ERA compose still gains a LATER-baked service", () => {
@@ -1053,6 +1147,171 @@ describe("cinatra-cli#237 — a diverging or shrunk compose file is never blindl
     expect(registryRow(installDir).row.ports.wayflow).toBeUndefined();
     // What the file DOES still publish is untouched — a repair, never a wipe.
     expect(registryRow(installDir).row.ports.postgres).toEqual([5434 + OFFSET]);
+  });
+
+  // ── round-2 finding 1 ──────────────────────────────────────────────────────
+  // A parse-success file whose bindings are VARIABLE-BACKED states no static
+  // port for those services. Under wholesale replacement it looked exactly like
+  // a removed service, so the run DELETED a legitimate recorded allocation,
+  // rewrote `.env.local` without that endpoint, and launched anyway.
+  it("round-2 finding 1: a service whose published port is INTERPOLATED keeps its recorded allocation", async () => {
+    const installDir = await freshIsolatedInstall("iso237-interp");
+    const isoPath = path.join(installDir, "docker-compose.cinatra-isolated.yml");
+    const { doc } = readGeneratedCompose(installDir);
+
+    // Two supported spellings, both valid Compose resolved at `up` time.
+    doc.services.wayflow.ports[0].published = "${WAYFLOW_PORT}";
+    doc.services.redis.ports = ["${REDIS_PORT}:6379"];
+    // ...and, in the SAME file, a genuinely REMOVED service — the case round-1
+    // finding 1 closed, which must stay closed. If the fallback were a blanket
+    // overlay of the recorded map, this entry would come back too.
+    delete doc.services["nango-server"];
+    writeFileSync(isoPath, JSON.stringify(doc, null, 2) + "\n");
+
+    const { row: freshRow } = registryRow(installDir);
+    expect(freshRow.ports.wayflow).toEqual([EXPECTED_WAYFLOW_PORT]);
+    expect(freshRow.ports["nango-server"]).toEqual([3003 + OFFSET]);
+
+    // Point .env.local at the DEFAULT wayflow port, so a re-point back to the
+    // offset port is only possible from the SURVIVING recorded entry.
+    const envPath = path.join(installDir, ".env.local");
+    writeFileSync(
+      envPath,
+      readFileSync(envPath, "utf8").replace(
+        /^WAYFLOW_BASE_URL=.*$/m,
+        `WAYFLOW_BASE_URL=http://127.0.0.1:${DEFAULT_WAYFLOW_PORT}`,
+      ),
+    );
+
+    let bringUpCalled = false;
+    const deps = { ...isolatedDeps(), bringUpInfra: () => { bringUpCalled = true; } };
+    const lines = [];
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "attach",
+      ],
+      { log: (l) => lines.push(String(l)), deps },
+    );
+    expect(res.infraPlan).toBe("attach");
+    // The interpolated ports are NOT a disagreement, so the stack comes up.
+    expect(bringUpCalled).toBe(true);
+
+    // The recorded allocations SURVIVE for the services the file declined to
+    // speak for — not deleted, and not "repaired" to something else.
+    const { row } = registryRow(installDir);
+    expect(row.ports.wayflow).toEqual([EXPECTED_WAYFLOW_PORT]);
+    expect(row.ports.redis).toEqual([6379 + OFFSET]);
+    // The service that genuinely LEFT the file still drops out (round-1
+    // finding 1 — the two cases stay distinguishable).
+    expect(row.ports["nango-server"]).toBeUndefined();
+    // What the file DOES state stands unchanged.
+    expect(row.ports.postgres).toEqual([5434 + OFFSET]);
+
+    // The endpoints this run speaks come from the surviving allocation: the tail
+    // and `.env.local` both name the offset port, never the default.
+    const runtimeLine = lines.find((l) => l.includes("Agent runtime:"));
+    expect(runtimeLine).toContain(`http://localhost:${EXPECTED_WAYFLOW_PORT}`);
+    expect(readFileSync(envPath, "utf8")).toMatch(
+      new RegExp(`WAYFLOW_BASE_URL=\\S*:${EXPECTED_WAYFLOW_PORT}\\b`),
+    );
+  });
+
+  // ── round-2 finding 3 ──────────────────────────────────────────────────────
+  // On the re-converge route `regenerateIsolatedComposeInPlace` ran BEFORE the
+  // guard, rewriting the compose file AND the registry row. Worse: because it
+  // re-derives the ports from the checkout at the RECORDED offset, it rewrote
+  // the divergent port away — masking the disagreement so the abort never fired
+  // and the stack came up on a silently clobbered file.
+  it("round-2 finding 3: a divergent file that ALSO misses a service aborts BEFORE the regeneration mutates anything", async () => {
+    const installDir = await freshIsolatedInstall("iso237-premutation");
+    const isoPath = path.join(installDir, "docker-compose.cinatra-isolated.yml");
+    const { doc } = readGeneratedCompose(installDir);
+
+    const recordedPgPort = 5434 + OFFSET;
+    const divergedPgPort = recordedPgPort + 1000;
+    doc.services.postgres.ports[0].published = String(divergedPgPort);
+    // Missing a service the checkout declares → the in-place regeneration is
+    // NOT a no-op here; it would run, rewrite the file (restoring postgres to
+    // the recorded port) and persist a new row.
+    delete doc.services.redis;
+    const wroteBody = JSON.stringify(doc, null, 2) + "\n";
+    writeFileSync(isoPath, wroteBody);
+
+    const rowBefore = JSON.stringify(registryRow(installDir).row);
+
+    let bringUpCalled = false;
+    const deps = { ...isolatedDeps(), bringUpInfra: () => { bringUpCalled = true; } };
+    // A plain re-run routes through the isolated re-converge (the regenerating one).
+    await expect(
+      runInstall(
+        ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+        { log: () => {}, deps },
+      ),
+    ).rejects.toThrow(/postgres/);
+    expect(bringUpCalled).toBe(false);
+
+    // "Nothing was started, and nothing was changed" — literally. The compose
+    // file is byte-identical to what the operator left, still diverged and still
+    // missing the service the regeneration wanted to add.
+    expect(readFileSync(isoPath, "utf8")).toBe(wroteBody);
+    const after = readGeneratedCompose(installDir).doc;
+    expect(String(after.services.postgres.ports[0].published)).toBe(String(divergedPgPort));
+    expect(after.services.redis).toBeUndefined();
+    // ...and the row is untouched, down to the `offset` the regeneration would
+    // have persisted alongside its enlarged map.
+    expect(JSON.stringify(registryRow(installDir).row)).toBe(rowBefore);
+  });
+
+  // ── round-2 finding 5 ──────────────────────────────────────────────────────
+  // Every recovery path must actually change the state the abort reacts to. The
+  // previous path 2 (`cinatra instance reset --yes`, then `cinatra install
+  // --on-conflict=isolated`) did not: `instance reset` resets the dev DATABASE
+  // and never touches the instance registry, and the re-install routes straight
+  // back into this same convergence and throws again.
+  it("round-2 finding 5: the abort names recovery steps that actually clear the state", async () => {
+    const installDir = await freshIsolatedInstall("iso237-recovery");
+    const isoPath = path.join(installDir, "docker-compose.cinatra-isolated.yml");
+    const { doc } = readGeneratedCompose(installDir);
+    const recordedPgPort = 5434 + OFFSET;
+    const divergedPgPort = recordedPgPort + 1000;
+    doc.services.postgres.ports[0].published = String(divergedPgPort);
+    writeFileSync(isoPath, JSON.stringify(doc, null, 2) + "\n");
+
+    const { row, slug } = registryRow(installDir);
+    const registryFile = process.env.CINATRA_INSTANCE_REGISTRY;
+
+    const err = await runInstall(
+      ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
+      { log: () => {}, deps: { ...isolatedDeps(), bringUpInfra: () => {} } },
+    ).then(
+      () => null,
+      (e) => e,
+    );
+    expect(err).toBeInstanceOf(Error);
+    const msg = err.message;
+
+    // (1) restore the file — states the exact port to put back.
+    expect(msg).toContain(`publishes ${recordedPgPort} again`);
+    // (2) adopt the file's port — names the ROW field that disagrees, in the
+    //     registry file that actually holds it, plus the exact `down` for this
+    //     instance's recorded compose project.
+    expect(msg).toContain(`instances["${slug}"].ports["postgres"] to [${divergedPgPort}]`);
+    expect(msg).toContain(registryFile);
+    expect(msg).toContain(`docker compose -p ${row.composeProject} -f docker-compose.cinatra-isolated.yml down`);
+    // (3) start over — the row and the checkout marker both have to go, or a
+    //     re-install lands back on the same record.
+    expect(msg).toContain(`delete the "${slug}" entry from ${registryFile}`);
+    expect(msg).toContain(".cinatra/instance.json");
+    expect(msg).toContain("cinatra install --on-conflict=isolated");
+
+    // The step that did NOT self-resolve is gone: `cinatra instance reset` is a
+    // dev-DATABASE reset and leaves this row (and so this abort) exactly as it
+    // was — offering it sent the operator in a circle.
+    expect(msg).not.toContain("cinatra instance reset");
+    // ...and a bare re-install is never offered as a way to "re-derive" the
+    // record from the file: on its own it re-enters this same convergence.
+    expect(msg).not.toMatch(/re-derived from the current file/);
   });
 
   it("findings 2 & 4: a SHARED service's port disagreeing between the row and the file ABORTS instead of launching the divergent stack", async () => {
