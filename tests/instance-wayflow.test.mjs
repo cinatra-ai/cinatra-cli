@@ -122,11 +122,16 @@ describe("wayflowHealthUrlFromEnv", () => {
     );
   });
 
-  it("falls back to the default endpoint when the variable is absent or unusable", () => {
-    expect(wayflowHealthUrlFromEnv({})).toBe("http://localhost:3010/.health");
-    expect(wayflowHealthUrlFromEnv({ WAYFLOW_BASE_URL: "   " })).toBe("http://localhost:3010/.health");
-    expect(wayflowHealthUrlFromEnv({ WAYFLOW_BASE_URL: "not a url" })).toBe("http://localhost:3010/.health");
-    expect(wayflowHealthUrlFromEnv({ WAYFLOW_BASE_URL: "ftp://host/x" })).toBe("http://localhost:3010/.health");
+  it("REFUSES rather than defaulting when the variable is absent or unusable (cinatra-cli#233)", () => {
+    // A hardcoded :3010 fallback is not a guess, it is a wrong answer: on an
+    // isolated/attached instance it names the DEFAULT stack's runtime, so the
+    // caller would report another instance's readiness as this one's. Null lets
+    // the caller derive the endpoint from what this instance PUBLISHED, and
+    // report it as undetermined when it cannot.
+    expect(wayflowHealthUrlFromEnv({})).toBeNull();
+    expect(wayflowHealthUrlFromEnv({ WAYFLOW_BASE_URL: "   " })).toBeNull();
+    expect(wayflowHealthUrlFromEnv({ WAYFLOW_BASE_URL: "not a url" })).toBeNull();
+    expect(wayflowHealthUrlFromEnv({ WAYFLOW_BASE_URL: "ftp://host/x" })).toBeNull();
   });
 });
 

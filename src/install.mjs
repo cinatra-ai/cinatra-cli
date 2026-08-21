@@ -158,6 +158,7 @@ import { resolveBuildTimeoutMs, buildPreviewBuildArgs } from "./preview.mjs";
 import {
   WAYFLOW_PROFILE,
   WAYFLOW_RUNTIME_KEY,
+  WAYFLOW_RUNTIME_LOCAL,
   buildWayflowImage,
   generateWayflowEnv,
   resolveWayflowRuntimeMode,
@@ -165,6 +166,16 @@ import {
   wayflowBuildFailureMessage,
   wayflowStatusLines,
 } from "./wayflow-runtime.mjs";
+// cinatra-cli#233 — the runtime is started with the rest of the stack, BEFORE
+// the extension sources it bind-mounts are on disk, so a fresh install mounts
+// 0 agents. This module makes the running runtime pick them up once the sync
+// has put them there (builtins-only, injectable, hermetically testable).
+import {
+  agentMountFailedClosed,
+  agentsUnavailableVerdictLines,
+  claimAgentsUnavailableExitCode,
+  mountAgentSourcesAfterSync,
+} from "./wayflow-agent-mount.mjs";
 import {
   deriveCoUseSlug,
   coUseDbName,
@@ -6137,6 +6148,61 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     }
   }
 
+  // 7a1. cinatra-cli#233 — MOUNT the agent sources the runtime was started
+  //      before. Steps 4b/6 bring the local stack up, WayFlow included; step 7
+  //      (above) is what puts the agent sources on disk — the dev clone of the
+  //      declared extension repos, or the prod acquisition. The runtime
+  //      bind-mounts `./extensions:/agents:ro` and walks it ONCE at boot, so on
+  //      a FRESH install it walked an empty directory: 0 agents mounted, every
+  //      `/agents/<vendor>/<slug>/` route HTTP 404 — while `/.health` still
+  //      answers `ok` and the compose healthcheck passes, so nothing surfaced
+  //      it (cinatra#2654 row 7). This step is the ordering fix the runtime's
+  //      own hot-reload route exists for: it runs AFTER the sources exist, and
+  //      makes the runtime re-read them (reload, or a service restart when the
+  //      route is unavailable), then VERIFIES against `/.health` + a real agent
+  //      route.
+  //
+  //      Only for an install that OWNS a local runtime (`local` — not
+  //      `--no-wayflow`, not external/co-use), and never on a checkout-only run
+  //      that started no stack. Non-fatal by contract, like the health wait it
+  //      complements: the instance is already provisioned here, so a failure is
+  //      reported loudly and by name (and `cinatra doctor`'s agent-availability
+  //      probe fails on the same state) rather than rolling back a working
+  //      install. But it does NOT let the install exit 0 either: the tail
+  //      restates the outcome and claims the typed exit code
+  //      INSTALL_EXIT_AGENTS_UNAVAILABLE (21), the same shape cinatra-cli#200
+  //      uses for a completed-with-a-named-defect install. "Exited 0 and
+  //      recorded ready" is exactly the lie this issue is about.
+  //      `deps.mountAgentSourcesAfterSync` is the test seam.
+  let agentMountResult = null;
+  //
+  //      The compose project is what proves a bring-up actually happened on
+  //      this run: `defaultProject` is set only inside the default bring-up
+  //      block, and the isolated/attach plans carry the project they started.
+  //      Without one there is no runtime of ours to address, so the step does
+  //      not run (and never warns about a runtime nobody started).
+  const mountComposeProject =
+    infraPlan === "isolated" || infraPlan === "attach"
+      ? (resolution?.instance?.composeProject ?? null)
+      : defaultProject;
+  if (wayflowRuntimeMode === WAYFLOW_RUNTIME_LOCAL && mountComposeProject) {
+    const mountComposeFiles =
+      infraPlan === "isolated" || infraPlan === "attach" ? (resolution?.instance?.composeFiles ?? null) : null;
+    const mountEnvFile = path.join(targetDir, ".env.local");
+    const mount = deps.mountAgentSourcesAfterSync ?? mountAgentSourcesAfterSync;
+    agentMountResult = await mount({
+      targetDir,
+      composeArgs: composeArgsFor({
+        composeFiles: mountComposeFiles,
+        composeProject: mountComposeProject,
+        envFile: existsSync(mountEnvFile) ? mountEnvFile : null,
+        profiles: [WAYFLOW_PROFILE],
+      }),
+      log,
+      deps: { spawnSync, ...(deps.wayflowMountDeps ?? {}) },
+    });
+  }
+
   // 7a2. Execution plane (cinatra-cli#160): the install-time execution-mode choice
   //      + first-class L0 image acquisition. Gated to the full provision path —
   //      --dry-run returns long before here; --no-install / --no-setup skip it
@@ -6226,6 +6292,21 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     for (const line of registrySkewVerdictLines([], { context: "install-tail" })) log(line);
     // Never overwrite a non-zero this install already set for a real failure.
     process.exitCode = claimRegistrySkewExitCode(process.exitCode);
+  }
+
+  // 8c-bis. cinatra-cli#233 — the deferred AGENT-AVAILABILITY verdict. The
+  //     instance is provisioned, so this is not a rollback; but a runtime that
+  //     cannot serve its agents must not be reported as a clean success, which
+  //     is precisely the "exited 0, recorded ready, cannot run an agent" state
+  //     this issue exists to remove. Stated at the tail, with the typed code.
+  //      Fail CLOSED on `no-sources` too: this step runs only for an install
+  //      that OWNS a local runtime, so "nothing on disk to mount" describes a
+  //      runtime serving ZERO agents — the dev sync reporting `skipped` (step 7
+  //      above) or a prod acquisition that placed nothing — which is the same
+  //      state the doctor FAILs on, not a benign nothing-to-do.
+  if (agentMountFailedClosed(agentMountResult)) {
+    for (const line of agentsUnavailableVerdictLines(agentMountResult)) log(line);
+    process.exitCode = claimAgentsUnavailableExitCode(process.exitCode);
   }
 
   // cinatra#2654: state the agent-runtime outcome in the summary — started,
