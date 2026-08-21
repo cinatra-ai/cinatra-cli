@@ -1466,8 +1466,20 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
   // file declines to state (round-2 finding 1 stays closed).
   it("finding 1: a MIXED service whose static port the row DOES hold keeps its recorded allocation and launches", async () => {
     const installDir = await freshIsolatedInstall("iso237r3-mixed-ok");
-    const { doc } = readGeneratedCompose(installDir);
+    const registryFile = process.env.CINATRA_INSTANCE_REGISTRY;
+    const { slug } = registryRow(installDir);
 
+    // The record holds a SECOND port for this service that the file never states
+    // statically. That is what makes the fallback observable: without it the
+    // effective map would carry only the static half, which is a length
+    // disagreement against the record and would abort.
+    const extraRecorded = RECORDED_REDIS + 1;
+    const reg = JSON.parse(readFileSync(registryFile, "utf8"));
+    reg.instances[slug].ports.redis = [RECORDED_REDIS, extraRecorded];
+    writeFileSync(registryFile, JSON.stringify(reg, null, 2) + "\n");
+
+    const { doc } = readGeneratedCompose(installDir);
+    // One STATIC entry the record holds, one entry left to interpolation.
     doc.services.redis.ports = [`${RECORDED_REDIS}:6379`, "${EXTRA}:9000"];
     writeCompose(installDir, doc);
 
@@ -1481,10 +1493,12 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
       { log: () => {}, deps },
     );
     expect(res.infraPlan).toBe("attach");
+    // The static half agrees with the record, so this is not a disagreement.
     expect(bringUpCalled).toBe(true);
-    // The recorded entry survives whole — the interpolated remainder is covered
-    // by the record, never deleted and never "repaired" to the static half only.
-    expect(registryRow(installDir).row.ports.redis).toEqual([RECORDED_REDIS]);
+    // ...and the record answered for the INTERPOLATED remainder: the entry the
+    // file declined to state survives whole, rather than being trimmed to the
+    // static half the file happened to name.
+    expect(registryRow(installDir).row.ports.redis).toEqual([RECORDED_REDIS, extraRecorded]);
   });
 
   // ── finding 2 ──────────────────────────────────────────────────────────────
