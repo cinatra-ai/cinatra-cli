@@ -5042,19 +5042,28 @@ function concurrentRowMoveError(
   currentPorts,
   { expectedOffset = undefined, currentOffset = undefined, composeFileMayBeRewritten = false } = {},
 ) {
-  const offsetClause =
-    expectedOffset !== undefined && expectedOffset !== currentOffset
-      ? ` Its band offset also moved (this run read ${expectedOffset ?? "none"}; the registry now holds ${currentOffset ?? "none"}).`
-      : "";
+  const offsetMoved = expectedOffset !== undefined && expectedOffset !== currentOffset;
+  const offsetClause = offsetMoved
+    ? ` Its band offset also moved (this run read ${expectedOffset ?? "none"}; the registry now holds ${currentOffset ?? "none"}).`
+    : "";
   const changedClause = composeFileMayBeRewritten
     ? ` The regenerated ${ISOLATED_COMPOSE_FILENAME} may already be rewritten on disk, but the registry row was NOT — the row is the ` +
       `authority to re-run against, and the next run reads the file back from it.`
     : ` Nothing was started, and nothing was changed.`;
+  // cinatra#2654 round-5 review, non-blocking 1: "re-run to converge" only
+  // holds when the row that moved is the one this run already agrees with —
+  // a PORT move without an offset move. When the OFFSET moved too, a re-run
+  // re-derives at that new offset and lands on `assertIsolatedPortsConverge`
+  // instead (the port-divergence gate), which carries its OWN recovery — so
+  // this message must not promise the re-run simply converges.
+  const reRunClause = offsetMoved
+    ? " Re-run this command: it re-derives at the new offset, and (if the checkout's own compose still " +
+      "disagrees with it) aborts at the port-divergence gate instead, with its own recovery."
+    : " Re-run this command to converge against the other operation's row.";
   const err = new Error(
     `Refusing to bring up isolated instance "${slug}": a concurrent cinatra operation moved its recorded ` +
       `ports while this repair was in flight (this run read ${JSON.stringify(expectedPorts ?? {})}; the ` +
-      `registry now holds ${JSON.stringify(currentPorts ?? {})}).${offsetClause}${changedClause} Re-run this ` +
-      `command to converge against the other operation's row.`,
+      `registry now holds ${JSON.stringify(currentPorts ?? {})}).${offsetClause}${changedClause}${reRunClause}`,
   );
   err[CONCURRENT_ROW_MOVE] = true;
   return err;
