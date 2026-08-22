@@ -5744,7 +5744,12 @@ async function executeAttach({ targetDir, opts, resolvedSha, classified, log = c
  *  install on the default ports. `--teardown-existing` adds `-v` behind a
  *  SEPARATE typed confirm. REFUSES an `unrelated`/`mixed` holder. After a
  *  successful down, RELEASES the torn-down instance's row + marker + alloc band
- *  reservation transactionally (review hardening #6 / §C.8). */
+ *  reservation transactionally (review hardening #6 / §C.8).
+ *
+ *  cinatra-cli#239: the `down` and the release run inside the SAME held alloc
+ *  lock, down-first, exactly as the teardown path does (cinatra-cli#232), and
+ *  an unreadable registry THROWS instead of being swallowed into "no row to
+ *  release" — which used to leave a stopped instance holding its whole band. */
 async function executeStopExisting({ targetDir, opts, conflicts, classified, log = console.log, deps = {} }) {
   if (classified.kind !== "other-cinatra") {
     throw new Error(
@@ -5783,23 +5788,26 @@ async function executeStopExisting({ targetDir, opts, conflicts, classified, log
     return { infraPlan: "skip", done: false, dryRun: true };
   }
 
-  // Tear down the RECORDED project + files (never a bare dir `down`).
-  // cinatra-cli#35(e): use the recorded EXPLICIT `-p` (default OR isolated); a
-  // pre-#35 legacy "cinatra" sentinel row falls back to basename derivation.
-  runCompose(holder.installDir, {
-    composeFiles: holder.composeFiles,
-    composeProject: composeProjectArgForRow(holder),
-    volumes: withVolumes,
-  });
-
-  // Transactional release of the torn-down instance's row + marker + band.
+  // Tear down the RECORDED project + files, then release the torn-down row +
+  // marker + band — ALL inside ONE held alloc lock (cinatra-cli#239), the same
+  // down-first-under-the-lock ordering the teardown path uses (cinatra-cli#232).
+  //
+  // Why the lock has to span the `down` as well: while the containers are being
+  // stopped, the row still reserves the whole band. A concurrent install that
+  // took the lock in that window would either read a reservation whose stack is
+  // already going away, or slip in between the `down` and the release and be
+  // handed the very ports this install is about to claim. One lock across both
+  // makes that window unrepresentable rather than merely unlikely.
   await withAllocLock(lockPath, async () => {
-    let reg;
-    try {
-      reg = requireUsableInstanceRegistry(registryPath);
-    } catch {
-      reg = null;
-    }
+    // A registry we cannot read is LOUD (cinatra-cli#239). Swallowing it left
+    // the stopped instance's row — and therefore its ENTIRE port reservation —
+    // in place while we reported the stack stopped, which is the leak this
+    // fixes. It is read BEFORE the `down`, so a registry we cannot parse costs
+    // no containers: nothing has been stopped when the error surfaces.
+    // A MISSING registry is not a read failure (it reads as an empty registry),
+    // so a label/marker-proven holder with no recorded row still stops fine.
+    const reg = requireUsableInstanceRegistry(registryPath);
+
     // cinatra-cli#39 (codex #1): release the slug's row ONLY when it still maps
     // to the dir we actually tore down. A label/marker-proven holder whose slug
     // COLLIDES with an unrelated registry row (backfill skipped, see
@@ -5807,18 +5815,52 @@ async function executeStopExisting({ targetDir, opts, conflicts, classified, log
     // we tore down `holder.installDir`, so we may only release a row pointing
     // there. (For a normal registry-backed holder the dirs match, so this is a
     // no-op tightening.)
-    const existing = reg ? getInstance(reg, holder.slug) : null;
-    if (existing && path.resolve(existing.installDir) === path.resolve(holder.installDir)) {
+    const existing = getInstance(reg, holder.slug);
+    const releasable = existing != null && path.resolve(existing.installDir) === path.resolve(holder.installDir);
+
+    // Tear down what the row says NOW, not the snapshot the classifier took
+    // before the lock (codex round 1, blocking). `holder` was resolved outside
+    // the lock; if the slug was re-provisioned at the same dir in between, its
+    // recorded project/files have moved on. Downing the stale project and then
+    // releasing the FRESH row would leave a live stack unregistered with its
+    // ports handed back — the very leak this fixes, inverted. The row read
+    // under the lock is the authority, exactly as teardownInstance does it.
+    // A label/marker-proven holder has no row (or one pointing elsewhere), and
+    // then its own proof is the only description of the stack there is.
+    const target = releasable ? existing : holder;
+
+    // The `down` runs FIRST and inside the lock. `composeDown` THROWS on a
+    // non-zero exit, so a failed teardown leaves this block before the registry
+    // is touched: the reservation survives whole, never half-released, and a
+    // live stack is never left unregistered.
+    // cinatra-cli#35(e): use the recorded EXPLICIT `-p` (default OR isolated); a
+    // pre-#35 legacy "cinatra" sentinel row falls back to basename derivation.
+    runCompose(target.installDir, {
+      composeFiles: target.composeFiles,
+      composeProject: composeProjectArgForRow(target),
+      volumes: withVolumes,
+    });
+
+    // The release: removing the row IS releasing `appPort` + every port in
+    // `ports` — the same bytes, one atomic write. Nothing observes a partial.
+    if (releasable) {
       const { registry: next } = releaseInstance(reg, holder.slug);
       writeInstanceRegistry(registryPath, next);
     }
+
+    // Best-effort cleanup of the per-checkout HINT, still under the lock: from
+    // the release write onwards the row is gone, so a concurrent install may
+    // reserve the same band and write its OWN marker into this very directory
+    // (a same-directory reinstall is exactly that case). Removing it after the
+    // lock dropped could delete a live install's marker. Unconditional, as
+    // before: the marker describes the stack we just stopped either way.
+    try {
+      const markerFile = path.join(target.installDir, ".cinatra", "instance.json");
+      if (existsSync(markerFile)) spawnSync("rm", ["-f", markerFile]);
+    } catch {
+      /* best-effort */
+    }
   });
-  try {
-    const markerFile = path.join(holder.installDir, ".cinatra", "instance.json");
-    if (existsSync(markerFile)) spawnSync("rm", ["-f", markerFile]);
-  } catch {
-    /* best-effort */
-  }
   log(`  Stopped "${holder.slug}". Installing on the default ports.`);
 
   // Proceed with a DEFAULT install on the now-free default band.
