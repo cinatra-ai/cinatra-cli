@@ -2341,6 +2341,107 @@ describe("cinatra#2654 round 6 — the a2a self-heal reproduces the install's re
     expect(after.wayflow).toBe(false);
   });
 
+  // ── round-6 codex convergence, round 3 ───────────────────────────────────
+  // The `id` cannot see a remove-and-reallocate of the SAME checkout under the
+  // SAME slug: an allocation derives the id deterministically as
+  // `inst_<slug>`, so the replacement row carries the identical one and the
+  // directory matches too. `createdAt` — stamped once at allocation, never
+  // rewritten by any patch writer — is what tells the two allocations apart.
+  it("a slug REMOVED and re-allocated for the same checkout mid-run is a different allocation, and is left alone", async () => {
+    const installDir = path.join(sandbox, "iso2654r6-realloc");
+    const slug = "iso2654r6realloc";
+    const args = (extra) => [
+      "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+      "--yes", "--no-install", "--on-conflict", "isolated", "--instance", slug,
+      "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ...extra,
+    ];
+    await runInstall(args(["--no-wayflow"]), { log: () => {}, deps: isolatedDeps() });
+    const first = registryRow(installDir).row;
+    expect(first.wayflow).toBe(false);
+
+    const registryFile = process.env.CINATRA_INSTANCE_REGISTRY;
+    let realloced = false;
+    const realloc = () => {
+      const reg = JSON.parse(readFileSync(registryFile, "utf8"));
+      // Removed and re-created: same slug, same checkout, same derived id — a
+      // NEW allocation, and only `createdAt` says so.
+      reg.instances[slug] = { ...reg.instances[slug], createdAt: "2099-01-01T00:00:00.000Z", wayflow: false };
+      writeFileSync(registryFile, JSON.stringify(reg, null, 2) + "\n");
+      realloced = true;
+    };
+
+    // This run does NOT opt out, so its persist would delete the new
+    // allocation's opt-out.
+    await runInstall(args([]), {
+      log: (l) => {
+        if (!realloced && String(l).includes("Regenerated docker-compose.cinatra-isolated.yml")) realloc();
+      },
+      deps: isolatedDeps(),
+    });
+    expect(realloced).toBe(true);
+
+    const after = JSON.parse(readFileSync(registryFile, "utf8")).instances[slug];
+    expect(after.id).toBe(first.id); // the id genuinely could not tell them apart
+    expect(after.createdAt).toBe("2099-01-01T00:00:00.000Z");
+    expect(after.wayflow).toBe(false);
+  });
+
+  // The promotion standing immediately after the choice write was older, and
+  // slug-only: a hand-over during the bring-up marked the REPLACEMENT row ready
+  // and overwrote its recorded SHA with this run's.
+  it("the ready-promotion is identity-checked too: a PROVISIONING row that changed hands is not promoted", async () => {
+    const installDir = path.join(sandbox, "iso2654r6-promote");
+    const slug = "iso2654r6promote";
+    await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", slug,
+        "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ],
+      { log: () => {}, deps: isolatedDeps() },
+    );
+    // The PLAIN re-run (no --on-conflict): the route whose tail carries the
+    // ready-promotion under test.
+    const reRun = ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"];
+
+    const registryFile = process.env.CINATRA_INSTANCE_REGISTRY;
+    const otherDir = path.join(sandbox, "iso2654r6-promote-other");
+    // Put the row back into `provisioning` so the re-run reaches the promotion.
+    {
+      const reg = JSON.parse(readFileSync(registryFile, "utf8"));
+      reg.instances[slug] = { ...reg.instances[slug], state: "provisioning", sha: "aaaaaaa" };
+      writeFileSync(registryFile, JSON.stringify(reg, null, 2) + "\n");
+    }
+
+    let swapped = false;
+    const swap = () => {
+      const reg = JSON.parse(readFileSync(registryFile, "utf8"));
+      reg.instances[slug] = {
+        ...reg.instances[slug],
+        id: "inst_someone_else",
+        installDir: otherDir,
+        state: "provisioning",
+        sha: "bbbbbbb",
+      };
+      writeFileSync(registryFile, JSON.stringify(reg, null, 2) + "\n");
+      swapped = true;
+    };
+
+    await runInstall(reRun, {
+      log: (l) => {
+        if (!swapped && String(l).includes("Regenerated docker-compose.cinatra-isolated.yml")) swap();
+      },
+      deps: isolatedDeps(),
+    });
+    expect(swapped).toBe(true);
+
+    const after = JSON.parse(readFileSync(registryFile, "utf8")).instances[slug];
+    // The other instance is NOT reported ready by this run, and keeps its SHA.
+    expect(after.state).toBe("provisioning");
+    expect(after.sha).toBe("bbbbbbb");
+  });
+
   it("BLOCKING B: `instance a2a start` self-heals a --no-wayflow install WITHOUT demanding a bridge-token route", async () => {
     const installDir = await leanIsolatedInstall("iso2654r6-a2a-lean");
 

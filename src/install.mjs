@@ -5651,12 +5651,25 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     log,
   });
   // Promote a stale provisioning row to ready after a successful ensure.
+  //
+  // cinatra#2654 (round-6 codex convergence, round 3): identity-checked on the
+  // same terms as the choice write just above. This promotion is older than
+  // that write and was already slug-only, so a slug that changed hands during
+  // the bring-up had the REPLACEMENT row marked ready and its recorded SHA
+  // overwritten with this run's. Left alone it would also be an UNCHECKED write
+  // standing immediately after a checked one, which reads as a rule that does
+  // not mean anything. Same severity for the same reason: the ensure succeeded,
+  // so this warns and skips rather than failing the install.
   if (row.state !== "ready") {
     await withAllocLock(lockPath, async () => {
       const reg = requireUsableInstanceRegistry(registryPath);
-      if (getInstance(reg, row.slug)) {
-        writeInstanceRegistry(registryPath, markInstanceReady(reg, row.slug, { sha: resolvedSha }));
+      const current = getInstance(reg, row.slug);
+      if (!current) return;
+      if (!sameRecordedRowAllocation(row, current)) {
+        log(slugChangedHandsWarning(row.slug, "its recorded state and commit"));
+        return;
       }
+      writeInstanceRegistry(registryPath, markInstanceReady(reg, row.slug, { sha: resolvedSha }));
     });
   }
   // cinatra-cli#231: hand back the row carrying the EFFECTIVE port map, not the
@@ -5697,16 +5710,11 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
  * byte-identical to what every previous version wrote. A no-change call takes
  * the lock, compares, and writes nothing.
  *
- * IDENTITY-CHECKED (round-6 codex convergence, round 2). The lock serialises
- * writers; it does NOT stop a slug from changing hands. `cinatra instance
- * remove x` followed by a fresh install that re-uses the slug `x` for a
- * DIFFERENT checkout leaves this run holding a slug that now names someone
- * else's row — and writing this field onto it would flip THAT instance's
- * WayFlow choice. So the row locked here must still be the row this run
- * reasoned about: same immutable `id`, same install directory. A mismatch is a
- * SKIP, warned rather than thrown: the bring-up above already succeeded, so
- * failing the install over a field that describes an instance we no longer own
- * would report a false failure. `row` is the pre-lock snapshot to match.
+ * IDENTITY-CHECKED (round-6 codex convergence, rounds 2 and 3) — see
+ * `sameRecordedRowAllocation`. A mismatch is a SKIP, warned rather than thrown:
+ * the bring-up above already succeeded, so failing the install over a field
+ * that describes an instance we no longer own would report a false failure.
+ * `row` is the pre-lock snapshot to match.
  */
 async function persistRecordedWayflowChoice({ row, wayflow, registryPath, lockPath, log = console.log }) {
   const slug = row?.slug;
@@ -5715,17 +5723,8 @@ async function persistRecordedWayflowChoice({ row, wayflow, registryPath, lockPa
     const reg = requireUsableInstanceRegistry(registryPath);
     const current = getInstance(reg, slug);
     if (!current) return;
-    const idMoved = row.id != null && current.id != null && current.id !== row.id;
-    const dirMoved =
-      typeof row.installDir === "string" &&
-      typeof current.installDir === "string" &&
-      canonicalPath(current.installDir) !== canonicalPath(row.installDir);
-    if (idMoved || dirMoved) {
-      log(
-        `  ⚠ Instance slug "${slug}" now names a different instance than this run started against — ` +
-          "leaving its recorded WayFlow choice untouched. Re-run the install on that checkout if you " +
-          "meant to change it.",
-      );
+    if (!sameRecordedRowAllocation(row, current)) {
+      log(slugChangedHandsWarning(slug, "its recorded WayFlow choice"));
       return;
     }
     if (recordedWayflowChoice(current) === (wayflow !== false)) return;
@@ -5734,6 +5733,60 @@ async function persistRecordedWayflowChoice({ row, wayflow, registryPath, lockPa
     else delete next.wayflow;
     writeInstanceRegistry(registryPath, { ...reg, instances: { ...reg.instances, [slug]: next } });
   });
+}
+
+/**
+ * cinatra#2654 (round-6 codex convergence, rounds 2 and 3) — is the row locked
+ * just now still the SAME ALLOCATION this run reasoned about?
+ *
+ * The alloc lock serialises WRITERS; it does not stop a slug from changing
+ * hands. `cinatra instance remove x` followed by a fresh install re-using the
+ * slug leaves a run holding a slug that now names a DIFFERENT row, and a
+ * slug-only write then lands on that row instead.
+ *
+ * All three fields are compared, and each closes a case the others cannot:
+ *   - `installDir` catches the slug being re-used for another CHECKOUT (the
+ *     round-2 case). Canonicalised, because the recorded spelling is whatever
+ *     `--dir` was given while a caller may hold a realpath.
+ *   - `createdAt` catches a remove-and-reallocate of the SAME checkout under
+ *     the SAME slug (the round-3 case): `id` cannot see it, because an
+ *     allocation derives the id deterministically as `inst_<slug>` and the
+ *     replacement therefore carries the identical one. It is stamped once at
+ *     allocation and no patch writer ever rewrites it, so it is this repo's
+ *     existing per-allocation identity — the same `{name, createdAt}` idiom
+ *     `recreate-preflight.mjs` uses to tell a recreated Docker volume apart.
+ *   - `id` is the explicit check for a row that carries a NON-derived one.
+ *
+ * A field ABSENT on either side cannot decide anything, so it is skipped rather
+ * than read as a mismatch: a legacy/hand-edited row is still matched on the
+ * fields it does carry. Pure.
+ */
+function sameRecordedRowAllocation(expected, current) {
+  if (!expected || !current) return false;
+  if (expected.id != null && current.id != null && expected.id !== current.id) return false;
+  if (
+    typeof expected.createdAt === "string" &&
+    typeof current.createdAt === "string" &&
+    expected.createdAt !== current.createdAt
+  ) {
+    return false;
+  }
+  if (
+    typeof expected.installDir === "string" &&
+    typeof current.installDir === "string" &&
+    canonicalPath(current.installDir) !== canonicalPath(expected.installDir)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/** The one wording for "this slug is no longer the instance we started against". */
+function slugChangedHandsWarning(slug, what) {
+  return (
+    `  ⚠ Instance slug "${slug}" now names a different instance than this run started against — ` +
+    `leaving ${what} untouched. Re-run the install on that checkout if you meant to change it.`
+  );
 }
 
 /** cinatra#2654 D1 — the ONE reconcile-facing wrapper around
