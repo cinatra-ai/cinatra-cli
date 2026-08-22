@@ -2505,4 +2505,76 @@ describe("cinatra#2654 round 6 — the a2a self-heal reproduces the install's re
     expect(err).toBeInstanceOf(Error);
     expect(err.message).toMatch(/a2a-peers services and could not be regenerated/i);
   });
+
+  // ── round-7 review, NB2 ───────────────────────────────────────────────────
+  // The re-record ran AFTER the bring-up on both re-install routes, so a failed
+  // `up` left the row describing the PREVIOUS install's choice while the compose
+  // on disk was already re-rendered for this one. The later `instance a2a`
+  // self-heal reads that row, and the disagreement is invisible until it
+  // demands (or skips) a bridge-token route for the wrong reason. The field
+  // describes the RENDER, so it is written next to the regeneration it
+  // describes — before the bring-up that can fail.
+  const failingUpDeps = (extra = {}) =>
+    inliningDeps({
+      captureDeployedVersions: () => ({ ok: true, versions: {} }),
+      bringUpInfra: () => {
+        throw new Error("docker compose up failed (simulated)");
+      },
+      ...extra,
+    });
+
+  it("NB2: a FAILED bring-up on the RE-CONVERGE route still leaves the choice recorded", async () => {
+    const installDir = path.join(sandbox, "iso2654r7-nb2-reconverge");
+    const args = (extra) => [
+      "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+      "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso2654r7nb2rec",
+      "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ...extra,
+    ];
+    // (1) a normal install: nothing recorded, which reads as "wayflow in scope".
+    await runInstall(args([]), { log: () => {}, deps: isolatedDeps() });
+    expect(registryRow(installDir).row.wayflow).toBeUndefined();
+
+    // (2) the operator re-installs LEAN — a plain re-run (no --on-conflict), so
+    //     runInstall routes through the isolated re-converge — and the `up`
+    //     fails after the compose has already been re-rendered without a
+    //     WayFlow route.
+    const err = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--no-wayflow",
+      ],
+      { log: () => {}, deps: failingUpDeps() },
+    ).then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(Error);
+
+    // THE FIX: the row describes the compose that WAS rendered, not the
+    // bring-up that failed after it.
+    const row = registryRow(installDir).row;
+    expect(row.wayflow).toBe(false);
+    expect(recordedWayflowChoice(row)).toBe(false);
+  });
+
+  it("NB2: a FAILED bring-up on the EXPLICIT --on-conflict=isolated re-run still leaves the choice recorded", async () => {
+    const installDir = path.join(sandbox, "iso2654r7-nb2-explicit");
+    const args = (extra) => [
+      "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+      "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso2654r7nb2exp",
+      "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ...extra,
+    ];
+    await runInstall(args([]), { log: () => {}, deps: isolatedDeps() });
+    expect(registryRow(installDir).row.wayflow).toBeUndefined();
+    expect(registryRow(installDir).row.state).toBe("ready");
+
+    // The idempotent re-run of a recorded READY row: it re-renders the compose,
+    // then brings the stack up — and that `up` fails.
+    const err = await runInstall(args(["--no-wayflow"]), { log: () => {}, deps: failingUpDeps() })
+      .then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(Error);
+
+    const row = registryRow(installDir).row;
+    expect(row.wayflow).toBe(false);
+    expect(recordedWayflowChoice(row)).toBe(false);
+  });
 });

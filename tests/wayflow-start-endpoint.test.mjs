@@ -251,6 +251,28 @@ describe("runDevWayflow — the isolated WayFlow route repair is wired, in order
     expect(at("reconcileIsolatedWayflowRoute({")).toBeLessThan(at('spawnSync("docker"'));
   });
 
+  // ── round-7 review, NB4 ─────────────────────────────────────────────────
+  // The reconcile REPORTS what it re-pointed (`envRepointed` / `repointed`) and
+  // nothing in production read it — a return value with no consumer documents a
+  // contract nobody has to keep. `.env.local` is the operator's own file, and a
+  // command that rewrites keys in it and then starts containers should say so.
+  it("CONSUMES the reconcile's result and reports the .env.local re-point (NB4)", () => {
+    // The result is bound, not discarded.
+    expect(body).toMatch(/const\s+\w+\s*=\s*await reconcileIsolatedWayflowRoute\(\{/);
+    const binding = /const\s+(\w+)\s*=\s*await reconcileIsolatedWayflowRoute\(\{/.exec(body)[1];
+    // …read for what the writer DID…
+    expect(body).toContain(`${binding}?.envRepointed`);
+    // …and reported on a line that names what moved.
+    const reportAt = body.indexOf(`${binding}?.envRepointed`);
+    expect(reportAt).toBeGreaterThan(-1);
+    const report = body.slice(reportAt, reportAt + 500);
+    expect(report).toMatch(/console\.log\(/);
+    expect(report).toMatch(/\.env\.local/);
+    expect(report).toContain(`${binding}.repointed`);
+    // …before the `up`, so the operator reads it as part of THIS start.
+    expect(reportAt).toBeLessThan(at('spawnSync("docker"'));
+  });
+
   it("runs on the `start` verb ONLY — `stop` never rewrites the recorded compose", () => {
     const call = at("reconcileIsolatedWayflowRoute({");
     // Walk back to the nearest enclosing `if (verb === "start") {` and confirm

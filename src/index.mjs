@@ -46,6 +46,7 @@ import {
   defaultInstanceRegistryPath as instanceRegistryDefaultPath,
   findInstanceByInstallDir as instanceRowByInstallDir,
   readInstanceRegistry as readInstanceRegistryFile,
+  recordedWayflowChoice,
 } from "./instance-registry.mjs";
 // cinatra#2654: the WayFlow agent runtime is part of every install-owned local
 // stack. The lifecycle command and the doctor assertion both address the
@@ -68,6 +69,7 @@ import {
 import {
   ISOLATED_COMPOSE_FILENAME,
   WAYFLOW_SERVICE_NAME,
+  WAYFLOW_TOKEN_KEY,
   composeEnvWiringGaps,
   parseIsolatedComposeDoc,
 } from "./install-isolation.mjs";
@@ -12126,12 +12128,17 @@ function ensureWayflowBridgeEnv(
  * A non-isolated row (default/attach/external/co-use), or one with no on-disk
  * generated compose to read, skips the whole detection — not merely a no-op.
  *
- * When the re-derive ENLARGED the port map, `.env.local` is re-pointed through
- * the install path's own `writeIsolatedAppEnv` before the caller's `up` runs —
- * see the comment at that step (cinatra#2654 round-6 review, BLOCKING A).
+ * `.env.local` is reconciled against the effective port map through the install
+ * path's own `writeIsolatedAppEnv` before the caller's `up` runs — on EVERY
+ * start, not only behind a regeneration, and writing only keys that moved or
+ * that the file already carries. See `repointEnv` below (cinatra#2654 round-6
+ * review BLOCKING A, round-7 review BLOCKING A + B).
+ *
+ * A row that recorded the install's `--no-wayflow` opt-out has it CLEARED here:
+ * this command is the act of turning the runtime on (round-7 review, NB1).
  *
  * @returns {Promise<{ regenerated: boolean, reason: string, skipped?: string|null,
- *                     ports?: object|null, envRepointed?: boolean }>}
+ *                     ports?: object|null, envRepointed?: boolean, repointed?: string }>}
  */
 async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log = console.log, deps = {} } = {}) {
   const isolatedFilename = deps.ISOLATED_COMPOSE_FILENAME ?? ISOLATED_COMPOSE_FILENAME;
@@ -12140,7 +12147,39 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
   }
   const existsImpl = deps.existsSync ?? existsSync;
   const isoPath = path.join(repoRoot, isolatedFilename);
-  if (!existsImpl(isoPath)) return { regenerated: false, reason: "absent" };
+
+  /**
+   * cinatra#2654 (round 7 review, NB1) — this command TURNS THE RUNTIME ON, so a
+   * row still recording the install's `--no-wayflow` opt-out is now recording
+   * something untrue. Left there, the LATER `instance a2a` self-heal reads it
+   * (`recordedWayflowChoice`) and skips demanding the bridge-token route for an
+   * instance that runs the runtime — the exact assertion this command re-derives
+   * the compose to satisfy. Recorded at the point the command changes it,
+   * through the install path's own IDENTITY-CHECKED writer.
+   *
+   * Called on EVERY path this reconcile RETURNS from (round-7 codex
+   * convergence, rounds 1 and 2): the caller's `up` proceeds whether the route
+   * was repaired, needed no repair, or could not be read at all, so a row left
+   * claiming the opt-out on any of those would mislead the self-heal exactly as
+   * before. It is deliberately NOT called ahead of the regeneration: a
+   * regeneration that THROWS aborts the command without starting anything, and
+   * an aborted start must not leave the row claiming a runtime this run never
+   * provisioned.
+   *
+   * A row that never opted out is left completely alone — no lock, no registry
+   * write, not even the `install.mjs` import.
+   */
+  const clearRecordedOptOut = async () => {
+    if (recordedWayflowChoice(row) !== false) return;
+    const installMod = await import("./install.mjs");
+    const record = deps.recordWayflowChoiceOnRow ?? installMod.recordWayflowChoiceOnRow;
+    await record({ row, wayflow: true, log, deps });
+  };
+
+  if (!existsImpl(isoPath)) {
+    await clearRecordedOptOut();
+    return { regenerated: false, reason: "absent" };
+  }
 
   const readFileImpl = deps.readFileSync ?? readFileSync;
   const parseDoc = deps.parseIsolatedComposeDoc ?? parseIsolatedComposeDoc;
@@ -12167,7 +12206,25 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
   // back into a silent no-op. An array document differs only in spelling: it
   // has no `services` either, so it reaches the same regeneration by the same
   // route. Unifying them would cost behaviour, not buy it.
-  if (!doc || typeof doc !== "object") return { regenerated: false, reason: "unparseable" };
+  //
+  // cinatra#2654 (round 7 review, C) — failing open is the right behaviour and
+  // the WRONG silence. `parseIsolatedComposeDoc` also returns null for a
+  // hand-written YAML compose (it reads the CLI's own JSON-shaped output), so an
+  // operator-edited file reaches this line, the check is skipped, and the `up`
+  // two steps later starts whatever that file declares — including a `wayflow`
+  // service carrying no bridge token, which crash-loops with no explanation of
+  // why THIS command did not repair it. Say so, loudly, before the `up`.
+  if (!doc || typeof doc !== "object") {
+    log(
+      `  ⚠ Could not read ${path.join(repoRoot, isolatedFilename)} as a cinatra-generated compose document ` +
+        `(hand-edited or hand-written YAML is not re-derivable). SKIPPING the WayFlow bridge-token check: if that ` +
+        `file's "${WAYFLOW_SERVICE_NAME}" service carries no ${WAYFLOW_TOKEN_KEY} route, the runtime this start ` +
+        `is about to launch will come up WITHOUT a token and crash-loop. Re-run \`cinatra install\` on this ` +
+        `checkout to have the CLI re-derive the file, or restore the generated compose from the install.`,
+    );
+    await clearRecordedOptOut();
+    return { regenerated: false, reason: "unparseable" };
+  }
 
   // cinatra#2654 round-5 review (codex convergence): do NOT classify the
   // RECORDED document by the LIVE Compose engine's capability. The live probe
@@ -12210,8 +12267,61 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
     }).filter((g) => g.includes(`"${WAYFLOW_SERVICE_NAME}"`));
   const alreadyWired =
     wayflowServicePresent && (wayflowGapsAs(true).length === 0 || wayflowGapsAs(false).length === 0);
+
+  /**
+   * cinatra#2654 (round 7 review, BLOCKING B) — the recovery is NOT atomic, so
+   * the env re-point is idempotent and runs on EVERY start rather than only
+   * behind a regeneration.
+   *
+   * The regenerator persists the compose file AND the enlarged port map on the
+   * registry row durably; the `.env.local` re-point happens after it. A crash
+   * (or a `^C`) in that window leaves an install whose compose and row are
+   * already REPAIRED while the env file still names the old port — and the next
+   * `instance wayflow start` reads that repaired compose, answers
+   * "already-wired", and returns before ever reaching the re-point. The stale
+   * env then survives every subsequent start: the app keeps dialling the
+   * DEFAULT :3010 (a dead port, or worse, another instance's runtime) forever.
+   *
+   * So the recorded map and the env file are reconciled on every start. What it
+   * may write is deliberately narrow (BLOCKING A, `writeIsolatedAppEnv`'s
+   * `movedServices`): a key the env file already CARRIES is re-pointed at the
+   * recorded port, and a key it does not carry is written only for a service
+   * that actually MOVED. A repair never invents a connection string the
+   * operator did not have — for a key they rely on the runtime's own default
+   * for, a synthesized URL would carry no credentials and break it.
+   */
+  const repointEnv = async (effectivePorts) => {
+    const none = { envRepointed: false, repointed: "" };
+    if (!effectivePorts || typeof effectivePorts !== "object") return none;
+    // `writeIsolatedAppEnv` is a silent no-op without the file; skip the import too.
+    if (!existsImpl(path.join(repoRoot, ".env.local"))) return none;
+    const install = await import("./install.mjs");
+    const same = deps.samePortMaps ?? install.samePortMaps;
+    const recorded = row.ports ?? {};
+    // Per service, under the SAME normalisation `samePortMaps` applies to the
+    // whole map — a re-ordered or re-spelled port list is not a move.
+    const movedServices = Object.keys(effectivePorts).filter(
+      (svc) => !same({ svc: recorded[svc] ?? [] }, { svc: effectivePorts[svc] ?? [] }),
+    );
+    const repoint = deps.writeIsolatedAppEnv ?? install.writeIsolatedAppEnv;
+    const written = repoint({
+      targetDir: repoRoot,
+      // The app-port keys belong to a MOVE, not to the every-start verify: the
+      // recorded `appPort` describes the app, not the port map, and rewriting
+      // an operator's PORT on every start of an install nothing moved is not a
+      // repair. On a move this is the install path's own full re-point.
+      appPort: movedServices.length ? (row.appPort ?? null) : null,
+      ports: effectivePorts,
+      log,
+      movedServices,
+    });
+    return { envRepointed: !!written, repointed: (written && written.remapped) || "" };
+  };
+
   if (alreadyWired) {
-    return { regenerated: false, reason: "already-wired" };
+    const env = await repointEnv(row.ports ?? {});
+    await clearRecordedOptOut();
+    return { regenerated: false, reason: "already-wired", ...env };
   }
 
   log(
@@ -12243,24 +12353,21 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
   // the map actually MOVED, so the common "regenerated, nothing changed"
   // reconcile still leaves the operator's env file untouched.
   const ports = regen.regenerated && regen.ports && typeof regen.ports === "object" ? regen.ports : null;
-  const install = await import("./install.mjs");
-  const same = deps.samePortMaps ?? install.samePortMaps;
-  const portsMoved = !!ports && !same(row.ports ?? {}, ports);
   // `envRepointed` is what the writer DID, never what we asked it to do
   // (round-6 codex convergence): a checkout with no `.env.local` is a silent
   // no-op inside `writeIsolatedAppEnv`, and reporting a re-point that never
   // happened is the same shape of false success this issue exists to remove.
-  let envRepointed = false;
-  if (portsMoved) {
-    const repoint = deps.writeIsolatedAppEnv ?? install.writeIsolatedAppEnv;
-    envRepointed = repoint({ targetDir: repoRoot, appPort: row.appPort ?? null, ports, log }) === true;
-  }
+  // A regeneration that did not move the map still goes through the same
+  // reconcile as a start with no regeneration at all (BLOCKING B) — which is
+  // why it is one call on one effective map, not two spellings of the rule.
+  const env = await repointEnv(ports ?? row.ports ?? {});
+  await clearRecordedOptOut();
   return {
     regenerated: !!regen.regenerated,
     skipped: regen.skipped ?? null,
     reason: "route-repaired",
     ports,
-    envRepointed,
+    ...env,
   };
 }
 
@@ -12302,7 +12409,18 @@ async function runDevWayflow(argv = []) {
     // cheap read of the small registry file for THIS checkout's row, mirroring
     // `wayflowEndpointForCheckout` just above.
     const row = findInstanceRowByInstallDir(readInstanceRegistrySafe().registry, repoRoot);
-    await reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row });
+    const route = await reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row });
+    // cinatra#2654 (round 7 review, NB4): REPORT the re-point. `.env.local` is
+    // the operator's own file and this command may have just rewritten keys in
+    // it — silently changing a hand-maintained file and then starting
+    // containers is not something an operator should have to diff for. Naming
+    // the `svc:port` pairs also tells them which endpoints this start moved.
+    if (route?.envRepointed) {
+      console.log(
+        `Re-pointed .env.local at this instance's own infra ports before starting` +
+          `${route.repointed ? ` (${route.repointed})` : ""}.`,
+      );
+    }
   }
   // Relative, resolved against `cwd: repoRoot` below — which also keeps the
   // echoed command copy-pasteable from the checkout. A checkout with no

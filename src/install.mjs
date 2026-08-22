@@ -3381,6 +3381,24 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       // repeated would decide whether a fixed generator ever reaches the
       // instance. Same LOUD contract as there: a failure aborts.
       const regen = await regenerateIsolatedCompose({ targetDir, row: slot, log, wayflow: opts.wayflow !== false, deps });
+      // cinatra#2654 (round 6): the LATEST install decides this row's WayFlow
+      // choice — `allocateInstance` returned this row unchanged, so nothing
+      // above recorded it. See `persistRecordedWayflowChoice`.
+      //
+      // cinatra#2654 (round 7 review, NB2): written HERE, next to the
+      // regeneration it describes, rather than after the bring-up. The field
+      // records which compose this install RENDERED, and that render has just
+      // happened; a `startInfra` failure below leaves the row describing the
+      // file on disk either way, where the old ordering left a `--no-wayflow`
+      // re-install recorded as still running the runtime until some later
+      // install happened to succeed.
+      await persistRecordedWayflowChoice({
+        row: slot,
+        wayflow: opts.wayflow !== false,
+        registryPath,
+        lockPath,
+        log,
+      });
       const slotPorts = regen.regenerated && regen.ports ? regen.ports : slot.ports;
       ensureIsolatedEnv({ targetDir, mode: opts.mode, resetEnv: opts.resetEnv, appPort: slot.appPort, ports: slotPorts, log });
       startInfra({
@@ -3393,16 +3411,6 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
         envFile: existsSync(envFile) ? envFile : null,
         nangoHealthUrl: nangoHealthUrlForPorts(slotPorts),
         wayflow: opts.wayflow !== false,
-      });
-      // cinatra#2654 (round 6): the LATEST install decides this row's WayFlow
-      // choice — `allocateInstance` returned this row unchanged, so nothing
-      // above recorded it. See `persistRecordedWayflowChoice`.
-      await persistRecordedWayflowChoice({
-        row: slot,
-        wayflow: opts.wayflow !== false,
-        registryPath,
-        lockPath,
-        log,
       });
       // cinatra-cli#128: record the deployed stateful-service versions in the
       // instance's ledger (best-effort — a re-up is an install-shaped event too).
@@ -4544,6 +4552,44 @@ function rewriteUrlPort(existing, newPort, fallbackProto, fallbackPath = "") {
   return `${fallbackProto}://127.0.0.1:${newPort}${fallbackPath}`;
 }
 
+/** The port a URL means when it states none. Only the schemes whose default the
+ *  WHATWG URL parser itself elides (`u.port` is "" for `http://h:80/`). */
+const DEFAULT_SCHEME_PORTS = { "http:": 80, "https:": 443, "ws:": 80, "wss:": 443 };
+
+/** Does this existing connection-URL name a DIFFERENT host port than `port`?
+ *
+ *  A value that is not a URL at all answers `false` — a restricted re-point
+ *  (cinatra#2654 round 7, BLOCKING A) leaves an operator value it cannot parse
+ *  alone rather than replacing it with a credential-less default.
+ *
+ *  A URL that states NO port means its scheme's default (round-7 codex
+ *  convergence): `http://host/x` already names port 80, so a target of 80 is
+ *  agreement, not a disagreement to rewrite. A scheme with no known default
+ *  (`postgresql://host/db`) states no port this writer can honour, so it counts
+ *  as disagreeing — the isolated instance publishes on its own band. */
+function urlPortDiffers(existing, port) {
+  try {
+    const u = new URL(String(existing));
+    if (u.port !== "") return u.port !== String(port);
+    const dflt = DEFAULT_SCHEME_PORTS[u.protocol];
+    return dflt == null || String(dflt) !== String(port);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * cinatra#2654 (round 7, BLOCKING A + codex convergence) — the ONLY services a
+ * RESTRICTED re-point may write a key for from NOTHING, and only when they
+ * moved. `wayflow` qualifies on both counts a synthesized key must meet: the
+ * URL it writes carries no credentials (so nothing can be lost by writing it),
+ * and the app's fallback for an absent WAYFLOW_BASE_URL is the DEFAULT :3010 —
+ * another instance's runtime whenever one is up, which is the very leak this
+ * repair exists to close. Every other service's fallback is either credentialled
+ * (the Nango DB's `nango:nango`) or simply not this command's business.
+ */
+const SYNTHESIZE_WHEN_MOVED = new Set(["wayflow"]);
+
 /**
  * Write the host app env for an ISOLATED instance: its own PORT + Better-Auth
  * URLs (so `pnpm dev` binds the isolated app port, not 3000 — review hardening #3) AND
@@ -4558,8 +4604,29 @@ function rewriteUrlPort(existing, newPort, fallbackProto, fallbackPath = "") {
  * map (a legacy compose with no `wayflow` service gets one, on an isolated host
  * port), and the app must be pointed at the port the container it is about to
  * start actually publishes. See `reconcileIsolatedWayflowRoute` (src/index.mjs).
+ *
+ * cinatra#2654 (round 7 review, BLOCKING A) — `movedServices` RESTRICTS that
+ * re-point. On the INSTALL path (the default, `null`) every key in the table
+ * below is written: the install owns the file it just wrote, and a key it
+ * leaves absent falls back to a DEFAULT-band URL, which is the isolation leak
+ * this writer exists to close. A REPAIR reaching a pre-existing install owns
+ * nothing of the sort. `rewriteUrlPort` builds a fresh URL when the env carries
+ * no value for the key, and a fresh URL carries NO CREDENTIALS — for a service
+ * the operator never had a key for (the runtime supplies `nango:nango` for the
+ * Nango DB), writing one BREAKS a connection this command never touched. So a
+ * restricted re-point writes a key only when its service actually MOVED (the
+ * regeneration enlarged or shifted the map, and the app must follow it) or when
+ * the env file ALREADY CARRIES that key (a re-point there preserves the
+ * operator's own credentials and db-name — `rewriteUrlPort`'s existing arm).
+ * An absent key on an unmoved service is NEVER synthesized.
+ *
+ * @param {Iterable<string>|null} [movedServices]  restricted mode when non-null:
+ *   the compose service names whose published host ports actually moved.
+ * @returns {false | { remapped: string }}  `false` when nothing was written
+ *   (no `.env.local`, or a restricted re-point that found nothing to change);
+ *   otherwise the space-separated `svc:port` summary of what it re-pointed.
  */
-export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = console.log }) {
+export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = console.log, movedServices = null }) {
   const envPath = path.join(targetDir, ".env.local");
   // cinatra#2654 (round 6, codex convergence): report whether anything was
   // actually written. Every install caller ignores this (a checkout with no
@@ -4569,54 +4636,126 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
   // exists to remove.
   if (!existsSync(envPath)) return false;
   let body = readFileSync(envPath, "utf8");
+  const before = body;
   // The app-port keys are written only when an app port is actually RECORDED.
   // Every install route allocates one and hands it over, so nothing changes
   // there; the round-6 re-point caller above reads `row.appPort` off the
   // registry, and a legacy/hand-edited row that carries none must leave the
   // operator's own PORT alone rather than write `PORT=undefined`. The infra-URL
   // re-point below does not depend on the app port and still runs.
+  // Read the current env values ONCE, before anything is upserted: they are what
+  // preserves credentials/db-name on a rewrite, and what the restricted
+  // re-point compares against (a value this call already wrote is not evidence
+  // of what the operator had).
+  const cur = parseEnvBody(body);
   const appPortRecorded = Number.isInteger(appPort) && appPort > 0;
   if (appPortRecorded) {
     const baseUrl = `http://localhost:${appPort}`;
-    body = upsertEnvKey(body, "PORT", String(appPort));
-    body = upsertEnvKey(body, "BETTER_AUTH_URL", baseUrl);
-    body = upsertEnvKey(body, "NEXT_PUBLIC_BETTER_AUTH_URL", baseUrl);
+    // cinatra#2654 (round 7, codex convergence): under a RESTRICTED re-point,
+    // an app key is rewritten only when it actually DISAGREES with the recorded
+    // app port. Adding a wayflow entry to the map is not a reason to rewrite
+    // three unrelated app-settings keys the operator maintains — and a key that
+    // already names the recorded port needs no writing at all. A key that
+    // disagrees IS repaired: the recorded `appPort` is the allocation every
+    // other surface speaks (the compose's own callbacks included), it bears no
+    // credentials, and an env that contradicts it is cinatra-cli#231's split
+    // brain reached through this file.
+    // ABSENT is not a disagreement here (round-7 codex convergence): a repair
+    // that adds three app-settings keys an operator's file never had is not the
+    // WayFlow route repair this command performs, and the app's own default
+    // applies exactly as it did before this command ran. Only `wayflow` is
+    // synthesized from nothing — see `SYNTHESIZE_WHEN_MOVED`.
+    const appKeyDiffers = (key, value) =>
+      movedServices == null || (cur[key] != null && String(cur[key]) !== value);
+    if (appKeyDiffers("PORT", String(appPort))) body = upsertEnvKey(body, "PORT", String(appPort));
+    if (appKeyDiffers("BETTER_AUTH_URL", baseUrl)) body = upsertEnvKey(body, "BETTER_AUTH_URL", baseUrl);
+    if (appKeyDiffers("NEXT_PUBLIC_BETTER_AUTH_URL", baseUrl)) {
+      body = upsertEnvKey(body, "NEXT_PUBLIC_BETTER_AUTH_URL", baseUrl);
+    }
   }
 
-  // Read the current env values (to preserve credentials/db-name on rewrite).
-  const cur = parseEnvBody(body);
   const first = (svc) => {
     const list = ports?.[svc];
     return Array.isArray(list) && list.length ? list[0] : null;
+  };
+
+  // cinatra#2654 (round 7, BLOCKING A + codex convergence) — the restricted-mode
+  // rule, per KEY rather than per service, in ONE place:
+  //
+  //   - CARRIED and DISAGREEING with the recorded port → re-pointed from its OWN
+  //     current value, so the operator's credentials, db-name, scheme and path
+  //     survive. Each key is read and written independently: two keys naming the
+  //     same service (the Nango aliases, the two Verdaccio URLs) may legitimately
+  //     hold different values, and deriving both from one of them clobbers the
+  //     other.
+  //   - CARRIED and already naming that port → left alone. This runs on EVERY
+  //     start, so re-writing a value that already says the right thing would
+  //     churn the operator's file and announce a repair that repaired nothing.
+  //   - ABSENT → NOT written, with ONE exception (`SYNTHESIZE_WHEN_MOVED`): the
+  //     `wayflow` service this command exists to repair, and only when it moved.
+  //     A synthesized URL carries NO credentials, so writing one over a key the
+  //     operator relies on the runtime's own credentialled fallback for (the
+  //     Nango DB's `nango:nango`) BREAKS a connection this repair never touched.
+  //     `WAYFLOW_BASE_URL` is credential-free by construction, and its absence is
+  //     the leak itself: the app dials the DEFAULT :3010, which is another
+  //     instance's runtime whenever one is up.
+  //
+  // The install path (`movedServices === null`) is untouched by all of it: it
+  // owns the file it just wrote, and a key it leaves absent falls back to a
+  // DEFAULT-band URL — the isolation leak this writer exists to close.
+  const restricted = movedServices != null;
+  const moved = new Set(restricted ? Array.from(movedServices) : []);
+  const wrote = new Set();
+  const writesKey = (svc, key, target) => {
+    if (target == null) return false;
+    if (!restricted) return true;
+    if (cur[key] == null) return SYNTHESIZE_WHEN_MOVED.has(svc) && moved.has(svc);
+    return urlPortDiffers(cur[key], target);
+  };
+  /** Re-point ONE key from its own current value, and record that this service
+   *  was re-pointed so the report line can never claim more than was written. */
+  const repointKey = (svc, key, target, proto, fallbackPath = "") => {
+    if (!writesKey(svc, key, target)) return;
+    body = upsertEnvKey(body, key, rewriteUrlPort(cur[key], target, proto, fallbackPath));
+    wrote.add(svc);
   };
 
   // Map the well-known infra services → their connection-URL env keys, re-pointed
   // at the remapped host ports. Only services actually present in the remapped
   // band are rewritten.
   const pgPort = first("postgres");
-  if (pgPort) body = upsertEnvKey(body, "SUPABASE_DB_URL", rewriteUrlPort(cur.SUPABASE_DB_URL, pgPort, "postgresql", "/postgres"));
+  repointKey("postgres", "SUPABASE_DB_URL", pgPort, "postgresql", "/postgres");
   const redisPort = first("redis");
-  if (redisPort) body = upsertEnvKey(body, "REDIS_URL", rewriteUrlPort(cur.REDIS_URL, redisPort, "redis", ""));
+  repointKey("redis", "REDIS_URL", redisPort, "redis", "");
   const nangoPort = first("nango-server");
-  if (nangoPort) body = upsertEnvKey(body, "NANGO_SERVER_URL", rewriteUrlPort(cur.NANGO_SERVER_URL, nangoPort, "http", ""));
+  repointKey("nango-server", "NANGO_SERVER_URL", nangoPort, "http", "");
   // The Nango DB is a SEPARATE service (`nango-db`); setup reads NANGO_DATABASE_URL
   // (or NANGO_DB_URL) and otherwise falls back to the DEFAULT local Nango DB
   // (index.mjs getNangoDatabaseUrl) — so it MUST be re-pointed too (review hardening #2).
   const nangoDbPort = first("nango-db");
   if (nangoDbPort) {
-    const nangoDbUrl = rewriteUrlPort(cur.NANGO_DATABASE_URL ?? cur.NANGO_DB_URL, nangoDbPort, "postgresql", "/nango");
-    body = upsertEnvKey(body, "NANGO_DATABASE_URL", nangoDbUrl);
-    if (cur.NANGO_DB_URL != null) body = upsertEnvKey(body, "NANGO_DB_URL", nangoDbUrl);
+    if (restricted) {
+      // Each alias from its OWN value: they may carry different credentials, and
+      // a legacy install carrying NEITHER keeps the runtime's credentialled
+      // default rather than gaining a credential-less URL (round 7, BLOCKING A).
+      repointKey("nango-db", "NANGO_DATABASE_URL", nangoDbPort, "postgresql", "/nango");
+      repointKey("nango-db", "NANGO_DB_URL", nangoDbPort, "postgresql", "/nango");
+    } else {
+      const nangoDbUrl = rewriteUrlPort(cur.NANGO_DATABASE_URL ?? cur.NANGO_DB_URL, nangoDbPort, "postgresql", "/nango");
+      body = upsertEnvKey(body, "NANGO_DATABASE_URL", nangoDbUrl);
+      if (cur.NANGO_DB_URL != null) body = upsertEnvKey(body, "NANGO_DB_URL", nangoDbUrl);
+      wrote.add("nango-db");
+    }
   }
   const graphitiPort = first("graphiti");
-  if (graphitiPort) body = upsertEnvKey(body, "GRAPHITI_URL", rewriteUrlPort(cur.GRAPHITI_URL, graphitiPort, "http", ""));
+  repointKey("graphiti", "GRAPHITI_URL", graphitiPort, "http", "");
   // cinatra-cli#97: the app reaches the per-instance WayFlow runtime via
   // WAYFLOW_BASE_URL (default http://localhost:3010). WayFlow is a compose
   // service in the isolated band, so its host port is shifted — re-point the URL
   // at the isolated WayFlow host port too, else the isolated app's WayFlow-backed
   // features drive the DEFAULT/main instance's WayFlow (partial-isolation leak).
   const wayflowPort = first("wayflow");
-  if (wayflowPort) body = upsertEnvKey(body, "WAYFLOW_BASE_URL", rewriteUrlPort(cur.WAYFLOW_BASE_URL, wayflowPort, "http", ""));
+  repointKey("wayflow", "WAYFLOW_BASE_URL", wayflowPort, "http", "");
   // cinatra-cli#36: the registry CLIENT (Verdaccio) is env-overridable via
   // CINATRA_AGENT_REGISTRY_URL / _UI_URL (default …:4873). Without re-pointing
   // them, an isolated install run beside a live donor publishes/installs into the
@@ -4624,9 +4763,18 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
   // port is the same published port (verdaccio serves both the registry + web UI).
   const verdaccioPort = first("verdaccio");
   if (verdaccioPort) {
-    const registryUrl = `http://127.0.0.1:${verdaccioPort}`;
-    body = upsertEnvKey(body, "CINATRA_AGENT_REGISTRY_URL", registryUrl);
-    body = upsertEnvKey(body, "CINATRA_AGENT_REGISTRY_UI_URL", registryUrl);
+    if (restricted) {
+      // Each key from its own value: the UI URL may legitimately differ from the
+      // registry URL (host, path, scheme), and only the PORT is this repair's
+      // business (round 7, codex convergence).
+      repointKey("verdaccio", "CINATRA_AGENT_REGISTRY_URL", verdaccioPort, "http", "");
+      repointKey("verdaccio", "CINATRA_AGENT_REGISTRY_UI_URL", verdaccioPort, "http", "");
+    } else {
+      const registryUrl = `http://127.0.0.1:${verdaccioPort}`;
+      body = upsertEnvKey(body, "CINATRA_AGENT_REGISTRY_URL", registryUrl);
+      body = upsertEnvKey(body, "CINATRA_AGENT_REGISTRY_UI_URL", registryUrl);
+      wrote.add("verdaccio");
+    }
   }
   // cinatra-cli#36: the Neo4j client URL (NEO4J_URI, default bolt://…:7687) is
   // not in the rewrite set, so an isolated instance's Neo4j client + the
@@ -4636,27 +4784,43 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
   // of the two — pick the max rather than relying on compose port order.
   const neo4jPorts = Array.isArray(ports?.neo4j) ? ports.neo4j.filter((n) => Number.isInteger(n) && n > 0) : [];
   const neo4jBoltPort = neo4jPorts.length ? Math.max(...neo4jPorts) : null;
-  if (neo4jBoltPort) body = upsertEnvKey(body, "NEO4J_URI", rewriteUrlPort(cur.NEO4J_URI, neo4jBoltPort, "bolt", ""));
+  repointKey("neo4j", "NEO4J_URI", neo4jBoltPort, "bolt", "");
 
-  writeFileSync(envPath, body, { mode: 0o600 });
-  tightenEnvLocalPerms(envPath); // keep the secret-bearing env-file owner-only (cinatra-cli#57)
+  // A RESTRICTED re-point that found nothing to change does not touch the
+  // operator's file at all, and reports that it wrote nothing: it runs on EVERY
+  // `instance wayflow start` (the crash-safety arm), so a rewrite-and-announce
+  // on each start would be noise about a file that already said the right thing.
+  // The install path still writes unconditionally, exactly as before.
+  const changed = body !== before;
+  if (!restricted || changed) {
+    writeFileSync(envPath, body, { mode: 0o600 });
+    tightenEnvLocalPerms(envPath); // keep the secret-bearing env-file owner-only (cinatra-cli#57)
+  }
+  // Reports what was WRITTEN, never merely what was in the map: under a
+  // restricted re-point a service can be present and deliberately left alone.
   const remapped = [
-    pgPort && `db:${pgPort}`,
-    redisPort && `redis:${redisPort}`,
-    nangoPort && `nango:${nangoPort}`,
-    nangoDbPort && `nango-db:${nangoDbPort}`,
-    graphitiPort && `graphiti:${graphitiPort}`,
-    wayflowPort && `wayflow:${wayflowPort}`,
-    verdaccioPort && `verdaccio:${verdaccioPort}`,
-    neo4jBoltPort && `neo4j:${neo4jBoltPort}`,
+    ["postgres", `db:${pgPort}`],
+    ["redis", `redis:${redisPort}`],
+    ["nango-server", `nango:${nangoPort}`],
+    ["nango-db", `nango-db:${nangoDbPort}`],
+    ["graphiti", `graphiti:${graphitiPort}`],
+    ["wayflow", `wayflow:${wayflowPort}`],
+    ["verdaccio", `verdaccio:${verdaccioPort}`],
+    ["neo4j", `neo4j:${neo4jBoltPort}`],
   ]
-    .filter(Boolean)
+    .filter(([svc]) => wrote.has(svc))
+    .map(([, label]) => label)
     .join(" ");
+  if (restricted) {
+    if (!changed) return false;
+    log(`  ↻ .env.local re-pointed at the ports this instance publishes (${remapped || "app port only"}).`);
+    return { remapped };
+  }
   log(
     `  Isolated app port ${appPortRecorded ? appPort : "(none recorded — left as-is)"}; ` +
       `infra URLs re-pointed (${remapped}) in .env.local.`,
   );
-  return true;
+  return { remapped };
 }
 
 /** Minimal `.env` body → { KEY: value } map (last wins; quotes stripped). Used
@@ -5597,6 +5761,22 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     log,
     offset: effectiveOffset,
   });
+  // cinatra#2654 (round 6): the LATEST install decides this row's WayFlow
+  // choice. A plain `cinatra install` re-run never reaches `allocateInstance`
+  // at all, so without this a `--no-wayflow` re-install of a recorded instance
+  // stayed unrecorded. See `persistRecordedWayflowChoice`.
+  //
+  // cinatra#2654 (round 7 review, NB2): it rides with the row writes the
+  // regeneration above produced, BEFORE the bring-up — the choice describes the
+  // compose that was just rendered, so a failed `up` must not be what decides
+  // whether the row still claims the opposite choice.
+  await persistRecordedWayflowChoice({
+    row,
+    wayflow: opts.wayflow !== false,
+    registryPath,
+    lockPath,
+    log,
+  });
 
   // Re-point the env at the recorded remapped ports + bring up WITH
   // `--env-file .env.local` so the generated isolated compose's scrubbed
@@ -5638,17 +5818,6 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     envFile: existsSync(reconvEnvFile) ? reconvEnvFile : null,
     log,
     deps,
-  });
-  // cinatra#2654 (round 6): the LATEST install decides this row's WayFlow
-  // choice. A plain `cinatra install` re-run never reaches `allocateInstance`
-  // at all, so without this a `--no-wayflow` re-install of a recorded instance
-  // stayed unrecorded. See `persistRecordedWayflowChoice`.
-  await persistRecordedWayflowChoice({
-    row,
-    wayflow: opts.wayflow !== false,
-    registryPath,
-    lockPath,
-    log,
   });
   // Promote a stale provisioning row to ready after a successful ensure.
   //
@@ -5716,6 +5885,28 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
  * that describes an instance we no longer own would report a false failure.
  * `row` is the pre-lock snapshot to match.
  */
+/**
+ * cinatra#2654 (round 7 review, NB1) — the EXPORTED seam for a command outside
+ * this module that CHANGES an instance's WayFlow choice: `instance wayflow
+ * start` turns the runtime on for an instance whose row may still record the
+ * install's `--no-wayflow` opt-out, and a row that keeps claiming the opt-out
+ * makes the LATER `instance a2a` self-heal skip the bridge-token assertion for
+ * an instance that now runs the runtime.
+ *
+ * Resolves the registry/lock paths from the same `deps` names every isolated
+ * route uses, then writes through the ONE identity-checked writer below, so the
+ * hand-start's row write carries exactly the guarantees the install's does.
+ */
+export async function recordWayflowChoiceOnRow({ row, wayflow, log = console.log, deps = {} } = {}) {
+  return persistRecordedWayflowChoice({
+    row,
+    wayflow,
+    registryPath: deps.instanceRegistryPath ?? defaultInstanceRegistryPath(),
+    lockPath: deps.allocLockPath ?? defaultAllocLockPath(),
+    log,
+  });
+}
+
 async function persistRecordedWayflowChoice({ row, wayflow, registryPath, lockPath, log = console.log }) {
   const slug = row?.slug;
   if (typeof slug !== "string" || slug.length === 0) return;
