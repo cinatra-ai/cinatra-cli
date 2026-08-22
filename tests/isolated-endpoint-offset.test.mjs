@@ -2284,6 +2284,63 @@ describe("cinatra#2654 round 6 — the a2a self-heal reproduces the install's re
     expect(recordedWayflowChoice(row)).toBe(true);
   });
 
+  // ── round-6 codex convergence, round 2 ───────────────────────────────────
+  // The alloc lock serialises WRITERS; it does not stop a slug from changing
+  // hands. `cinatra instance remove x` plus a fresh install that re-uses the
+  // slug for a DIFFERENT checkout leaves a re-install holding a slug that now
+  // names someone else's row — and writing the choice onto it would flip THAT
+  // instance's WayFlow setting. The write is identity-checked: same immutable
+  // `id`, same install directory, or it is skipped.
+  it("a slug that changed hands mid-run is NOT re-recorded (identity, not just the lock)", async () => {
+    const installDir = path.join(sandbox, "iso2654r6-slug-reuse");
+    const slug = "iso2654r6slugreuse";
+    const args = (extra) => [
+      "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+      "--yes", "--no-install", "--on-conflict", "isolated", "--instance", slug,
+      "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ...extra,
+    ];
+    // This checkout opted out, so a later re-install WITHOUT the flag wants to
+    // DELETE the key — the destructive direction, and the one that silently
+    // turns another instance's runtime back on.
+    await runInstall(args(["--no-wayflow"]), { log: () => {}, deps: isolatedDeps() });
+    expect(registryRow(installDir).row.wayflow).toBe(false);
+
+    // Mid-run, another process removes the slug and re-uses it for a DIFFERENT
+    // checkout that ALSO opted out. Fired from the re-render log line, so it
+    // lands after this run read its row and before the choice is persisted.
+    const registryFile = process.env.CINATRA_INSTANCE_REGISTRY;
+    const otherDir = path.join(sandbox, "iso2654r6-slug-reuse-other");
+    let swapped = false;
+    const swap = () => {
+      const reg = JSON.parse(readFileSync(registryFile, "utf8"));
+      reg.instances[slug] = {
+        ...reg.instances[slug],
+        id: "inst_someone_else",
+        installDir: otherDir,
+        wayflow: false,
+      };
+      writeFileSync(registryFile, JSON.stringify(reg, null, 2) + "\n");
+      swapped = true;
+    };
+
+    // …and THIS run does not opt out, so its persist would delete that key.
+    await runInstall(args([]), {
+      log: (l) => {
+        if (!swapped && String(l).includes("Regenerated docker-compose.cinatra-isolated.yml")) swap();
+      },
+      deps: isolatedDeps(),
+    });
+    expect(swapped).toBe(true);
+
+    // The OTHER instance's opt-out stands: this run did not delete it, and did
+    // not write its own choice onto a row it no longer owns.
+    const after = JSON.parse(readFileSync(registryFile, "utf8")).instances[slug];
+    expect(after.id).toBe("inst_someone_else");
+    expect(after.installDir).toBe(otherDir);
+    expect(after.wayflow).toBe(false);
+  });
+
   it("BLOCKING B: `instance a2a start` self-heals a --no-wayflow install WITHOUT demanding a bridge-token route", async () => {
     const installDir = await leanIsolatedInstall("iso2654r6-a2a-lean");
 

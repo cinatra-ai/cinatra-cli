@@ -3398,10 +3398,11 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       // choice — `allocateInstance` returned this row unchanged, so nothing
       // above recorded it. See `persistRecordedWayflowChoice`.
       await persistRecordedWayflowChoice({
-        slug,
+        row: slot,
         wayflow: opts.wayflow !== false,
         registryPath,
         lockPath,
+        log,
       });
       // cinatra-cli#128: record the deployed stateful-service versions in the
       // instance's ledger (best-effort — a re-up is an install-shaped event too).
@@ -5643,10 +5644,11 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
   // at all, so without this a `--no-wayflow` re-install of a recorded instance
   // stayed unrecorded. See `persistRecordedWayflowChoice`.
   await persistRecordedWayflowChoice({
-    slug: row.slug,
+    row,
     wayflow: opts.wayflow !== false,
     registryPath,
     lockPath,
+    log,
   });
   // Promote a stale provisioning row to ready after a successful ensure.
   if (row.state !== "ready") {
@@ -5694,18 +5696,43 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
  * opt-IN DELETES the key rather than writing `true`, keeping a default row
  * byte-identical to what every previous version wrote. A no-change call takes
  * the lock, compares, and writes nothing.
+ *
+ * IDENTITY-CHECKED (round-6 codex convergence, round 2). The lock serialises
+ * writers; it does NOT stop a slug from changing hands. `cinatra instance
+ * remove x` followed by a fresh install that re-uses the slug `x` for a
+ * DIFFERENT checkout leaves this run holding a slug that now names someone
+ * else's row — and writing this field onto it would flip THAT instance's
+ * WayFlow choice. So the row locked here must still be the row this run
+ * reasoned about: same immutable `id`, same install directory. A mismatch is a
+ * SKIP, warned rather than thrown: the bring-up above already succeeded, so
+ * failing the install over a field that describes an instance we no longer own
+ * would report a false failure. `row` is the pre-lock snapshot to match.
  */
-async function persistRecordedWayflowChoice({ slug, wayflow, registryPath, lockPath }) {
+async function persistRecordedWayflowChoice({ row, wayflow, registryPath, lockPath, log = console.log }) {
+  const slug = row?.slug;
+  if (typeof slug !== "string" || slug.length === 0) return;
   await withAllocLock(lockPath, async () => {
     const reg = requireUsableInstanceRegistry(registryPath);
     const current = getInstance(reg, slug);
     if (!current) return;
+    const idMoved = row.id != null && current.id != null && current.id !== row.id;
+    const dirMoved =
+      typeof row.installDir === "string" &&
+      typeof current.installDir === "string" &&
+      canonicalPath(current.installDir) !== canonicalPath(row.installDir);
+    if (idMoved || dirMoved) {
+      log(
+        `  ⚠ Instance slug "${slug}" now names a different instance than this run started against — ` +
+          "leaving its recorded WayFlow choice untouched. Re-run the install on that checkout if you " +
+          "meant to change it.",
+      );
+      return;
+    }
     if (recordedWayflowChoice(current) === (wayflow !== false)) return;
     const next = { ...current };
     if (wayflow === false) next.wayflow = false;
     else delete next.wayflow;
-    const reg2 = { ...reg, instances: { ...reg.instances, [slug]: next } };
-    writeInstanceRegistry(registryPath, reg2);
+    writeInstanceRegistry(registryPath, { ...reg, instances: { ...reg.instances, [slug]: next } });
   });
 }
 
