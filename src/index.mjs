@@ -56,9 +56,21 @@ import {
   WAYFLOW_RUNTIME_EXTERNAL,
   WAYFLOW_RUNTIME_KEY,
   WAYFLOW_RUNTIME_OFF,
+  WAYFLOW_ENV_FILE,
   normalizeWayflowRuntimeMode,
   resolveRecordedComposeContext,
 } from "./wayflow-runtime.mjs";
+// cinatra#2654 (round 5) — the isolated-compose wiring primitives `instance
+// wayflow start` reuses to detect (never re-derive) whether the RECORDED
+// generated compose already carries a bridge-token route. Import-light (node
+// builtins only, no `index.mjs` graph — see the module's own header), so a
+// static import here carries none of `install.mjs`'s startup cost.
+import {
+  ISOLATED_COMPOSE_FILENAME,
+  WAYFLOW_SERVICE_NAME,
+  composeEnvWiringGaps,
+  parseIsolatedComposeDoc,
+} from "./install-isolation.mjs";
 // cinatra-cli#233 — agent AVAILABILITY. A runtime that answers `/.health` `ok`
 // while mounting 0 agents is not agent-ready; the doctor compares the agent
 // sources on disk against what the runtime actually serves.
@@ -12065,6 +12077,136 @@ function ensureWayflowBridgeEnv(
   return true;
 }
 
+/**
+ * cinatra#2654 (round 5) — `instance wayflow start` is the documented hand-start
+ * for a runtime the install did not start (`--no-wayflow`), or one an operator
+ * is restarting. On the FALLBACK compose-render route (this Docker Compose has
+ * no `config --no-env-resolution` — `install.mjs`'s `resolveIsolatedComposeConfig`,
+ * "the ONE resolution the isolated paths use, and the one place that decides
+ * which env-file route this Compose can give us") an install rendered under
+ * `--no-wayflow` never got a bridge-token route baked into the recorded
+ * compose at all: reference preservation on the PRESERVING route is generic —
+ * driven by the compose SOURCE, not the flag — but the fallback route's
+ * `environment:` placeholder is explicitly gated on `wayflow` being in scope
+ * at RENDER time (`install-isolation.mjs`'s `composeEnvWiringGaps`, arm (2)).
+ * So a `--no-wayflow` FALLBACK install's `wayflow` service carries neither an
+ * `env_file:` reference nor a token value, and `--env-file .env.local` at `up`
+ * time can only supply a placeholder that is ALREADY there — it cannot restore
+ * a directive the render never wrote.
+ *
+ * Detects that state HONESTLY and reuses the existing machinery rather than
+ * inventing a parallel detector: the same wiring-gap check
+ * `assertGeneratedEnvWiring` asserts at generation time
+ * (`composeEnvWiringGaps`), run here against the RECORDED document — but
+ * NEVER gated on the live Compose engine's capability (cinatra#2654 round-5
+ * review, codex convergence). The live probe answers what a render started
+ * NOW would produce; it says nothing about which route the document ON DISK
+ * actually took, possibly at an earlier `cinatra install` against a
+ * different Compose version, so classifying the recorded document by it
+ * misclassifies an already-healthy document across an engine change. Instead
+ * the check runs the invariant under BOTH possible interpretations of the
+ * document and treats it as already wired if EITHER one finds nothing
+ * missing — the route-agnostic, file-shape-only answer. Regeneration runs
+ * ONLY when NEITHER interpretation is satisfied: a preserving-route install
+ * (the `env_file:` reference is always present, whatever the wayflow flag
+ * was) and a fallback install that already carries its placeholder (wayflow
+ * was in scope when it was rendered) are both no-ops here, so today's
+ * behavior is unchanged for every install this bug does not reach.
+ *
+ * `wayflow: true` is passed EXPLICITLY, never left to the regenerator's
+ * default — this command IS the act of turning the runtime on, so demanding
+ * the token route is what it must do. Contrast the `instance a2a` self-heal
+ * (`regenerateIsolatedComposeInPlace` called with no `wayflow` argument,
+ * defaulting to `true` — cinatra#2654 round-5 review, NB3, disclosed and
+ * untouched): that instance may never have asked to run wayflow at all, so the
+ * SAME default there wrongly demands a route a `--no-wayflow` install never
+ * needed. Here the explicit `true` is not a default threaded blindly; it is
+ * what the command means.
+ *
+ * A non-isolated row (default/attach/external/co-use), or one with no on-disk
+ * generated compose to read, skips the whole detection — not merely a no-op.
+ *
+ * @returns {Promise<{ regenerated: boolean, reason: string, skipped?: string|null }>}
+ */
+async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log = console.log, deps = {} } = {}) {
+  const isolatedFilename = deps.ISOLATED_COMPOSE_FILENAME ?? ISOLATED_COMPOSE_FILENAME;
+  if (!row || !Array.isArray(composeFiles) || !composeFiles.includes(isolatedFilename)) {
+    return { regenerated: false, reason: "not-isolated" };
+  }
+  const existsImpl = deps.existsSync ?? existsSync;
+  const isoPath = path.join(repoRoot, isolatedFilename);
+  if (!existsImpl(isoPath)) return { regenerated: false, reason: "absent" };
+
+  const readFileImpl = deps.readFileSync ?? readFileSync;
+  const parseDoc = deps.parseIsolatedComposeDoc ?? parseIsolatedComposeDoc;
+  let doc = null;
+  try {
+    doc = parseDoc(readFileImpl(isoPath, "utf8"));
+  } catch {
+    doc = null;
+  }
+  // Cannot parse it → cannot tell. This leaves whatever `docker compose up`
+  // already does with an unparseable file UNCHANGED — this fix targets the
+  // diagnosed fallback+--no-wayflow chain, not a corrupted checkout; the
+  // in-place regenerator's own operator-edits policy is the right place for
+  // that, and it already runs on every OTHER recorded-compose reconcile path.
+  if (!doc || typeof doc !== "object") return { regenerated: false, reason: "unparseable" };
+
+  // cinatra#2654 round-5 review (codex convergence): do NOT classify the
+  // RECORDED document by the LIVE Compose engine's capability. The live probe
+  // answers what a render started NOW would produce; it says nothing about
+  // which route the document ON DISK actually took, possibly at an earlier
+  // `cinatra install` against a different Compose version. Gating the gap
+  // check on it misclassified an already-healthy document whenever the
+  // engine changed since install (or the probe transiently failed) —
+  // "preserving doc, engine downgraded" and "fallback doc, engine upgraded"
+  // both read as a gap that is not really there, turning the promised no-op
+  // into an unwanted regeneration or refusal.
+  //
+  // Ask the SAME invariant `assertGeneratedEnvWiring` runs under BOTH
+  // possible interpretations of the document instead: it already carries a
+  // working route if EITHER reading finds nothing missing. That is the
+  // route-agnostic, file-shape-only answer to "is this document already
+  // wired" — no live dependency, and no probe subprocess, in the common case
+  // where nothing needs to change.
+  //
+  // cinatra#2654 round-5 review (codex convergence, round 2): the wayflow
+  // ARM of `composeEnvWiringGaps` only runs when `services.wayflow` exists
+  // and is an object (install-isolation.mjs's own guard) — a document with
+  // no `wayflow` service AT ALL (a LEGACY recorded compose predating
+  // cinatra-cli#113's profile-gated-service baking; `isolated-endpoint-
+  // offset.test.mjs`'s own fixtures carry exactly this shape) produces NO
+  // gap under EITHER interpretation, and would have read as "already wired"
+  // — the opposite of true, since a document with no route for a service
+  // that is not even IN it plainly needs re-deriving. Checked explicitly,
+  // ahead of and independent from the two interpretations.
+  const wayflowSvc = doc.services && typeof doc.services === "object" ? doc.services[WAYFLOW_SERVICE_NAME] : undefined;
+  const wayflowServicePresent = !!wayflowSvc && typeof wayflowSvc === "object" && !Array.isArray(wayflowSvc);
+
+  const wiringGaps = deps.composeEnvWiringGaps ?? composeEnvWiringGaps;
+  const wayflowGapsAs = (envFilesPreserved) =>
+    wiringGaps(doc, {
+      wayflowEnvFilePath: path.join(repoRoot, WAYFLOW_ENV_FILE),
+      wayflow: true,
+      envFilesPreserved,
+      baseDir: repoRoot,
+    }).filter((g) => g.includes(`"${WAYFLOW_SERVICE_NAME}"`));
+  const alreadyWired =
+    wayflowServicePresent && (wayflowGapsAs(true).length === 0 || wayflowGapsAs(false).length === 0);
+  if (alreadyWired) {
+    return { regenerated: false, reason: "already-wired" };
+  }
+
+  log(
+    `  ↻ The recorded ${isolatedFilename} carries no WayFlow bridge-token route for "${WAYFLOW_SERVICE_NAME}" ` +
+      "under EITHER render route — re-deriving it now that `instance wayflow start` is turning the runtime on.",
+  );
+  const regenerate =
+    deps.regenerateIsolatedCompose ?? (await import("./install.mjs")).regenerateIsolatedCompose;
+  const regen = await regenerate({ targetDir: repoRoot, row, log, wayflow: true, deps });
+  return { regenerated: !!regen.regenerated, skipped: regen.skipped ?? null, reason: "route-repaired" };
+}
+
 // `argv` is the legacy rest (argv.slice(2)); its first token is the start|stop verb.
 async function runDevWayflow(argv = []) {
   rejectTailscaleAuthkeyFlag(argv);
@@ -12096,6 +12238,15 @@ async function runDevWayflow(argv = []) {
     return;
   }
   const { project, composeFiles } = wayflowComposeContext(repoRoot);
+  if (verb === "start") {
+    // cinatra#2654 (round 5): re-derive the recorded isolated compose's
+    // wayflow token route AFTER the provisioning above succeeded, when (and
+    // only when) it is missing — see reconcileIsolatedWayflowRoute. A second,
+    // cheap read of the small registry file for THIS checkout's row, mirroring
+    // `wayflowEndpointForCheckout` just above.
+    const row = findInstanceRowByInstallDir(readInstanceRegistrySafe().registry, repoRoot);
+    await reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row });
+  }
   // Relative, resolved against `cwd: repoRoot` below — which also keeps the
   // echoed command copy-pasteable from the checkout. A checkout with no
   // `.env.local` keeps compose's normal `.env` discovery (null envFile).
@@ -14783,6 +14934,11 @@ export {
   effectiveComposeProjectName,
   wayflowComposeContext,
   wayflowHealthUrlFromEnv,
+  // cinatra#2654 (round 5) — the fallback-route wayflow-token-route detector +
+  // regeneration `instance wayflow start` runs after provisioning. Exported so
+  // it can be exercised directly against a real generated isolated compose
+  // (the fail-first regression coverage), not only through the live spawn.
+  reconcileIsolatedWayflowRoute,
   // cinatra-cli#240 — the printed start endpoint, derived from the instance's
   // recorded port map instead of a hardcoded default.
   recordedWayflowHostPort,

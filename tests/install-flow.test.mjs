@@ -13,9 +13,13 @@ import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { DEFAULT_REPO_URL, parseInstallArgs, runInstall } from "../src/install.mjs";
-import { parseIsolatedComposeDoc } from "../src/install-isolation.mjs";
+import { parseIsolatedComposeDoc, writeIsolatedComposeFile } from "../src/install-isolation.mjs";
 import { readInstanceRegistry } from "../src/instance-registry.mjs";
 import { readMarker } from "../src/instance-marker.mjs";
+// cinatra#2654 (round 5) — `instance wayflow start`'s fallback-route detector +
+// regeneration, exercised against a REAL generated isolated compose (the same
+// fixture style as the D1 round-4 tests below).
+import { reconcileIsolatedWayflowRoute } from "../src/index.mjs";
 import { RecreatePreflightError } from "../src/recreate-preflight.mjs";
 
 // ---------------------------------------------------------------------------
@@ -832,6 +836,299 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
       readFileSync(path.join(installDir, "docker-compose.cinatra-isolated.yml"), "utf8"),
     );
     expect(doc.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBe("${CINATRA_BRIDGE_TOKEN}");
+  });
+
+  // ── cinatra#2654 (round 5) — `cinatra instance wayflow start` is the
+  //    documented hand-start the "start it by hand" message promises. A
+  //    --no-wayflow FALLBACK install's recorded compose never got a
+  //    bridge-token route baked in at all (the render invariant is gated on
+  //    the SAME opt-out that skipped provisioning `.wayflow.env`), so starting
+  //    it against the RECORDED compose with only `--env-file .env.local` gave
+  //    the runtime no token: a placeholder ALREADY IN the file can be
+  //    resolved that way, but a directive the render never wrote cannot be
+  //    restored by it. `reconcileIsolatedWayflowRoute` (src/index.mjs) must
+  //    re-derive the recorded compose, WITH wayflow now in scope, once
+  //    `.wayflow.env` is provisioned — and the token must reach the wayflow
+  //    service definition the subsequent `docker compose up` starts. ────────
+  describe("instance wayflow start — the fallback-route --no-wayflow recovery (cinatra#2654 round 5)", () => {
+    it("re-derives the recorded compose so the bridge token reaches the wayflow service (fail-first at 9846340b)", async () => {
+      const installDir = path.join(sandbox, "iso-wf-start-fallback");
+      // (1) The install this bug reaches: --no-wayflow on a FALLBACK (inlining)
+      //     Compose. Completes (the invariant is gated on the opt-out), but
+      //     the recorded compose carries NO route for the token at all.
+      await runInstall(
+        [
+          "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+          "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "isowfstart",
+          "--port-offset", "auto", "--no-wayflow",
+        ],
+        { log: () => {}, deps: inliningWayflowDeps() },
+      );
+      const before = parseIsolatedComposeDoc(
+        readFileSync(path.join(installDir, "docker-compose.cinatra-isolated.yml"), "utf8"),
+      );
+      expect(before.services.wayflow.environment?.CINATRA_BRIDGE_TOKEN).toBeUndefined();
+      expect(before.services.wayflow.env_file ?? []).toEqual([]);
+
+      // (2) `instance wayflow start` provisions .wayflow.env FIRST (mirrors
+      //     ensureWayflowBridgeEnv's real generator run, which reads the
+      //     secret ensureEnvLocal already minted into .env.local).
+      const envLocal = Object.fromEntries(
+        readFileSync(path.join(installDir, ".env.local"), "utf8")
+          .split("\n")
+          .filter((l) => l.includes("="))
+          .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim()]),
+      );
+      expect(envLocal.CINATRA_BRIDGE_TOKEN).toBeTruthy();
+      mkdirSync(path.join(installDir, "docker", "wayflow"), { recursive: true });
+      writeFileSync(
+        path.join(installDir, WAYFLOW_ENV_REL_PATH),
+        `CINATRA_BRIDGE_TOKEN=${envLocal.CINATRA_BRIDGE_TOKEN}\n`,
+      );
+
+      // (3) The fix under test: re-derive the recorded compose. Same inlining
+      //     `composeConfigForFiles` fake as the reconcile-order test above —
+      //     it reads the REAL .wayflow.env off disk at render time, exactly
+      //     like a real fallback Compose engine would.
+      const row = readInstanceRegistry(regPath).registry.instances.isowfstart;
+      const result = await reconcileIsolatedWayflowRoute({
+        repoRoot: installDir,
+        composeFiles: row.composeFiles,
+        row,
+        log: () => {},
+        deps: {
+          composeSupportsNoEnvResolution: () => false,
+          composeConfigForFiles: inliningConfigFor(installDir),
+          instanceRegistryPath: regPath,
+          allocLockPath: lockPath,
+        },
+      });
+      expect(result.regenerated).toBe(true);
+
+      // (4) The container definition `docker compose up` is about to start now
+      //     carries a non-empty token — resolved from `.env.local` at `up`
+      //     time via the re-symbolised `${VAR}` placeholder.
+      const after = parseIsolatedComposeDoc(
+        readFileSync(path.join(installDir, "docker-compose.cinatra-isolated.yml"), "utf8"),
+      );
+      expect(after.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBe("${CINATRA_BRIDGE_TOKEN}");
+    });
+
+    it("a PRESERVING-route install (env_file reference survives regardless of --no-wayflow): today's behavior is unchanged", async () => {
+      const installDir = path.join(sandbox, "iso-wf-start-preserving");
+      await runInstall(
+        [
+          "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+          "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "isowfpreserve",
+          "--port-offset", "auto", "--no-wayflow",
+        ],
+        {
+          log: () => {},
+          deps: flowDeps({
+            detectPortConflicts: conflictOnDefaultBand,
+            composeConfigForFiles: preservingWayflowConfig(installDir),
+          }),
+        },
+      );
+      const row = readInstanceRegistry(regPath).registry.instances.isowfpreserve;
+      const isoPath = path.join(installDir, "docker-compose.cinatra-isolated.yml");
+      const before = readFileSync(isoPath, "utf8");
+      let regenerateCalled = false;
+      const result = await reconcileIsolatedWayflowRoute({
+        repoRoot: installDir,
+        composeFiles: row.composeFiles,
+        row,
+        log: () => {},
+        deps: {
+          // Still the preserving route: the env_file reference the render
+          // above wrote is unconditional (reference preservation does not
+          // gate on --no-wayflow), so this must be a pure no-op — no
+          // regenerator call at all.
+          composeSupportsNoEnvResolution: () => true,
+          composeConfigForFiles: preservingWayflowConfig(installDir),
+          regenerateIsolatedCompose: () => {
+            regenerateCalled = true;
+            throw new Error("regenerateIsolatedCompose must not run — the wayflow route is already wired");
+          },
+        },
+      });
+      expect(result.regenerated).toBe(false);
+      expect(result.reason).toBe("already-wired");
+      expect(regenerateCalled).toBe(false);
+      // The file on disk is untouched, byte for byte.
+      expect(readFileSync(isoPath, "utf8")).toBe(before);
+    });
+
+    // ── codex convergence (round-1 review of this fix) — the detector must
+    //    classify the RECORDED document by its own shape, never by the LIVE
+    //    Compose engine's capability: the live probe answers what a render
+    //    started NOW would produce, not which route an EARLIER render (a
+    //    possibly different Compose version) actually took. Gating the gap
+    //    check on it misclassified an already-healthy document across an
+    //    engine change (upgrade or downgrade) since install. These two pin
+    //    that a stale/misleading live answer can never turn a healthy
+    //    document into an unwanted regeneration. ─────────────────────────
+    it("a PRESERVING-route doc stays a no-op even when the live probe (if consulted) would say fallback", async () => {
+      const installDir = path.join(sandbox, "iso-wf-start-preserving-live-false");
+      await runInstall(
+        [
+          "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+          "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "isowfpreslivefalse",
+          "--port-offset", "auto", "--no-wayflow",
+        ],
+        {
+          log: () => {},
+          deps: flowDeps({
+            detectPortConflicts: conflictOnDefaultBand,
+            composeConfigForFiles: preservingWayflowConfig(installDir),
+          }),
+        },
+      );
+      const row = readInstanceRegistry(regPath).registry.instances.isowfpreslivefalse;
+      const isoPath = path.join(installDir, "docker-compose.cinatra-isolated.yml");
+      const before = readFileSync(isoPath, "utf8");
+      let regenerateCalled = false;
+      const result = await reconcileIsolatedWayflowRoute({
+        repoRoot: installDir,
+        composeFiles: row.composeFiles,
+        row,
+        log: () => {},
+        deps: {
+          // The engine "now" reports it CANNOT preserve env_file — a
+          // downgrade, or the probe misfiring. The recorded document was
+          // rendered on a preserving engine and still carries its reference:
+          // that must decide it, not this stale/misleading live answer.
+          composeSupportsNoEnvResolution: () => false,
+          regenerateIsolatedCompose: () => {
+            regenerateCalled = true;
+            throw new Error("regenerateIsolatedCompose must not run — the recorded doc is already wired");
+          },
+        },
+      });
+      expect(result.regenerated).toBe(false);
+      expect(result.reason).toBe("already-wired");
+      expect(regenerateCalled).toBe(false);
+      expect(readFileSync(isoPath, "utf8")).toBe(before);
+    });
+
+    it("a FALLBACK-route doc that already carries a good token stays a no-op even when the live probe (if consulted) would say preserving", async () => {
+      const installDir = path.join(sandbox, "iso-wf-start-fallback-live-true");
+      // An install WITHOUT --no-wayflow, on an inlining Compose, only
+      // succeeds once the render already carries a non-empty token — the
+      // exact "control" fixture the D1 round-4 test above builds. Build it
+      // the same way that test does: generateWayflowEnv actually provisions
+      // the file the inlining config reads, so the completed install's
+      // recorded document already has a working fallback-route token.
+      const provisioned = flowDeps({
+        detectPortConflicts: conflictOnDefaultBand,
+        composeSupportsNoEnvResolution: () => false,
+        composeConfigForFiles: inliningConfigFor(installDir),
+        generateWayflowEnv: ({ targetDir }) => {
+          mkdirSync(path.join(targetDir, "docker", "wayflow"), { recursive: true });
+          writeFileSync(
+            path.join(targetDir, WAYFLOW_ENV_REL_PATH),
+            "CINATRA_BRIDGE_TOKEN=already-wired-token\nCINATRA_CONTEXT_ATTEST_KEY=already-wired-attest\n",
+            { mode: 0o600 },
+          );
+          return { ok: true, skipped: false, reason: null };
+        },
+      });
+      await runInstall(
+        [
+          "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+          "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "isowffallbacklivetrue",
+          "--port-offset", "auto",
+        ],
+        { log: () => {}, deps: provisioned },
+      );
+      const row = readInstanceRegistry(regPath).registry.instances.isowffallbacklivetrue;
+      const isoPath = path.join(installDir, "docker-compose.cinatra-isolated.yml");
+      const before = readFileSync(isoPath, "utf8");
+      const beforeDoc = parseIsolatedComposeDoc(before);
+      expect(beforeDoc.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBe("${CINATRA_BRIDGE_TOKEN}");
+      let regenerateCalled = false;
+      const result = await reconcileIsolatedWayflowRoute({
+        repoRoot: installDir,
+        composeFiles: row.composeFiles,
+        row,
+        log: () => {},
+        deps: {
+          // The engine "now" reports it CAN preserve env_file — an upgrade
+          // since install. The recorded document was rendered on a fallback
+          // engine and already carries a non-empty token: that must decide
+          // it, not this stale/misleading live answer.
+          composeSupportsNoEnvResolution: () => true,
+          regenerateIsolatedCompose: () => {
+            regenerateCalled = true;
+            throw new Error("regenerateIsolatedCompose must not run — the recorded doc is already wired");
+          },
+        },
+      });
+      expect(result.regenerated).toBe(false);
+      expect(result.reason).toBe("already-wired");
+      expect(regenerateCalled).toBe(false);
+      expect(readFileSync(isoPath, "utf8")).toBe(before);
+    });
+
+    it("a non-isolated (default) row is skipped entirely — no file read", async () => {
+      const row = { slug: "default-row", composeProject: "cinatra_default_row", composeFiles: ["docker-compose.yml", "docker-compose.dev.yml"] };
+      const result = await reconcileIsolatedWayflowRoute({
+        repoRoot: path.join(sandbox, "does-not-exist-and-must-not-be-touched"),
+        composeFiles: row.composeFiles,
+        row,
+        log: () => {},
+        deps: {},
+      });
+      expect(result).toEqual({ regenerated: false, reason: "not-isolated" });
+    });
+
+    // ── codex convergence (round-2 review of this fix) — the wayflow ARM of
+    //    `composeEnvWiringGaps` only runs when `services.wayflow` exists and
+    //    is an object; a document with NO wayflow service at all (a LEGACY
+    //    recorded compose predating cinatra-cli#113's profile-gated-service
+    //    baking) produced no gap under EITHER interpretation and so read as
+    //    "already wired" — the opposite of true. ─────────────────────────
+    it("a doc missing the wayflow service entirely (a legacy pre-profile-baking compose) is NOT read as already wired", async () => {
+      const installDir = path.join(sandbox, "iso-wf-start-legacy-no-wayflow-svc");
+      mkdirSync(installDir, { recursive: true });
+      const isoPath = path.join(installDir, "docker-compose.cinatra-isolated.yml");
+      // Exactly the shape isolated-endpoint-offset.test.mjs's own "pre-a2a-era"
+      // fixtures use: a valid CLI-generated document that simply predates the
+      // wayflow service being baked in — `wayflow` is not a key in `services`
+      // at all, not merely mis-wired.
+      writeIsolatedComposeFile(isoPath, {
+        name: "cinatra_legacy",
+        services: {
+          postgres: {
+            image: "postgres:16",
+            ports: [{ published: "25434", target: 5432, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+          },
+        },
+      });
+      const row = {
+        slug: "legacy-row",
+        composeProject: "cinatra_legacy",
+        composeFiles: ["docker-compose.cinatra-isolated.yml"],
+        ports: { postgres: [25434] },
+        offset: 20000,
+      };
+      let regenerateCalled = false;
+      const result = await reconcileIsolatedWayflowRoute({
+        repoRoot: installDir,
+        composeFiles: row.composeFiles,
+        row,
+        log: () => {},
+        deps: {
+          regenerateIsolatedCompose: () => {
+            regenerateCalled = true;
+            return { regenerated: true, ports: row.ports, offset: row.offset };
+          },
+        },
+      });
+      expect(regenerateCalled).toBe(true);
+      expect(result.regenerated).toBe(true);
+      expect(result.reason).not.toBe("already-wired");
+    });
   });
 
   it("#2654 D1: a wiring refusal names an operator RECOVERY, not only 'please report it'", async () => {
