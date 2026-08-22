@@ -1390,6 +1390,20 @@ export function composeEnvWiringGaps(doc, {
 // say so, in the file itself, rather than to imply a preservation that does not
 // exist. Operator-owned customisation belongs in the checkout's own compose
 // files, which every regeneration re-reads.
+//
+// cinatra#2654 round-5 review, non-blocking 2: an edit here does NOT always
+// reach a next `cinatra install` to be silently lost — most edits are caught
+// BEFORE that point, loudly, on the AUDITED path (a plain install/reconcile
+// runs install.mjs's `effectiveIsolatedPorts` / `unauditableIsolatedComposeError`
+// port audit, then the port-divergence gate — `assertIsolatedPortsConverge` /
+// `assertIsolatedPortsStillConverge` — before regeneration ever runs). Only
+// the narrow case (valid JSON, no published port moved) actually reaches
+// "silently replaced" there; the header must say which case it is, not the
+// one that sounds simplest. A DIRECT in-place re-derive that skips that
+// audit (`instance a2a`'s self-heal calls `regenerateIsolatedComposeInPlace`
+// straight, cinatra#2654 round-5 review, codex convergence round 3) replaces
+// an unparseable file outright instead of refusing it — the header says so
+// too, rather than claiming the refusal is universal.
 const GENERATED_COMPOSE_HEADER = [
   "# GENERATED FILE — DO NOT EDIT.",
   "#",
@@ -1399,9 +1413,18 @@ const GENERATED_COMPOSE_HEADER = [
   "#",
   "# This file is CLI-OWNED: `cinatra install` re-derives it in full on every",
   "# run and every reconcile, and preserves NOTHING from the previous copy.",
-  "# Any edit you make here is lost on the next `cinatra install`. To change",
-  "# the stack, edit the checkout's own compose files (or .env.local) and",
-  "# re-run `cinatra install` — the change is picked up from there.",
+  "# An edit here does not survive the next `cinatra install` or reconcile:",
+  "#   - on that path, an edit that breaks the JSON shape below is REFUSED",
+  "#     (not silently lost) — the CLI cannot audit it, so it stops rather",
+  "#     than guess. A direct in-place re-derive (e.g. `instance a2a`'s",
+  "#     self-heal) instead replaces it outright, same as any other edit;",
+  "#   - a JSON-shaped edit that MOVES a published port ABORTS at the",
+  "#     port-divergence gate instead, naming the disagreement;",
+  "#   - a JSON-shaped edit that keeps every published port where it was is",
+  "#     silently replaced either way. That is the case actually lost.",
+  "# To change the stack, edit the checkout's own compose files (or",
+  "# .env.local) and re-run `cinatra install` — the change is picked up",
+  "# from there.",
   "#",
   "# YAML 1.2 is a JSON superset, so the document below is valid compose YAML.",
 ].join("\n");
