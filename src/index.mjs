@@ -12246,16 +12246,21 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
   const install = await import("./install.mjs");
   const same = deps.samePortMaps ?? install.samePortMaps;
   const portsMoved = !!ports && !same(row.ports ?? {}, ports);
+  // `envRepointed` is what the writer DID, never what we asked it to do
+  // (round-6 codex convergence): a checkout with no `.env.local` is a silent
+  // no-op inside `writeIsolatedAppEnv`, and reporting a re-point that never
+  // happened is the same shape of false success this issue exists to remove.
+  let envRepointed = false;
   if (portsMoved) {
     const repoint = deps.writeIsolatedAppEnv ?? install.writeIsolatedAppEnv;
-    repoint({ targetDir: repoRoot, appPort: row.appPort ?? null, ports, log });
+    envRepointed = repoint({ targetDir: repoRoot, appPort: row.appPort ?? null, ports, log }) === true;
   }
   return {
     regenerated: !!regen.regenerated,
     skipped: regen.skipped ?? null,
     reason: "route-repaired",
     ports,
-    envRepointed: portsMoved,
+    envRepointed,
   };
 }
 

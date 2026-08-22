@@ -1267,6 +1267,96 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
       expect(readFileSync(envPath, "utf8")).toBe(before);
       expect(result.envRepointed).toBe(false);
     });
+
+    // ── round-6 codex convergence ───────────────────────────────────────────
+    // `writeIsolatedAppEnv` is a silent no-op on a checkout with no
+    // `.env.local`. The reconcile must report what the writer DID, not what it
+    // was asked to do — a claimed re-point that never happened is the same
+    // shape of false success this whole issue exists to remove.
+    it("a checkout with NO .env.local reports envRepointed=false and creates no file", async () => {
+      const installDir = path.join(sandbox, "iso-wf-start-legacy-no-envlocal");
+      mkdirSync(installDir, { recursive: true });
+      writeIsolatedComposeFile(path.join(installDir, "docker-compose.cinatra-isolated.yml"), {
+        name: "cinatra_legacy_noenv",
+        services: {
+          postgres: {
+            image: "postgres:16",
+            ports: [{ published: "25434", target: 5432, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+          },
+        },
+      });
+      const envPath = path.join(installDir, ".env.local");
+      expect(existsSync(envPath)).toBe(false);
+      const row = {
+        slug: "legacy-noenv",
+        composeProject: "cinatra_legacy_noenv",
+        composeFiles: ["docker-compose.cinatra-isolated.yml"],
+        ports: { postgres: [25434] },
+        appPort: LEGACY_APP_PORT,
+        offset: LEGACY_OFFSET,
+      };
+      const result = await reconcileIsolatedWayflowRoute({
+        repoRoot: installDir,
+        composeFiles: row.composeFiles,
+        row,
+        log: () => {},
+        deps: {
+          regenerateIsolatedCompose: () => ({
+            regenerated: true,
+            ports: LEGACY_REGENERATED_PORTS,
+            offset: row.offset,
+          }),
+        },
+      });
+      expect(result.regenerated).toBe(true);
+      expect(result.envRepointed).toBe(false);
+      expect(existsSync(envPath)).toBe(false);
+    });
+
+    // A legacy/hand-edited row can carry no `appPort`. The infra re-point must
+    // still run (that is the whole point of the repair), and the operator's own
+    // PORT must be left alone rather than written as `PORT=undefined`.
+    it("a row with NO recorded appPort still re-points the infra URLs and leaves PORT untouched", async () => {
+      const installDir = path.join(sandbox, "iso-wf-start-legacy-no-appport");
+      mkdirSync(installDir, { recursive: true });
+      writeIsolatedComposeFile(path.join(installDir, "docker-compose.cinatra-isolated.yml"), {
+        name: "cinatra_legacy_noapp",
+        services: {
+          postgres: {
+            image: "postgres:16",
+            ports: [{ published: "25434", target: 5432, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+          },
+        },
+      });
+      const envPath = path.join(installDir, ".env.local");
+      writeFileSync(envPath, `PORT=3000\nWAYFLOW_BASE_URL=http://localhost:3010\n`, { mode: 0o600 });
+      const row = {
+        slug: "legacy-noapp",
+        composeProject: "cinatra_legacy_noapp",
+        composeFiles: ["docker-compose.cinatra-isolated.yml"],
+        ports: { postgres: [25434] },
+        offset: LEGACY_OFFSET,
+      };
+      const result = await reconcileIsolatedWayflowRoute({
+        repoRoot: installDir,
+        composeFiles: row.composeFiles,
+        row,
+        log: () => {},
+        deps: {
+          regenerateIsolatedCompose: () => ({
+            regenerated: true,
+            ports: LEGACY_REGENERATED_PORTS,
+            offset: row.offset,
+          }),
+        },
+      });
+      expect(result.envRepointed).toBe(true);
+      const after = readFileSync(envPath, "utf8");
+      expect(after).toMatch(new RegExp(`^WAYFLOW_BASE_URL=http://localhost:${LEGACY_WAYFLOW_PORT}/?$`, "m"));
+      // NOT `PORT=undefined` / `PORT=null`.
+      expect(after).toMatch(/^PORT=3000$/m);
+      expect(after).not.toMatch(/^PORT=(undefined|null|NaN)$/m);
+    });
   });
 
   it("#2654 D1: a wiring refusal names an operator RECOVERY, not only 'please report it'", async () => {

@@ -2235,6 +2235,55 @@ describe("cinatra#2654 round 6 — the a2a self-heal reproduces the install's re
     expect(recordedWayflowChoice({ slug: "legacy" })).toBe(true);
   });
 
+  // ── round-6 codex convergence ─────────────────────────────────────────────
+  // `allocateInstance` returns an EXISTING same-directory row unchanged (its
+  // idempotence contract), so a re-install never reached the field. Both
+  // transitions were silently lost, and each breaks a LATER `instance a2a`
+  // self-heal rather than the install that made them. The LATEST install
+  // decides, exactly like the ports and offset it also re-records.
+  it("a --no-wayflow RE-install of a recorded row records the opt-out (allocateInstance never sees it)", async () => {
+    const installDir = path.join(sandbox, "iso2654r6-reinstall-optout");
+    const args = (extra) => [
+      "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+      "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso2654r6reoptout",
+      "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ...extra,
+    ];
+    // (1) a normal install: nothing recorded, which reads as "wayflow in scope".
+    await runInstall(args([]), { log: () => {}, deps: isolatedDeps() });
+    expect(registryRow(installDir).row.wayflow).toBeUndefined();
+
+    // (2) the operator changes their mind and re-installs lean.
+    await runInstall(args(["--no-wayflow"]), { log: () => {}, deps: isolatedDeps() });
+    const row = registryRow(installDir).row;
+    expect(row.wayflow).toBe(false);
+    expect(recordedWayflowChoice(row)).toBe(false);
+    // …and nothing else about the row moved.
+    expect(row.appPort).toBe(APP_PORT);
+    expect(row.offset).toBe(OFFSET);
+    expect(row.ports.wayflow).toEqual([DEFAULT_WAYFLOW_PORT + OFFSET]);
+  });
+
+  it("a re-install WITHOUT the opt-out clears a recorded opt-out (the key is DELETED, not written `true`)", async () => {
+    const installDir = path.join(sandbox, "iso2654r6-reinstall-optin");
+    const args = (extra) => [
+      "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+      "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso2654r6reoptin",
+      "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ...extra,
+    ];
+    await runInstall(args(["--no-wayflow"]), { log: () => {}, deps: inliningDeps() });
+    expect(registryRow(installDir).row.wayflow).toBe(false);
+
+    await runInstall(args([]), { log: () => {}, deps: isolatedDeps() });
+    const row = registryRow(installDir).row;
+    // A default row is byte-identical to what every previous version wrote:
+    // ABSENT, never a literal `true`.
+    expect(row.wayflow).toBeUndefined();
+    expect("wayflow" in row).toBe(false);
+    expect(recordedWayflowChoice(row)).toBe(true);
+  });
+
   it("BLOCKING B: `instance a2a start` self-heals a --no-wayflow install WITHOUT demanding a bridge-token route", async () => {
     const installDir = await leanIsolatedInstall("iso2654r6-a2a-lean");
 

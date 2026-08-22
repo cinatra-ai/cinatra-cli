@@ -3394,6 +3394,15 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
         nangoHealthUrl: nangoHealthUrlForPorts(slotPorts),
         wayflow: opts.wayflow !== false,
       });
+      // cinatra#2654 (round 6): the LATEST install decides this row's WayFlow
+      // choice — `allocateInstance` returned this row unchanged, so nothing
+      // above recorded it. See `persistRecordedWayflowChoice`.
+      await persistRecordedWayflowChoice({
+        slug,
+        wayflow: opts.wayflow !== false,
+        registryPath,
+        lockPath,
+      });
       // cinatra-cli#128: record the deployed stateful-service versions in the
       // instance's ledger (best-effort — a re-up is an install-shaped event too).
       await recordVersions({
@@ -4551,7 +4560,13 @@ function rewriteUrlPort(existing, newPort, fallbackProto, fallbackPath = "") {
  */
 export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = console.log }) {
   const envPath = path.join(targetDir, ".env.local");
-  if (!existsSync(envPath)) return;
+  // cinatra#2654 (round 6, codex convergence): report whether anything was
+  // actually written. Every install caller ignores this (a checkout with no
+  // `.env.local` was always a silent no-op here), but the `instance wayflow
+  // start` re-point REPORTS what it did, and claiming a re-point that this
+  // early return skipped is exactly the kind of false success this issue
+  // exists to remove.
+  if (!existsSync(envPath)) return false;
   let body = readFileSync(envPath, "utf8");
   // The app-port keys are written only when an app port is actually RECORDED.
   // Every install route allocates one and hands it over, so nothing changes
@@ -4640,6 +4655,7 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
     `  Isolated app port ${appPortRecorded ? appPort : "(none recorded — left as-is)"}; ` +
       `infra URLs re-pointed (${remapped}) in .env.local.`,
   );
+  return true;
 }
 
 /** Minimal `.env` body → { KEY: value } map (last wins; quotes stripped). Used
@@ -5622,6 +5638,16 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
     log,
     deps,
   });
+  // cinatra#2654 (round 6): the LATEST install decides this row's WayFlow
+  // choice. A plain `cinatra install` re-run never reaches `allocateInstance`
+  // at all, so without this a `--no-wayflow` re-install of a recorded instance
+  // stayed unrecorded. See `persistRecordedWayflowChoice`.
+  await persistRecordedWayflowChoice({
+    slug: row.slug,
+    wayflow: opts.wayflow !== false,
+    registryPath,
+    lockPath,
+  });
   // Promote a stale provisioning row to ready after a successful ensure.
   if (row.state !== "ready") {
     await withAllocLock(lockPath, async () => {
@@ -5642,6 +5668,45 @@ async function reconvergeIsolated({ targetDir, opts, resolvedSha, row, log = con
   // re-reset would be the last writer and the stale map never re-points it.
   // Every reader of `instance.ports` downstream sees what was actually written.
   return { infraPlan: "isolated", instance: { ...row, ports: effectivePorts }, done: true };
+}
+
+/**
+ * cinatra#2654 (round 6, codex convergence) — RE-RECORD the install's WayFlow
+ * choice on an EXISTING isolated row.
+ *
+ * `allocateInstance` records the choice, but it returns an existing
+ * same-directory row UNCHANGED (that is its idempotence contract), so a re-run
+ * against a recorded instance never reached it. Both transitions were then
+ * silently lost, and each breaks a LATER `instance a2a` self-heal rather than
+ * the install that made them:
+ *
+ *   - `cinatra install --on-conflict=isolated --no-wayflow` over a row with no
+ *     recorded choice left the row reading "wayflow in scope", so the self-heal
+ *     kept demanding a bridge-token route this install had just stopped
+ *     provisioning.
+ *   - a re-install WITHOUT the opt-out over a `wayflow: false` row left the row
+ *     reading "opted out", so the self-heal stopped demanding a route for an
+ *     instance that now runs the runtime.
+ *
+ * The LATEST install decides, exactly like the ports and the offset it also
+ * re-records. Only the one field is written, over the row read INSIDE the lock,
+ * so a concurrent writer's ports/offset/state cannot be clobbered — and an
+ * opt-IN DELETES the key rather than writing `true`, keeping a default row
+ * byte-identical to what every previous version wrote. A no-change call takes
+ * the lock, compares, and writes nothing.
+ */
+async function persistRecordedWayflowChoice({ slug, wayflow, registryPath, lockPath }) {
+  await withAllocLock(lockPath, async () => {
+    const reg = requireUsableInstanceRegistry(registryPath);
+    const current = getInstance(reg, slug);
+    if (!current) return;
+    if (recordedWayflowChoice(current) === (wayflow !== false)) return;
+    const next = { ...current };
+    if (wayflow === false) next.wayflow = false;
+    else delete next.wayflow;
+    const reg2 = { ...reg, instances: { ...reg.instances, [slug]: next } };
+    writeInstanceRegistry(registryPath, reg2);
+  });
 }
 
 /** cinatra#2654 D1 — the ONE reconcile-facing wrapper around
