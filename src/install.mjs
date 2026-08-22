@@ -3621,9 +3621,10 @@ function composeDown(targetDir, { composeFiles = null, composeProject = null, vo
 //   • `down` succeeds → the single release write happens while the lock is
 //     still held, so a concurrent install can neither observe the freed ports
 //     while the stack is still up, nor race the write.
-// Everything OUTSIDE the lock (marker file, generated compose file) is
-// best-effort cleanup of HINTS — never a reservation — and runs only after a
-// successful release, so its failure can never desynchronise the two.
+// The HINT cleanup (marker file, generated compose file) also runs INSIDE the
+// lock, after a successful release — it is still best-effort and never a
+// reservation, but holding the lock closes the same-directory reinstall window
+// where a fresh install writes new hints between our release and our cleanup.
 // ---------------------------------------------------------------------------
 
 /** Rows whose recorded resources this command may `down`. A "co-use" row records
