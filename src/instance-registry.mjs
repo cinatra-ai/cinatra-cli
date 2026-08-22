@@ -270,6 +270,13 @@ export function allocateInstance(registry, slug, fields) {
     // rows and on isolated rows recorded before this field existed (those derive
     // the offset from the recorded ports vs the base band).
     offset = null,
+    // cinatra#2654 (round 6) — the install's WayFlow choice, recorded ONLY when
+    // the operator OPTED OUT (`--no-wayflow`). An ABSENT field means "wayflow
+    // was in scope", which is the default for every install and the only
+    // reading a row recorded before this field existed can be given — so no
+    // existing registry file changes shape and no legacy row changes meaning.
+    // Read it back through `recordedWayflowChoice` rather than by hand.
+    wayflow = null,
     repoUrl,
     ref,
     sha = null,
@@ -345,6 +352,8 @@ export function allocateInstance(registry, slug, fields) {
     appPort,
     // Only isolated rows carry an offset; keep default rows byte-identical.
     ...(Number.isInteger(offset) && offset > 0 ? { offset } : {}),
+    // Only an OPT-OUT is recorded (see above): `true` is the absent default.
+    ...(wayflow === false ? { wayflow: false } : {}),
     repoUrl,
     ref,
     sha,
@@ -386,6 +395,26 @@ export function updateInstance(registry, slug, patch = {}) {
   const next = cloneRegistryObject(registry);
   next.instances[slug] = { ...existing, ...patch, slug };
   return next;
+}
+
+/**
+ * cinatra#2654 (round 6) — the ONE reader of a row's recorded WayFlow choice.
+ *
+ * `regenerateIsolatedComposeInPlace` renders the WayFlow bridge-token route
+ * under a `wayflow` flag, and its DEFAULT is `true`. That default is right for
+ * `instance wayflow start` (the command IS the act of turning the runtime on)
+ * and wrong for the `instance a2a` self-heal, which regenerates the compose for
+ * an unrelated reason: on a `--no-wayflow` install that self-heal re-enabled a
+ * runtime the operator opted out of, and demanded a bridge-token route that
+ * install never provisioned. The choice is recorded at allocation and read back
+ * here, so a lean install stays lean when an unrelated command re-derives its
+ * compose.
+ *
+ * ABSENT means TRUE — a legacy row, and every row that did not opt out, keeps
+ * today's behaviour exactly. Only the literal `false` opts out.
+ */
+export function recordedWayflowChoice(row) {
+  return row?.wayflow !== false;
 }
 
 /** Remove a row. Returns { registry, removed } — `removed` is the dropped row or null. */

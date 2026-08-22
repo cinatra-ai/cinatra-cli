@@ -850,6 +850,15 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
   //    re-derive the recorded compose, WITH wayflow now in scope, once
   //    `.wayflow.env` is provisioned — and the token must reach the wayflow
   //    service definition the subsequent `docker compose up` starts. ────────
+  // The legacy-document fixtures below share one allocation, so the ENLARGED
+  // map a re-derive returns is arithmetic (3010 + offset) rather than a magic
+  // number, and the `.env.local` assertions can name the same port the compose
+  // would publish.
+  const LEGACY_OFFSET = 20000;
+  const LEGACY_APP_PORT = 3350;
+  const LEGACY_WAYFLOW_PORT = 3010 + LEGACY_OFFSET; // 23010
+  const LEGACY_REGENERATED_PORTS = Object.freeze({ postgres: [25434], wayflow: [LEGACY_WAYFLOW_PORT] });
+
   describe("instance wayflow start — the fallback-route --no-wayflow recovery (cinatra#2654 round 5)", () => {
     it("re-derives the recorded compose so the bridge token reaches the wayflow service (fail-first at 9846340b)", async () => {
       const installDir = path.join(sandbox, "iso-wf-start-fallback");
@@ -1110,8 +1119,20 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
         composeProject: "cinatra_legacy",
         composeFiles: ["docker-compose.cinatra-isolated.yml"],
         ports: { postgres: [25434] },
-        offset: 20000,
+        appPort: LEGACY_APP_PORT,
+        offset: LEGACY_OFFSET,
       };
+      // The regeneration that a legacy document actually gets: the re-derive
+      // ADDS the `wayflow` service, so the returned map is ENLARGED with an
+      // ISOLATED host port. Round-5's stub echoed `row.ports` back unchanged,
+      // which made the test blind to everything that follows an enlargement —
+      // it could not fail whether or not the caller did anything with the map
+      // (cinatra#2654 round-6 review, BLOCKING A, "the test blindness").
+      writeFileSync(
+        path.join(installDir, ".env.local"),
+        `PORT=3000\nWAYFLOW_BASE_URL=http://localhost:3010\nSUPABASE_DB_URL=postgresql://u:p@127.0.0.1:5434/postgres\n`,
+        { mode: 0o600 },
+      );
       let regenerateCalled = false;
       const result = await reconcileIsolatedWayflowRoute({
         repoRoot: installDir,
@@ -1121,13 +1142,130 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
         deps: {
           regenerateIsolatedCompose: () => {
             regenerateCalled = true;
-            return { regenerated: true, ports: row.ports, offset: row.offset };
+            return { regenerated: true, ports: LEGACY_REGENERATED_PORTS, offset: row.offset };
           },
         },
       });
       expect(regenerateCalled).toBe(true);
       expect(result.regenerated).toBe(true);
       expect(result.reason).not.toBe("already-wired");
+      // The enlarged map REACHES the caller instead of being discarded.
+      expect(result.ports).toEqual(LEGACY_REGENERATED_PORTS);
+    });
+
+    // ── round-6 review, BLOCKING A ──────────────────────────────────────────
+    // Re-deriving a legacy document ADDS the wayflow service on this instance's
+    // ISOLATED host port, and persists that enlarged map to the registry row.
+    // `.env.local` still names the DEFAULT :3010, because it was written when
+    // the map held no wayflow entry at all. The `up` that follows this reconcile
+    // then starts the runtime on the remapped port while the app dials the
+    // default one — a dead port, or (with a default stack up) ANOTHER
+    // instance's runtime, which is worse because it answers. The reconcile must
+    // apply the SAME `.env.local` re-point the install path performs.
+    it("BLOCKING A: a regeneration that ENLARGED the port map re-points .env.local at the isolated WayFlow port", async () => {
+      const installDir = path.join(sandbox, "iso-wf-start-legacy-repoint");
+      mkdirSync(installDir, { recursive: true });
+      writeIsolatedComposeFile(path.join(installDir, "docker-compose.cinatra-isolated.yml"), {
+        name: "cinatra_legacy_repoint",
+        services: {
+          postgres: {
+            image: "postgres:16",
+            ports: [{ published: "25434", target: 5432, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+          },
+        },
+      });
+      const envPath = path.join(installDir, ".env.local");
+      writeFileSync(
+        envPath,
+        // What a pre-profile-baking install left behind: the DEFAULT WayFlow
+        // endpoint, because this instance's band never held a wayflow port.
+        `PORT=3000\nBETTER_AUTH_URL=http://localhost:3000\n` +
+          `WAYFLOW_BASE_URL=http://localhost:3010\n` +
+          `SUPABASE_DB_URL=postgresql://u:p@127.0.0.1:25434/postgres\n`,
+        { mode: 0o600 },
+      );
+      const row = {
+        slug: "legacy-repoint",
+        composeProject: "cinatra_legacy_repoint",
+        composeFiles: ["docker-compose.cinatra-isolated.yml"],
+        ports: { postgres: [25434] },
+        appPort: LEGACY_APP_PORT,
+        offset: LEGACY_OFFSET,
+      };
+      const result = await reconcileIsolatedWayflowRoute({
+        repoRoot: installDir,
+        composeFiles: row.composeFiles,
+        row,
+        log: () => {},
+        deps: {
+          regenerateIsolatedCompose: () => ({
+            regenerated: true,
+            ports: LEGACY_REGENERATED_PORTS,
+            offset: row.offset,
+          }),
+        },
+      });
+      expect(result.regenerated).toBe(true);
+
+      const after = readFileSync(envPath, "utf8");
+      // THE FIX: the app dials the port the container it is about to start
+      // publishes, never the default one another instance may hold.
+      expect(after).toMatch(new RegExp(`^WAYFLOW_BASE_URL=http://localhost:${LEGACY_WAYFLOW_PORT}/?$`, "m"));
+      expect(after).not.toMatch(/^WAYFLOW_BASE_URL=http:\/\/localhost:3010\/?$/m);
+      // …written by the install path's OWN writer, so the whole isolated
+      // re-point ran: the recorded app port too, and the credentials on an
+      // existing URL preserved rather than rebuilt.
+      expect(after).toMatch(new RegExp(`^PORT=${LEGACY_APP_PORT}$`, "m"));
+      expect(after).toMatch(new RegExp(`^BETTER_AUTH_URL=http://localhost:${LEGACY_APP_PORT}$`, "m"));
+      expect(after).toMatch(/^SUPABASE_DB_URL=postgresql:\/\/u:p@127\.0\.0\.1:25434\/postgres$/m);
+      // …and the result SAYS it re-pointed, so the caller can report it.
+      expect(result.envRepointed).toBe(true);
+    });
+
+    // The other side of the same rule: an UNCHANGED map is not an excuse to
+    // rewrite the operator's env file. Most reconciles re-derive a document
+    // that publishes exactly what the row already records.
+    it("BLOCKING A: a regeneration that changed NOTHING leaves .env.local byte-identical", async () => {
+      const installDir = path.join(sandbox, "iso-wf-start-legacy-no-repoint");
+      mkdirSync(installDir, { recursive: true });
+      writeIsolatedComposeFile(path.join(installDir, "docker-compose.cinatra-isolated.yml"), {
+        name: "cinatra_legacy_same",
+        services: {
+          postgres: {
+            image: "postgres:16",
+            ports: [{ published: "25434", target: 5432, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+          },
+        },
+      });
+      const envPath = path.join(installDir, ".env.local");
+      const before = `PORT=9999\nWAYFLOW_BASE_URL=http://localhost:3010\n`;
+      writeFileSync(envPath, before, { mode: 0o600 });
+      const row = {
+        slug: "legacy-same",
+        composeProject: "cinatra_legacy_same",
+        composeFiles: ["docker-compose.cinatra-isolated.yml"],
+        ports: { postgres: [25434] },
+        appPort: LEGACY_APP_PORT,
+        offset: LEGACY_OFFSET,
+      };
+      const result = await reconcileIsolatedWayflowRoute({
+        repoRoot: installDir,
+        composeFiles: row.composeFiles,
+        row,
+        log: () => {},
+        deps: {
+          // Same map, spelled differently (string ports, reordered) — a benign
+          // spelling difference must not read as a move.
+          regenerateIsolatedCompose: () => ({
+            regenerated: true,
+            ports: { postgres: ["25434"] },
+            offset: row.offset,
+          }),
+        },
+      });
+      expect(result.regenerated).toBe(true);
+      expect(readFileSync(envPath, "utf8")).toBe(before);
+      expect(result.envRepointed).toBe(false);
     });
   });
 

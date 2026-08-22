@@ -41,6 +41,8 @@ import {
 } from "../src/install-isolation.mjs";
 import { isolatedComposeHasA2aPeers, missingIsolatedServices } from "../src/isolated-a2a.mjs";
 import { DEFAULT_APP_PORT as ALLOCATOR_DEFAULT_APP_PORT } from "../src/instance-alloc.mjs";
+// cinatra#2654 (round 6) — the ONE reader of a row's recorded WayFlow choice.
+import { recordedWayflowChoice } from "../src/instance-registry.mjs";
 import {
   DEFAULT_WAYFLOW_PORT,
   WAYFLOW_RUNTIME_LOCAL,
@@ -2120,5 +2122,180 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
         ),
       ).toBe(false);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cinatra#2654 round 6, BLOCKING B — a command that re-derives the generated
+// compose for its OWN reason must reproduce the install the operator asked for.
+//
+// `regenerateIsolatedComposeInPlace` renders under a `wayflow` flag whose
+// DEFAULT is `true`, and the `instance a2a` self-heal passed no flag at all. On
+// a `--no-wayflow` install that default DEMANDS a bridge-token route the install
+// deliberately never provisioned: the re-derive fails the wiring invariant, the
+// self-heal swallows that as a warning, and `instance a2a start` then dead-ends
+// on "the isolated compose does not include the a2a-peers services and could not
+// be regenerated in place" — for an instance whose compose is exactly what its
+// own install wrote. The choice is now RECORDED on the registry row at
+// allocation and threaded through that caller.
+// ---------------------------------------------------------------------------
+describe("cinatra#2654 round 6 — the a2a self-heal reproduces the install's recorded WayFlow choice", () => {
+  let sandbox;
+  let originRepo;
+
+  beforeAll(() => {
+    sandbox = mkdtempSync(path.join(os.tmpdir(), "cin-2654r6-"));
+    originRepo = buildFixtureOrigin(sandbox);
+  });
+  afterAll(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    const d = mkdtempSync(path.join(sandbox, "home-"));
+    process.env.CINATRA_INSTANCE_REGISTRY = path.join(d, "instances.json");
+    process.env.CINATRA_ALLOC_LOCK = path.join(d, "alloc.lock");
+  });
+
+  function registryRow(installDir) {
+    const reg = JSON.parse(readFileSync(process.env.CINATRA_INSTANCE_REGISTRY, "utf8"));
+    const slug = Object.keys(reg.instances).find(
+      (s) => path.resolve(reg.instances[s].installDir) === path.resolve(installDir),
+    );
+    return { reg, slug, row: reg.instances[slug] };
+  }
+
+  // A Compose that INLINES `env_file:` — the route on which the WayFlow arm of
+  // the wiring invariant has real teeth, because only an explicit non-empty
+  // value can carry the token and the fixture's `wayflow` service carries none.
+  // (That is precisely a `--no-wayflow` install: nothing ever wrote
+  // `docker/wayflow/.wayflow.env`, so nothing could be inlined from it.)
+  const inliningDeps = (extra = {}) => ({
+    ...isolatedDeps(),
+    composeSupportsNoEnvResolution: () => false,
+    ...extra,
+  });
+
+  // The peers are genuinely MISSING from the recorded document (installed with
+  // the plain fixture), so `instance a2a start` has a real self-heal to run.
+  const peerAwareDeps = (extra = {}) =>
+    inliningDeps({
+      composeConfigForFiles: () => RESOLVED_CONFIG_WITH_PEERS,
+      composePublishedPortsForTarget: () => DEFAULT_BAND_WITH_PEERS,
+      // `runIsolatedA2aPeers` reads `deps.isComposeAvailable`, not the
+      // `composeAvailable` key the install route uses — without it this falls
+      // through to a REAL `docker compose version` probe.
+      isComposeAvailable: () => true,
+      ...extra,
+    });
+
+  async function leanIsolatedInstall(name) {
+    const installDir = path.join(sandbox, name);
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", name,
+        "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+        "--no-wayflow",
+      ],
+      { log: () => {}, deps: inliningDeps() },
+    );
+    expect(res.infraPlan).toBe("isolated");
+    return installDir;
+  }
+
+  const readIsoDoc = (installDir) =>
+    JSON.parse(
+      readFileSync(path.join(installDir, "docker-compose.cinatra-isolated.yml"), "utf8")
+        .split("\n")
+        .filter((l) => !l.trimStart().startsWith("#"))
+        .join("\n"),
+    );
+
+  it("records the OPT-OUT on the registry row (an install that did not opt out records nothing)", async () => {
+    const lean = await leanIsolatedInstall("iso2654r6-recorded-lean");
+    expect(registryRow(lean).row.wayflow).toBe(false);
+
+    // The default install is byte-identical to what it always recorded: an
+    // ABSENT field, which every reader takes as "wayflow was in scope".
+    const fullDir = path.join(sandbox, "iso2654r6-recorded-full");
+    await runInstall(
+      [
+        "--dir", fullDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso2654r6recfull",
+        "--port-offset", String(OFFSET + 10000), "--app-port", String(APP_PORT + 1),
+      ],
+      { log: () => {}, deps: isolatedDeps() },
+    );
+    const fullRow = registryRow(fullDir).row;
+    expect(fullRow.wayflow).toBeUndefined();
+    expect(recordedWayflowChoice(fullRow)).toBe(true);
+    expect(recordedWayflowChoice(registryRow(lean).row)).toBe(false);
+    // A row from before the field existed reads as "in scope" too.
+    expect(recordedWayflowChoice({ slug: "legacy" })).toBe(true);
+  });
+
+  it("BLOCKING B: `instance a2a start` self-heals a --no-wayflow install WITHOUT demanding a bridge-token route", async () => {
+    const installDir = await leanIsolatedInstall("iso2654r6-a2a-lean");
+
+    // The install this reaches: lean by request. The `wayflow` service is
+    // rendered (every profile-gated service is, so it can be enabled later) but
+    // carries no token route, and nothing on disk could give it one.
+    const before = readIsoDoc(installDir);
+    expect(before.services.wayflow).toBeDefined();
+    expect(before.services.wayflow.environment?.CINATRA_BRIDGE_TOKEN).toBeUndefined();
+    expect(isolatedComposeHasA2aPeers(before)).toBe(false);
+
+    let upCalled = false;
+    const err = await runIsolatedA2aPeers(["start"], {
+      targetDir: installDir,
+      log: () => {},
+      deps: peerAwareDeps({ runCompose: () => { upCalled = true; return { status: 0 }; } }),
+    }).then(() => null, (e) => e);
+
+    // THE FIX: the self-heal reproduces the install's own choice, so it
+    // regenerates cleanly and the peers actually start.
+    expect(err).toBe(null);
+    expect(upCalled).toBe(true);
+
+    const after = readIsoDoc(installDir);
+    expect(isolatedComposeHasA2aPeers(after)).toBe(true);
+    // …and the instance is still LEAN: the self-heal did not turn the agent
+    // runtime on behind the operator's back by baking in a route for it.
+    expect(after.services.wayflow.environment?.CINATRA_BRIDGE_TOKEN).toBeUndefined();
+  });
+
+  it("BLOCKING B, the other direction: a row that did NOT opt out still has the WayFlow route demanded", async () => {
+    // Same inlining Compose, same tokenless fixture — but this install never
+    // opted out, so the wiring invariant's WayFlow arm must still refuse. This
+    // is the over-fix guard: threading `false` unconditionally (or dropping the
+    // arm from this caller) would silently self-heal a BROKEN runtime into
+    // place for an instance that does want one.
+    const installDir = path.join(sandbox, "iso2654r6-a2a-full");
+    await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso2654r6a2afull",
+        "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ],
+      // The install itself runs on a PRESERVING Compose (so it completes: the
+      // `env_file:` reference carries the route). The a2a run below then meets
+      // an INLINING one — an engine downgrade, or a different machine.
+      { log: () => {}, deps: isolatedDeps() },
+    );
+    expect(registryRow(installDir).row.wayflow).toBeUndefined();
+
+    const err = await runIsolatedA2aPeers(["start"], {
+      targetDir: installDir,
+      log: () => {},
+      deps: peerAwareDeps({
+        runCompose: () => {
+          throw new Error("runCompose must not be reached: the WayFlow route is still demanded for this row");
+        },
+      }),
+    }).then(() => null, (e) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/a2a-peers services and could not be regenerated/i);
   });
 });

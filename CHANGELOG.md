@@ -170,6 +170,45 @@ project adheres to [Semantic Versioning](https://semver.org/).
   command an operator runs to restart it. `stop` passes it too, so `rm` addresses
   an identically interpolated document.
 
+  That command can now also REWRITE the recorded compose, and can REFUSE to
+  start. `cinatra instance wayflow start` is the documented hand-start for an
+  install that opted out of the runtime, and a `--no-wayflow` install's recorded
+  compose never had a bridge-token route rendered into it at all — the render
+  invariant is gated on the same opt-out that skipped provisioning the env file.
+  A placeholder already IN the file can be resolved by `--env-file .env.local`;
+  a directive the render never wrote cannot be. So the command now re-derives
+  that generated file, with WayFlow in scope, once the env file is provisioned
+  and before the `up` — the ONLY moment at which the repair reaches the
+  container this run starts. It runs on `start` only, never on `stop`, and only
+  when the recorded document carries no working route under either render route:
+  a document that is already wired is left byte-identical and no regeneration
+  runs at all. Because the re-derive can ENLARGE the instance's port map — a
+  compose predating the profile-gated services gains a `wayflow` service on this
+  instance's own offset host port — the command also re-points `.env.local` at
+  what it allocated, through the same writer the install path uses. Without that
+  the runtime would start on the offset port while the app kept dialling the
+  default one: a dead port, or, with a default stack also up, ANOTHER instance's
+  runtime, which is worse because it answers. An unchanged map re-points nothing.
+  And when the file genuinely cannot be re-derived in place (an ambiguous legacy
+  band offset, a shifted base band) the recorded document is validated against
+  the same wiring invariant rather than started on trust — so this command can
+  now FAIL an operator's start, attributably and with the recovery named,
+  instead of bringing up a runtime already known to have no bridge token.
+
+  `cinatra instance a2a start` no longer turns the agent runtime back on for an
+  install that asked for none. That command self-heals a stale isolated compose
+  by re-deriving it (so the a2a-peer services it needs are present), and the
+  re-derive demanded a WayFlow bridge-token route unconditionally — a route a
+  `--no-wayflow` install deliberately never provisioned. On a Compose that
+  inlines env files the re-derive therefore failed the wiring invariant, the
+  self-heal swallowed that as a warning, and the command dead-ended on "the
+  isolated compose does not include the a2a-peers services and could not be
+  regenerated in place" for an instance whose compose is exactly what its own
+  install wrote. An isolated install now RECORDS its WayFlow choice on the
+  registry row, and the self-heal reproduces it: a lean install stays lean, and
+  every instance that did not opt out — including every instance recorded before
+  this field existed — keeps the route demanded exactly as before.
+
   Two things found while recording that command's real-run transcript, both of
   which had to be fixed for it to reach the right stack at all. `cinatra instance
   wayflow start` looks its instance up by install directory: the registry records

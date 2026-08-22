@@ -12115,18 +12115,23 @@ function ensureWayflowBridgeEnv(
  *
  * `wayflow: true` is passed EXPLICITLY, never left to the regenerator's
  * default — this command IS the act of turning the runtime on, so demanding
- * the token route is what it must do. Contrast the `instance a2a` self-heal
- * (`regenerateIsolatedComposeInPlace` called with no `wayflow` argument,
- * defaulting to `true` — cinatra#2654 round-5 review, NB3, disclosed and
- * untouched): that instance may never have asked to run wayflow at all, so the
- * SAME default there wrongly demands a route a `--no-wayflow` install never
- * needed. Here the explicit `true` is not a default threaded blindly; it is
- * what the command means.
+ * the token route is what it must do. Contrast the `instance a2a` self-heal,
+ * which now threads the install's RECORDED WayFlow choice instead
+ * (`recordedWayflowChoice(row)` — cinatra#2654 round-6 review, BLOCKING B):
+ * that instance may never have asked to run wayflow at all, and the old
+ * `wayflow = true` default there demanded a route a `--no-wayflow` install
+ * never needed. Here the explicit `true` is not a default threaded blindly; it
+ * is what the command means.
  *
  * A non-isolated row (default/attach/external/co-use), or one with no on-disk
  * generated compose to read, skips the whole detection — not merely a no-op.
  *
- * @returns {Promise<{ regenerated: boolean, reason: string, skipped?: string|null }>}
+ * When the re-derive ENLARGED the port map, `.env.local` is re-pointed through
+ * the install path's own `writeIsolatedAppEnv` before the caller's `up` runs —
+ * see the comment at that step (cinatra#2654 round-6 review, BLOCKING A).
+ *
+ * @returns {Promise<{ regenerated: boolean, reason: string, skipped?: string|null,
+ *                     ports?: object|null, envRepointed?: boolean }>}
  */
 async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log = console.log, deps = {} } = {}) {
   const isolatedFilename = deps.ISOLATED_COMPOSE_FILENAME ?? ISOLATED_COMPOSE_FILENAME;
@@ -12150,6 +12155,18 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
   // diagnosed fallback+--no-wayflow chain, not a corrupted checkout; the
   // in-place regenerator's own operator-edits policy is the right place for
   // that, and it already runs on every OTHER recorded-compose reconcile path.
+  //
+  // cinatra#2654 round-6 review, NB2 (considered, deliberately NOT unified with
+  // `isGeneratedComposeShape` in install.mjs): the two guards answer DIFFERENT
+  // questions. That one asks "is this a CLI-generated document I can diff the
+  // re-render against", so it also demands a `services` map. This one asks only
+  // "can I read the file at all", and a document with no `services` map must
+  // keep FALLING THROUGH to the regeneration below — a compose that declares no
+  // wayflow service is exactly the legacy shape the round-2 fix exists to
+  // repair, and adopting the stricter predicate here would turn that repair
+  // back into a silent no-op. An array document differs only in spelling: it
+  // has no `services` either, so it reaches the same regeneration by the same
+  // route. Unifying them would cost behaviour, not buy it.
   if (!doc || typeof doc !== "object") return { regenerated: false, reason: "unparseable" };
 
   // cinatra#2654 round-5 review (codex convergence): do NOT classify the
@@ -12204,7 +12221,42 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
   const regenerate =
     deps.regenerateIsolatedCompose ?? (await import("./install.mjs")).regenerateIsolatedCompose;
   const regen = await regenerate({ targetDir: repoRoot, row, log, wayflow: true, deps });
-  return { regenerated: !!regen.regenerated, skipped: regen.skipped ?? null, reason: "route-repaired" };
+
+  // cinatra#2654 (round 6, BLOCKING A) — a regeneration can ENLARGE the port
+  // map, and the app must be re-pointed at what it enlarged it to.
+  //
+  // The legacy case this repair exists for is a recorded compose with NO
+  // `wayflow` service at all (pre-cinatra-cli#113 profile-gated-service baking).
+  // Re-deriving it ADDS that service, on this instance's ISOLATED host port
+  // (`3010 + offset`), and `regenerateIsolatedComposeInPlace` persists the
+  // enlarged map to the registry row. `.env.local`, however, still names the
+  // DEFAULT `:3010` in WAYFLOW_BASE_URL — the file was written when the map
+  // held no wayflow entry, so the install's own re-point had nothing to write.
+  // The `up` two steps below then starts the runtime on the remapped port while
+  // the app dials the default one: a dead port, or — with a default stack also
+  // running — ANOTHER instance's runtime, which is the worse failure because it
+  // answers. That is cinatra-cli#231's defect, reached through this command.
+  //
+  // The install path closes it by re-pointing `.env.local` from the EFFECTIVE
+  // port map (`writeIsolatedAppEnv`, src/install.mjs). This runs the SAME
+  // writer, on the same map, so the two routes cannot disagree — and only when
+  // the map actually MOVED, so the common "regenerated, nothing changed"
+  // reconcile still leaves the operator's env file untouched.
+  const ports = regen.regenerated && regen.ports && typeof regen.ports === "object" ? regen.ports : null;
+  const install = await import("./install.mjs");
+  const same = deps.samePortMaps ?? install.samePortMaps;
+  const portsMoved = !!ports && !same(row.ports ?? {}, ports);
+  if (portsMoved) {
+    const repoint = deps.writeIsolatedAppEnv ?? install.writeIsolatedAppEnv;
+    repoint({ targetDir: repoRoot, appPort: row.appPort ?? null, ports, log });
+  }
+  return {
+    regenerated: !!regen.regenerated,
+    skipped: regen.skipped ?? null,
+    reason: "route-repaired",
+    ports,
+    envRepointed: portsMoved,
+  };
 }
 
 // `argv` is the legacy rest (argv.slice(2)); its first token is the start|stop verb.

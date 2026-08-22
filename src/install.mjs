@@ -96,6 +96,7 @@ import {
   releaseInstance,
   getInstance,
   listInstances,
+  recordedWayflowChoice,
 } from "./instance-registry.mjs";
 import {
   writeMarker,
@@ -3335,6 +3336,11 @@ async function executeIsolatedInstall({ targetDir, opts, resolvedSha, log = cons
       ports,
       appPort,
       offset, // cinatra-cli#113: persist for deterministic in-place regeneration
+      // cinatra#2654 (round 6): persist the install's WayFlow choice, so a LATER
+      // command that re-derives this compose for its own reasons (the `instance
+      // a2a` self-heal) reproduces the install the operator asked for instead of
+      // re-enabling a runtime they opted out of. Only the opt-out is recorded.
+      wayflow: opts.wayflow !== false,
       repoUrl: opts.repoUrl,
       ref: opts.ref,
       sha: resolvedSha,
@@ -4535,15 +4541,31 @@ function rewriteUrlPort(existing, newPort, fallbackProto, fallbackPath = "") {
  * otherwise setup connects to the DEFAULT/conflicting stack). The remapped host
  * ports come from the generated compose's per-service `ports` map. Existing URL
  * credentials / db-name are preserved; only the port is rewritten.
+ *
+ * cinatra#2654 (round 6): EXPORTED so `instance wayflow start`'s route repair
+ * re-points `.env.local` through this ONE writer rather than a second, parallel
+ * spelling of the same rule — that command's regeneration can ENLARGE the port
+ * map (a legacy compose with no `wayflow` service gets one, on an isolated host
+ * port), and the app must be pointed at the port the container it is about to
+ * start actually publishes. See `reconcileIsolatedWayflowRoute` (src/index.mjs).
  */
-function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = console.log }) {
+export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = console.log }) {
   const envPath = path.join(targetDir, ".env.local");
   if (!existsSync(envPath)) return;
-  const baseUrl = `http://localhost:${appPort}`;
   let body = readFileSync(envPath, "utf8");
-  body = upsertEnvKey(body, "PORT", String(appPort));
-  body = upsertEnvKey(body, "BETTER_AUTH_URL", baseUrl);
-  body = upsertEnvKey(body, "NEXT_PUBLIC_BETTER_AUTH_URL", baseUrl);
+  // The app-port keys are written only when an app port is actually RECORDED.
+  // Every install route allocates one and hands it over, so nothing changes
+  // there; the round-6 re-point caller above reads `row.appPort` off the
+  // registry, and a legacy/hand-edited row that carries none must leave the
+  // operator's own PORT alone rather than write `PORT=undefined`. The infra-URL
+  // re-point below does not depend on the app port and still runs.
+  const appPortRecorded = Number.isInteger(appPort) && appPort > 0;
+  if (appPortRecorded) {
+    const baseUrl = `http://localhost:${appPort}`;
+    body = upsertEnvKey(body, "PORT", String(appPort));
+    body = upsertEnvKey(body, "BETTER_AUTH_URL", baseUrl);
+    body = upsertEnvKey(body, "NEXT_PUBLIC_BETTER_AUTH_URL", baseUrl);
+  }
 
   // Read the current env values (to preserve credentials/db-name on rewrite).
   const cur = parseEnvBody(body);
@@ -4614,7 +4636,10 @@ function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = console.log
   ]
     .filter(Boolean)
     .join(" ");
-  log(`  Isolated app port ${appPort}; infra URLs re-pointed (${remapped}) in .env.local.`);
+  log(
+    `  Isolated app port ${appPortRecorded ? appPort : "(none recorded — left as-is)"}; ` +
+      `infra URLs re-pointed (${remapped}) in .env.local.`,
+  );
 }
 
 /** Minimal `.env` body → { KEY: value } map (last wins; quotes stripped). Used
@@ -5257,7 +5282,7 @@ function effectiveIsolatedPorts(targetDir, recordedPorts = {}) {
  *  the shared `normalisePortList` — the same coercion `firstSharedServicePortMismatch`
  *  compares with — so a benign spelling difference can never read as a port
  *  disagreement here while a genuine one does there. Pure. */
-function samePortMaps(a, b) {
+export function samePortMaps(a, b) {
   const ka = Object.keys(a ?? {}).sort();
   const kb = Object.keys(b ?? {}).sort();
   if (ka.length !== kb.length || ka.some((k, i) => k !== kb[i])) return false;
@@ -5985,7 +6010,23 @@ export async function runIsolatedA2aPeers(argv = [], { targetDir = null, log = c
   let doc = readDoc();
   if (!doc || !isolatedComposeHasA2aPeers(doc)) {
     try {
-      const regen = await regenerateIsolatedComposeInPlace({ targetDir: dir, row, log, deps });
+      // cinatra#2654 (round 6, BLOCKING B): thread the install's RECORDED
+      // WayFlow choice. This caller regenerates the compose for an UNRELATED
+      // reason (the a2a-peer services are missing from a pre-profile-baking
+      // document), and the regenerator's `wayflow` default is `true` — so a
+      // `--no-wayflow` install's self-heal re-enabled the runtime it opted out
+      // of: the re-derived document carried a wayflow service whose bridge-token
+      // route that install never provisioned, which is a tokenless runtime one
+      // `docker compose up --profile wayflow` away. `recordedWayflowChoice`
+      // reads `true` for every row that did not opt out (including every legacy
+      // row), so nothing else changes.
+      const regen = await regenerateIsolatedComposeInPlace({
+        targetDir: dir,
+        row,
+        log,
+        wayflow: recordedWayflowChoice(row),
+        deps,
+      });
       if (regen.regenerated) doc = readDoc();
     } catch (err) {
       // cinatra-cli#237 round-4 non-blocking: this is the SECOND caller of
@@ -7928,7 +7969,9 @@ export function moveExistingCheckoutToRef({
   return sha;
 }
 
-// Test-only seam onto otherwise-private pure helpers (cinatra-cli#237 round 4:
-// `samePortMaps` has no other caller-visible surface to assert its comparison
-// semantics against directly).
+// Test-only seam onto otherwise-private pure helpers (cinatra-cli#237 round 4).
+// `samePortMaps` is a NAMED export as of cinatra#2654 round 6 — `instance
+// wayflow start`'s route repair asks it whether a regeneration actually moved
+// the port map before it re-points `.env.local` — and stays reachable here so
+// the round-4 tests that pin its comparison semantics keep their seam.
 export const __test = { samePortMaps };

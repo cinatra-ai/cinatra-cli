@@ -217,3 +217,52 @@ describe("runDevWayflow — the printed endpoint is derived, not hardcoded", () 
     expect(INDEX_SRC).not.toMatch(/\bWAYFLOW_LOCAL_URL\b/);
   });
 });
+
+// ===========================================================================
+// cinatra#2654 round 6, NB1 — STATIC pin on the route-repair CALL SITE.
+//
+// `reconcileIsolatedWayflowRoute` has direct behavioural coverage
+// (install-flow.test.mjs), but nothing pinned that `runDevWayflow` still CALLS
+// it, or where. Its position is the whole contract: AFTER the bridge-token
+// provisioning gate (the re-derive must see the file it is about to reference
+// or inline) and BEFORE the `up` (a repair that lands after the container
+// starts repairs nothing this run). Delete the call, or move it either side of
+// those two, and every behavioural test in the suite still passes.
+// ===========================================================================
+describe("runDevWayflow — the isolated WayFlow route repair is wired, in order", () => {
+  const body = INDEX_SRC.slice(INDEX_SRC.indexOf("async function runDevWayflow")).split("\n}\n")[0];
+
+  const at = (needle) => {
+    const i = body.indexOf(needle);
+    expect(i, `runDevWayflow no longer contains ${needle}`).toBeGreaterThan(-1);
+    return i;
+  };
+
+  it("calls the reconcile at all", () => {
+    expect(body).toMatch(/await reconcileIsolatedWayflowRoute\(\{/);
+  });
+
+  it("runs it AFTER the bridge-token provisioning gate and BEFORE the compose `up`", () => {
+    // The env file must exist before the re-derive: on a Compose that inlines,
+    // what the render inlines IS the wiring.
+    expect(at("ensureWayflowBridgeEnv(repoRoot)")).toBeLessThan(at("reconcileIsolatedWayflowRoute({"));
+    // …and the repaired file must be the one the `up` reads.
+    expect(at("reconcileIsolatedWayflowRoute({")).toBeLessThan(at("composeWayflowArgs(verb"));
+    expect(at("reconcileIsolatedWayflowRoute({")).toBeLessThan(at('spawnSync("docker"'));
+  });
+
+  it("runs on the `start` verb ONLY — `stop` never rewrites the recorded compose", () => {
+    const call = at("reconcileIsolatedWayflowRoute({");
+    // Walk back to the nearest enclosing `if (verb === "start") {` and confirm
+    // the call is genuinely INSIDE it (brace depth never returns to 0 between
+    // the guard and the call), rather than merely preceded by one.
+    const guard = body.lastIndexOf('if (verb === "start") {', call);
+    expect(guard, "the reconcile call is not guarded by a `start`-verb branch").toBeGreaterThan(-1);
+    let depth = 0;
+    for (const ch of body.slice(guard + 'if (verb === "start") {'.length, call)) {
+      if (ch === "{") depth += 1;
+      else if (ch === "}") depth -= 1;
+      expect(depth, "the reconcile call sits OUTSIDE the `start`-verb branch").toBeGreaterThanOrEqual(0);
+    }
+  });
+});
