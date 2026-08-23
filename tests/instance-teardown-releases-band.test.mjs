@@ -535,7 +535,7 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
     expect(rowFor(registryPath, "row1")).not.toBeNull();
   });
 
-  // ── The round-3 review HIGH: the reclaim must resolve the LEGACY sentinel ──
+  // ── The reclaim must resolve the LEGACY sentinel ─────────────────────────
   // A row written before cinatra-cli#35 records the literal "cinatra" as its
   // composeProject even when Compose derived the project from the checkout
   // BASENAME. The `down` path already compensates (`composeProjectArgForRow`
@@ -625,9 +625,9 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
     expect(forced.released).toBe(true);
   });
 
-  // cinatra-cli#232 review R4. The case above uses `custom-name`, a basename on
-  // which every plausible derivation agrees — so it could not catch a derivation
-  // that is merely CLOSE to Compose's. This one uses a DOTTED basename, where the
+  // The case above uses `custom-name`, a basename on which every plausible
+  // derivation agrees — so it could not catch a derivation that is merely CLOSE
+  // to Compose's. This one uses a DOTTED basename, where the
   // two rules part company: Compose deletes the dot (`cinatradev`), while the
   // old helper substituted it (`cinatra_dev`). The Docker stub answers honestly
   // about `cinatradev`, the name Compose really brought the stack up under, and

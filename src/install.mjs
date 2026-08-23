@@ -3933,13 +3933,13 @@ async function runInstallDown({ opts, log = console.log, deps = {} }) {
   }
 
   const plan = planInstanceTeardown(row, { volumes: opts.teardownExisting === true });
-  // cinatra-cli#232 review R4 (non-blocking): the echo and the typed confirm must
-  // name the project the commands ACTUALLY use, not the recorded literal. For a
-  // pre-cinatra-cli#35 sentinel row the real `down` OMITS `-p` (Compose re-derives
-  // the basename project, `composeProjectArgForRow`), so printing `-p cinatra`
-  // shows an operator — under `--dry-run` especially — a command line that is not
-  // the one that runs, and names something that targets nothing. Same reason the
-  // refusals were corrected to the resolved name; this is the one place short.
+  // The echo and the typed confirm must name the project the commands ACTUALLY
+  // use, not the recorded literal. For a pre-cinatra-cli#35 sentinel row the real
+  // `down` OMITS `-p` (Compose re-derives the basename project,
+  // `composeProjectArgForRow`), so printing `-p cinatra` shows an operator — under
+  // `--dry-run` especially — a command line that is not the one that runs, and
+  // names something that targets nothing. The refusals name the resolved project
+  // for the same reason.
   const downProjectArg = composeProjectArgForRow(row);
   // The project the stack really runs under: the recorded one, else the basename
   // Compose derives, else null (nothing derivable — then say so name-free).
@@ -4094,9 +4094,9 @@ export function computeDefaultProject(opts, targetDir) {
  *  where Compose uses `myinstance`, `cinatra+two` → `cinatra_two` where Compose
  *  uses `cinatratwo`.
  *
- *  That divergence is not cosmetic (cinatra-cli#232 review R4). The reclaim gate
- *  in `teardownInstance` inspects THIS name for a pre-cinatra-cli#35 sentinel
- *  row (`reclaimInspectProjectForRow`), and an empty answer RELEASES the row. A
+ *  That divergence is not cosmetic. The reclaim gate in `teardownInstance`
+ *  inspects THIS name for a pre-cinatra-cli#35 sentinel row
+ *  (`reclaimInspectProjectForRow`), and an empty answer RELEASES the row. A
  *  name Compose never used comes back truthfully empty, so a wrong derivation
  *  hands a live stack's host ports to the next install — the same failure the
  *  gate exists to refuse. The polarity matters: for the other consumer
@@ -5231,20 +5231,17 @@ function composeProjectArgForRow(row) {
  *  must REFUSE, exactly as it refuses an inspection that failed — never inspect
  *  some other project and read its emptiness as an all-clear.
  *
- *  KNOWN BOUNDARY (cinatra-cli#232 review R4, codex-confirmed). The derivation is
- *  faithful to Compose for every basename SHAPE — the character rule now matches
- *  `NormalizeProjectName` exactly, unicode and empty results included — but it
- *  reads the recorded path LEXICALLY (`path.resolve`, not `realpath`). If the
- *  LEAF of the recorded `installDir` was itself a symlink, Compose derived from
- *  the physical target's basename and we derive from the link's, so the gate can
- *  still inspect the wrong project. That case is NOT closable here: this branch
- *  only runs once the checkout is GONE, so the link no longer exists to resolve,
- *  and nothing else the row records (sentinel, compose files, ports, repo/ref)
- *  recovers the physical basename. Recording a realpath at install time would not
- *  help either — the rows that reach this gate were written by a PRE-#35 CLI.
- *  Closing it needs a different design: a global `docker ps -a` across all compose
- *  projects, matched back to the row by its recorded port set, refusing on zero or
- *  ambiguous matches. Filed as a separate hardening, not smuggled in here. */
+ *  KNOWN BOUNDARY. The derivation is faithful to Compose for every basename
+ *  SHAPE — the character rule matches `NormalizeProjectName` exactly, unicode and
+ *  empty results included — but it is LEXICAL: it reads the recorded path with
+ *  `path.resolve`, which never touches the filesystem, and by the time this branch
+ *  runs the checkout is GONE anyway. So the reach of this gate ends wherever
+ *  Compose's own working-directory resolution would differ from `path.resolve` of
+ *  the recorded `installDir`. Whether any such case exists in practice is NOT
+ *  established here: it was not reproduced against a running Compose, and reading
+ *  the reference implementation suggests the derivation is lexical on that side
+ *  too. Do not design against this boundary until a case is demonstrated with an
+ *  observed `docker compose config`. */
 function reclaimInspectProjectForRow(row) {
   const explicit = composeProjectArgForRow(row);
   if (explicit) return explicit;

@@ -47,9 +47,8 @@ describe("legacyBasenameProject (cinatra-cli#35)", () => {
   it("mirrors compose's basename-derived project (the legacy default behavior)", () => {
     expect(legacyBasenameProject("/Users/me/Code/cinatra")).toBe("cinatra");
     expect(legacyBasenameProject("/Users/me/Code/_TEST")).toBe("test");
-    // cinatra-cli#232 review R4: Compose DELETES characters outside
-    // `[a-z0-9_-]`; it does not substitute them. This expectation used to read
-    // "my_app" and locked the divergence in.
+    // Compose DELETES characters outside `[a-z0-9_-]`; it does not substitute
+    // them. This expectation used to read "my_app" and locked the divergence in.
     expect(legacyBasenameProject("/Users/me/Code/My.App")).toBe("myapp");
   });
 
