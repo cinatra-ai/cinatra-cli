@@ -4021,7 +4021,7 @@ async function runInstallDown({ opts, log = console.log, deps = {} }) {
       `Remove them (\`docker compose -p ${inspected} down -v\`) and re-run, or pass --force to release the row anyway.`,
     "inspect-failed":
       `the checkout ${row.installDir} is gone, so the row can only be released after PROVING no container of ` +
-      `${inspectTarget} is still running — and that check itself FAILED, so NOTHING was released. ` +
+      `${inspectTarget} still exists — and that check itself FAILED, so NOTHING was released. ` +
       `An inspection error is not an "all clear": containers may well be live and holding those ports. ` +
       `Fix the Docker error and re-run \`cinatra install --down\`, or pass --force to release the row without the proof.` +
       (result.error ? `\n  ${result.error.message}` : ""),
@@ -5212,7 +5212,22 @@ function composeProjectArgForRow(row) {
  *
  *  Null (nothing derivable from the recorded path) is NOT an answer. The caller
  *  must REFUSE, exactly as it refuses an inspection that failed — never inspect
- *  some other project and read its emptiness as an all-clear. */
+ *  some other project and read its emptiness as an all-clear.
+ *
+ *  KNOWN BOUNDARY (cinatra-cli#232 review R4, codex-confirmed). The derivation is
+ *  faithful to Compose for every basename SHAPE — the character rule now matches
+ *  `NormalizeProjectName` exactly, unicode and empty results included — but it
+ *  reads the recorded path LEXICALLY (`path.resolve`, not `realpath`). If the
+ *  LEAF of the recorded `installDir` was itself a symlink, Compose derived from
+ *  the physical target's basename and we derive from the link's, so the gate can
+ *  still inspect the wrong project. That case is NOT closable here: this branch
+ *  only runs once the checkout is GONE, so the link no longer exists to resolve,
+ *  and nothing else the row records (sentinel, compose files, ports, repo/ref)
+ *  recovers the physical basename. Recording a realpath at install time would not
+ *  help either — the rows that reach this gate were written by a PRE-#35 CLI.
+ *  Closing it needs a different design: a global `docker ps -a` across all compose
+ *  projects, matched back to the row by its recorded port set, refusing on zero or
+ *  ambiguous matches. Filed as a separate hardening, not smuggled in here. */
 function reclaimInspectProjectForRow(row) {
   const explicit = composeProjectArgForRow(row);
   if (explicit) return explicit;
