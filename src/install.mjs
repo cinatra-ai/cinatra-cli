@@ -4633,11 +4633,14 @@ const SYNTHESIZE_WHEN_ABSENT = new Set(["wayflow"]);
  * and whose ABSENCE is itself the leak. An absent key for any other service is
  * NEVER synthesized.
  *
- * @param {Iterable<string>|null} [movedServices]  restricted mode when non-null:
- *   the compose service names whose published host ports actually moved. In
- *   restricted mode that set decides one thing — whether this call may touch the
- *   APP keys at all; every infra key is decided by what the file publishes and
- *   by the value the env already carries (round-8 review, BLOCKING 2).
+ * @param {Iterable<string>|null} [movedServices]  the compose service names whose
+ *   published host ports actually moved. Non-null SELECTS restricted mode; the
+ *   set itself no longer decides anything. Every infra key is decided by what the
+ *   file publishes and by the value the env already carries (round-8 review,
+ *   BLOCKING 2), and whether the APP keys are in scope is the caller's to say —
+ *   it says so by passing an `appPort`, or `null` for "not this arm" (round-9
+ *   review, BLOCKING 1). A service in this set is the ROW lagging the FILE, which
+ *   is not an app move and may not be read as one.
  * @returns {false | { remapped: string }}  `false` when nothing was written
  *   (no `.env.local`, or a restricted re-point that found nothing to change);
  *   otherwise the space-separated `svc:port` summary of what it re-pointed.
@@ -4665,14 +4668,23 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
   // of what the operator had).
   const cur = parseEnvBody(body);
   const restricted = movedServices != null;
-  const moved = new Set(restricted ? Array.from(movedServices) : []);
-  // cinatra#2654 (round-8 review): the "nothing moved → do not touch the app
-  // keys at all" half of the rule below lives HERE, next to the rest of it,
-  // rather than in the caller passing `appPort: null` to mean it. `movedServices`
-  // then has exactly one job in this writer — deciding what a restricted
-  // re-point may say about the APP — now that a synthesizable infra key is
-  // decided by what the file publishes instead (`SYNTHESIZE_WHEN_ABSENT`).
-  const appPortRecorded = Number.isInteger(appPort) && appPort > 0 && (!restricted || moved.size > 0);
+  // cinatra#2654 (round-9 review, BLOCKING 1): whether a restricted re-point may
+  // touch the APP keys is the CALLER's decision, expressed by passing an
+  // `appPort` at all — the caller is what knows whether the APP moved, and this
+  // writer cannot tell. Round 8 read it off `movedServices` instead, and in the
+  // same commit that set became FILE-vs-ROW: non-empty whenever the row lags the
+  // file for ANY service, which is the crash-window state the every-start
+  // re-point exists to repair. An infra-only lag then rewrote three app-identity
+  // keys on a start where nothing about the app had moved, to a value taken from
+  // the row. See `reconcileIsolatedWayflowRoute` (src/index.mjs) for which arm
+  // passes one.
+  const appPortRecorded = Number.isInteger(appPort) && appPort > 0;
+  // Whether an app key was actually WRITTEN, so the restricted summary can name
+  // it: a re-point that touched the app keys and no infra key at all used to
+  // report an empty set, which this writer labelled "app port only" and the
+  // command then announced as an infra re-point. Both lines now say what
+  // happened (round-9 review, BLOCKING 1).
+  let wroteApp = false;
   if (appPortRecorded) {
     const baseUrl = `http://localhost:${appPort}`;
     // cinatra#2654 (round 7, codex convergence): under a RESTRICTED re-point,
@@ -4690,10 +4702,17 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
     // applies exactly as it did before this command ran. Only `wayflow` is
     // synthesized from nothing — see `SYNTHESIZE_WHEN_ABSENT`.
     const appKeyDiffers = (key, value) => !restricted || (cur[key] != null && String(cur[key]) !== value);
-    if (appKeyDiffers("PORT", String(appPort))) body = upsertEnvKey(body, "PORT", String(appPort));
-    if (appKeyDiffers("BETTER_AUTH_URL", baseUrl)) body = upsertEnvKey(body, "BETTER_AUTH_URL", baseUrl);
+    if (appKeyDiffers("PORT", String(appPort))) {
+      body = upsertEnvKey(body, "PORT", String(appPort));
+      wroteApp = true;
+    }
+    if (appKeyDiffers("BETTER_AUTH_URL", baseUrl)) {
+      body = upsertEnvKey(body, "BETTER_AUTH_URL", baseUrl);
+      wroteApp = true;
+    }
     if (appKeyDiffers("NEXT_PUBLIC_BETTER_AUTH_URL", baseUrl)) {
       body = upsertEnvKey(body, "NEXT_PUBLIC_BETTER_AUTH_URL", baseUrl);
+      wroteApp = true;
     }
   }
 
@@ -4827,7 +4846,7 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
   }
   // Reports what was WRITTEN, never merely what was in the map: under a
   // restricted re-point a service can be present and deliberately left alone.
-  const remapped = [
+  const infraRemapped = [
     ["postgres", `db:${pgPort}`],
     ["redis", `redis:${redisPort}`],
     ["nango-server", `nango:${nangoPort}`],
@@ -4838,11 +4857,16 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
     ["neo4j", `neo4j:${neo4jBoltPort}`],
   ]
     .filter(([svc]) => wrote.has(svc))
-    .map(([, label]) => label)
-    .join(" ");
+    .map(([, label]) => label);
+  // The app is not a compose service, so it is not in the table above; under a
+  // RESTRICTED re-point it is named here when it was written, so neither this
+  // writer's line nor the command's can call an app-only re-point an infra one
+  // (round-9 review, BLOCKING 1). The install path's own line names the app port
+  // separately and is left exactly as it was.
+  const remapped = [...(restricted && wroteApp ? [`app:${appPort}`] : []), ...infraRemapped].join(" ");
   if (restricted) {
     if (!changed) return false;
-    log(`  ↻ .env.local re-pointed at the ports this instance publishes (${remapped || "app port only"}).`);
+    log(`  ↻ .env.local re-pointed at the ports this instance publishes${remapped ? ` (${remapped})` : ""}.`);
     return { remapped };
   }
   log(

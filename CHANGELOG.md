@@ -203,18 +203,29 @@ project adheres to [Semantic Versioning](https://semver.org/).
   carries no credentials and whose absence IS the leak, since the app then dials
   the default `:3010`.
 
+  The app-identity keys are narrower still. `PORT`, `BETTER_AUTH_URL` and
+  `NEXT_PUBLIC_BETTER_AUTH_URL` describe the app, not the port map, so only a
+  re-derive that MOVED the map can rewrite them, and only where the file already
+  carries a value that disagrees with the recorded app port. The move is measured
+  on the file this run re-derived, before against after. A start that merely
+  verifies leaves all three exactly as the operator set them, and so does a
+  re-derive that moved no port, however far the registry row lags the compose
+  file for some other service.
+
   Two consequences to know before running it. First, the re-point is not limited
   to WayFlow: `SUPABASE_DB_URL`, `REDIS_URL`, the two Nango URLs, the two agent
   registry URLs and `NEO4J_URI` are re-pointed as well when the file carries them
   and their port disagrees with what this instance publishes. `.env.local` is a
   file operators maintain by hand, so the command now also PRINTS the
-  `service:port` pairs it re-pointed, before the `up`. Second, the ports it
-  speaks are the ports the generated compose it is about to bring up PUBLISHES,
-  never a recorded row that lags that file. When a shared service's recorded port
-  disagrees with what the file publishes, the command refuses the start, names
-  the service and both ports, and changes nothing; it re-reads the file once more
-  immediately before the `up`, so the launch is never authorised by a reading its
-  own writes have had time to invalidate.
+  `service:port` pairs it re-pointed, before the `up` — and `app:<port>` when it
+  wrote the app keys, so the line can never call an app-only re-point an infra
+  one. Second, the ports it speaks are the ports the generated compose it is
+  about to bring up PUBLISHES, never a recorded row that lags that file. When a
+  shared service's recorded port disagrees with what the file publishes, the
+  command refuses the start, names the service and both ports, and changes
+  nothing; it re-reads the file once more immediately before the `up`, so the
+  launch is never authorised by a reading its own writes have had time to
+  invalidate.
 
   The command also CLEARS a recorded `--no-wayflow` opt-out on the instance's
   registry row, on every path it returns from, because starting the runtime by

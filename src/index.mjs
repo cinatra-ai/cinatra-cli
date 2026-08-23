@@ -12312,7 +12312,7 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
    * operator did not have — for a key they rely on the runtime's own default
    * for, a synthesized URL would carry no credentials and break it.
    */
-  const repointEnv = async (effectivePorts) => {
+  const repointEnv = async (effectivePorts, { appKeys = false } = {}) => {
     const none = { envRepointed: false, repointed: "" };
     if (!effectivePorts || typeof effectivePorts !== "object") return none;
     // `writeIsolatedAppEnv` is a silent no-op without the file; skip the import too.
@@ -12330,18 +12330,51 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
     const repoint = deps.writeIsolatedAppEnv ?? install.writeIsolatedAppEnv;
     const written = repoint({
       targetDir: repoRoot,
-      // The app-port keys belong to a MOVE, not to the every-start verify: the
-      // recorded `appPort` describes the app, not the port map, and rewriting
-      // an operator's PORT on every start of an install nothing moved is not a
-      // repair. On a move this is the install path's own full re-point. The
-      // writer applies that rule itself, from `movedServices` (round-8 review).
-      appPort: row.appPort ?? null,
+      // cinatra#2654 (round-9 review, BLOCKING 1) — the app-identity keys belong
+      // to an APP move, and the ONLY thing on this route that can move the app is
+      // this run's OWN re-derive. So the caller decides (`appKeys`), and it says
+      // yes on exactly one arm: the regeneration below, whose enlarged map IS the
+      // install path's full re-point reached through this command. The
+      // every-start verify says no.
+      //
+      // Round 8 handed that decision to the writer, keyed on `movedServices` —
+      // and in the SAME commit the moved set became FILE-vs-ROW (see
+      // `convergedPorts`), so it is non-empty exactly when the row lags the file
+      // for any service. That is the crash-window state this repair exists for:
+      // an infra-only lag then rewrote `PORT`, `BETTER_AUTH_URL` and
+      // `NEXT_PUBLIC_BETTER_AUTH_URL` on a start where nothing about the app had
+      // moved, from the RECORDED row — the source this same commit ruled may not
+      // decide the map, and with no file to check it against, since the app is
+      // not a compose service. The recorded `appPort` describes the app, not the
+      // port map, and rewriting an operator's PORT on every start of an install
+      // nothing moved is not a repair.
+      //
+      // `movedServices` is deliberately NOT part of this: it compares the FILE
+      // against the ROW, so a lag this run did not produce would license the
+      // rewrite all over again (round-9 codex convergence). The caller compares
+      // the map BEFORE its re-derive with the map AFTER it, which is the only
+      // reading of "the app's own install moved" this route has.
+      appPort: appKeys ? (row.appPort ?? null) : null,
       ports: effectivePorts,
       log,
       movedServices,
     });
     return { envRepointed: !!written, repointed: (written && written.remapped) || "" };
   };
+
+  /**
+   * cinatra#2654 (round-9 review, NB 4) — the OFFSET this run speaks, tracked the
+   * way the install path tracks it (`reconvergeIsolated`, src/install.mjs): the
+   * recorded one until a regeneration DERIVES and PERSISTS a different one, and
+   * that one afterwards. The gates read it to explain a divergence ("its band
+   * offset also moved"), so a legacy row that carried none, repaired by the
+   * re-derive below, would otherwise leave every later gate — this reconcile's
+   * own second gate and the caller's last one before the `up` — judging with an
+   * offset this run has already replaced. Stricter, and fail-closed, but it
+   * reads an in-band gain as a disagreement; the install path does not, and the
+   * two run the same function on the same file.
+   */
+  let effectiveOffset = Number.isInteger(row.offset) && row.offset > 0 ? row.offset : null;
 
   /**
    * cinatra#2654 (round-8 review, BLOCKING 1) — the map this command SPEAKS is
@@ -12408,7 +12441,7 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
       ports: effective,
       composeProject: row.composeProject,
       registryPath: deps.instanceRegistryPath,
-      offset: Number.isInteger(row.offset) && row.offset > 0 ? row.offset : null,
+      offset: effectiveOffset,
       unchangedClause:
         `Nothing was started, and nothing about this instance's ports was changed: not ` +
         `${isolatedFilename}, not its registry row, not .env.local. (This command re-provisions this ` +
@@ -12422,9 +12455,19 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
   const preRepairPorts = await convergedPorts(doc, row.ports ?? {});
 
   if (alreadyWired) {
+    // The every-start VERIFY: no regeneration ran, so nothing about the app can
+    // have moved, so the app-identity keys are out of scope (round-9 review,
+    // BLOCKING 1). The infra keys are decided as before, by what the file
+    // publishes and what the env already carries.
     const env = await repointEnv(preRepairPorts);
     await clearRecordedOptOut();
-    return { regenerated: false, reason: "already-wired", ports: preRepairPorts, ...env };
+    return {
+      regenerated: false,
+      reason: "already-wired",
+      ports: preRepairPorts,
+      offset: effectiveOffset,
+      ...env,
+    };
   }
 
   log(
@@ -12469,20 +12512,48 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
   // reports (or, when it validly SKIPPED, the recorded row — the lagging-row
   // case in full). Same rule, same helper and same refusal as the already-wired
   // arm above; the regenerator's map only answers for what the re-read cannot.
+  // The offset a regeneration DERIVED and persisted this run supersedes the
+  // recorded one for every gate after it, exactly as on the install path
+  // (`reconvergeIsolated`, src/install.mjs — round-9 review, NB 4).
+  if (regen.regenerated && Number.isInteger(regen.offset) && regen.offset > 0) effectiveOffset = regen.offset;
   const ports = await convergedPorts(readComposeDoc(), regenPorts ?? preRepairPorts);
-  const env = await repointEnv(ports);
+  // The app keys belong to a re-derive that actually MOVED this install's map:
+  // the enlarged map is the one thing on this route that can leave the app's own
+  // keys behind, and it is the install path's own full re-point reached through
+  // this command (round-9 review, BLOCKING 1).
+  //
+  // The comparison is BEFORE-vs-AFTER the re-derive, on the two maps the FILE
+  // published, and never the file against the ROW (round-9 codex convergence):
+  // a row that already lagged on some unrelated service describes a state this
+  // run did not create, and reading it as a move rewrites the operator's app
+  // keys for a regeneration that moved nothing — the round-8 defect, narrowed to
+  // this arm rather than removed from it.
+  const sameMaps = deps.samePortMaps ?? (await import("./install.mjs")).samePortMaps;
+  const regenMovedMap = !!regen.regenerated && !sameMaps(preRepairPorts ?? {}, ports ?? {});
+  const env = await repointEnv(ports, { appKeys: regenMovedMap });
   await clearRecordedOptOut();
   return {
     regenerated: !!regen.regenerated,
     skipped: regen.skipped ?? null,
     reason: "route-repaired",
     ports,
+    offset: effectiveOffset,
     ...env,
   };
 }
 
 // `argv` is the legacy rest (argv.slice(2)); its first token is the start|stop verb.
-async function runDevWayflow(argv = []) {
+//
+// `deps` is the test seam (cinatra#2654 round-9 review, NB 2): the four
+// boundaries this command crosses before the `up` — the compose-availability
+// probe, the checkout root, the bridge-token provisioning and the route
+// reconcile — plus the launch itself. It exists so the LAST gate before the `up`
+// can be exercised BEHAVIOURALLY: a test lets the REAL reconcile run, rewrites
+// the compose file inside the window that reconcile opened, and asserts this
+// command then refuses to launch. Pinning that gate by source-text ordering
+// alone left a later arm change free to stop returning a map and silently
+// disable it with every test still green. Production passes nothing.
+async function runDevWayflow(argv = [], deps = {}) {
   rejectTailscaleAuthkeyFlag(argv);
   const verb = String(argv[0] ?? "").trim();
   if (verb !== "start" && verb !== "stop") {
@@ -12501,13 +12572,13 @@ async function runDevWayflow(argv = []) {
         `Expected: cinatra instance wayflow <start|stop>.`,
     );
   }
-  if (!isComposeAvailable()) {
+  if (!(deps.isComposeAvailable ?? isComposeAvailable)()) {
     throw new Error(
       "`docker compose` is not available on PATH. Install Docker + the compose plugin, then retry.",
     );
   }
-  const repoRoot = getRepoRoot();
-  if (verb === "start" && !ensureWayflowBridgeEnv(repoRoot)) {
+  const repoRoot = (deps.getRepoRoot ?? getRepoRoot)();
+  if (verb === "start" && !(deps.ensureWayflowBridgeEnv ?? ensureWayflowBridgeEnv)(repoRoot)) {
     process.exitCode = 1;
     return;
   }
@@ -12519,15 +12590,22 @@ async function runDevWayflow(argv = []) {
     // cheap read of the small registry file for THIS checkout's row, mirroring
     // `wayflowEndpointForCheckout` just above.
     const row = findInstanceRowByInstallDir(readInstanceRegistrySafe().registry, repoRoot);
-    const route = await reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row });
+    const reconcile = deps.reconcileIsolatedWayflowRoute ?? reconcileIsolatedWayflowRoute;
+    const route = await reconcile({ repoRoot, composeFiles, row });
     // cinatra#2654 (round 7 review, NB4): REPORT the re-point. `.env.local` is
     // the operator's own file and this command may have just rewritten keys in
     // it — silently changing a hand-maintained file and then starting
     // containers is not something an operator should have to diff for. Naming
     // the `svc:port` pairs also tells them which endpoints this start moved.
+    // cinatra#2654 (round-9 review, BLOCKING 1): the line says what it
+    // re-pointed, not what it usually re-points. The re-point can write the
+    // app-identity keys and no infra key at all (a re-derive that enlarged the
+    // map onto an env already naming every service correctly), and this line
+    // called that "this instance's own infra ports". The writer now names the
+    // app port in the summary too, so the parenthetical answers the sentence.
     if (route?.envRepointed) {
       console.log(
-        `Re-pointed .env.local at this instance's own infra ports before starting` +
+        `Re-pointed .env.local at the ports this instance publishes before starting` +
           `${route.repointed ? ` (${route.repointed})` : ""}.`,
       );
     }
@@ -12556,7 +12634,12 @@ async function runDevWayflow(argv = []) {
         targetDir: repoRoot,
         ports: route.ports,
         composeProject: row.composeProject,
-        offset: Number.isInteger(row.offset) && row.offset > 0 ? row.offset : null,
+        // The offset the RECONCILE speaks, not the row's (round-9 review, NB 4):
+        // a re-derive that repaired a legacy row's missing offset persisted the
+        // new one, and this gate must judge with the same offset the reconcile's
+        // own gates did — the parity the install path already keeps
+        // (`reconvergeIsolated`, src/install.mjs).
+        offset: Number.isInteger(route.offset) && route.offset > 0 ? route.offset : null,
       });
     }
   }
@@ -12571,7 +12654,7 @@ async function runDevWayflow(argv = []) {
       ? `Starting the WayFlow agent runtime (${shownCmd}) ...`
       : `Stopping the WayFlow agent runtime (${shownCmd}) ...`,
   );
-  const result = spawnSync("docker", args, {
+  const result = (deps.spawnSync ?? spawnSync)("docker", args, {
     cwd: repoRoot,
     stdio: ["ignore", "inherit", "inherit"],
   });
@@ -15252,6 +15335,11 @@ export {
   // it can be exercised directly against a real generated isolated compose
   // (the fail-first regression coverage), not only through the live spawn.
   reconcileIsolatedWayflowRoute,
+  // cinatra#2654 (round-9 review, NB 2) — the command itself, exported with its
+  // `deps` seam so the LAST gate before the `up` is pinned by BEHAVIOUR: the
+  // compose file is rewritten inside the window the reconcile opens, and the
+  // launch must refuse rather than bind whatever the file now says.
+  runDevWayflow,
   // cinatra-cli#240 — the printed start endpoint, derived from the instance's
   // recorded port map instead of a hardcoded default.
   recordedWayflowHostPort,
