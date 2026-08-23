@@ -625,6 +625,91 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
     expect(forced.released).toBe(true);
   });
 
+  // cinatra-cli#232 review R4. The case above uses `custom-name`, a basename on
+  // which every plausible derivation agrees — so it could not catch a derivation
+  // that is merely CLOSE to Compose's. This one uses a DOTTED basename, where the
+  // two rules part company: Compose deletes the dot (`cinatradev`), while the
+  // old helper substituted it (`cinatra_dev`). The Docker stub answers honestly
+  // about `cinatradev`, the name Compose really brought the stack up under, and
+  // says nothing else exists. A helper that derives `cinatra_dev` therefore asks
+  // about a project that never existed, is told the truth ("empty"), and RELEASES
+  // a live stack's band. Red at b4750341b (released: true, row gone), green here.
+  it("REFUSES a legacy sentinel row whose basename DIVERGES between the two derivations (dotted dir)", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    const legacy = legacySentinelRow({ registryPath, dirName: "cinatra.dev" });
+    // Compose's own normalisation DELETES the dot — it does not substitute it.
+    expect(legacy.project).toBe("cinatradev");
+    rmSync(legacy.targetDir, { recursive: true, force: true }); // the operator's `rm -rf`
+    const before = readFileSync(registryPath, "utf8");
+    const down = recordingDown();
+
+    const asked = [];
+    const deps = {
+      instanceRegistryPath: registryPath,
+      allocLockPath,
+      runComposeDown: down.fn,
+      // Docker's honest answer: `cinatradev` is live, and NOTHING else is — in
+      // particular the `cinatra_dev` a substituting derivation would ask about.
+      inspectProjectLiveness: (names) => {
+        asked.push(...names);
+        return {
+          containerRows: names.includes("cinatradev") ? [{ Id: "live-1" }, { Id: "live-2" }] : [],
+          volumeRows: [],
+        };
+      },
+    };
+
+    const refused = await teardownInstance({ slug: "row1", log: () => {}, deps });
+
+    expect(asked).toEqual(["cinatradev"]);
+    expect(asked).not.toContain("cinatra_dev"); // the substituting derivation's ghost
+    expect(asked).not.toContain("cinatra"); // and never the sentinel
+    expect(refused).toMatchObject({
+      released: false,
+      reason: "stack-still-live",
+      liveContainers: 2,
+      inspectedProject: "cinatradev",
+    });
+    // Nothing released: the row, its reservation, the bytes on disk.
+    expect(rowFor(registryPath, "row1")).not.toBeNull();
+    expect(readFileSync(registryPath, "utf8")).toBe(before);
+    expect(down.calls).toHaveLength(0);
+    expect(tryAllocateOffset(registryPath, 3301).offset).toBe(20000);
+  });
+
+  // The same divergence through a SPACED basename, driven end-to-end so the
+  // operator-facing remediation is pinned too: `docker compose -p cinatra_two
+  // down -v` (or `-p cinatra`) targets nothing at all.
+  it("`--down` names the COMPOSE-TRUE project for a divergent basename (spaced/`+` dir)", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    const legacy = legacySentinelRow({ registryPath, dirName: "My Instance" });
+    expect(legacy.project).toBe("myinstance");
+    rmSync(legacy.targetDir, { recursive: true, force: true });
+
+    const asked = [];
+    await expect(
+      runInstall(["--down", "--instance", "row1", "--yes"], {
+        log: () => {},
+        deps: {
+          instanceRegistryPath: registryPath,
+          allocLockPath,
+          runComposeDown: recordingDown().fn,
+          inspectProjectLiveness: (names) => {
+            asked.push(...names);
+            return {
+              containerRows: names.includes("myinstance") ? [{ Id: "live-1" }] : [],
+              volumeRows: [],
+            };
+          },
+        },
+      }),
+    ).rejects.toThrow(/docker compose -p myinstance down -v/);
+    expect(asked).toEqual(["myinstance"]);
+    expect(rowFor(registryPath, "row1")).not.toBeNull();
+  });
+
   it("still reclaims a legacy sentinel row when its BASENAME project is empty (the all-clear)", async () => {
     const { registryPath, allocLockPath } = newRegistryPaths();
     writeInstanceRegistry(registryPath, { version: 1, instances: {} });

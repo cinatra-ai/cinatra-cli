@@ -117,8 +117,9 @@ export function reservedPorts({ cloneRegistry = null, instanceRegistry = null } 
 }
 
 /**
- * The instance rows that currently HOLD a reservation, newest-recorded last, as
- * short human lines. cinatra-cli#232: an exhaustion error used to say only
+ * The instance rows that currently HOLD a reservation, sorted by slug, as short
+ * human lines (the registry records no ordering the operator could rely on, so
+ * the listing is alphabetical and stable rather than insertion-ordered). cinatra-cli#232: an exhaustion error used to say only
  * "release an instance" without saying WHICH — and the rows that exhaust the
  * band are usually STALE (a torn-down instance whose row was never released), so
  * the operator could not tell a live holder from a leftover. Naming the holders

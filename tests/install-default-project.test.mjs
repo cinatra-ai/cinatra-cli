@@ -47,7 +47,37 @@ describe("legacyBasenameProject (cinatra-cli#35)", () => {
   it("mirrors compose's basename-derived project (the legacy default behavior)", () => {
     expect(legacyBasenameProject("/Users/me/Code/cinatra")).toBe("cinatra");
     expect(legacyBasenameProject("/Users/me/Code/_TEST")).toBe("test");
-    expect(legacyBasenameProject("/Users/me/Code/My.App")).toBe("my_app");
+    // cinatra-cli#232 review R4: Compose DELETES characters outside
+    // `[a-z0-9_-]`; it does not substitute them. This expectation used to read
+    // "my_app" and locked the divergence in.
+    expect(legacyBasenameProject("/Users/me/Code/My.App")).toBe("myapp");
+  });
+
+  // The reclaim gate (cinatra-cli#232) reads this name's EMPTINESS as permission
+  // to release a live stack's port reservation, so every shape where the old
+  // collapse-runs-to-`_` rule diverged from Compose is pinned here. The values
+  // are Compose's own, read off `docker compose config` in a dir of each shape.
+  it("DELETES invalid characters exactly as Compose does (never substitutes `_`)", () => {
+    expect(legacyBasenameProject("/Users/me/Code/cinatra.dev")).toBe("cinatradev");
+    expect(legacyBasenameProject("/Users/me/Code/My Instance")).toBe("myinstance");
+    expect(legacyBasenameProject("/Users/me/Code/cinatra+two")).toBe("cinatratwo");
+    expect(legacyBasenameProject("/Users/me/Code/v1.2.3")).toBe("v123");
+  });
+
+  // The other edge of the same rule: a purely LEADING invalid run agrees under
+  // both derivations, because the leading `_`/`-` trim removes what either rule
+  // produced. Pinning it keeps a future "fix" from breaking the agreeing shape.
+  it("agrees on a purely LEADING invalid run (the trim swallows it either way)", () => {
+    expect(legacyBasenameProject("/Users/me/Code/.github")).toBe("github");
+    expect(legacyBasenameProject("/Users/me/Code/...cinatra")).toBe("cinatra");
+    expect(legacyBasenameProject("/Users/me/Code/--edge")).toBe("edge");
+  });
+
+  // Nothing derivable at all. The reclaim gate treats this as its THIRD state
+  // (could-not-inspect → refuse), never as an all-clear.
+  it("yields an EMPTY name when the basename holds no usable character", () => {
+    expect(legacyBasenameProject("/Users/me/Code/...")).toBe("");
+    expect(legacyBasenameProject("/Users/me/Code/@@@")).toBe("");
   });
 });
 

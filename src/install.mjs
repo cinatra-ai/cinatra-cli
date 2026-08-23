@@ -3745,9 +3745,14 @@ export async function teardownInstance({
     } else if (plan.down && !checkoutPresent) {
       // RECLAIM (the stale-row case the matrix hit): the checkout is gone, so
       // there is no compose file to `down` from. Releasing the row is only safe
-      // when nothing of the project is still alive — a live container really
-      // does hold those host ports, and handing them to the next install would
-      // trade a stale reservation for a real collision.
+      // when nothing of the project is left — a RUNNING container really does
+      // hold those host ports, and handing them to the next install would trade
+      // a stale reservation for a real collision. A STOPPED container counts
+      // too, deliberately: `inspectProjectLiveness` probes with `docker ps -a`,
+      // and a `compose stop`-ed stack holds no port at this instant but takes
+      // those exact ports back the moment it is started again. So the refusal
+      // wording names both states rather than claiming every counted container
+      // is running.
       //
       // An inspection ERROR is NOT an answer (review blocker: the safety failed
       // OPEN). Docker being down, unreadable or unparseable tells us NOTHING
@@ -3928,10 +3933,30 @@ async function runInstallDown({ opts, log = console.log, deps = {} }) {
   }
 
   const plan = planInstanceTeardown(row, { volumes: opts.teardownExisting === true });
+  // cinatra-cli#232 review R4 (non-blocking): the echo and the typed confirm must
+  // name the project the commands ACTUALLY use, not the recorded literal. For a
+  // pre-cinatra-cli#35 sentinel row the real `down` OMITS `-p` (Compose re-derives
+  // the basename project, `composeProjectArgForRow`), so printing `-p cinatra`
+  // shows an operator — under `--dry-run` especially — a command line that is not
+  // the one that runs, and names something that targets nothing. Same reason the
+  // refusals were corrected to the resolved name; this is the one place short.
+  const downProjectArg = composeProjectArgForRow(row);
+  // The project the stack really runs under: the recorded one, else the basename
+  // Compose derives, else null (nothing derivable — then say so name-free).
+  const effectiveProject = reclaimInspectProjectForRow(row);
   log(`Tearing down instance "${row.slug}" (${row.mode}, ${row.infraMode}, project ${row.composeProject}).`);
   log(`  dir:      ${row.installDir}`);
   if (plan.down) {
-    log(`  compose:  down -p ${row.composeProject} -f ${plan.composeFiles.join(" -f ")}${plan.volumes ? " -v" : ""}`);
+    log(
+      `  compose:  down${downProjectArg ? ` -p ${downProjectArg}` : ""} -f ${plan.composeFiles.join(" -f ")}` +
+        `${plan.volumes ? " -v" : ""}`,
+    );
+    if (!downProjectArg) {
+      log(
+        `            (no -p: this row records the pre-cinatra-cli#35 "cinatra" sentinel, so Compose re-derives ` +
+          `the project from the checkout basename${effectiveProject ? ` — "${effectiveProject}"` : ""}.)`,
+      );
+    }
   } else {
     log(`  compose:  (nothing install-owned to bring down for an ${row.infraMode} instance)`);
   }
@@ -3946,7 +3971,8 @@ async function runInstallDown({ opts, log = console.log, deps = {} }) {
   // already uses for stop-existing, never satisfiable by a bare `--yes`.
   if (plan.down && opts.teardownExisting) {
     const ok = await typedConfirm(
-      `⚠ --teardown-existing will DELETE instance "${row.slug}"'s data volumes (project ${row.composeProject}).\n` +
+      `⚠ --teardown-existing will DELETE instance "${row.slug}"'s data volumes ` +
+        `(${effectiveProject ? `project ${effectiveProject}` : "the project this row's stack runs under"}).\n` +
         `  This is IRREVERSIBLE.`,
       `delete ${row.slug}`,
     );
@@ -3990,8 +4016,9 @@ async function runInstallDown({ opts, log = console.log, deps = {} }) {
       (result.error ? `\n  ${result.error.message}` : ""),
     "stack-still-live":
       `the checkout ${row.installDir} is gone but ${result.liveContainers} container(s) of project ` +
-      `${inspected} are still running — they really do hold those ports. Stop them ` +
-      `(\`docker compose -p ${inspected} down -v\`) and re-run, or pass --force to release the row anyway.`,
+      `${inspected} still exist — a RUNNING one really does hold those ports, and a STOPPED one ` +
+      `(\`compose stop\`) holds none right now but reclaims them the moment it is started again. ` +
+      `Remove them (\`docker compose -p ${inspected} down -v\`) and re-run, or pass --force to release the row anyway.`,
     "inspect-failed":
       `the checkout ${row.installDir} is gone, so the row can only be released after PROVING no container of ` +
       `${inspectTarget} is still running — and that check itself FAILED, so NOTHING was released. ` +
@@ -4038,13 +4065,32 @@ export function computeDefaultProject(opts, targetDir) {
 }
 
 /** The BARE basename Compose project a LEGACY default install (brought up under
- *  the dir basename, no `-p`) would have used. Compose lowercases + strips to
- *  `[a-z0-9_-]` and collapses other runs to `_`. Pure. */
+ *  the dir basename, no `-p`) would have used. Pure.
+ *
+ *  This MIRRORS Compose's own `NormalizeProjectName`, character for character:
+ *  lowercase, KEEP every character in `[a-z0-9_-]`, DELETE every other one, then
+ *  trim leading `_`/`-`. Compose deletes; it does NOT substitute. An earlier
+ *  version here collapsed runs of invalid characters to `_`, which agrees with
+ *  Compose only when the invalid run is leading (`.github` → `github` either
+ *  way) and DIVERGES on every internal or trailing one: `cinatra.dev` →
+ *  `cinatra_dev` where Compose uses `cinatradev`, `My Instance` → `my_instance`
+ *  where Compose uses `myinstance`, `cinatra+two` → `cinatra_two` where Compose
+ *  uses `cinatratwo`.
+ *
+ *  That divergence is not cosmetic (cinatra-cli#232 review R4). The reclaim gate
+ *  in `teardownInstance` inspects THIS name for a pre-cinatra-cli#35 sentinel
+ *  row (`reclaimInspectProjectForRow`), and an empty answer RELEASES the row. A
+ *  name Compose never used comes back truthfully empty, so a wrong derivation
+ *  hands a live stack's host ports to the next install — the same failure the
+ *  gate exists to refuse. The polarity matters: for the other consumer
+ *  (`resolveDefaultProject`) a wrong name only means "no legacy stack found" and
+ *  the install declines to adopt, but a refusal must not inherit a best-effort
+ *  reconstruction. */
 export function legacyBasenameProject(targetDir) {
   const base = path.basename(path.resolve(targetDir));
   return base
     .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/[^a-z0-9_-]+/g, "")
     .replace(/^[_-]+/, "");
 }
 
@@ -4308,6 +4354,11 @@ function inspectProjectLiveness(projectNames, deps = {}) {
   const containerRows = [];
   const seen = new Set();
   for (const name of names) {
+    // `-a`, so STOPPED containers count as well as running ones. That is on
+    // purpose for this gate: a `compose stop`-ed stack holds no host port right
+    // now, but it takes those ports straight back on the next `start`, so
+    // releasing the reservation would still set up the collision. The refusal
+    // message says "exist", not "are running", for exactly this reason.
     const ids = cap("docker", ["ps", "-a", "--filter", `label=com.docker.compose.project=${name}`, "-q"]);
     // null = the command FAILED (non-zero exit / could not spawn). "" = it
     // succeeded and the project has no containers. Never conflate the two.
