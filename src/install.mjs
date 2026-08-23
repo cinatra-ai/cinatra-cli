@@ -3944,7 +3944,14 @@ async function runInstallDown({ opts, log = console.log, deps = {} }) {
   // The project the stack really runs under: the recorded one, else the basename
   // Compose derives, else null (nothing derivable — then say so name-free).
   const effectiveProject = reclaimInspectProjectForRow(row);
-  log(`Tearing down instance "${row.slug}" (${row.mode}, ${row.infraMode}, project ${row.composeProject}).`);
+  // The header names the SAME resolved project as the two lines under it. Printing
+  // `row.composeProject` here put the sentinel first and its correction second, so
+  // the operator read `project cinatra` before the `cinatradev` that actually runs.
+  // Nothing derivable → say nothing rather than name something that targets nothing.
+  log(
+    `Tearing down instance "${row.slug}" (${row.mode}, ${row.infraMode}` +
+      `${effectiveProject ? `, project ${effectiveProject}` : ""}).`,
+  );
   log(`  dir:      ${row.installDir}`);
   if (plan.down) {
     log(

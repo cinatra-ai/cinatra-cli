@@ -757,6 +757,42 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
     expect(readFileSync(registryPath, "utf8")).toBe(before);
   });
 
+  // The plan echo for a sentinel row, driven end-to-end. `--dry-run` is where an
+  // operator READS the command before running it, so every name on screen must be
+  // the one the real `down` uses: no `-p` at all (Compose re-derives the project
+  // from the checkout basename), the derived name spelled out, and the header
+  // naming that same derived project rather than the sentinel it records.
+  it("`--down --dry-run` on a sentinel row echoes the OMITTED `-p` and the derived project", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    const legacy = legacySentinelRow({ registryPath, dirName: "cinatra.dev" });
+    expect(legacy.project).toBe("cinatradev");
+    const bytes = readFileSync(registryPath, "utf8");
+    const down = recordingDown();
+
+    const lines = [];
+    const result = await runInstall(["--down", "--instance", "row1", "--dry-run"], {
+      log: (...a) => lines.push(a.join(" ")),
+      deps: { instanceRegistryPath: registryPath, allocLockPath, runComposeDown: down.fn },
+    });
+    const text = lines.join("\n");
+
+    expect(result).toMatchObject({ down: true, dryRun: true });
+    // The header names the project the commands really use, not the sentinel.
+    expect(text).toMatch(/^Tearing down instance "row1" \(dev, new, project cinatradev\)\./m);
+    // The `down` passes NO `-p`: that is what makes Compose re-derive the name.
+    expect(text).toMatch(/^ {2}compose: {2}down -f /m);
+    expect(text).not.toMatch(/compose: {2}down -p /);
+    // …and the echo says WHY, naming the derivation's result.
+    expect(text).toMatch(/\(no -p: .*re-derives the project from the checkout basename — "cinatradev"\.\)/);
+    // The sentinel is never presented as a target, in the header or the command.
+    expect(text).not.toMatch(/-p cinatra\b/);
+    expect(text).not.toMatch(/project cinatra\)/);
+    // A dry run touches nothing.
+    expect(down.calls).toHaveLength(0);
+    expect(readFileSync(registryPath, "utf8")).toBe(bytes);
+  });
+
   it("still reclaims a legacy sentinel row when its BASENAME project is empty (the all-clear)", async () => {
     const { registryPath, allocLockPath } = newRegistryPaths();
     writeInstanceRegistry(registryPath, { version: 1, instances: {} });
