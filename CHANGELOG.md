@@ -206,7 +206,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
   The app-identity keys are narrower still. `PORT`, `BETTER_AUTH_URL` and
   `NEXT_PUBLIC_BETTER_AUTH_URL` describe the app, not the port map, so only a
   re-derive that MOVED the map can rewrite them, and only where the file already
-  carries a value that disagrees with the recorded app port. The move is measured
+  carries a value that disagrees with the recorded app port. `PORT` is a bare
+  number, so it disagrees when it names a different number. The two auth keys
+  hold URLs, and they follow the same rule as every other URL this command
+  re-points: only the PORT is compared, and only the PORT is written. An auth URL
+  that already names the recorded port is left exactly as it is, whatever its
+  scheme, host or path, so `https://auth.example.test:3350/custom` comes out of a
+  start untouched. An auth URL that names a different port keeps its scheme,
+  credentials, host, path and query, and gains the new port, in the normalised
+  spelling of the URL parser (an empty path gains its `/`). A URL that states no
+  port names its scheme's default (443 for `https://`), so it agrees only when
+  the recorded app port IS that default, and otherwise gains an explicit one. A
+  value the CLI cannot parse as a URL is left alone. The move is measured
   on the file this run re-derived, before against after. A start that merely
   verifies leaves all three exactly as the operator set them, and so does a
   re-derive that moved no port, however far the registry row lags the compose

@@ -4617,8 +4617,8 @@ const SYNTHESIZE_WHEN_ABSENT = new Set(["wayflow"]);
  * port), and the app must be pointed at the port the container it is about to
  * start actually publishes. See `reconcileIsolatedWayflowRoute` (src/index.mjs).
  *
- * cinatra#2654 (round 7 review, BLOCKING A) — `movedServices` RESTRICTS that
- * re-point. On the INSTALL path (the default, `null`) every key in the table
+ * cinatra#2654 (round 7 review, BLOCKING A) — `restricted` RESTRICTS that
+ * re-point. On the INSTALL path (the default, `false`) every key in the table
  * below is written: the install owns the file it just wrote, and a key it
  * leaves absent falls back to a DEFAULT-band URL, which is the isolation leak
  * this writer exists to close. A REPAIR reaching a pre-existing install owns
@@ -4633,19 +4633,21 @@ const SYNTHESIZE_WHEN_ABSENT = new Set(["wayflow"]);
  * and whose ABSENCE is itself the leak. An absent key for any other service is
  * NEVER synthesized.
  *
- * @param {Iterable<string>|null} [movedServices]  the compose service names whose
- *   published host ports actually moved. Non-null SELECTS restricted mode; the
- *   set itself no longer decides anything. Every infra key is decided by what the
- *   file publishes and by the value the env already carries (round-8 review,
- *   BLOCKING 2), and whether the APP keys are in scope is the caller's to say —
- *   it says so by passing an `appPort`, or `null` for "not this arm" (round-9
- *   review, BLOCKING 1). A service in this set is the ROW lagging the FILE, which
- *   is not an app move and may not be read as one.
+ * @param {boolean} [restricted]  select the RESTRICTED (repair) mode. It is a
+ *   plain MODE MARKER and carries no per-service information, because none is
+ *   read: every infra key is decided by what the file publishes and by the value
+ *   the env already carries (round-8 review, BLOCKING 2), and whether the APP
+ *   keys are in scope is the caller's to say — it says so by passing an
+ *   `appPort`, or `null` for "not this arm" (round-9 review, BLOCKING 1). It was
+ *   a `movedServices` set until the round-10 review: the set had stopped
+ *   deciding anything two rounds earlier, and a live-looking set of "services
+ *   that moved" sitting in this signature is an invitation to re-attach a
+ *   decision to it — which is exactly how the round-9 blocker was written.
  * @returns {false | { remapped: string }}  `false` when nothing was written
  *   (no `.env.local`, or a restricted re-point that found nothing to change);
  *   otherwise the space-separated `svc:port` summary of what it re-pointed.
  */
-export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = console.log, movedServices = null }) {
+export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = console.log, restricted = false }) {
   const envPath = path.join(targetDir, ".env.local");
   // cinatra#2654 (round 6, codex convergence): report whether anything was
   // actually written. Every install caller ignores this (a checkout with no
@@ -4667,17 +4669,17 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
   // re-point compares against (a value this call already wrote is not evidence
   // of what the operator had).
   const cur = parseEnvBody(body);
-  const restricted = movedServices != null;
   // cinatra#2654 (round-9 review, BLOCKING 1): whether a restricted re-point may
   // touch the APP keys is the CALLER's decision, expressed by passing an
   // `appPort` at all — the caller is what knows whether the APP moved, and this
-  // writer cannot tell. Round 8 read it off `movedServices` instead, and in the
-  // same commit that set became FILE-vs-ROW: non-empty whenever the row lags the
-  // file for ANY service, which is the crash-window state the every-start
+  // writer cannot tell. Round 8 read it off a `movedServices` set instead, and in
+  // the same commit that set became FILE-vs-ROW: non-empty whenever the row lags
+  // the file for ANY service, which is the crash-window state the every-start
   // re-point exists to repair. An infra-only lag then rewrote three app-identity
   // keys on a start where nothing about the app had moved, to a value taken from
-  // the row. See `reconcileIsolatedWayflowRoute` (src/index.mjs) for which arm
-  // passes one.
+  // the row. The set is gone (round-10 review); `restricted` is now a mode marker
+  // and nothing else. See `reconcileIsolatedWayflowRoute` (src/index.mjs) for
+  // which arm passes an `appPort`.
   const appPortRecorded = Number.isInteger(appPort) && appPort > 0;
   // Whether an app key was actually WRITTEN, so the restricted summary can name
   // it: a re-point that touched the app keys and no infra key at all used to
@@ -4701,17 +4703,55 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
     // WayFlow route repair this command performs, and the app's own default
     // applies exactly as it did before this command ran. Only `wayflow` is
     // synthesized from nothing — see `SYNTHESIZE_WHEN_ABSENT`.
-    const appKeyDiffers = (key, value) => !restricted || (cur[key] != null && String(cur[key]) !== value);
-    if (appKeyDiffers("PORT", String(appPort))) {
+    // `PORT` is a bare number, not a URL: whole-value equality IS the port test.
+    if (!restricted || (cur.PORT != null && String(cur.PORT) !== String(appPort))) {
       body = upsertEnvKey(body, "PORT", String(appPort));
       wroteApp = true;
     }
-    if (appKeyDiffers("BETTER_AUTH_URL", baseUrl)) {
-      body = upsertEnvKey(body, "BETTER_AUTH_URL", baseUrl);
-      wroteApp = true;
-    }
-    if (appKeyDiffers("NEXT_PUBLIC_BETTER_AUTH_URL", baseUrl)) {
-      body = upsertEnvKey(body, "NEXT_PUBLIC_BETTER_AUTH_URL", baseUrl);
+    // cinatra#2654 (round-10 review, BLOCKING): the two auth keys hold URLs, and
+    // under a RESTRICTED re-point only their PORT is this repair's business —
+    // the same rule, through the same two helpers, the infra keys below use.
+    // Comparing the WHOLE string against `http://localhost:${appPort}` replaced
+    // `BETTER_AUTH_URL=https://auth.example.test:3350/custom` — a value that
+    // already names the recorded port — with the canonical one, losing the
+    // operator's scheme, host and path on a start that had nothing to repair.
+    //
+    // `urlPortDiffers` decides and `rewriteUrlPort` writes, so the semantics are
+    // the ones this writer already states for every other URL key, held here too:
+    //   - an explicit port that AGREES → left alone (`http://127.0.0.1:3350`);
+    //   - an explicit port that DISAGREES → the port alone is rewritten, and
+    //     scheme, userinfo, host, path and query survive;
+    //   - NO explicit port → the URL names its scheme's default (443 for
+    //     `https://auth.example.test/x`), so it agrees only when the recorded app
+    //     port IS that default, and otherwise gains an explicit one. This is the
+    //     one shape where the rewrite adds a component rather than replacing it,
+    //     and it is deliberate: an isolated instance whose app binds 3350 while
+    //     its own auth URL names 443 is cinatra-cli#231's split brain, and the
+    //     alternative — treating "states no port" as unjudgeable — would leave
+    //     `http://localhost/` pointing at a port this instance never publishes.
+    //   - not a URL at all → left alone, as `urlPortDiffers` answers `false`.
+    //
+    // Round-10 codex convergence, on the one case this costs: an operator who
+    // fronts the isolated app with a proxy on 443 has that URL re-pointed at the
+    // app port. That is NOT an argument for exempting the portless spelling —
+    // an explicit `https://…:443/` would be re-pointed just the same, so the
+    // exemption would be inconsistent AND incomplete. A proxied auth origin
+    // needs an explicit opt-out from app-port repair, which is not this item.
+    //
+    // What "only the PORT is written" means textually: `rewriteUrlPort` returns
+    // the WHATWG serialization, so a rewritten URL is normalised (an empty path
+    // gains its `/`). Every semantic component survives; the exact byte spelling
+    // of a value this repair had to change may not.
+    //
+    // The INSTALL path still writes the canonical `baseUrl` unconditionally: it
+    // owns the file it just wrote.
+    for (const key of ["BETTER_AUTH_URL", "NEXT_PUBLIC_BETTER_AUTH_URL"]) {
+      if (restricted) {
+        if (cur[key] == null || !urlPortDiffers(cur[key], appPort)) continue;
+        body = upsertEnvKey(body, key, rewriteUrlPort(cur[key], appPort, "http", ""));
+      } else {
+        body = upsertEnvKey(body, key, baseUrl);
+      }
       wroteApp = true;
     }
   }
@@ -4745,7 +4785,7 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
   //     the leak itself: the app dials the DEFAULT :3010, which is another
   //     instance's runtime whenever one is up.
   //
-  // The install path (`movedServices === null`) is untouched by all of it: it
+  // The install path (`restricted === false`) is untouched by all of it: it
   // owns the file it just wrote, and a key it leaves absent falls back to a
   // DEFAULT-band URL — the isolation leak this writer exists to close.
   const wrote = new Set();

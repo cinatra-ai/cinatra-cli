@@ -1321,7 +1321,10 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
       // re-point ran: the recorded app port too, and the credentials on an
       // existing URL preserved rather than rebuilt.
       expect(after).toMatch(new RegExp(`^PORT=${LEGACY_APP_PORT}$`, "m"));
-      expect(after).toMatch(new RegExp(`^BETTER_AUTH_URL=http://localhost:${LEGACY_APP_PORT}$`, "m"));
+      // Re-pointed from its OWN value now (round-10 review), so the trailing
+      // slash `rewriteUrlPort` normalises an empty path to is tolerated here
+      // exactly as it is for `WAYFLOW_BASE_URL` above.
+      expect(after).toMatch(new RegExp(`^BETTER_AUTH_URL=http://localhost:${LEGACY_APP_PORT}/?$`, "m"));
       expect(after).toMatch(/^SUPABASE_DB_URL=postgresql:\/\/u:p@127\.0\.0\.1:25434\/postgres$/m);
       // …and the result SAYS it re-pointed, so the caller can report it.
       expect(result.envRepointed).toBe(true);
@@ -4081,11 +4084,11 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
   const read = () => readFileSync(path.join(dir, ".env.local"), "utf8");
   const repoint = (opts) => writeIsolatedAppEnv({ targetDir: dir, appPort: null, log: () => {}, ...opts });
 
-  it("does NOT synthesize an absent key for a service that did not move", () => {
+  it("does NOT synthesize an absent CREDENTIAL-BEARING key for a service the file publishes", () => {
     write("WAYFLOW_BASE_URL=http://localhost:3010\n");
     const res = repoint({
       ports: { "nango-db": [25435], postgres: [25434], wayflow: [23010] },
-      movedServices: ["wayflow"],
+      restricted: true,
     });
     expect(read()).not.toMatch(/NANGO_DATABASE_URL/);
     expect(read()).not.toMatch(/SUPABASE_DB_URL/);
@@ -4094,16 +4097,18 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
   });
 
   // ── round-7 codex convergence ────────────────────────────────────────────
-  // The first cut protected an absent key only when its service had not moved.
-  // A legacy row whose map GAINS `nango-db` moves it — and the same
-  // credential-less `postgresql://127.0.0.1:…/nango` would have been written,
-  // which is the exact defect this item names.
-  it("does NOT synthesize an absent credential-bearing key even when its service MOVED", () => {
+  // The first cut protected an absent key only when its service had not MOVED,
+  // so a legacy row whose map GAINS `nango-db` got the credential-less
+  // `postgresql://127.0.0.1:…/nango` written over it. The moved set is gone
+  // entirely as of the round-10 review, which forecloses the whole class — this
+  // case is kept because it pins the surviving rule against the WIDEST map a
+  // legacy row can gain, where the narrow case above pins it against a small one.
+  it("does NOT synthesize an absent credential-bearing key, however much the map gained", () => {
     write("WAYFLOW_BASE_URL=http://localhost:3010\n");
     repoint({
-      ports: { "nango-db": [25435], postgres: [25434], redis: [26379], wayflow: [23010] },
       // Everything is new to this row: a legacy map held none of them.
-      movedServices: ["nango-db", "postgres", "redis", "wayflow"],
+      ports: { "nango-db": [25435], postgres: [25434], redis: [26379], wayflow: [23010] },
+      restricted: true,
     });
     const after = read();
     expect(after).not.toMatch(/NANGO_DATABASE_URL/);
@@ -4118,7 +4123,7 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
 
   it("SYNTHESIZES the absent WAYFLOW_BASE_URL when the wayflow service moved — the one exception", () => {
     write("PORT=3350\n");
-    const res = repoint({ ports: { wayflow: [23010] }, movedServices: ["wayflow"] });
+    const res = repoint({ ports: { wayflow: [23010] }, restricted: true });
     // Credential-free by construction, and its absence IS the leak: the app
     // dials the default :3010, which is another instance's runtime.
     expect(read()).toMatch(/^WAYFLOW_BASE_URL=http:\/\/127\.0\.0\.1:23010\/?$/m);
@@ -4133,10 +4138,11 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
   // before either of them, carries no WAYFLOW_BASE_URL at all. An absent key for
   // a service the file PUBLISHES is itself the disagreement (the app is pointed
   // at the default band while the container binds this instance's), so it is
-  // synthesized whether or not that service moved.
-  it("SYNTHESIZES the absent WAYFLOW_BASE_URL even when NOTHING moved (round-8 review, BLOCKING 2)", () => {
+  // synthesized whether or not that service moved — and since the round-10
+  // review the writer is not told what moved at all, so it cannot do otherwise.
+  it("SYNTHESIZES the absent WAYFLOW_BASE_URL from nothing (round-8 review, BLOCKING 2)", () => {
     write("PORT=3350\n");
-    const res = repoint({ ports: { wayflow: [23010] }, movedServices: [] });
+    const res = repoint({ ports: { wayflow: [23010] }, restricted: true });
     expect(read()).toMatch(/^WAYFLOW_BASE_URL=http:\/\/127\.0\.0\.1:23010\/?$/m);
     expect(res).toEqual({ remapped: "wayflow:23010" });
   });
@@ -4145,13 +4151,13 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
     const before = "PORT=3350\n";
     write(before);
     // No `wayflow` entry in the effective map → no port to point anything at.
-    expect(repoint({ ports: { postgres: [25434] }, movedServices: [] })).toBe(false);
+    expect(repoint({ ports: { postgres: [25434] }, restricted: true })).toBe(false);
     expect(read()).toBe(before);
   });
 
   it("does NOT add app-settings keys an operator's file never carried", () => {
     write("PORT=3000\nWAYFLOW_BASE_URL=http://localhost:3010\n");
-    repoint({ appPort: 3350, ports: { wayflow: [23010] }, movedServices: ["wayflow"] });
+    repoint({ appPort: 3350, ports: { wayflow: [23010] }, restricted: true });
     const after = read();
     // The carried, disagreeing key is repaired…
     expect(after).toMatch(/^PORT=3350$/m);
@@ -4164,7 +4170,7 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
       "SUPABASE_DB_URL=postgresql://app:pw@127.0.0.1:5434/postgres\n" +
         "REDIS_URL=redis://:redispw@127.0.0.1:6379\n",
     );
-    repoint({ ports: { postgres: [25434], redis: [26379] }, movedServices: [] });
+    repoint({ ports: { postgres: [25434], redis: [26379] }, restricted: true });
     expect(read()).toMatch(/^SUPABASE_DB_URL=postgresql:\/\/app:pw@127\.0\.0\.1:25434\/postgres$/m);
     expect(read()).toMatch(/^REDIS_URL=redis:\/\/:redispw@127\.0\.0\.1:26379$/m);
   });
@@ -4178,7 +4184,7 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
         "CINATRA_AGENT_REGISTRY_URL=http://127.0.0.1:4873\n" +
         "CINATRA_AGENT_REGISTRY_UI_URL=http://127.0.0.1:4873/-/web\n",
     );
-    repoint({ ports: { "nango-db": [25435], verdaccio: [24873] }, movedServices: [] });
+    repoint({ ports: { "nango-db": [25435], verdaccio: [24873] }, restricted: true });
     const after = read();
     expect(after).toMatch(/^NANGO_DATABASE_URL=postgresql:\/\/a:one@127\.0\.0\.1:25435\/nango$/m);
     expect(after).toMatch(/^NANGO_DB_URL=postgresql:\/\/b:two@127\.0\.0\.1:25435\/nango_alt$/m);
@@ -4190,7 +4196,7 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
   it("leaves a carried value the CLI cannot parse as a URL alone", () => {
     const before = "SUPABASE_DB_URL=host=127.0.0.1 port=5434 dbname=postgres\n";
     write(before);
-    const res = repoint({ ports: { postgres: [25434] }, movedServices: ["postgres"] });
+    const res = repoint({ ports: { postgres: [25434] }, restricted: true });
     // Never replaced with a credential-less default it cannot merge into.
     expect(read()).toBe(before);
     expect(res).toBe(false);
@@ -4199,7 +4205,7 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
   it("treats an IMPLICIT default port as agreement, not a rewrite (round-7 codex convergence)", () => {
     const before = "GRAPHITI_URL=http://graphiti.internal/api\n";
     write(before);
-    const res = repoint({ ports: { graphiti: [80] }, movedServices: [] });
+    const res = repoint({ ports: { graphiti: [80] }, restricted: true });
     expect(read()).toBe(before);
     expect(res).toBe(false);
   });
@@ -4207,7 +4213,7 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
   it("writes nothing — and reports nothing — when every carried key already agrees", () => {
     const before = "WAYFLOW_BASE_URL=http://localhost:23010\nPORT=3350\n";
     write(before);
-    const res = repoint({ appPort: 3350, ports: { wayflow: [23010] }, movedServices: [] });
+    const res = repoint({ appPort: 3350, ports: { wayflow: [23010] }, restricted: true });
     expect(read()).toBe(before);
     expect(res).toBe(false);
   });
@@ -4216,16 +4222,16 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
     write("WAYFLOW_BASE_URL=http://localhost:3010\nGRAPHITI_URL=http://127.0.0.1:8000\n");
     const res = repoint({
       ports: { wayflow: [23010], graphiti: [8000], postgres: [25434] },
-      movedServices: ["wayflow", "postgres"],
+      restricted: true,
     });
     // graphiti already agrees; postgres has no carried key and may not be
-    // synthesized; only wayflow moved AND changed.
+    // synthesized; only wayflow both is carried AND disagrees.
     expect(res).toEqual({ remapped: "wayflow:23010" });
   });
 
   it("re-points an app key that DISAGREES with the recorded app port, and leaves an agreeing one alone", () => {
     write("PORT=3000\nBETTER_AUTH_URL=http://localhost:3350\nWAYFLOW_BASE_URL=http://localhost:3010\n");
-    repoint({ appPort: 3350, ports: { wayflow: [23010] }, movedServices: ["wayflow"] });
+    repoint({ appPort: 3350, ports: { wayflow: [23010] }, restricted: true });
     const after = read();
     expect(after).toMatch(/^PORT=3350$/m);
     // Already correct: rewritten to the same value, so the operator sees no churn.
@@ -4233,18 +4239,98 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
     expect(after).toMatch(/^WAYFLOW_BASE_URL=http:\/\/localhost:23010\/?$/m);
   });
 
+  // ── round-10 review, BLOCKING ──────────────────────────────────────────────
+  // The two auth keys hold URLs, and the test above could not see it: it pins
+  // only exact CANONICAL equality (`http://localhost:3350` against the very
+  // string the writer would have written). The comparison behind it was a whole
+  // -string one, so every value that named the recorded port in ANY other
+  // spelling — the operator's own scheme, host, path or loopback literal — was
+  // replaced wholesale with `http://localhost:${appPort}`, against the rule the
+  // CHANGELOG states ("only where the port disagrees") and against the whole
+  // reason the infra keys are re-pointed from their OWN value.
+  //
+  // The rule is now the infra rule, through the same two helpers: only the PORT
+  // is compared, and only the PORT is written.
+  it("leaves an auth URL with the recorded port alone, whatever its scheme, host and path", () => {
+    const before =
+      "PORT=3350\n" +
+      "BETTER_AUTH_URL=https://auth.example.test:3350/custom\n" +
+      "NEXT_PUBLIC_BETTER_AUTH_URL=http://127.0.0.1:3350\n" +
+      "WAYFLOW_BASE_URL=http://localhost:23010\n";
+    write(before);
+    const res = repoint({ appPort: 3350, ports: { wayflow: [23010] }, restricted: true });
+    // Byte-identical: the operator's auth front door is not this repair's business
+    // once it already names the port this instance publishes.
+    expect(read()).toBe(before);
+    // …and nothing is announced, because nothing was written.
+    expect(res).toBe(false);
+  });
+
+  it("re-points a DISAGREEING auth URL by its PORT alone, preserving every other component", () => {
+    write(
+      "PORT=3005\n" +
+        "BETTER_AUTH_URL=https://svc:pw@auth.example.test:3005/custom?tenant=a\n" +
+        "NEXT_PUBLIC_BETTER_AUTH_URL=http://[::1]:3005/auth\n" +
+        "WAYFLOW_BASE_URL=http://localhost:23010\n",
+    );
+    const res = repoint({ appPort: 3350, ports: { wayflow: [23010] }, restricted: true });
+    const after = read();
+    expect(after).toMatch(/^PORT=3350$/m);
+    // Scheme, userinfo, host, path and query all survive; only the port moved.
+    expect(after).toMatch(
+      /^BETTER_AUTH_URL=https:\/\/svc:pw@auth\.example\.test:3350\/custom\?tenant=a$/m,
+    );
+    // An IPv6 literal keeps its brackets, and its path.
+    expect(after).toMatch(/^NEXT_PUBLIC_BETTER_AUTH_URL=http:\/\/\[::1\]:3350\/auth$/m);
+    // The canonical `http://localhost:3350` is nowhere in the file: it is what
+    // the whole-string comparison used to write over all three keys.
+    expect(after).not.toContain("http://localhost:3350");
+    expect(res).toEqual({ remapped: "app:3350" });
+  });
+
+  // The default-port semantics this writer holds for EVERY URL key, stated for
+  // the auth keys too (round-10 review): a URL that names no port names its
+  // scheme's default. So `https://…/custom` agrees only when the recorded app
+  // port IS 443, and otherwise gains an explicit one — the single shape where
+  // the rewrite ADDS a component. The alternative, treating "states no port" as
+  // unjudgeable, would leave an isolated instance's auth URL naming a port the
+  // instance never publishes, which is the split brain this key exists to avoid.
+  it("reads an auth URL with NO port as its scheme's default, and writes one only on a disagreement", () => {
+    write("PORT=3350\nBETTER_AUTH_URL=https://auth.example.test/custom\nWAYFLOW_BASE_URL=http://localhost:23010\n");
+    repoint({ appPort: 3350, ports: { wayflow: [23010] }, restricted: true });
+    // 443 is not 3350 → an explicit port is written, and the path survives.
+    expect(read()).toMatch(/^BETTER_AUTH_URL=https:\/\/auth\.example\.test:3350\/custom$/m);
+
+    const agreeing = "PORT=443\nBETTER_AUTH_URL=https://auth.example.test/custom\nWAYFLOW_BASE_URL=http://localhost:23010\n";
+    write(agreeing);
+    // 443 IS the recorded port → the implicit default agrees, and nothing is written.
+    expect(repoint({ appPort: 443, ports: { wayflow: [23010] }, restricted: true })).toBe(false);
+    expect(read()).toBe(agreeing);
+  });
+
+  // The same fail-open the infra keys keep: a value this CLI cannot parse is the
+  // operator's, and replacing it with a canonical default is the loss, not the fix.
+  it("leaves an auth value it cannot parse as a URL alone", () => {
+    const before = "PORT=3350\nBETTER_AUTH_URL=not a url at all\nWAYFLOW_BASE_URL=http://localhost:23010\n";
+    write(before);
+    expect(repoint({ appPort: 3350, ports: { wayflow: [23010] }, restricted: true })).toBe(false);
+    expect(read()).toBe(before);
+  });
+
   // ── round-9 review, BLOCKING 1 ─────────────────────────────────────────────
   // Whether a RESTRICTED re-point may touch the app-identity keys is the
   // CALLER's decision, made by passing an `appPort` at all. This writer cannot
-  // tell whether the APP moved: `movedServices` describes the ROW against the
-  // FILE, and a service the row lags on says nothing about the app port.
-  it("leaves the app keys alone when the caller passes no appPort, whatever moved", () => {
+  // tell whether the APP moved, and since the round-10 review it is not handed
+  // anything it could mistake for an answer: `restricted` is a mode marker, and
+  // the per-service set that used to sit beside it is gone.
+  it("leaves the app keys alone when the caller passes no appPort", () => {
     write("PORT=3005\nBETTER_AUTH_URL=http://localhost:3005\nWAYFLOW_BASE_URL=http://localhost:3010\n");
     const res = repoint({
       appPort: null,
+      // A row lagging the file on both services — and NOT a reason to rewrite
+      // the app keys, which only an `appPort` can license.
       ports: { postgres: [25434], wayflow: [23010] },
-      // A lagging row: non-empty, and NOT a reason to rewrite the app keys.
-      movedServices: ["postgres", "wayflow"],
+      restricted: true,
     });
     const after = read();
     expect(after).toMatch(/^PORT=3005$/m);
@@ -4260,13 +4346,13 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
     // which this writer labelled "app port only" and the command then announced
     // as "this instance's own infra ports".
     write("PORT=3005\nWAYFLOW_BASE_URL=http://localhost:23010\n");
-    const res = repoint({ appPort: 3350, ports: { wayflow: [23010] }, movedServices: ["wayflow"] });
+    const res = repoint({ appPort: 3350, ports: { wayflow: [23010] }, restricted: true });
     expect(read()).toMatch(/^PORT=3350$/m);
     expect(res).toEqual({ remapped: "app:3350" });
   });
 
   // The INSTALL path is untouched by all of it.
-  it("the INSTALL path (no movedServices) still writes every key, including absent ones", () => {
+  it("the INSTALL path (restricted: false) still writes every key, including absent ones", () => {
     write("PORT=3000\n");
     const res = repoint({
       appPort: 3350,
@@ -4281,7 +4367,7 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
   });
 
   it("is still a silent no-op on a checkout with no .env.local", () => {
-    expect(repoint({ ports: { wayflow: [23010] }, movedServices: ["wayflow"] })).toBe(false);
+    expect(repoint({ ports: { wayflow: [23010] }, restricted: true })).toBe(false);
     expect(existsSync(path.join(dir, ".env.local"))).toBe(false);
   });
 });

@@ -12306,11 +12306,12 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
    *
    * So the recorded map and the env file are reconciled on every start. What it
    * may write is deliberately narrow (BLOCKING A, `writeIsolatedAppEnv`'s
-   * `movedServices`): a key the env file already CARRIES is re-pointed at the
-   * recorded port, and a key it does not carry is written only for a service
-   * that actually MOVED. A repair never invents a connection string the
-   * operator did not have — for a key they rely on the runtime's own default
-   * for, a synthesized URL would carry no credentials and break it.
+   * `restricted` mode): a key the env file already CARRIES is re-pointed at the
+   * port the file publishes, and a key it does not carry is written only for
+   * `wayflow`, whose absence IS the leak this repair exists to close. A repair
+   * never invents a connection string the operator did not have — for a key they
+   * rely on the runtime's own default for, a synthesized URL would carry no
+   * credentials and break it.
    */
   const repointEnv = async (effectivePorts, { appKeys = false } = {}) => {
     const none = { envRepointed: false, repointed: "" };
@@ -12318,15 +12319,6 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
     // `writeIsolatedAppEnv` is a silent no-op without the file; skip the import too.
     if (!existsImpl(path.join(repoRoot, ".env.local"))) return none;
     const install = await import("./install.mjs");
-    const same = deps.samePortMaps ?? install.samePortMaps;
-    const recorded = row.ports ?? {};
-    // Per service, under the SAME normalisation `samePortMaps` applies to the
-    // whole map — a re-ordered or re-spelled port list is not a move. The map on
-    // the left is what the FILE publishes (see `convergedPorts`), so a service
-    // the row lags on reads as the move it is.
-    const movedServices = Object.keys(effectivePorts).filter(
-      (svc) => !same({ svc: recorded[svc] ?? [] }, { svc: effectivePorts[svc] ?? [] }),
-    );
     const repoint = deps.writeIsolatedAppEnv ?? install.writeIsolatedAppEnv;
     const written = repoint({
       targetDir: repoRoot,
@@ -12337,11 +12329,11 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
       // install path's full re-point reached through this command. The
       // every-start verify says no.
       //
-      // Round 8 handed that decision to the writer, keyed on `movedServices` —
-      // and in the SAME commit the moved set became FILE-vs-ROW (see
-      // `convergedPorts`), so it is non-empty exactly when the row lags the file
-      // for any service. That is the crash-window state this repair exists for:
-      // an infra-only lag then rewrote `PORT`, `BETTER_AUTH_URL` and
+      // Round 8 handed that decision to the writer, keyed on a per-service
+      // `movedServices` set — and in the SAME commit that set became FILE-vs-ROW
+      // (see `convergedPorts`), so it was non-empty exactly when the row lagged
+      // the file for any service. That is the crash-window state this repair
+      // exists for: an infra-only lag then rewrote `PORT`, `BETTER_AUTH_URL` and
       // `NEXT_PUBLIC_BETTER_AUTH_URL` on a start where nothing about the app had
       // moved, from the RECORDED row — the source this same commit ruled may not
       // decide the map, and with no file to check it against, since the app is
@@ -12349,15 +12341,19 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
       // port map, and rewriting an operator's PORT on every start of an install
       // nothing moved is not a repair.
       //
-      // `movedServices` is deliberately NOT part of this: it compares the FILE
-      // against the ROW, so a lag this run did not produce would license the
-      // rewrite all over again (round-9 codex convergence). The caller compares
-      // the map BEFORE its re-derive with the map AFTER it, which is the only
-      // reading of "the app's own install moved" this route has.
+      // A FILE-vs-ROW set may not license the rewrite: a lag this run did not
+      // produce says nothing about the app (round-9 codex convergence). The
+      // caller compares the map BEFORE its re-derive with the map AFTER it,
+      // which is the only reading of "the app's own install moved" this route
+      // has. So this call site computes no such set at all any more — it passes
+      // the mode marker the writer actually reads (round-10 review, NB 1): the
+      // set was dead compute under a comment that still explained the decision
+      // role this commit's predecessor removed, which is how the round-9 blocker
+      // came to be written in the first place.
       appPort: appKeys ? (row.appPort ?? null) : null,
       ports: effectivePorts,
       log,
-      movedServices,
+      restricted: true,
     });
     return { envRepointed: !!written, repointed: (written && written.remapped) || "" };
   };
