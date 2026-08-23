@@ -680,7 +680,13 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
 
   // The same divergence through a SPACED basename, driven end-to-end so the
   // operator-facing remediation is pinned too: `docker compose -p cinatra_two
-  // down -v` (or `-p cinatra`) targets nothing at all.
+  // down` (or `-p cinatra`) targets nothing at all.
+  //
+  // The remedy's SHAPE is pinned here as well, and it must not carry `-v`. This
+  // path is a plain `--down --yes`: the operator never asked to delete volumes
+  // and never typed the confirmation this CLI requires for that. A remedy that
+  // says `down -v` would route them around that gate and destroy the named
+  // volumes' data the refusal exists to protect.
   it("`--down` names the COMPOSE-TRUE project for a divergent basename (spaced/`+` dir)", async () => {
     const { registryPath, allocLockPath } = newRegistryPaths();
     writeInstanceRegistry(registryPath, { version: 1, instances: {} });
@@ -689,25 +695,66 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
     rmSync(legacy.targetDir, { recursive: true, force: true });
 
     const asked = [];
+    const err = await runInstall(["--down", "--instance", "row1", "--yes"], {
+      log: () => {},
+      deps: {
+        instanceRegistryPath: registryPath,
+        allocLockPath,
+        runComposeDown: recordingDown().fn,
+        inspectProjectLiveness: (names) => {
+          asked.push(...names);
+          return {
+            containerRows: names.includes("myinstance") ? [{ Id: "live-1" }] : [],
+            volumeRows: [],
+          };
+        },
+      },
+    }).then(
+      () => null,
+      (e) => e,
+    );
+
+    expect(err).toBeInstanceOf(Error);
+    // The Compose-TRUE project, and a NON-destructive remedy: `down`, no `-v`.
+    expect(err.message).toContain("Remove them (`docker compose -p myinstance down`)");
+    // Never the substituting derivation's ghost, never the sentinel.
+    expect(err.message).not.toContain("cinatra_two");
+    expect(err.message).not.toMatch(/-p cinatra\b/);
+    // And never a volume-deleting command on a path with no typed confirmation.
+    expect(err.message).not.toMatch(/down -v/);
+    expect(asked).toEqual(["myinstance"]);
+    expect(rowFor(registryPath, "row1")).not.toBeNull();
+  });
+
+  // The other half of the same guarantee: `-v` is not something the operator can
+  // reach by passing `--yes`. `--teardown-existing` arms volume deletion, and the
+  // typed confirm gates it — non-interactively that confirm always REFUSES, so the
+  // run aborts before any `down` and before the reclaim gate is ever consulted.
+  // This is why the refusal above may not hand out a `-v` remedy: the CLI does not
+  // delete volumes on this path, so it must not tell the operator to.
+  it("`--teardown-existing` cannot be armed by `--yes` — the typed confirm gates it", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    const legacy = legacySentinelRow({ registryPath, dirName: "My Instance" });
+    rmSync(legacy.targetDir, { recursive: true, force: true });
+    const before = readFileSync(registryPath, "utf8");
+    const down = recordingDown();
+
     await expect(
-      runInstall(["--down", "--instance", "row1", "--yes"], {
+      runInstall(["--down", "--instance", "row1", "--yes", "--teardown-existing"], {
         log: () => {},
         deps: {
           instanceRegistryPath: registryPath,
           allocLockPath,
-          runComposeDown: recordingDown().fn,
-          inspectProjectLiveness: (names) => {
-            asked.push(...names);
-            return {
-              containerRows: names.includes("myinstance") ? [{ Id: "live-1" }] : [],
-              volumeRows: [],
-            };
-          },
+          runComposeDown: down.fn,
+          inspectProjectLiveness: () => ({ containerRows: [], volumeRows: [] }),
         },
       }),
-    ).rejects.toThrow(/docker compose -p myinstance down -v/);
-    expect(asked).toEqual(["myinstance"]);
+    ).rejects.toThrow(/not confirmed \(type "delete row1"\)/);
+
+    expect(down.calls).toHaveLength(0);
     expect(rowFor(registryPath, "row1")).not.toBeNull();
+    expect(readFileSync(registryPath, "utf8")).toBe(before);
   });
 
   it("still reclaims a legacy sentinel row when its BASENAME project is empty (the all-clear)", async () => {
@@ -800,8 +847,11 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
     const legacy = legacySentinelRow({ registryPath, dirName: "custom-name" });
     rmSync(legacy.targetDir, { recursive: true, force: true });
 
-    // `docker compose -p cinatra down -v` would target NOTHING; the remediation
-    // must name the project the containers are actually labelled with.
+    // `docker compose -p cinatra down` would target NOTHING; the remediation must
+    // name the project the containers are actually labelled with. It must also
+    // stay NON-destructive: this is a plain `--yes` run, so the operator neither
+    // asked for volume deletion nor typed the confirmation this CLI requires for
+    // it, and a `-v` remedy would walk them around that gate.
     await expect(
       runInstall(["--down", "--instance", "row1", "--yes"], {
         log: () => {},
@@ -812,7 +862,7 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
           inspectProjectLiveness: () => ({ containerRows: [{ Id: "live-1" }], volumeRows: [] }),
         },
       }),
-    ).rejects.toThrow(/docker compose -p custom-name down -v/);
+    ).rejects.toThrow(/Remove them \(`docker compose -p custom-name down`\)/);
     expect(rowFor(registryPath, "row1")).not.toBeNull();
   });
 

@@ -4009,6 +4009,16 @@ async function runInstallDown({ opts, log = console.log, deps = {} }) {
   const inspectTarget = result.inspectedProject
     ? `project ${result.inspectedProject}`
     : `the project this row's stack actually runs under`;
+  // The remedy must not prescribe what this CLI itself gates. `down -v` DELETES
+  // the named volumes' data, and volume deletion here is only ever reached
+  // behind the typed `--teardown-existing` confirm — a bare `--yes` can never
+  // satisfy it. Handing every refusal a `-v` would route the operator around
+  // that gate to destroy the very data it protects, and a plain `down` already
+  // removes the containers this refusal is about. So `-v` appears ONLY when the
+  // operator asked for volume deletion AND typed the confirmation: reaching
+  // here with `plan.volumes` set means that confirm already passed (it runs
+  // before `teardownInstance`, and a refusal to type it throws instead).
+  const removeCommand = `docker compose -p ${inspected} down${plan.volumes ? " -v" : ""}`;
   const why = {
     "down-failed":
       `\`docker compose down\` failed, so NOTHING was released — the row and its whole reservation are intact. ` +
@@ -4018,7 +4028,7 @@ async function runInstallDown({ opts, log = console.log, deps = {} }) {
       `the checkout ${row.installDir} is gone but ${result.liveContainers} container(s) of project ` +
       `${inspected} still exist — a RUNNING one really does hold those ports, and a STOPPED one ` +
       `(\`compose stop\`) holds none right now but reclaims them the moment it is started again. ` +
-      `Remove them (\`docker compose -p ${inspected} down -v\`) and re-run, or pass --force to release the row anyway.`,
+      `Remove them (\`${removeCommand}\`) and re-run, or pass --force to release the row anyway.`,
     "inspect-failed":
       `the checkout ${row.installDir} is gone, so the row can only be released after PROVING no container of ` +
       `${inspectTarget} still exists — and that check itself FAILED, so NOTHING was released. ` +
