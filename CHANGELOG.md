@@ -73,18 +73,40 @@ project adheres to [Semantic Versioning](https://semver.org/).
   reported the stack stopped. The registry is read BEFORE the teardown, so the
   refusal costs no containers, and a MISSING registry is still not a read
   failure: a holder proven by its Docker labels stops as before. Third, the row
-  read under the lock is now compared against the stack the operator was shown,
-  on both the Compose project and the Compose file set, and the command REFUSES
-  when they differ instead of adopting the newer row. A slug re-provisioned at
-  the same directory while the confirmation was pending is a live concurrent
-  install, and stopping it would destroy it. With `--teardown-existing` the
-  refusal also prevents a `down -v` deleting the named volumes of a project that
-  was never displayed in the typed confirm. Re-run the command to be shown, and
-  to confirm, the stack that is actually there. The confirm and the log line also
-  now name the project the teardown will REALLY reach: an instance recorded
-  before explicit Compose project names is torn down with no `-p` at all, so
-  Compose derives the project from the directory name, and printing the recorded
-  `cinatra` placeholder named a project the teardown never touches.
+  read under the lock is now compared against the stack the operator was shown
+  — on the Compose project, on the Compose file set, AND on the identity the
+  registry mints when it creates a row — and the command REFUSES when they
+  differ instead of adopting the newer row. A slug re-provisioned at the same
+  directory is a live concurrent install, and stopping it would destroy it. The
+  minted identity is what makes that case detectable at all: a re-provisioning
+  of a given slug picks the same Compose project and the same generated Compose
+  file every time, so the two installs are identical on both of those fields
+  and only the row's own identity tells them apart. That identity is a new
+  `instanceNonce` field, a random value the registry mints when it CREATES a
+  row and no later write rewrites; an idempotent re-run of the same install
+  keeps its own. Registry files written before this release carry no such field and need
+  no migration: those rows identify by their creation stamp instead, which is
+  what this comparison used before the field existed, and a legacy row replaced
+  by a freshly minted one is still refused. A holder recognised from its Docker
+  labels rather than from a registry row carries no identity at all, so a row
+  that appears for its slug during the same window is refused rather than
+  adopted: it cannot be told apart from a concurrent install. With
+  `--teardown-existing` the refusal also prevents a `down -v` deleting the
+  named volumes of a project that was never displayed in the typed confirm.
+  Re-run the command to be shown, and to confirm, the stack that is actually
+  there. The refusal names the window the row drifted in accurately:
+  `--teardown-existing` waits on a typed confirm, and without it there is no
+  prompt at all, only the interval between the port-conflict classification and
+  the allocation lock. One known gap is left open and tracked in
+  cinatra-cli#244: the release of the stopped instance's band and the
+  reservation of its replacement are still two transactions, so a crash between
+  them leaves the default band unreserved with the old stack already gone. The
+  ports are genuinely free and re-running `cinatra install` re-records the row.
+  The confirm and the log line also now name the project the teardown will
+  REALLY reach: an instance recorded before explicit Compose project names is
+  torn down with no `-p` at all, so Compose derives the project from the
+  directory name, and printing the recorded `cinatra` placeholder named a
+  project the teardown never touches.
 
 - **A concurrent `cinatra` command now waits for a teardown instead of failing
   ten seconds into it.** The allocation lock is now held across `docker compose

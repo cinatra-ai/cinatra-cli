@@ -32,6 +32,7 @@ import {
   allocateInstance,
   markInstanceReady,
   readInstanceRegistry,
+  releaseInstance,
   writeInstanceRegistry,
 } from "../src/instance-registry.mjs";
 
@@ -168,6 +169,61 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
     "--yes", "--no-install", "--on-conflict", "stop-existing", ...extra,
   ];
 
+  // A GENUINE same-slug re-provisioning, the way `provisionIsolatedInstance`
+  // does it: the old row is RELEASED and a fresh one is allocated for the same
+  // slug at the same directory. cinatra-cli#243 (review round 2, blocking) —
+  // the compose project and the compose file are DERIVED FROM THE SLUG
+  // (`cinatra_<slug>` at src/install.mjs:2910; the single generated
+  // `docker-compose.cinatra-isolated.yml` at :3120-3127), so a real
+  // re-provisioning reproduces both EXACTLY and the ports with them. Nothing is
+  // hand-faked here: the real `releaseInstance` / `allocateInstance` /
+  // `markInstanceReady` run, so the replacement row's minted identity is the one
+  // the registry itself mints.
+  //
+  // And the replacement row is forced to carry the OLD row's `createdAt`. That
+  // is the hard case, not a convenience: `createdAt` is an ISO stamp with
+  // millisecond resolution, so two row creations inside one millisecond share
+  // it, and a test that merely waited for the clock to tick would prove only
+  // that the two installs started at different times — not that the identity
+  // distinguishes them. Pinning the stamp leaves `instanceNonce` as the ONLY
+  // difference between the two rows, which is exactly the claim under test.
+  function reprovisionSameSlug(slug, dir) {
+    const before = readInstanceRegistry(regPath).registry;
+    const old = before.instances[slug];
+    const { registry: released } = releaseInstance(before, slug);
+    let reg = allocateInstance(released, slug, {
+      mode: "dev",
+      installDir: dir,
+      // Identical on every field a re-provisioning derives from the slug.
+      composeProject: old.composeProject,
+      composeFiles: [...old.composeFiles],
+      ports: { ...old.ports },
+      appPort: old.appPort,
+      repoUrl: "x",
+      ref: "main",
+      sha: "s",
+      infraMode: "new",
+    }).registry;
+    reg = markInstanceReady(reg, slug);
+    // Collide the stamp deliberately — see above.
+    reg.instances[slug] = { ...reg.instances[slug], createdAt: old.createdAt };
+    writeInstanceRegistry(regPath, reg);
+    return { before: old.instanceNonce, after: reg.instances[slug].instanceNonce };
+  }
+
+  // Make the seeded row look like one written by an OLDER cinatra-cli: before
+  // `instanceNonce` existed (cinatra-cli#243), rows carried `createdAt` and
+  // nothing else minted per row. Such a row must keep working — that is the
+  // backward-compatible fallback the identity comparison promises.
+  function stripMintedNonce(slug) {
+    const reg = readInstanceRegistry(regPath).registry;
+    const { instanceNonce, ...legacy } = reg.instances[slug];
+    expect(instanceNonce).toEqual(expect.any(String));
+    reg.instances[slug] = legacy;
+    writeInstanceRegistry(regPath, reg);
+    return legacy;
+  }
+
   // Rewrite the seeded row IN PLACE, as a concurrent install re-provisioning the
   // slug at the same directory would: a new compose project and a new generated
   // compose file, same `installDir`.
@@ -259,7 +315,7 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
     expect(existsSync(lockPath)).toBe(false);
   });
 
-  it("REFUSES when the row was re-provisioned while the confirmation was pending", async () => {
+  it("REFUSES when the row was re-provisioned in the classify-to-lock window", async () => {
     // cinatra-cli#243 (review round 2, blocking). `holder` is the classifier's
     // snapshot, taken before the lock. A slug re-provisioned at the SAME
     // directory in that window is a live, in-flight concurrent install — downing
@@ -290,7 +346,13 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
         }),
       }),
     ).rejects.toThrow(
-      /instance "restaleother" was re-provisioned while the confirmation was pending \(confirmed cinatra_restaleother, registry now records cinatra_restale_v2\)/,
+      // cinatra-cli#243 (review round 2, NEW 3): this argv carries NO
+      // `--teardown-existing`, so nothing prompted — the window is
+      // classification-to-lock, and the message must say so rather than send a
+      // scripted operator looking for a confirm that was never displayed. The
+      // `-v` arm keeps the think-time wording (see the `--teardown-existing`
+      // test below), exactly as the `-v` clause is already conditional.
+      /instance "restaleother" was re-provisioned between the port-conflict classification and this command taking the allocation lock \(confirmed cinatra_restaleother, registry now records cinatra_restale_v2\)/,
     );
 
     // Neither stack is touched: not the one that was confirmed, and certainly
@@ -304,6 +366,229 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
     const reserved = reservedPorts({ instanceRegistry: readInstanceRegistry(regPath).registry });
     expect(reserved.has(16379)).toBe(true);
     expect(reserved.has(3300)).toBe(true);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("REFUSES a same-slug RE-PROVISION that reproduces the project and the files exactly", async () => {
+    // cinatra-cli#243 (review round 2, THE blocking finding). The previous
+    // comparison read `composeProject` and the compose file paths only. Both are
+    // derived from the slug, so provisioning the SAME slug twice mints a second,
+    // completely different install that is byte-identical on both fields — the
+    // drift check saw no difference, and the stop tore down the concurrent
+    // install's stack and released its band.
+    //
+    // This is the reviewer's case, run for real: seed one install, then in the
+    // classify-to-lock window release its row and provision the slug again
+    // through the actual registry writers. Only the identity the registry mints
+    // when it CREATES a row differs, and that is what must refuse.
+    const otherDir = path.join(sandbox, "reprov-holder");
+    seedRemappedHolder("reprovother", otherDir);
+    const seeded = readInstanceRegistry(regPath).registry.instances.reprovother;
+
+    const downCalls = [];
+    let stamps = null;
+    await expect(
+      runInstall(stopExistingArgv(path.join(sandbox, "reprov-new")), {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+          liveComposeInspect: holderOwns5434(otherDir),
+          probeCookiePrefixSupport: () => {
+            stamps = reprovisionSameSlug("reprovother", otherDir);
+            return false;
+          },
+          runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
+        }),
+      }),
+    ).rejects.toThrow(/instance "reprovother" was re-provisioned[\s\S]*The registry row itself was REPLACED/);
+
+    // The premise the refusal has to survive on: project and files are IDENTICAL
+    // across the two installs, so nothing but the minted identity distinguishes
+    // them. If this ever stops holding, the test has stopped testing the defect.
+    const replacement = readInstanceRegistry(regPath).registry.instances.reprovother;
+    expect(replacement.composeProject).toBe(seeded.composeProject);
+    expect(replacement.composeFiles).toEqual(seeded.composeFiles);
+    expect(replacement.installDir).toBe(seeded.installDir);
+    // The stamp is IDENTICAL by construction, so `createdAt` could not have
+    // refused this: the random per-row `instanceNonce` is the only thing that
+    // differs, and it is the only thing that could have refused.
+    expect(replacement.createdAt).toBe(seeded.createdAt);
+    expect(replacement.instanceNonce).toEqual(expect.any(String));
+    expect(replacement.instanceNonce).not.toBe(seeded.instanceNonce);
+    expect(stamps).toEqual({ before: seeded.instanceNonce, after: replacement.instanceNonce });
+
+    // Nothing of the concurrent install is touched: its stack is not downed, its
+    // row is not released, its whole band is still reserved, and the lock the
+    // refusal threw inside is not leaked.
+    expect(downCalls).toEqual([]);
+    const reserved = reservedPorts({ instanceRegistry: readInstanceRegistry(regPath).registry });
+    expect(reserved.has(16379)).toBe(true);
+    expect(reserved.has(15435)).toBe(true);
+    expect(reserved.has(3300)).toBe(true);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("--teardown-existing REFUSES a same-slug RE-PROVISION rather than `down -v` it", async () => {
+    // The destructive half of the same blocking finding. The typed confirm named
+    // the first install's project; the second install reuses that exact project
+    // name, so `down -v` would delete the named volumes of a stack the operator
+    // never saw — and, because the project name matches, would look correct in
+    // every log line while doing it.
+    const otherDir = path.join(sandbox, "reprov-v-holder");
+    seedRemappedHolder("reprovvother", otherDir);
+
+    const downCalls = [];
+    await expect(
+      runInstall(stopExistingArgv(path.join(sandbox, "reprov-v-new"), ["--teardown-existing"]), {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+          liveComposeInspect: holderOwns5434(otherDir),
+          // The re-provision lands INSIDE the typed confirm — the window really
+          // is human think-time on this arm, which is why the message keeps that
+          // wording here and drops it on the arm that never prompts.
+          typedConfirm: async () => {
+            reprovisionSameSlug("reprovvother", otherDir);
+            return true;
+          },
+          runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
+        }),
+      }),
+    ).rejects.toThrow(
+      /was re-provisioned while the confirmation was pending[\s\S]*The registry row itself was REPLACED[\s\S]*deleting its named volumes irreversibly/,
+    );
+
+    // No `down` at all — least of all one carrying `-v`.
+    expect(downCalls).toEqual([]);
+    const row = readInstanceRegistry(regPath).registry.instances.reprovvother;
+    expect(row).toBeTruthy();
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("REFUSES a row that appears for a LABEL-PROVEN holder — it cannot be told apart from a concurrent install", async () => {
+    // cinatra-cli#243 (review round 2, codex): the hole in a SYMMETRIC identity
+    // rule. A label/marker-proven holder is a synthesized object with no
+    // registry row behind it, so it carries no minted identity. "Compare only
+    // when both sides have one" therefore DISABLES the identity check exactly
+    // there — and a row that appears at that directory after classification is
+    // slug-derived-identical on project and compose files, so it sails through
+    // project+files and its stack is torn down. That is the original blocking
+    // defect reached through the proven-holder door.
+    //
+    // The window is injected the way it really opens: the registry is
+    // unreadable when the backfill runs (so the backfill declines and the holder
+    // stays synthesized), and readable — with a row for the slug — by the time
+    // the executor takes the lock.
+    const otherDir = path.join(sandbox, "provenrace-holder");
+    mkdirSync(otherDir, { recursive: true });
+    writeFileSync(regPath, "{ this is not json", "utf8");
+
+    const downCalls = [];
+    await expect(
+      runInstall(stopExistingArgv(path.join(sandbox, "provenrace-new")), {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+          liveComposeInspect: holderOwns5434(otherDir, {
+            "ai.cinatra.managed": "true",
+            "ai.cinatra.kind": "instance",
+            "ai.cinatra.instance": "provenracer",
+            "ai.cinatra.project": "cinatra_provenracer",
+          }),
+          probeCookiePrefixSupport: () => {
+            // The concurrent install lands its row: same slug, same directory,
+            // and — because both are derived from the slug — the same compose
+            // project and the same generated compose file the label proof named.
+            seedRemappedHolder("provenracer", otherDir);
+            return false;
+          },
+          runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
+        }),
+      }),
+    ).rejects.toThrow(
+      /instance "provenracer" was re-provisioned[\s\S]*recognised from its Docker labels\/marker rather than from a registry row/,
+    );
+
+    // The premise: project and files are identical, so nothing but the identity
+    // could have refused this.
+    const row = readInstanceRegistry(regPath).registry.instances.provenracer;
+    expect(row.composeProject).toBe("cinatra_provenracer");
+    expect(row.composeFiles).toEqual(["docker-compose.cinatra-isolated.yml"]);
+
+    // The concurrent install keeps its stack, its row and its whole band.
+    expect(downCalls).toEqual([]);
+    const reserved = reservedPorts({ instanceRegistry: readInstanceRegistry(regPath).registry });
+    expect(reserved.has(16379)).toBe(true);
+    expect(reserved.has(3300)).toBe(true);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("a LEGACY row with NO minted nonce still stops — the identity falls back to `createdAt`", async () => {
+    // Backward compatibility, stated because the review required it to be
+    // stated (cinatra-cli#243). `instanceNonce` is minted at row CREATION, so
+    // rows written by an older cinatra-cli have none. They must not be refused:
+    // their identity falls back to `createdAt`, which is what this branch
+    // compared before the nonce existed, and which is still strictly more than
+    // the project+files comparison it replaced. A registry file written before
+    // the upgrade keeps working without a migration.
+    const otherDir = path.join(sandbox, "legacy-holder");
+    seedRemappedHolder("legacyother", otherDir);
+    const legacy = stripMintedNonce("legacyother");
+    expect(legacy.instanceNonce).toBeUndefined();
+
+    const downCalls = [];
+    const res = await runInstall(stopExistingArgv(path.join(sandbox, "legacy-new")), {
+      log: () => {},
+      deps: flowDeps({
+        detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+        liveComposeInspect: holderOwns5434(otherDir),
+        runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
+      }),
+    });
+
+    expect(res.infraPlan).toBe("default");
+    expect(downCalls.length).toBe(1);
+    expect(downCalls[0].composeProject).toBe("cinatra_legacyother");
+    const after = readInstanceRegistry(regPath).registry;
+    expect(after.instances.legacyother).toBeUndefined();
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("REFUSES when a LEGACY row is REPLACED by a freshly minted one, even at the same `createdAt`", async () => {
+    // The other half of the backward-compatible fallback, and the reason
+    // `rowMintedIdentity` PREFIXES what it returns. The confirmed side is a
+    // legacy row, so it identifies by its stamp; the replacement is a row
+    // created since this change, so it identifies by its nonce. The stamp is
+    // pinned to the legacy row's own value, so a bare string comparison of the
+    // two identities would have matched and torn the replacement down. The
+    // prefix is what keeps `createdAt:<t>` and `nonce:<u>` distinct — a row that
+    // changed which kind of identity it carries is a row that was RE-CREATED.
+    const otherDir = path.join(sandbox, "legacyrepl-holder");
+    seedRemappedHolder("legacyreplother", otherDir);
+    stripMintedNonce("legacyreplother");
+
+    const downCalls = [];
+    await expect(
+      runInstall(stopExistingArgv(path.join(sandbox, "legacyrepl-new")), {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+          liveComposeInspect: holderOwns5434(otherDir),
+          probeCookiePrefixSupport: () => {
+            reprovisionSameSlug("legacyreplother", otherDir);
+            return false;
+          },
+          runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
+        }),
+      }),
+    ).rejects.toThrow(/instance "legacyreplother" was re-provisioned[\s\S]*The registry row itself was REPLACED/);
+
+    // The premise: the stamp is identical and the replacement carries a nonce.
+    const replacement = readInstanceRegistry(regPath).registry.instances.legacyreplother;
+    expect(replacement.instanceNonce).toEqual(expect.any(String));
+    expect(downCalls).toEqual([]);
+    const reserved = reservedPorts({ instanceRegistry: readInstanceRegistry(regPath).registry });
+    expect(reserved.has(16379)).toBe(true);
     expect(existsSync(lockPath)).toBe(false);
   });
 
@@ -332,7 +617,9 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
           runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
         }),
       }),
-    ).rejects.toThrow(/was re-provisioned while the confirmation was pending[\s\S]*compose files moved too/);
+    ).rejects.toThrow(
+      /was re-provisioned between the port-conflict classification and this command taking the allocation lock[\s\S]*compose files moved too/,
+    );
 
     expect(downCalls).toEqual([]);
   });

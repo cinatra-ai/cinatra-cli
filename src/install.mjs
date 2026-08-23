@@ -5770,24 +5770,112 @@ function normalizedComposeFiles(row) {
   return (Array.isArray(row?.composeFiles) ? row.composeFiles : []).map((f) => path.resolve(dir, f));
 }
 
+/** The per-install IDENTITY carried by a registry ROW — `instanceNonce` when the
+ *  row has one, else the `createdAt` stamp. Returns a PREFIXED string so the two
+ *  sources can never compare equal by accident, or null when the row carries
+ *  neither.
+ *
+ *  cinatra-cli#243 (review round 2, blocking): the drift check compared only
+ *  `composeProject` and the compose file paths, and BOTH are derived from the
+ *  slug. An isolated provisioning for slug X picks `cinatra_<slug>` (`:2910`) and
+ *  the one generated `docker-compose.cinatra-isolated.yml` (`:3120-3127`) every
+ *  time, so a concurrent same-slug install that REPLACED this row reproduced both
+ *  exactly and was torn down. `id` is no better — it defaults to `inst_<slug>`.
+ *
+ *  Why a nonce and not the stamp alone (codex): `createdAt` is wall-clock at
+ *  MILLISECOND resolution, so two row creations inside one millisecond mint the
+ *  same string, and a clock stepped backwards can re-mint an earlier one. That is
+ *  a narrow window, but "narrow" is not "closed", and this comparison is the last
+ *  thing standing between a `down -v` and a stack the operator never saw. So
+ *  `allocateInstance` now mints a random `instanceNonce` per ROW
+ *  (`src/instance-registry.mjs`). It is derived from nothing, and two rows
+ *  collide on it only with the negligible probability of a v4 UUID collision —
+ *  not never, but not a millisecond either. An idempotent re-run does NOT
+ *  re-mint it: `allocateInstance` returns
+ *  the existing row untouched when the slug already maps to the same directory,
+ *  and no caller patches the field.
+ *
+ *  Backward compatibility, and why the fallback is safe rather than a hole: a row
+ *  written before this field existed has no nonce, so it identifies by
+ *  `createdAt` — exactly the comparison this branch shipped with, and strictly
+ *  better than the project+files comparison it replaced. The prefix is what makes
+ *  the mixed case correct: a legacy row identifies as `createdAt:…` and any row
+ *  created after this change as `nonce:…`, so a legacy row REPLACED by a fresh
+ *  one never compares equal. Rows only gain a nonce by being created, so a row
+ *  that changed prefix is a row that was replaced.
+ *
+ *  Returns null only for a holder with no row at all: the label/marker-proven
+ *  snapshot is a SYNTHESIZED object (`synthInstanceFromProof` in
+ *  `src/install-isolation.mjs`). How the caller treats that null is ASYMMETRIC —
+ *  see `stopTargetDrift`. Pure. */
+function rowMintedIdentity(row) {
+  const nonce = row?.instanceNonce;
+  if (typeof nonce === "string" && nonce.length > 0) return `nonce:${nonce}`;
+  const createdAt = row?.createdAt;
+  return typeof createdAt === "string" && createdAt.length > 0 ? `createdAt:${createdAt}` : null;
+}
+
 /** Has the stack a stop-existing confirm was taken against MOVED?
  *  cinatra-cli#243: compares the classifier's pre-lock snapshot (`confirmed`)
- *  with the row read under the lock (`current`) on the two fields that decide
- *  WHICH containers a `down` reaches — the compose project and the compose file
- *  set. Returns null when they name the same stack, else a `{ filesClause }`
- *  describing the difference for the refusal message. Pure. */
+ *  with the row read under the lock (`current`) on the fields that decide WHICH
+ *  containers a `down` reaches — the compose project and the compose file set —
+ *  AND on the row's minted identity (`rowMintedIdentity`), which is what tells a
+ *  REPLACED row apart from the one that was confirmed when the first two are
+ *  reproduced exactly. Returns null when they are the same install, else a
+ *  `{ filesClause, identityClause }` describing the difference for the refusal
+ *  message.
+ *
+ *  The identity test is ASYMMETRIC, and that asymmetry is load-bearing (codex).
+ *  Only `current` decides whether an identity is REQUIRED:
+ *
+ *    - `current` has one, `confirmed` has one   → they must be EQUAL.
+ *    - `current` has one, `confirmed` has NONE  → DRIFT. A synthesized
+ *      label/marker-proven snapshot carries no identity, so a symmetric
+ *      "compare only when both sides have one" rule would DISABLE the check
+ *      exactly there — and a registry row that appeared at that directory after
+ *      classification (a concurrent install provisioning the slug, or a
+ *      backfill that lost the race) is slug-derived-identical on project and
+ *      files, so it would sail through and be torn down. That is the original
+ *      blocking defect, reachable through the proven-holder door. We cannot
+ *      prove the row is the stack that was shown, so we refuse to destroy it.
+ *    - `current` has NONE → nothing to compare; fall back to project + files.
+ *      Unreachable for a persisted row (`isValidInstanceSlot` requires
+ *      `createdAt`), kept so the helper is total.
+ *
+ *  The cost of the second rule is a re-run for a proven holder whose backfill
+ *  declined while a row for its slug exists — and the re-run then reads that row
+ *  as the holder and matches, because classification prefers a row that maps to
+ *  the directory over a label proof. A refusal costs a re-run; adopting the wrong
+ *  row costs a stack, and with `-v` its volumes. Pure. */
 function stopTargetDrift(confirmed, current) {
   const projectMoved = (confirmed?.composeProject ?? null) !== (current?.composeProject ?? null);
   const confirmedFiles = normalizedComposeFiles(confirmed);
   const currentFiles = normalizedComposeFiles(current);
   const filesMoved =
     confirmedFiles.length !== currentFiles.length || confirmedFiles.some((f, i) => f !== currentFiles[i]);
-  if (!projectMoved && !filesMoved) return null;
+  const confirmedIdentity = rowMintedIdentity(confirmed);
+  const currentIdentity = rowMintedIdentity(current);
+  const identityUnprovable = currentIdentity !== null && confirmedIdentity === null;
+  const identityReplaced =
+    currentIdentity !== null && confirmedIdentity !== null && confirmedIdentity !== currentIdentity;
+  if (!projectMoved && !filesMoved && !identityUnprovable && !identityReplaced) return null;
   return {
     filesClause: filesMoved
       ? ` Its compose files moved too (confirmed ${JSON.stringify(confirmed?.composeFiles ?? [])}; the ` +
         `registry now records ${JSON.stringify(current?.composeFiles ?? [])}).`
       : "",
+    identityClause: identityReplaced
+      ? ` The registry row itself was REPLACED: the row that was classified is identified by ` +
+        `${confirmedIdentity}, the row now recorded for this slug by ${currentIdentity}. A re-provisioning ` +
+        `reuses the same compose project and the same generated compose file for a given slug, so the row ` +
+        `identity is what tells the two installs apart.`
+      : identityUnprovable
+        ? ` The holder was recognised from its Docker labels/marker rather than from a registry row, and a ` +
+          `registry row identified by ${currentIdentity} now claims this slug at the same directory. A ` +
+          `re-provisioning reuses the same compose project and compose files for a given slug, so that row ` +
+          `cannot be told apart from the stack you were shown — and it may belong to a concurrent install. ` +
+          `Re-run so the holder is read from the registry row itself.`
+        : "",
   };
 }
 
@@ -5924,17 +6012,34 @@ async function executeStopExisting({ targetDir, opts, conflicts, classified, log
     // project (`:5771`) and `down -v` would irreversibly delete the named
     // volumes of a project the operator was never shown.
     //
-    // So: compare project identity AND compose files against the snapshot, and
-    // refuse on any difference. Refuse rather than prompt — nothing may prompt
-    // inside the lock, and a second confirm is not what the operator asked for
-    // anyway. Re-running re-classifies and re-confirms against the stack that is
-    // actually there, which is the only safe way to consent to it.
+    // So: compare the compose project, the compose files AND the row's minted
+    // identity against the snapshot, and refuse on any difference. Refuse rather
+    // than prompt — nothing may prompt inside the lock, and a second confirm is
+    // not what the operator asked for anyway. Re-running re-classifies and
+    // re-confirms against the stack that is actually there, which is the only
+    // safe way to consent to it.
     //
-    // The honest boundary: this compares what the registry records. A concurrent
-    // re-provision that lands on the SAME project name and the SAME compose
-    // files is indistinguishable from the stack that was confirmed, and is
-    // downed. Nothing in the registry can tell those apart; the reservation the
-    // row expresses is identical either way.
+    // Why the identity is REQUIRED and not belt-and-braces (review round 2,
+    // blocking): project and files are DERIVED FROM THE SLUG. A genuine isolated
+    // re-provisioning of slug X picks `cinatra_<slug>` (`:2910`) and the one
+    // generated `docker-compose.cinatra-isolated.yml` (`:3120-3127`) every time,
+    // so the common case — a concurrent same-slug install that replaced this
+    // row — reproduces BOTH fields exactly and passed a project+files-only
+    // comparison. That is the very install this refusal exists to protect, and
+    // it was the one case that got through. `rowMintedIdentity` reads a value
+    // minted when the ROW is created rather than derived from the slug, which is
+    // what makes it discriminating here: `instanceNonce` (random, per row) on
+    // any row created since this change, and `createdAt` on a row written
+    // before the field existed.
+    //
+    // The honest boundary that remains: a row written by an OLDER cinatra-cli
+    // identifies by `createdAt` alone, which is wall-clock at millisecond
+    // resolution — so two such rows created inside one millisecond, or a clock
+    // stepped backwards, could compare equal. That needs BOTH sides to predate
+    // this change, because a row created since then carries a nonce and a nonce
+    // never compares equal to a stamp (`rowMintedIdentity` prefixes them). It
+    // therefore closes itself as installs are re-provisioned. In that residual
+    // case the failure is the PRE-EXISTING one (adopt), never a new one.
     //
     // A label/marker-proven holder has no row (or one pointing elsewhere), so
     // there is nothing to compare: its own proof is the only description of the
@@ -5942,11 +6047,23 @@ async function executeStopExisting({ targetDir, opts, conflicts, classified, log
     if (releasable) {
       const drift = stopTargetDrift(holder, existing);
       if (drift) {
+        // Name the window that ACTUALLY existed, the same way the `-v` clause
+        // below is already conditional on `withVolumes` (cinatra-cli#243, review
+        // round 2, NEW 3). Only `--teardown-existing` prompts: without it there
+        // is no typed confirm at all, just the log line at `:5866`, and the
+        // window the row drifted in is classification-to-lock, not human
+        // think-time at a prompt. Telling a scripted, non-interactive operator
+        // that a confirmation was pending sends them looking for a prompt that
+        // was never displayed.
+        const window = withVolumes
+          ? "while the confirmation was pending"
+          : "between the port-conflict classification and this command taking the allocation lock";
         throw new Error(
-          `Refusing --on-conflict=stop-existing: instance "${holder.slug}" was re-provisioned while ` +
-            `the confirmation was pending (confirmed ${holder.composeProject ?? "<none>"}, registry now ` +
+          `Refusing --on-conflict=stop-existing: instance "${holder.slug}" was re-provisioned ${window} ` +
+            `(confirmed ${holder.composeProject ?? "<none>"}, registry now ` +
             `records ${existing.composeProject ?? "<none>"}) — re-run \`cinatra install\` so the stack ` +
             `that is actually there is the one you are shown and confirm.${drift.filesClause}` +
+            `${drift.identityClause}` +
             (withVolumes
               ? ` --teardown-existing is set, so continuing would have run \`down -v\` against a project ` +
                 `that was never displayed, deleting its named volumes irreversibly.`
@@ -5996,6 +6113,10 @@ async function executeStopExisting({ targetDir, opts, conflicts, classified, log
     // this executor. The residue is self-healing rather than silent: the ports
     // are genuinely free (nothing is running on them) and re-running `cinatra
     // install` re-records the row.
+    //
+    // Tracked: cinatra-cli#244 — the follow-up that moves where the default
+    // install reserves, so this gap is a filed piece of work rather than a note
+    // only the next reader of this function would ever find.
     if (releasable) {
       const { registry: next } = releaseInstance(reg, holder.slug);
       writeInstanceRegistry(registryPath, next);
