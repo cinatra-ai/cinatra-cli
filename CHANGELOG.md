@@ -188,7 +188,40 @@ project adheres to [Semantic Versioning](https://semver.org/).
   what it allocated, through the same writer the install path uses. Without that
   the runtime would start on the offset port while the app kept dialling the
   default one: a dead port, or, with a default stack also up, ANOTHER instance's
-  runtime, which is worse because it answers. An unchanged map re-points nothing.
+  runtime, which is worse because it answers.
+
+  That re-point now runs on EVERY start, not only behind a re-derive. The
+  compose file, the registry row and `.env.local` are written at three different
+  moments, so a run interrupted between them leaves an install whose file and row
+  are already repaired while the env still names the old port; every later start
+  read the repaired file, answered "already wired", and returned before it got
+  to the env. What the re-point may write stays narrow. A key `.env.local`
+  already carries is re-pointed from its OWN value, so credentials, database
+  name, scheme and path survive. A key that already names the right port is left
+  alone, so a start with nothing to repair leaves the file byte-identical. Only
+  one absent key is ever written from nothing: `WAYFLOW_BASE_URL`, whose URL
+  carries no credentials and whose absence IS the leak, since the app then dials
+  the default `:3010`.
+
+  Two consequences to know before running it. First, the re-point is not limited
+  to WayFlow: `SUPABASE_DB_URL`, `REDIS_URL`, the two Nango URLs, the two agent
+  registry URLs and `NEO4J_URI` are re-pointed as well when the file carries them
+  and their port disagrees with what this instance publishes. `.env.local` is a
+  file operators maintain by hand, so the command now also PRINTS the
+  `service:port` pairs it re-pointed, before the `up`. Second, the ports it
+  speaks are the ports the generated compose it is about to bring up PUBLISHES,
+  never a recorded row that lags that file. When a shared service's recorded port
+  disagrees with what the file publishes, the command refuses the start, names
+  the service and both ports, and changes nothing; it re-reads the file once more
+  immediately before the `up`, so the launch is never authorised by a reading its
+  own writes have had time to invalidate.
+
+  The command also CLEARS a recorded `--no-wayflow` opt-out on the instance's
+  registry row, on every path it returns from, because starting the runtime by
+  hand is the act of turning it on. `cinatra instance a2a` reads that record when
+  it self-heals a stale compose; left in place it would skip the bridge-token
+  assertion for an instance that does run the runtime. A row that never opted out
+  is not rewritten at all.
   And when the file genuinely cannot be re-derived in place (an ambiguous legacy
   band offset, a shifted base band) the recorded document is validated against
   the same wiring invariant rather than started on trust — so this command can

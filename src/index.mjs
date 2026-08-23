@@ -12130,23 +12130,27 @@ function ensureWayflowBridgeEnv(
  *
  * `.env.local` is reconciled against the effective port map through the install
  * path's own `writeIsolatedAppEnv` before the caller's `up` runs — on EVERY
- * start, not only behind a regeneration, and writing only keys that moved or
- * that the file already carries. See `repointEnv` below (cinatra#2654 round-6
- * review BLOCKING A, round-7 review BLOCKING A + B).
+ * start, not only behind a regeneration, and writing only keys the file already
+ * carries plus the one credential-free key whose ABSENCE is itself the leak. See
+ * `repointEnv` below (cinatra#2654 round-6 review BLOCKING A, round-7 review
+ * BLOCKING A + B, round-8 review BLOCKING 2).
+ *
+ * That effective map is the map the FILE this start is about to bring up
+ * PUBLISHES, never the recorded row — and when the two genuinely disagree this
+ * REFUSES rather than adopting either. See `convergedPorts` below (round-8
+ * review, BLOCKING 1).
  *
  * A row that recorded the install's `--no-wayflow` opt-out has it CLEARED here:
  * this command is the act of turning the runtime on (round-7 review, NB1).
+ *
+ * `ports` is that effective map on both arms that read a compose document, so
+ * the caller can re-gate on it immediately before the `up` (round-8 review).
  *
  * @returns {Promise<{ regenerated: boolean, reason: string, skipped?: string|null,
  *                     ports?: object|null, envRepointed?: boolean, repointed?: string }>}
  */
 async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log = console.log, deps = {} } = {}) {
   const isolatedFilename = deps.ISOLATED_COMPOSE_FILENAME ?? ISOLATED_COMPOSE_FILENAME;
-  if (!row || !Array.isArray(composeFiles) || !composeFiles.includes(isolatedFilename)) {
-    return { regenerated: false, reason: "not-isolated" };
-  }
-  const existsImpl = deps.existsSync ?? existsSync;
-  const isoPath = path.join(repoRoot, isolatedFilename);
 
   /**
    * cinatra#2654 (round 7 review, NB1) — this command TURNS THE RUNTIME ON, so a
@@ -12170,11 +12174,26 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
    * write, not even the `install.mjs` import.
    */
   const clearRecordedOptOut = async () => {
-    if (recordedWayflowChoice(row) !== false) return;
+    if (!row || recordedWayflowChoice(row) !== false) return;
     const installMod = await import("./install.mjs");
     const record = deps.recordWayflowChoiceOnRow ?? installMod.recordWayflowChoiceOnRow;
     await record({ row, wayflow: true, log, deps });
   };
+
+  // cinatra#2654 (round-8 review, the "every return arm" overstatement): the
+  // NOT-ISOLATED return is a return arm too, and the `up` runs after it exactly
+  // as it does after the others. A default/attach/external/co-use row can carry
+  // the install's recorded `--no-wayflow` opt-out just as an isolated one can —
+  // `persistRecordedWayflowChoice` records the choice on whatever row the
+  // install wrote, not only on isolated rows — and this command is still the act
+  // of turning that runtime on. A checkout with NO row at all has nothing to
+  // clear, which `clearRecordedOptOut` answers by itself.
+  if (!row || !Array.isArray(composeFiles) || !composeFiles.includes(isolatedFilename)) {
+    await clearRecordedOptOut();
+    return { regenerated: false, reason: "not-isolated" };
+  }
+  const existsImpl = deps.existsSync ?? existsSync;
+  const isoPath = path.join(repoRoot, isolatedFilename);
 
   if (!existsImpl(isoPath)) {
     await clearRecordedOptOut();
@@ -12183,12 +12202,15 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
 
   const readFileImpl = deps.readFileSync ?? readFileSync;
   const parseDoc = deps.parseIsolatedComposeDoc ?? parseIsolatedComposeDoc;
-  let doc = null;
-  try {
-    doc = parseDoc(readFileImpl(isoPath, "utf8"));
-  } catch {
-    doc = null;
-  }
+  /** Read + parse the recorded compose AS IT STANDS. Null when either fails. */
+  const readComposeDoc = () => {
+    try {
+      return parseDoc(readFileImpl(isoPath, "utf8"));
+    } catch {
+      return null;
+    }
+  };
+  const doc = readComposeDoc();
   // Cannot parse it → cannot tell. This leaves whatever `docker compose up`
   // already does with an unparseable file UNCHANGED — this fix targets the
   // diagnosed fallback+--no-wayflow chain, not a corrupted checkout; the
@@ -12299,7 +12321,9 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
     const same = deps.samePortMaps ?? install.samePortMaps;
     const recorded = row.ports ?? {};
     // Per service, under the SAME normalisation `samePortMaps` applies to the
-    // whole map — a re-ordered or re-spelled port list is not a move.
+    // whole map — a re-ordered or re-spelled port list is not a move. The map on
+    // the left is what the FILE publishes (see `convergedPorts`), so a service
+    // the row lags on reads as the move it is.
     const movedServices = Object.keys(effectivePorts).filter(
       (svc) => !same({ svc: recorded[svc] ?? [] }, { svc: effectivePorts[svc] ?? [] }),
     );
@@ -12309,8 +12333,9 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
       // The app-port keys belong to a MOVE, not to the every-start verify: the
       // recorded `appPort` describes the app, not the port map, and rewriting
       // an operator's PORT on every start of an install nothing moved is not a
-      // repair. On a move this is the install path's own full re-point.
-      appPort: movedServices.length ? (row.appPort ?? null) : null,
+      // repair. On a move this is the install path's own full re-point. The
+      // writer applies that rule itself, from `movedServices` (round-8 review).
+      appPort: row.appPort ?? null,
       ports: effectivePorts,
       log,
       movedServices,
@@ -12318,10 +12343,88 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
     return { envRepointed: !!written, repointed: (written && written.remapped) || "" };
   };
 
+  /**
+   * cinatra#2654 (round-8 review, BLOCKING 1) — the map this command SPEAKS is
+   * the map the FILE it is about to bring up publishes, never the recorded row.
+   *
+   * The re-point above rewrites the operator's `.env.local`. Handed the ROW, it
+   * rewrites a CORRECT env to ports the `up` will not publish whenever the row
+   * lags the file — which is not hypothetical: the regenerator's own
+   * concurrent-row-move abort raises AFTER the compose was written
+   * (`composeFileMayBeRewritten`), and a hand-edited generated compose is never
+   * regenerated by the already-wired arm at all. That is the exact defect this
+   * PR exists to remove, produced by the repair. The rule the repo already
+   * states for the install path is the rule here (`reconvergeIsolated`,
+   * src/install.mjs): "the ports this re-converge speaks are the ports the file
+   * it is about to bring up publishes — never a recorded map that lags it".
+   *
+   * So the effective map is derived from the PARSED document, through the
+   * install path's own `effectiveIsolatedPortsFromDoc` — one spelling of the
+   * interpolated-port semantics, not two: a service the file publishes
+   * statically is the file's, a service whose published port defers to a `${VAR}`
+   * falls back per-service to the row, and a service absent from the file is
+   * absent from the map.
+   *
+   * And when the two genuinely DISAGREE — a shared service publishing a port the
+   * row does not hold — this REFUSES, through the same
+   * `assertIsolatedPortsConverge` every other isolated route runs, before
+   * anything is written. Adopting the file's port silently could launch this
+   * stack onto a port another instance owns; adopting the ROW's is the defect
+   * above. The refusal names the service, both ports and the three recoveries.
+   * It runs BEFORE the env write, the row write and the `up`, so its promise
+   * ("nothing was started, and nothing was changed") holds — which is also why
+   * this reconcile does not repair the row here: a write is the one thing the
+   * pre-mutation gate may not do, and the lagging row is corrected by the
+   * install path (`persistIsolatedPortRepair`) on the next `cinatra install`.
+   *
+   * ORDER, for the same reason the install path states it (`reconvergeIsolated`,
+   * cinatra-cli#237 round-2 finding 3): the gate runs on the document EXACTLY as
+   * it stands, BEFORE the regeneration below. The in-place regeneration rewrites
+   * the compose file AND the registry row, and it re-derives the ports from the
+   * checkout at the RECORDED offset — so a regeneration allowed to run first
+   * could rewrite an operator's divergent port away entirely, masking the
+   * disagreement so the abort never fired, and any refusal AFTER it would be
+   * claiming "nothing was changed" about a file and a row it had already
+   * written. It then runs a SECOND time on the re-read file, which is the
+   * belt-and-braces gate `persistIsolatedPortRepair` runs for the same reason.
+   *
+   * The refusal SAYS so precisely (round-8 codex convergence, round 2). This
+   * command re-provisions the bridge-token env file before the reconcile
+   * (`ensureWayflowBridgeEnv`, so the re-derive can see it), so the gate's
+   * default promise — "nothing was changed" — would be an overstatement here by
+   * one file. That file is idempotent, belongs to this checkout alone and holds
+   * no port; the clause below names what the refusal really guarantees instead
+   * of claiming more than this command has earned.
+   */
+  const convergedPorts = async (docNow, fallbackPorts) => {
+    const install = await import("./install.mjs");
+    const fromDoc = deps.effectiveIsolatedPortsFromDoc ?? install.effectiveIsolatedPortsFromDoc;
+    const converge = deps.assertIsolatedPortsConverge ?? install.assertIsolatedPortsConverge;
+    const base = fallbackPorts && typeof fallbackPorts === "object" ? fallbackPorts : (row.ports ?? {});
+    const effective = docNow ? fromDoc(docNow, base) : base;
+    converge({
+      slug: row.slug,
+      recordedPorts: row.ports ?? {},
+      ports: effective,
+      composeProject: row.composeProject,
+      registryPath: deps.instanceRegistryPath,
+      offset: Number.isInteger(row.offset) && row.offset > 0 ? row.offset : null,
+      unchangedClause:
+        `Nothing was started, and nothing about this instance's ports was changed: not ` +
+        `${isolatedFilename}, not its registry row, not .env.local. (This command re-provisions this ` +
+        `checkout's ${WAYFLOW_ENV_FILE} before it checks; that file holds the bridge token and no ports.)`,
+    });
+    return effective;
+  };
+
+  // The PRE-MUTATION gate, on the document as it stands: it must clear before
+  // the regeneration below is allowed to rewrite the very file it judges.
+  const preRepairPorts = await convergedPorts(doc, row.ports ?? {});
+
   if (alreadyWired) {
-    const env = await repointEnv(row.ports ?? {});
+    const env = await repointEnv(preRepairPorts);
     await clearRecordedOptOut();
-    return { regenerated: false, reason: "already-wired", ...env };
+    return { regenerated: false, reason: "already-wired", ports: preRepairPorts, ...env };
   }
 
   log(
@@ -12352,7 +12455,7 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
   // writer, on the same map, so the two routes cannot disagree — and only when
   // the map actually MOVED, so the common "regenerated, nothing changed"
   // reconcile still leaves the operator's env file untouched.
-  const ports = regen.regenerated && regen.ports && typeof regen.ports === "object" ? regen.ports : null;
+  const regenPorts = regen.regenerated && regen.ports && typeof regen.ports === "object" ? regen.ports : null;
   // `envRepointed` is what the writer DID, never what we asked it to do
   // (round-6 codex convergence): a checkout with no `.env.local` is a silent
   // no-op inside `writeIsolatedAppEnv`, and reporting a re-point that never
@@ -12360,7 +12463,14 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
   // A regeneration that did not move the map still goes through the same
   // reconcile as a start with no regeneration at all (BLOCKING B) — which is
   // why it is one call on one effective map, not two spellings of the rule.
-  const env = await repointEnv(ports ?? row.ports ?? {});
+  //
+  // cinatra#2654 (round-8 review, BLOCKING 1): re-READ the file the regeneration
+  // just wrote and speak what IT publishes, rather than the map the regenerator
+  // reports (or, when it validly SKIPPED, the recorded row — the lagging-row
+  // case in full). Same rule, same helper and same refusal as the already-wired
+  // arm above; the regenerator's map only answers for what the re-read cannot.
+  const ports = await convergedPorts(readComposeDoc(), regenPorts ?? preRepairPorts);
+  const env = await repointEnv(ports);
   await clearRecordedOptOut();
   return {
     regenerated: !!regen.regenerated,
@@ -12420,6 +12530,34 @@ async function runDevWayflow(argv = []) {
         `Re-pointed .env.local at this instance's own infra ports before starting` +
           `${route.repointed ? ` (${route.repointed})` : ""}.`,
       );
+    }
+    // cinatra#2654 (round-8 review, re-weighting) — RE-GATE on the file as it
+    // stands RIGHT NOW, with nothing left between this check and the `up`.
+    //
+    // The reconcile above cleared its convergence gate against a SNAPSHOT of the
+    // compose, and then this run did real work with that verdict in hand: it may
+    // have re-derived the document, rewritten `.env.local` and written the
+    // registry row. Everything in that window is time in which the file can
+    // change — a sibling cinatra process, an editor writing out a buffer, a
+    // regeneration in another checkout — and `docker compose up` binds whatever
+    // the file says at THAT moment, which nothing has checked. This is the same
+    // check-then-use gap the install path closes immediately before its own
+    // bring-up (`assertIsolatedPortsStillConverge`, src/install.mjs), and it is
+    // closed here by the same function rather than a second spelling of it.
+    //
+    // Gated on the reconcile having produced a map at all: the `absent`,
+    // `unparseable` and `not-isolated` arms deliberately let the `up` proceed on
+    // a document this CLI could not audit, and turning that documented fail-open
+    // into a refusal is not this item.
+    if (route?.ports && row?.slug) {
+      const { assertIsolatedPortsStillConverge } = await import("./install.mjs");
+      assertIsolatedPortsStillConverge({
+        slug: row.slug,
+        targetDir: repoRoot,
+        ports: route.ports,
+        composeProject: row.composeProject,
+        offset: Number.isInteger(row.offset) && row.offset > 0 ? row.offset : null,
+      });
     }
   }
   // Relative, resolved against `cwd: repoRoot` below — which also keeps the

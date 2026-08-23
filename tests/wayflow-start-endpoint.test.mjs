@@ -273,6 +273,23 @@ describe("runDevWayflow — the isolated WayFlow route repair is wired, in order
     expect(reportAt).toBeLessThan(at('spawnSync("docker"'));
   });
 
+  // ── round-8 review, re-weighting ────────────────────────────────────────
+  // The reconcile clears its convergence gate against a SNAPSHOT, and this run
+  // then rewrites `.env.local` and the registry row before it hands the file to
+  // Compose. That window is time in which the file can change, and `up` binds
+  // whatever it says at THAT moment. The install path closes the same gap with
+  // `assertIsolatedPortsStillConverge` immediately before its bring-up; this
+  // command must too, and the position is the whole point of it.
+  it("RE-GATES on the compose file immediately before the `up` (round-8 review)", () => {
+    expect(body).toContain("assertIsolatedPortsStillConverge");
+    // After the reconcile — it re-reads what the reconcile may have rewritten…
+    expect(at("reconcileIsolatedWayflowRoute({")).toBeLessThan(at("assertIsolatedPortsStillConverge({"));
+    // …and before the `up`, with the argv construction after it, so nothing
+    // this command does can invalidate the verdict it launches on.
+    expect(at("assertIsolatedPortsStillConverge({")).toBeLessThan(at("composeWayflowArgs(verb"));
+    expect(at("assertIsolatedPortsStillConverge({")).toBeLessThan(at('spawnSync("docker"'));
+  });
+
   it("runs on the `start` verb ONLY — `stop` never rewrites the recorded compose", () => {
     const call = at("reconcileIsolatedWayflowRoute({");
     // Walk back to the nearest enclosing `if (verb === "start") {` and confirm

@@ -4580,15 +4580,27 @@ function urlPortDiffers(existing, port) {
 
 /**
  * cinatra#2654 (round 7, BLOCKING A + codex convergence) — the ONLY services a
- * RESTRICTED re-point may write a key for from NOTHING, and only when they
- * moved. `wayflow` qualifies on both counts a synthesized key must meet: the
- * URL it writes carries no credentials (so nothing can be lost by writing it),
- * and the app's fallback for an absent WAYFLOW_BASE_URL is the DEFAULT :3010 —
- * another instance's runtime whenever one is up, which is the very leak this
- * repair exists to close. Every other service's fallback is either credentialled
- * (the Nango DB's `nango:nango`) or simply not this command's business.
+ * RESTRICTED re-point may write a key for from NOTHING. `wayflow` qualifies on
+ * both counts a synthesized key must meet: the URL it writes carries no
+ * credentials (so nothing can be lost by writing it), and the app's fallback for
+ * an absent WAYFLOW_BASE_URL is the DEFAULT :3010 — another instance's runtime
+ * whenever one is up, which is the very leak this repair exists to close. Every
+ * other service's fallback is either credentialled (the Nango DB's
+ * `nango:nango`) or simply not this command's business.
+ *
+ * cinatra#2654 (round-8 review, BLOCKING 2) — WHEN it may write it: whenever the
+ * effective map NAMES the service, not only when that service MOVED. This was
+ * `SYNTHESIZE_WHEN_MOVED`, and on the every-start arm nothing ever moves — the
+ * caller compares the map it is about to speak against the row, and for the
+ * legacy install this repair exists for those agree: the compose is wired on the
+ * instance's own port, the row records it, and the `.env.local` written before
+ * either of them carries no WAYFLOW_BASE_URL at all. So the synthesis never
+ * fired for the one state it was written for, and the app went on dialling
+ * :3010 after every interrupted first repair. An absent key for a service the
+ * file publishes IS the disagreement — the app is pointed at the default band
+ * while the container binds this instance's — so it is treated as one.
  */
-const SYNTHESIZE_WHEN_MOVED = new Set(["wayflow"]);
+const SYNTHESIZE_WHEN_ABSENT = new Set(["wayflow"]);
 
 /**
  * Write the host app env for an ISOLATED instance: its own PORT + Better-Auth
@@ -4614,14 +4626,18 @@ const SYNTHESIZE_WHEN_MOVED = new Set(["wayflow"]);
  * no value for the key, and a fresh URL carries NO CREDENTIALS — for a service
  * the operator never had a key for (the runtime supplies `nango:nango` for the
  * Nango DB), writing one BREAKS a connection this command never touched. So a
- * restricted re-point writes a key only when its service actually MOVED (the
- * regeneration enlarged or shifted the map, and the app must follow it) or when
- * the env file ALREADY CARRIES that key (a re-point there preserves the
- * operator's own credentials and db-name — `rewriteUrlPort`'s existing arm).
- * An absent key on an unmoved service is NEVER synthesized.
+ * restricted re-point writes a key only when the env file ALREADY CARRIES it (a
+ * re-point there preserves the operator's own credentials and db-name —
+ * `rewriteUrlPort`'s existing arm) or when its service is in
+ * `SYNTHESIZE_WHEN_ABSENT` — `wayflow` alone, whose URL carries no credentials
+ * and whose ABSENCE is itself the leak. An absent key for any other service is
+ * NEVER synthesized.
  *
  * @param {Iterable<string>|null} [movedServices]  restricted mode when non-null:
- *   the compose service names whose published host ports actually moved.
+ *   the compose service names whose published host ports actually moved. In
+ *   restricted mode that set decides one thing — whether this call may touch the
+ *   APP keys at all; every infra key is decided by what the file publishes and
+ *   by the value the env already carries (round-8 review, BLOCKING 2).
  * @returns {false | { remapped: string }}  `false` when nothing was written
  *   (no `.env.local`, or a restricted re-point that found nothing to change);
  *   otherwise the space-separated `svc:port` summary of what it re-pointed.
@@ -4648,7 +4664,15 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
   // re-point compares against (a value this call already wrote is not evidence
   // of what the operator had).
   const cur = parseEnvBody(body);
-  const appPortRecorded = Number.isInteger(appPort) && appPort > 0;
+  const restricted = movedServices != null;
+  const moved = new Set(restricted ? Array.from(movedServices) : []);
+  // cinatra#2654 (round-8 review): the "nothing moved → do not touch the app
+  // keys at all" half of the rule below lives HERE, next to the rest of it,
+  // rather than in the caller passing `appPort: null` to mean it. `movedServices`
+  // then has exactly one job in this writer — deciding what a restricted
+  // re-point may say about the APP — now that a synthesizable infra key is
+  // decided by what the file publishes instead (`SYNTHESIZE_WHEN_ABSENT`).
+  const appPortRecorded = Number.isInteger(appPort) && appPort > 0 && (!restricted || moved.size > 0);
   if (appPortRecorded) {
     const baseUrl = `http://localhost:${appPort}`;
     // cinatra#2654 (round 7, codex convergence): under a RESTRICTED re-point,
@@ -4664,9 +4688,8 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
     // that adds three app-settings keys an operator's file never had is not the
     // WayFlow route repair this command performs, and the app's own default
     // applies exactly as it did before this command ran. Only `wayflow` is
-    // synthesized from nothing — see `SYNTHESIZE_WHEN_MOVED`.
-    const appKeyDiffers = (key, value) =>
-      movedServices == null || (cur[key] != null && String(cur[key]) !== value);
+    // synthesized from nothing — see `SYNTHESIZE_WHEN_ABSENT`.
+    const appKeyDiffers = (key, value) => !restricted || (cur[key] != null && String(cur[key]) !== value);
     if (appKeyDiffers("PORT", String(appPort))) body = upsertEnvKey(body, "PORT", String(appPort));
     if (appKeyDiffers("BETTER_AUTH_URL", baseUrl)) body = upsertEnvKey(body, "BETTER_AUTH_URL", baseUrl);
     if (appKeyDiffers("NEXT_PUBLIC_BETTER_AUTH_URL", baseUrl)) {
@@ -4691,8 +4714,11 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
   //   - CARRIED and already naming that port → left alone. This runs on EVERY
   //     start, so re-writing a value that already says the right thing would
   //     churn the operator's file and announce a repair that repaired nothing.
-  //   - ABSENT → NOT written, with ONE exception (`SYNTHESIZE_WHEN_MOVED`): the
-  //     `wayflow` service this command exists to repair, and only when it moved.
+  //   - ABSENT → NOT written, with ONE exception (`SYNTHESIZE_WHEN_ABSENT`): the
+  //     `wayflow` service this command exists to repair, whenever the map names
+  //     it (round-8 review, BLOCKING 2 — the every-start arm never sees a MOVE,
+  //     so gating the synthesis on one meant the legacy install this repair was
+  //     written for never got the key at all).
   //     A synthesized URL carries NO credentials, so writing one over a key the
   //     operator relies on the runtime's own credentialled fallback for (the
   //     Nango DB's `nango:nango`) BREAKS a connection this repair never touched.
@@ -4703,13 +4729,16 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
   // The install path (`movedServices === null`) is untouched by all of it: it
   // owns the file it just wrote, and a key it leaves absent falls back to a
   // DEFAULT-band URL — the isolation leak this writer exists to close.
-  const restricted = movedServices != null;
-  const moved = new Set(restricted ? Array.from(movedServices) : []);
   const wrote = new Set();
   const writesKey = (svc, key, target) => {
+    // `target == null` is the map not naming this service at all: there is no
+    // port to point anything at, so nothing is written under either mode.
     if (target == null) return false;
     if (!restricted) return true;
-    if (cur[key] == null) return SYNTHESIZE_WHEN_MOVED.has(svc) && moved.has(svc);
+    // ABSENT → only `SYNTHESIZE_WHEN_ABSENT`, and `target` above has already
+    // established that the file this start is about to bring up publishes the
+    // service (round-8 review, BLOCKING 2).
+    if (cur[key] == null) return SYNTHESIZE_WHEN_ABSENT.has(svc);
     return urlPortDiffers(cur[key], target);
   };
   /** Re-point ONE key from its own current value, and record that this service
@@ -5287,6 +5316,26 @@ function isGeneratedComposeShape(doc) {
 }
 
 /**
+ * What a refusal may TRUTHFULLY promise about this run's writes
+ * (cinatra#2654 round-8 codex convergence, round 2).
+ *
+ * The sentence is part of the contract, not decoration: an operator reads it to
+ * decide whether they have to undo anything before following the recovery steps.
+ * A gate that runs before every mutation may say "nothing was changed"; one that
+ * runs after this run has already written may not, and a caller whose command
+ * touched an unrelated file of its own says which. So it is a PARAMETER with a
+ * strict default, rather than an absolute claim every call site inherits whether
+ * it has earned it or not.
+ */
+const UNCHANGED_NOTHING_AT_ALL = "Nothing was started, and nothing was changed.";
+/** The honest form for the LAST gate before a launch: this run has by then done
+ *  its own work (regenerated the compose, repaired the row, re-pointed the env),
+ *  and only the bring-up is refused. */
+const UNCHANGED_ONLY_THE_LAUNCH =
+  "Nothing was brought up. This is the LAST check before the launch, so this run's earlier " +
+  "writes (a re-derived compose, a repaired registry row, a re-pointed .env.local) stand as they are.";
+
+/**
  * The refusal for a generated-compose file this CLI can READ but cannot PARSE
  * (cinatra-cli#237 round-3 finding 2).
  *
@@ -5304,13 +5353,13 @@ function isGeneratedComposeShape(doc) {
  * @param {string} isoPath the file we could not parse
  * @returns {Error}
  */
-function unauditableIsolatedComposeError(isoPath) {
+function unauditableIsolatedComposeError(isoPath, unchangedClause = UNCHANGED_NOTHING_AT_ALL) {
   return new Error(
     `Refusing to bring up this isolated instance: ${isoPath} could not be parsed as the document ` +
       `cinatra generates (JSON rendered into a .yml). Docker Compose may still accept and launch this file — ` +
       `YAML is a superset of JSON — but cinatra cannot then check WHICH host ports it would bind, so it cannot ` +
       `confirm the stack stays inside this instance's allocated band rather than on a port another instance ` +
-      `owns. Nothing was started, and nothing was changed. Recover by one of:\n` +
+      `owns. ${unchangedClause} Recover by one of:\n` +
       `  (1) RESTORE the generated form — revert your edit so ${ISOLATED_COMPOSE_FILENAME} is again the JSON ` +
       `document cinatra wrote (valid Compose YAML as-is), then re-run this command.\n` +
       `  (2) REGENERATE it from scratch — bring the stack down (\`docker compose -f ${ISOLATED_COMPOSE_FILENAME} down\` ` +
@@ -5397,7 +5446,7 @@ function unauditableIsolatedComposeError(isoPath) {
  * @param {Record<string, number[]>} [recordedPorts] the registry row's map
  * @returns {Record<string, number[]>}
  */
-function effectiveIsolatedPorts(targetDir, recordedPorts = {}) {
+function effectiveIsolatedPorts(targetDir, recordedPorts = {}, unchangedClause = UNCHANGED_NOTHING_AT_ALL) {
   const base = recordedPorts && typeof recordedPorts === "object" ? recordedPorts : {};
   const isoPath = path.join(targetDir, ISOLATED_COMPOSE_FILENAME);
   // (a) The file cannot be READ at all — absent, or an fs error. There is no
@@ -5424,7 +5473,37 @@ function effectiveIsolatedPorts(targetDir, recordedPorts = {}) {
   // restored the exact blanket overlay findings 1 and 2 removed — a service
   // deleted from the file and a static port changed in it both became
   // invisible, and the gate passed on a map describing a file nobody had read.
-  if (!isGeneratedComposeShape(doc)) throw unauditableIsolatedComposeError(isoPath);
+  if (!isGeneratedComposeShape(doc)) throw unauditableIsolatedComposeError(isoPath, unchangedClause);
+  return effectiveIsolatedPortsFromDoc(doc, base);
+}
+
+/**
+ * The pure core of `effectiveIsolatedPorts`: the map a PARSED generated compose
+ * document publishes, with the recorded row answering per-service for what the
+ * document declines to state (cinatra#2654 round-8 review, finding 1).
+ *
+ * Split out and EXPORTED because a second surface must ask the same question of
+ * a document it has ALREADY parsed: `reconcileIsolatedWayflowRoute`
+ * (src/index.mjs) reads the recorded compose to decide whether the bridge-token
+ * route is wired, and then re-points `.env.local` before the `up`. Re-pointing
+ * that file at the recorded ROW rewrites a correct env to ports the `up` will
+ * not publish whenever the row lags the file — the very defect that repair
+ * exists to remove. The interpolated-port semantics are subtle enough
+ * (per-service fallback, mixed static/interpolated services compared against
+ * the record FIRST) that a second spelling of them WOULD drift; there is one.
+ *
+ * A document that is not the shape this CLI generates answers with the recorded
+ * map unchanged: the decision to REFUSE an unauditable file belongs to the
+ * caller that is about to launch it (`effectiveIsolatedPorts` above), not to
+ * this pure derivation.
+ *
+ * @param {object} doc parsed compose document (`{ services: { … } }`)
+ * @param {Record<string, number[]>} [recordedPorts] the registry row's map
+ * @returns {Record<string, number[]>}
+ */
+export function effectiveIsolatedPortsFromDoc(doc, recordedPorts = {}) {
+  const base = recordedPorts && typeof recordedPorts === "object" ? recordedPorts : {};
+  if (!isGeneratedComposeShape(doc)) return base;
   const effective = publishedPortsByService(doc);
   // Per-service fallback for the services the file declines to speak for. NOT a
   // blanket overlay: a service ABSENT from the file is not listed here, so it
@@ -5503,6 +5582,12 @@ export function samePortMaps(a, b) {
  * launching on (and the row silently adopting) a port that may already belong
  * to another instance.
  *
+ * cinatra#2654 (round-8 review, finding 1): EXPORTED. `instance wayflow start`
+ * re-points `.env.local` and then hands the very same file to `docker compose
+ * up`, so it owes the operator the same refusal every other isolated route
+ * gives — this error's own text already names that command as a surface which
+ * would otherwise go on advertising the recorded port.
+ *
  * @param {object} args
  * @param {string} args.slug the instance
  * @param {Record<string, number[]>} args.recordedPorts the registry row's map
@@ -5513,9 +5598,19 @@ export function samePortMaps(a, b) {
  * @param {number|null} [args.offset] this instance's recorded band offset —
  *   null/absent (a legacy row) means a gain can never be verified in-band, so
  *   it is treated as a disagreement (fail-closed).
+ * @param {string} [args.unchangedClause] what this CALLER may truthfully promise
+ *   about its own writes (see `UNCHANGED_NOTHING_AT_ALL`).
  * @throws {Error} naming the service, both ports, and how to get out
  */
-function assertIsolatedPortsConverge({ slug, recordedPorts, ports, composeProject, registryPath, offset = null }) {
+export function assertIsolatedPortsConverge({
+  slug,
+  recordedPorts,
+  ports,
+  composeProject,
+  registryPath,
+  offset = null,
+  unchangedClause = UNCHANGED_NOTHING_AT_ALL,
+}) {
   if (!slug || !ports) return;
   const mismatch = firstSharedServicePortMismatch(recordedPorts ?? {}, ports, { offset, bandWidth: BAND_OFFSET_STEP });
   if (!mismatch) return;
@@ -5538,8 +5633,8 @@ function assertIsolatedPortsConverge({ slug, recordedPorts, ports, composeProjec
     `Refusing to bring up isolated instance "${slug}": its recorded port for "${mismatch.service}" ` +
       `(${recorded}) disagrees with what ${ISOLATED_COMPOSE_FILENAME} now publishes ` +
       `(${actual}). Bringing the stack up on the diverging file could launch it OUTSIDE ` +
-      `this instance's allocated band, onto a port another instance may already own. Nothing was started, ` +
-      `and nothing was changed. Options 2 and 3 below hand-edit ${regFile}: stop any other cinatra ` +
+      `this instance's allocated band, onto a port another instance may already own. ${unchangedClause} ` +
+      `Options 2 and 3 below hand-edit ${regFile}: stop any other cinatra ` +
       `operations on this machine first, or a concurrent run can rewrite that row underneath your edit. ` +
       `Recover by one of:\n` +
       `  (1) KEEP the recorded allocation — edit ${ISOLATED_COMPOSE_FILENAME} so "${mismatch.service}" ` +
@@ -5582,6 +5677,11 @@ function assertIsolatedPortsConverge({ slug, recordedPorts, ports, composeProjec
  * row. Comparing the freshly-read file against that is the same question the
  * first gate asked, so an unchanged file always passes.
  *
+ * cinatra#2654 (round-8 review, re-weighting): EXPORTED for the same reason.
+ * `instance wayflow start` separates its reconcile from its `up` by an
+ * `.env.local` write and a registry write — precisely the window this re-read
+ * exists to close.
+ *
  * @param {object} args
  * @param {string} args.slug the instance
  * @param {string} args.targetDir the checkout holding the generated compose
@@ -5592,15 +5692,27 @@ function assertIsolatedPortsConverge({ slug, recordedPorts, ports, composeProjec
  *   (see `assertIsolatedPortsConverge`)
  * @throws {Error} when the file no longer converges, or can no longer be parsed
  */
-function assertIsolatedPortsStillConverge({ slug, targetDir, ports, composeProject, registryPath, offset = null }) {
+export function assertIsolatedPortsStillConverge({
+  slug,
+  targetDir,
+  ports,
+  composeProject,
+  registryPath,
+  offset = null,
+  unchangedClause = UNCHANGED_ONLY_THE_LAUNCH,
+}) {
   if (!slug) return;
   assertIsolatedPortsConverge({
     slug,
     recordedPorts: ports,
-    ports: effectiveIsolatedPorts(targetDir, ports),
+    // The clause travels with BOTH refusals this gate can raise: the divergence
+    // one below, and the unauditable-file one `effectiveIsolatedPorts` raises
+    // while re-reading (round-8 codex convergence, round 3).
+    ports: effectiveIsolatedPorts(targetDir, ports, unchangedClause),
     composeProject,
     registryPath,
     offset,
+    unchangedClause,
   });
 }
 

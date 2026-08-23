@@ -12,7 +12,14 @@ import path from "node:path";
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { DEFAULT_REPO_URL, parseInstallArgs, runInstall, writeIsolatedAppEnv } from "../src/install.mjs";
+import {
+  DEFAULT_REPO_URL,
+  assertIsolatedPortsStillConverge,
+  effectiveIsolatedPortsFromDoc,
+  parseInstallArgs,
+  runInstall,
+  writeIsolatedAppEnv,
+} from "../src/install.mjs";
 import { parseIsolatedComposeDoc, writeIsolatedComposeFile } from "../src/install-isolation.mjs";
 import { readInstanceRegistry } from "../src/instance-registry.mjs";
 import { readMarker } from "../src/instance-marker.mjs";
@@ -859,6 +866,40 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
   const LEGACY_WAYFLOW_PORT = 3010 + LEGACY_OFFSET; // 23010
   const LEGACY_REGENERATED_PORTS = Object.freeze({ postgres: [25434], wayflow: [LEGACY_WAYFLOW_PORT] });
 
+  /** The document an in-place regeneration LEAVES ON DISK — the ports the file
+   *  the `up` reads actually publishes. `reconcileIsolatedWayflowRoute` now
+   *  speaks that file's own map rather than the map the regenerator reports
+   *  (cinatra#2654 round-8 review, BLOCKING 1), so a stub that claims an
+   *  enlarged map must WRITE it, exactly as `regenerateIsolatedComposeInPlace`
+   *  does. A stub that only claimed it modelled a state that cannot occur. */
+  const writeGeneratedCompose = (installDir, projectName, ports) => {
+    const services = {};
+    for (const [svc, list] of Object.entries(ports)) {
+      services[svc] = {
+        image: `${svc}:local`,
+        ports: (list ?? []).map((port) => ({
+          published: String(port),
+          target: Number(port),
+          host_ip: "127.0.0.1",
+          protocol: "tcp",
+          mode: "host",
+        })),
+      };
+      // The route the re-derive exists to bake in.
+      if (svc === "wayflow") services[svc].environment = { CINATRA_BRIDGE_TOKEN: "${CINATRA_BRIDGE_TOKEN}" };
+    }
+    writeIsolatedComposeFile(path.join(installDir, "docker-compose.cinatra-isolated.yml"), {
+      name: projectName,
+      services,
+    });
+  };
+  /** A faithful `regenerateIsolatedCompose` stub: it writes the enlarged
+   *  document BEFORE reporting the enlarged map. */
+  const regeneratesTo = (installDir, projectName, ports, offset) => () => {
+    writeGeneratedCompose(installDir, projectName, ports);
+    return { regenerated: true, ports, offset };
+  };
+
   describe("instance wayflow start — the fallback-route --no-wayflow recovery (cinatra#2654 round 5)", () => {
     it("re-derives the recorded compose so the bridge token reaches the wayflow service (fail-first at 9846340b)", async () => {
       const installDir = path.join(sandbox, "iso-wf-start-fallback");
@@ -1142,7 +1183,7 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
         deps: {
           regenerateIsolatedCompose: () => {
             regenerateCalled = true;
-            return { regenerated: true, ports: LEGACY_REGENERATED_PORTS, offset: row.offset };
+            return regeneratesTo(installDir, row.composeProject, LEGACY_REGENERATED_PORTS, row.offset)();
           },
         },
       });
@@ -1198,11 +1239,7 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
         row,
         log: () => {},
         deps: {
-          regenerateIsolatedCompose: () => ({
-            regenerated: true,
-            ports: LEGACY_REGENERATED_PORTS,
-            offset: row.offset,
-          }),
+          regenerateIsolatedCompose: regeneratesTo(installDir, row.composeProject, LEGACY_REGENERATED_PORTS, row.offset),
         },
       });
       expect(result.regenerated).toBe(true);
@@ -1254,8 +1291,10 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
         row,
         log: () => {},
         deps: {
-          // Same map, spelled differently (string ports, reordered) — a benign
-          // spelling difference must not read as a move.
+          // Same map, spelled differently (string ports): a benign spelling
+          // difference must not read as a move. The file this stub leaves in
+          // place publishes exactly `postgres: 25434`, and that file is what the
+          // reconcile speaks (round-8 review, BLOCKING 1).
           regenerateIsolatedCompose: () => ({
             regenerated: true,
             ports: { postgres: ["25434"] },
@@ -1301,11 +1340,7 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
         row,
         log: () => {},
         deps: {
-          regenerateIsolatedCompose: () => ({
-            regenerated: true,
-            ports: LEGACY_REGENERATED_PORTS,
-            offset: row.offset,
-          }),
+          regenerateIsolatedCompose: regeneratesTo(installDir, row.composeProject, LEGACY_REGENERATED_PORTS, row.offset),
         },
       });
       expect(result.regenerated).toBe(true);
@@ -1343,11 +1378,7 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
         row,
         log: () => {},
         deps: {
-          regenerateIsolatedCompose: () => ({
-            regenerated: true,
-            ports: LEGACY_REGENERATED_PORTS,
-            offset: row.offset,
-          }),
+          regenerateIsolatedCompose: regeneratesTo(installDir, row.composeProject, LEGACY_REGENERATED_PORTS, row.offset),
         },
       });
       expect(result.envRepointed).toBe(true);
@@ -1403,11 +1434,12 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
         row,
         log: () => {},
         deps: {
-          regenerateIsolatedCompose: () => ({
-            regenerated: true,
-            ports: { postgres: [25434], "nango-db": [25435], wayflow: [LEGACY_WAYFLOW_PORT] },
-            offset: row.offset,
-          }),
+          regenerateIsolatedCompose: regeneratesTo(
+            installDir,
+            row.composeProject,
+            { postgres: [25434], "nango-db": [25435], wayflow: [LEGACY_WAYFLOW_PORT] },
+            row.offset,
+          ),
         },
       });
       expect(result.regenerated).toBe(true);
@@ -1461,11 +1493,12 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
         row,
         log: () => {},
         deps: {
-          regenerateIsolatedCompose: () => ({
-            regenerated: true,
-            ports: { postgres: [25434], "nango-db": [25435], wayflow: [LEGACY_WAYFLOW_PORT] },
-            offset: row.offset,
-          }),
+          regenerateIsolatedCompose: regeneratesTo(
+            installDir,
+            row.composeProject,
+            { postgres: [25434], "nango-db": [25435], wayflow: [LEGACY_WAYFLOW_PORT] },
+            row.offset,
+          ),
         },
       });
       const after = readFileSync(envPath, "utf8");
@@ -1546,7 +1579,11 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
       const after = readFileSync(envPath, "utf8");
       // THE FIX: the recorded map and the env file agree again, before the `up`.
       expect(after).toMatch(new RegExp(`^WAYFLOW_BASE_URL=http://localhost:${LEGACY_WAYFLOW_PORT}/?$`, "m"));
-      // A key the env carries but whose service did NOT move is left alone.
+      // A key the env CARRIES whose port disagrees is re-pointed too, whether or
+      // not its service moved: this runs on every start, and a carried key is
+      // re-pointed from its OWN value, so the operator's credentials survive
+      // (round-8 review, non-blocking 4 — this comment used to say the
+      // opposite of the assertion below it).
       expect(after).toMatch(/^SUPABASE_DB_URL=postgresql:\/\/u:p@127\.0\.0\.1:25434\/postgres$/m);
       expect(result.envRepointed).toBe(true);
       expect(result.repointed).toContain(`wayflow:${LEGACY_WAYFLOW_PORT}`);
@@ -1584,6 +1621,225 @@ describe("runInstall — conflict resolution (cinatra-cli#17)", () => {
       expect(result.envRepointed).toBe(false);
       // …and it did NOT synthesize the absent key for the postgres the row records.
       expect(readFileSync(envPath, "utf8")).not.toMatch(/SUPABASE_DB_URL/);
+    });
+
+    // ── round-8 review, BLOCKING 1 ──────────────────────────────────────────
+    // The every-start re-point must speak the ports the FILE it is about to
+    // bring up publishes, never the recorded row. Two in-repo routes reach a row
+    // that LAGS the file: the regenerator's concurrent-row-move abort, which
+    // raises AFTER the compose was written, and a hand-edited generated compose,
+    // which the already-wired arm never regenerates. Handed the row, the repair
+    // rewrites a CORRECT `.env.local` to ports the `up` will not publish — the
+    // exact defect this PR exists to remove, produced by the repair.
+    it("BLOCKING 1: a lagging row does not decide the re-point — the env follows the FILE", async () => {
+      const installDir = path.join(sandbox, "iso-wf-start-row-lags-file");
+      mkdirSync(installDir, { recursive: true });
+      // The file is current: it publishes this instance's own wayflow port.
+      wiredIsolatedCompose(installDir, "cinatra_row_lags", LEGACY_WAYFLOW_PORT);
+      const envPath = path.join(installDir, ".env.local");
+      writeFileSync(
+        envPath,
+        `PORT=${LEGACY_APP_PORT}\nWAYFLOW_BASE_URL=http://localhost:3010\n`,
+        { mode: 0o600 },
+      );
+      // The row LAGS it: written before the compose gained its wayflow service,
+      // and never repaired (the abort that wrote the file raised before the row).
+      const row = {
+        slug: "row-lags",
+        composeProject: "cinatra_row_lags",
+        composeFiles: ["docker-compose.cinatra-isolated.yml"],
+        ports: { postgres: [25434] },
+        appPort: LEGACY_APP_PORT,
+        offset: LEGACY_OFFSET,
+      };
+      const result = await reconcileIsolatedWayflowRoute({
+        repoRoot: installDir,
+        composeFiles: row.composeFiles,
+        row,
+        log: () => {},
+        deps: {
+          regenerateIsolatedCompose: () => {
+            throw new Error("the compose is already wired — nothing to regenerate");
+          },
+        },
+      });
+      expect(result.reason).toBe("already-wired");
+      // THE FIX: the map this start speaks is the file's, so the endpoint the
+      // row never learned about still reaches `.env.local`.
+      expect(result.ports).toEqual({ postgres: [25434], wayflow: [LEGACY_WAYFLOW_PORT] });
+      expect(readFileSync(envPath, "utf8")).toMatch(
+        new RegExp(`^WAYFLOW_BASE_URL=http://localhost:${LEGACY_WAYFLOW_PORT}/?$`, "m"),
+      );
+    });
+
+    it("BLOCKING 1: a row that DISAGREES with the file refuses the start, and writes nothing", async () => {
+      const installDir = path.join(sandbox, "iso-wf-start-row-disagrees");
+      mkdirSync(installDir, { recursive: true });
+      // What the file publishes — and what the `up` would therefore bind.
+      writeGeneratedCompose(installDir, "cinatra_row_disagrees", {
+        postgres: [25434],
+        wayflow: [LEGACY_WAYFLOW_PORT],
+      });
+      const envPath = path.join(installDir, ".env.local");
+      // The operator's env is CORRECT: it already names what the file publishes.
+      const before =
+        `PORT=${LEGACY_APP_PORT}\nWAYFLOW_BASE_URL=http://localhost:${LEGACY_WAYFLOW_PORT}\n` +
+        `SUPABASE_DB_URL=postgresql://u:p@127.0.0.1:25434/postgres\n`;
+      writeFileSync(envPath, before, { mode: 0o600 });
+      // The row names a different band entirely.
+      const row = {
+        slug: "row-disagrees",
+        composeProject: "cinatra_row_disagrees",
+        composeFiles: ["docker-compose.cinatra-isolated.yml"],
+        ports: { postgres: [15434], wayflow: [13010] },
+        appPort: LEGACY_APP_PORT,
+        offset: LEGACY_OFFSET,
+      };
+      const err = await reconcileIsolatedWayflowRoute({
+        repoRoot: installDir,
+        composeFiles: row.composeFiles,
+        row,
+        log: () => {},
+        deps: {},
+      }).then(() => null, (e) => e);
+      // THE FIX: it refuses instead of rewriting a correct file to a port
+      // nothing will publish. The refusal names the service and both ports.
+      expect(err).toBeInstanceOf(Error);
+      expect(err.message).toContain('"postgres"');
+      expect(err.message).toContain("15434");
+      expect(err.message).toContain("25434");
+      // …and it promises exactly what THIS command has earned, no more: it
+      // re-provisions the bridge-token env file before the check, so the gate's
+      // blanket "nothing was changed" would be an overstatement by one file
+      // (round-8 codex convergence, round 2).
+      expect(err.message).toContain("nothing about this instance's ports was changed");
+      expect(err.message).toContain(".wayflow.env");
+      expect(err.message).not.toContain("Nothing was started, and nothing was changed.");
+      // …and the promise it does make is kept, byte for byte.
+      expect(readFileSync(envPath, "utf8")).toBe(before);
+    });
+
+    // ── round-8 codex convergence ───────────────────────────────────────────
+    // ORDER. The refusal above only means anything if it runs BEFORE the
+    // regeneration: the in-place re-derive rewrites the compose AND the row, and
+    // it derives ports from the checkout at the RECORDED offset — so a
+    // regeneration allowed to run first could rewrite the operator's divergent
+    // port away entirely, masking the disagreement so the abort never fires, and
+    // a refusal after it would be claiming "nothing was changed" about a file it
+    // had already written. This is the NOT-already-wired arm: the one that
+    // regenerates.
+    it("BLOCKING 1: a divergent compose is refused BEFORE the regeneration can rewrite it", async () => {
+      const installDir = path.join(sandbox, "iso-wf-start-divergent-unwired");
+      mkdirSync(installDir, { recursive: true });
+      const isoPath = path.join(installDir, "docker-compose.cinatra-isolated.yml");
+      // NOT wired: the wayflow service carries no bridge-token route at all, so
+      // this document is the one the reconcile would re-derive…
+      writeIsolatedComposeFile(isoPath, {
+        name: "cinatra_divergent_unwired",
+        services: {
+          postgres: {
+            image: "postgres:16",
+            ports: [{ published: "25434", target: 5432, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+          },
+          wayflow: {
+            image: "cinatra-wayflow:local",
+            ports: [
+              {
+                published: String(LEGACY_WAYFLOW_PORT),
+                target: 3010,
+                host_ip: "127.0.0.1",
+                protocol: "tcp",
+                mode: "host",
+              },
+            ],
+          },
+        },
+      });
+      const composeBefore = readFileSync(isoPath, "utf8");
+      const envPath = path.join(installDir, ".env.local");
+      const envBefore = `PORT=${LEGACY_APP_PORT}\nWAYFLOW_BASE_URL=http://localhost:${LEGACY_WAYFLOW_PORT}\n`;
+      writeFileSync(envPath, envBefore, { mode: 0o600 });
+      // …and the row disagrees with it on a SHARED service.
+      const row = {
+        slug: "divergent-unwired",
+        composeProject: "cinatra_divergent_unwired",
+        composeFiles: ["docker-compose.cinatra-isolated.yml"],
+        ports: { postgres: [15434], wayflow: [LEGACY_WAYFLOW_PORT] },
+        appPort: LEGACY_APP_PORT,
+        offset: LEGACY_OFFSET,
+      };
+      let regenerateCalled = false;
+      const err = await reconcileIsolatedWayflowRoute({
+        repoRoot: installDir,
+        composeFiles: row.composeFiles,
+        row,
+        log: () => {},
+        deps: {
+          regenerateIsolatedCompose: () => {
+            regenerateCalled = true;
+            return { regenerated: true, ports: row.ports, offset: row.offset };
+          },
+        },
+      }).then(() => null, (e) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(err.message).toContain('"postgres"');
+      // THE ORDER: the gate ran first, so the re-derive never got to mask it.
+      expect(regenerateCalled).toBe(false);
+      expect(readFileSync(isoPath, "utf8")).toBe(composeBefore);
+      expect(readFileSync(envPath, "utf8")).toBe(envBefore);
+    });
+
+    // ── round-8 review, BLOCKING 2 ──────────────────────────────────────────
+    // The MISSING-KEY half of the crash window — the legacy install this command
+    // exists for. Its `.env.local` was written when the map held no `wayflow`
+    // entry at all, so it carries no WAYFLOW_BASE_URL; the compose and the row
+    // were then repaired by a run that was interrupted before the env re-point.
+    // Nothing MOVES on the next start, so a synthesis gated on a move never
+    // fires and the app goes on dialling the dead default :3010 forever.
+    it("BLOCKING 2: an ABSENT WAYFLOW_BASE_URL is synthesized on the every-start arm", async () => {
+      const installDir = path.join(sandbox, "iso-wf-start-absent-key");
+      mkdirSync(installDir, { recursive: true });
+      writeGeneratedCompose(installDir, "cinatra_absent_key", {
+        wayflow: [LEGACY_WAYFLOW_PORT],
+        "nango-db": [25435],
+      });
+      const envPath = path.join(installDir, ".env.local");
+      // No WAYFLOW_BASE_URL at all, and no Nango key either.
+      writeFileSync(envPath, `PORT=${LEGACY_APP_PORT}\nOPERATOR_ONLY=keep-me\n`, { mode: 0o600 });
+      const row = {
+        slug: "absent-key",
+        composeProject: "cinatra_absent_key",
+        composeFiles: ["docker-compose.cinatra-isolated.yml"],
+        // The row already AGREES with the file: nothing moved, which is exactly
+        // why the round-7 rule never repaired this install.
+        ports: { wayflow: [LEGACY_WAYFLOW_PORT], "nango-db": [25435] },
+        appPort: LEGACY_APP_PORT,
+        offset: LEGACY_OFFSET,
+      };
+      const result = await reconcileIsolatedWayflowRoute({
+        repoRoot: installDir,
+        composeFiles: row.composeFiles,
+        row,
+        log: () => {},
+        deps: {
+          regenerateIsolatedCompose: () => {
+            throw new Error("the compose is already wired — nothing to regenerate");
+          },
+        },
+      });
+      expect(result.reason).toBe("already-wired");
+      const after = readFileSync(envPath, "utf8");
+      // THE FIX: the app is pointed at the runtime this start is about to bring
+      // up, instead of the default port a sibling instance may answer on.
+      expect(after).toMatch(new RegExp(`^WAYFLOW_BASE_URL=http://127\\.0\\.0\\.1:${LEGACY_WAYFLOW_PORT}/?$`, "m"));
+      expect(result.envRepointed).toBe(true);
+      expect(result.repointed).toContain(`wayflow:${LEGACY_WAYFLOW_PORT}`);
+      // The narrowness of round-7's rule is UNCHANGED for every other service:
+      // a credential-bearing key the operator never carried is still not invented.
+      expect(after).not.toMatch(/NANGO_DATABASE_URL/);
+      expect(after).not.toMatch(/NANGO_DB_URL/);
+      // …and the operator's own lines survive.
+      expect(after).toMatch(/^OPERATOR_ONLY=keep-me$/m);
     });
 
     // ── round-7 review, C ───────────────────────────────────────────────────
@@ -3572,10 +3828,27 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
     expect(res).toEqual({ remapped: "wayflow:23010" });
   });
 
-  it("does NOT synthesize WAYFLOW_BASE_URL when the wayflow service did NOT move", () => {
+  // ── round-8 review, BLOCKING 2 ───────────────────────────────────────────
+  // This assertion used to demand the OPPOSITE, and the rule it pinned is what
+  // left the legacy install this repair exists for dialling the dead default
+  // :3010. On the every-start arm nothing ever MOVES: the compose is wired on
+  // this instance's own port and the row records it — only `.env.local`, written
+  // before either of them, carries no WAYFLOW_BASE_URL at all. An absent key for
+  // a service the file PUBLISHES is itself the disagreement (the app is pointed
+  // at the default band while the container binds this instance's), so it is
+  // synthesized whether or not that service moved.
+  it("SYNTHESIZES the absent WAYFLOW_BASE_URL even when NOTHING moved (round-8 review, BLOCKING 2)", () => {
+    write("PORT=3350\n");
+    const res = repoint({ ports: { wayflow: [23010] }, movedServices: [] });
+    expect(read()).toMatch(/^WAYFLOW_BASE_URL=http:\/\/127\.0\.0\.1:23010\/?$/m);
+    expect(res).toEqual({ remapped: "wayflow:23010" });
+  });
+
+  it("synthesizes NOTHING for a service the file does not publish", () => {
     const before = "PORT=3350\n";
     write(before);
-    expect(repoint({ ports: { wayflow: [23010] }, movedServices: [] })).toBe(false);
+    // No `wayflow` entry in the effective map → no port to point anything at.
+    expect(repoint({ ports: { postgres: [25434] }, movedServices: [] })).toBe(false);
     expect(read()).toBe(before);
   });
 
@@ -3681,5 +3954,55 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
   it("is still a silent no-op on a checkout with no .env.local", () => {
     expect(repoint({ ports: { wayflow: [23010] }, movedServices: ["wayflow"] })).toBe(false);
     expect(existsSync(path.join(dir, ".env.local"))).toBe(false);
+  });
+});
+
+// ===========================================================================
+// cinatra#2654 round-8 review — the two install-path primitives `instance
+// wayflow start` now shares, rather than re-spelling.
+// ===========================================================================
+describe("the effective-map primitives the every-start reconcile reuses (round-8 review)", () => {
+  let dir;
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cin-r8-effective-"));
+  });
+
+  const doc = (services) => ({ name: "cinatra_r8", services });
+  const svc = (ports) => ({
+    image: "x:local",
+    ports: ports.map((p) => ({ published: String(p), target: 5432, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" })),
+  });
+
+  it("speaks the FILE for a service it publishes, overriding a lagging record", () => {
+    expect(effectiveIsolatedPortsFromDoc(doc({ postgres: svc([25434]) }), { postgres: [5434] })).toEqual({
+      postgres: [25434],
+    });
+  });
+
+  it("falls back per-service to the record for a port the file INTERPOLATES", () => {
+    const d = doc({ postgres: { image: "x", ports: [{ published: "${PG_PORT}", target: 5432 }] } });
+    expect(effectiveIsolatedPortsFromDoc(d, { postgres: [25434] })).toEqual({ postgres: [25434] });
+  });
+
+  it("drops a service the file no longer declares, and answers the record for a document it cannot audit", () => {
+    expect(effectiveIsolatedPortsFromDoc(doc({ postgres: svc([25434]) }), { redis: [26379] })).toEqual({
+      postgres: [25434],
+    });
+    // Not the generated shape → the pure derivation refuses to invent an answer
+    // and hands back the record; refusing the LAUNCH is the caller's job.
+    expect(effectiveIsolatedPortsFromDoc(["not", "a", "compose"], { redis: [26379] })).toEqual({ redis: [26379] });
+  });
+
+  it("assertIsolatedPortsStillConverge RE-READS the file and refuses a map it no longer publishes", () => {
+    writeIsolatedComposeFile(path.join(dir, "docker-compose.cinatra-isolated.yml"), doc({ postgres: svc([25434]) }));
+    // The map this run believes it holds still matches the file.
+    expect(() =>
+      assertIsolatedPortsStillConverge({ slug: "r8", targetDir: dir, ports: { postgres: [25434] }, offset: 20000 }),
+    ).not.toThrow();
+    // Something rewrote the file underneath the run.
+    writeIsolatedComposeFile(path.join(dir, "docker-compose.cinatra-isolated.yml"), doc({ postgres: svc([35434]) }));
+    expect(() =>
+      assertIsolatedPortsStillConverge({ slug: "r8", targetDir: dir, ports: { postgres: [25434] }, offset: 20000 }),
+    ).toThrow(/Refusing to bring up isolated instance "r8"[\s\S]*"postgres"/);
   });
 });
