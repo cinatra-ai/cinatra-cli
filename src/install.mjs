@@ -3759,20 +3759,41 @@ export async function teardownInstance({
       //   • inspected, N > 0 containers → refuse ("stack-still-live")
       //   • COULD NOT inspect           → refuse ("inspect-failed")
       // Both refusals release nothing and are overridable by --force.
+      //
+      // WHICH project we inspect is itself part of the guarantee, and the
+      // recorded `composeProject` is NOT it. A pre-#35 row carries the literal
+      // "cinatra" sentinel even when Compose derived the project from the
+      // checkout basename, so inspecting it verbatim asks about a project that
+      // was never brought up, gets a truthful "zero containers", and releases a
+      // row whose real stack still holds those ports. The `down` path already
+      // compensates by omitting `-p` (`composeProjectArgForRow`); an inspection
+      // needs a literal name, so `reclaimInspectProjectForRow` runs that same
+      // basename derivation. A name it cannot derive is the THIRD state,
+      // "could not inspect" — never a fourth state, and never an all-clear.
+      const inspectedProject = reclaimInspectProjectForRow(row);
       let live = null;
       let inspectError = null;
-      try {
-        const result = inspectProject([row.composeProject]);
-        // Malformed/absent output is a failure to inspect, not an empty answer.
-        if (!result || !Array.isArray(result.containerRows)) {
-          throw new Error(
-            `docker inspection of project "${row.composeProject}" returned no usable container list ` +
-              `(got ${result === undefined ? "undefined" : JSON.stringify(result)?.slice(0, 120)}).`,
-          );
+      if (inspectedProject == null) {
+        inspectError = new Error(
+          `the row records the pre-cinatra-cli#35 "cinatra" sentinel as its compose project, so the project ` +
+            `actually brought up is the basename of its checkout ` +
+            `(${row.installDir ? `"${row.installDir}"` : "no installDir recorded"}) — and no Compose project ` +
+            `name can be derived from that path. Refusing to read another project's emptiness as an all-clear.`,
+        );
+      } else {
+        try {
+          const result = inspectProject([inspectedProject]);
+          // Malformed/absent output is a failure to inspect, not an empty answer.
+          if (!result || !Array.isArray(result.containerRows)) {
+            throw new Error(
+              `docker inspection of project "${inspectedProject}" returned no usable container list ` +
+                `(got ${result === undefined ? "undefined" : JSON.stringify(result)?.slice(0, 120)}).`,
+            );
+          }
+          live = result;
+        } catch (e) {
+          inspectError = e;
         }
-        live = result;
-      } catch (e) {
-        inspectError = e;
       }
 
       if (inspectError && !force) {
@@ -3781,6 +3802,7 @@ export async function teardownInstance({
           reason: "inspect-failed",
           plan,
           downRan: false,
+          inspectedProject,
           error: inspectError,
         };
         return;
@@ -3788,7 +3810,14 @@ export async function teardownInstance({
 
       const containers = live?.containerRows?.length ?? 0;
       if (containers > 0 && !force) {
-        outcome = { released: false, reason: "stack-still-live", plan, downRan: false, liveContainers: containers };
+        outcome = {
+          released: false,
+          reason: "stack-still-live",
+          plan,
+          downRan: false,
+          inspectedProject,
+          liveContainers: containers,
+        };
         return;
       }
       const leftoverVolumes = live?.volumeRows?.length ?? 0;
@@ -3800,7 +3829,7 @@ export async function teardownInstance({
       );
       if (leftoverVolumes > 0) {
         log(
-          `  ⚠ ${leftoverVolumes} named volume(s) still labelled for project ${row.composeProject} remain. ` +
+          `  ⚠ ${leftoverVolumes} named volume(s) still labelled for project ${inspectedProject} remain. ` +
             `They hold no host port (the reservation is released regardless); remove them with ` +
             `\`docker volume rm\` if you want the disk back.`,
         );
@@ -3943,6 +3972,17 @@ async function runInstallDown({ opts, log = console.log, deps = {} }) {
     log(`✓ Instance "${row.slug}" torn down; its reservations are released (${plan.releasesPorts.join(", ") || "none recorded"}).`);
     return { down: true, released: true, slug: row.slug, plan };
   }
+  // The project the reclaim gate actually inspected — for a pre-#35 legacy
+  // sentinel row that is the derived basename project, NOT the recorded
+  // "cinatra". Naming the sentinel here would hand the operator a
+  // `docker compose -p cinatra down -v` that targets nothing.
+  const inspected = result.inspectedProject ?? row.composeProject;
+  // `inspect-failed` can also mean the project could not be RESOLVED at all (a
+  // legacy sentinel row whose recorded path yields no basename), and then there
+  // is no name to print — say so rather than naming the sentinel.
+  const inspectTarget = result.inspectedProject
+    ? `project ${result.inspectedProject}`
+    : `the project this row's stack actually runs under`;
   const why = {
     "down-failed":
       `\`docker compose down\` failed, so NOTHING was released — the row and its whole reservation are intact. ` +
@@ -3950,11 +3990,11 @@ async function runInstallDown({ opts, log = console.log, deps = {} }) {
       (result.error ? `\n  ${result.error.message}` : ""),
     "stack-still-live":
       `the checkout ${row.installDir} is gone but ${result.liveContainers} container(s) of project ` +
-      `${row.composeProject} are still running — they really do hold those ports. Stop them ` +
-      `(\`docker compose -p ${row.composeProject} down -v\`) and re-run, or pass --force to release the row anyway.`,
+      `${inspected} are still running — they really do hold those ports. Stop them ` +
+      `(\`docker compose -p ${inspected} down -v\`) and re-run, or pass --force to release the row anyway.`,
     "inspect-failed":
       `the checkout ${row.installDir} is gone, so the row can only be released after PROVING no container of ` +
-      `project ${row.composeProject} is still running — and that check itself FAILED, so NOTHING was released. ` +
+      `${inspectTarget} is still running — and that check itself FAILED, so NOTHING was released. ` +
       `An inspection error is not an "all clear": containers may well be live and holding those ports. ` +
       `Fix the Docker error and re-run \`cinatra install --down\`, or pass --force to release the row without the proof.` +
       (result.error ? `\n  ${result.error.message}` : ""),
@@ -5099,6 +5139,35 @@ function composeProjectArgForRow(row) {
   const proj = row?.composeProject;
   if (!proj || proj === "cinatra") return null;
   return proj;
+}
+
+/** The Compose project NAME the RECLAIM path must INSPECT for a recorded row, or
+ *  null when none can be derived. This is `composeProjectArgForRow`'s sentinel
+ *  rule read for an inspection instead of for a `-p`, and it must stay that one
+ *  rule: keep the two helpers together, and never let one learn a project the
+ *  other does not.
+ *
+ *  `composeProjectArgForRow` answers "which `-p` does the `down` pass" and
+ *  returns null for a pre-#35 legacy `"cinatra"` sentinel row, because OMITTING
+ *  `-p` makes Compose re-derive the project from the dir basename — the same
+ *  derivation the old `up` used. An INSPECTION has no such fallback: `docker ps
+ *  --filter label=com.docker.compose.project=<name>` needs a literal name. So we
+ *  run that basename derivation OURSELVES (`legacyBasenameProject`), off the
+ *  `installDir` the row still carries even when the directory itself is gone.
+ *  Inspecting the bare sentinel instead would ask Docker about project `cinatra`
+ *  for a legacy `/path/custom-name` checkout, find zero containers, release the
+ *  row — and hand the live `custom-name` stack's host ports to the next install,
+ *  which is the collision the reclaim gate exists to refuse.
+ *
+ *  Null (nothing derivable from the recorded path) is NOT an answer. The caller
+ *  must REFUSE, exactly as it refuses an inspection that failed — never inspect
+ *  some other project and read its emptiness as an all-clear. */
+function reclaimInspectProjectForRow(row) {
+  const explicit = composeProjectArgForRow(row);
+  if (explicit) return explicit;
+  const dir = row?.installDir;
+  if (typeof dir !== "string" || dir.trim() === "") return null;
+  return legacyBasenameProject(dir) || null;
 }
 
 /** Read the instance-registry row that records THIS checkout AS an ISOLATED

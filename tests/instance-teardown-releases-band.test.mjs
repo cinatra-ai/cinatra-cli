@@ -20,6 +20,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  legacyBasenameProject,
   planInstanceTeardown,
   resolveTeardownTarget,
   teardownInstance,
@@ -531,6 +532,202 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
       }),
       // Names the inspection failure, says nothing was released, offers retry OR --force.
     ).rejects.toThrow(/NOTHING was released[\s\S]*re-run[\s\S]*--force[\s\S]*could not inspect Docker/);
+    expect(rowFor(registryPath, "row1")).not.toBeNull();
+  });
+
+  // ── The round-3 review HIGH: the reclaim must resolve the LEGACY sentinel ──
+  // A row written before cinatra-cli#35 records the literal "cinatra" as its
+  // composeProject even when Compose derived the project from the checkout
+  // BASENAME. The `down` path already compensates (`composeProjectArgForRow`
+  // returns null for the sentinel, so `-p` is omitted and basename derivation
+  // applies). The RECLAIM path inspected `row.composeProject` VERBATIM: for a
+  // legacy `/path/custom-name` checkout it asked Docker about project "cinatra",
+  // got a truthful zero, released the row — and the live `custom-name` stack kept
+  // the host ports that the next install would then be handed. That is exactly
+  // the collision the three-state gate exists to refuse, reached by inspecting
+  // the wrong project rather than by failing open.
+
+  /** A pre-#35 DEFAULT row: the "cinatra" sentinel as composeProject, the base
+   *  compose pair, and a checkout dir whose BASENAME is the project Compose
+   *  really used. `dirName` is exact (not mkdtemp-suffixed) so the derived
+   *  project is predictable. Returns before the `rm -rf` so a caller can choose. */
+  function legacySentinelRow({ registryPath, slug = "row1", appPort = 3300, dirName = "custom-name" }) {
+    const targetDir = path.join(mkTmp("cli232-legacy-"), dirName);
+    mkdirSync(path.join(targetDir, ".cinatra"), { recursive: true });
+    writeFileSync(path.join(targetDir, ".cinatra", "instance.json"), JSON.stringify({ slug }));
+
+    const registry = requireUsableInstanceRegistry(registryPath);
+    const { offset, remapped } = allocateBandOffset({ band: BASE_BAND, instanceRegistry: registry, extraReserved: appPort });
+    const ports = portsMapFor(remapped);
+    let next = allocateInstance(registry, slug, {
+      mode: "dev",
+      installDir: targetDir,
+      composeProject: "cinatra", // the pre-#35 sentinel — NOT what compose used
+      composeFiles: ["docker-compose.yml", "docker-compose.dev.yml"],
+      ports,
+      appPort,
+      offset,
+      repoUrl: "https://github.com/cinatra-ai/cinatra.git",
+      ref: "main",
+      infraMode: "new",
+      state: "provisioning",
+    }).registry;
+    next = markInstanceReady(next, slug, { sha: "deadbeef", ports });
+    writeInstanceRegistry(registryPath, next);
+    return { slug, targetDir, appPort, project: legacyBasenameProject(targetDir) };
+  }
+
+  it("REFUSES a legacy sentinel row whose BASENAME project is still live (never inspects 'cinatra')", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    const legacy = legacySentinelRow({ registryPath, dirName: "custom-name" });
+    expect(legacy.project).toBe("custom-name"); // what the old `up` really used
+    rmSync(legacy.targetDir, { recursive: true, force: true }); // the operator's `rm -rf`
+    const before = readFileSync(registryPath, "utf8");
+    const down = recordingDown();
+
+    // Docker's honest answer: the `custom-name` project is live; "cinatra" is not.
+    const asked = [];
+    const deps = {
+      instanceRegistryPath: registryPath,
+      allocLockPath,
+      runComposeDown: down.fn,
+      inspectProjectLiveness: (names) => {
+        asked.push(...names);
+        return {
+          containerRows: names.includes("custom-name") ? [{ Id: "live-1" }, { Id: "live-2" }] : [],
+          volumeRows: [],
+        };
+      },
+    };
+
+    const refused = await teardownInstance({ slug: "row1", log: () => {}, deps });
+
+    // The resolution: the basename project was inspected, the sentinel never was.
+    expect(asked).toEqual(["custom-name"]);
+    expect(asked).not.toContain("cinatra");
+    // The gate then does its job on that truthful answer.
+    expect(refused).toMatchObject({
+      released: false,
+      reason: "stack-still-live",
+      liveContainers: 2,
+      inspectedProject: "custom-name",
+    });
+    // Nothing released: the row, its whole reservation, the bytes on disk.
+    expect(rowFor(registryPath, "row1")).not.toBeNull();
+    expect(readFileSync(registryPath, "utf8")).toBe(before);
+    expect(down.calls).toHaveLength(0);
+    // And the ports the live stack holds are still reserved against the next install.
+    expect(tryAllocateOffset(registryPath, 3301).offset).toBe(20000);
+
+    // --force stays the eyes-open override, same as for a modern row.
+    const forced = await teardownInstance({ slug: "row1", force: true, log: () => {}, deps });
+    expect(forced.released).toBe(true);
+  });
+
+  it("still reclaims a legacy sentinel row when its BASENAME project is empty (the all-clear)", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    const legacy = legacySentinelRow({ registryPath, dirName: "custom-name" });
+    rmSync(legacy.targetDir, { recursive: true, force: true });
+    const down = recordingDown();
+
+    const asked = [];
+    const result = await teardownInstance({
+      slug: "row1",
+      log: () => {},
+      deps: {
+        instanceRegistryPath: registryPath,
+        allocLockPath,
+        runComposeDown: down.fn,
+        inspectProjectLiveness: (names) => {
+          asked.push(...names);
+          return { containerRows: [], volumeRows: [] };
+        },
+      },
+    });
+
+    expect(asked).toEqual(["custom-name"]); // resolved, not the sentinel
+    expect(result.released).toBe(true);
+    expect(down.calls).toHaveLength(0); // no compose file to `down` from
+    expect(tryAllocateOffset(registryPath, 3300).offset).toBe(10000);
+  });
+
+  it("a legacy row whose dir IS named `cinatra` resolves to the same project (no behaviour change)", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    const legacy = legacySentinelRow({ registryPath, dirName: "cinatra" });
+    expect(legacy.project).toBe("cinatra");
+    rmSync(legacy.targetDir, { recursive: true, force: true });
+
+    const asked = [];
+    const refused = await teardownInstance({
+      slug: "row1",
+      log: () => {},
+      deps: {
+        instanceRegistryPath: registryPath,
+        allocLockPath,
+        runComposeDown: recordingDown().fn,
+        inspectProjectLiveness: (names) => {
+          asked.push(...names);
+          return { containerRows: [{ Id: "live-1" }], volumeRows: [] };
+        },
+      },
+    });
+    expect(asked).toEqual(["cinatra"]);
+    expect(refused).toMatchObject({ released: false, reason: "stack-still-live", inspectedProject: "cinatra" });
+  });
+
+  it("REFUSES when no project can be derived at all (an unresolvable name is not an all-clear)", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    // A recorded path whose basename sanitises to nothing at all.
+    const legacy = legacySentinelRow({ registryPath, dirName: "..." });
+    expect(legacyBasenameProject(legacy.targetDir)).toBe("");
+    rmSync(legacy.targetDir, { recursive: true, force: true });
+    const before = readFileSync(registryPath, "utf8");
+    const down = recordingDown();
+
+    let inspectorCalled = false;
+    const deps = {
+      instanceRegistryPath: registryPath,
+      allocLockPath,
+      runComposeDown: down.fn,
+      inspectProjectLiveness: () => {
+        inspectorCalled = true;
+        return { containerRows: [], volumeRows: [] };
+      },
+    };
+    const refused = await teardownInstance({ slug: "row1", log: () => {}, deps });
+
+    // We never asked Docker about SOME OTHER project and read its emptiness as proof.
+    expect(inspectorCalled).toBe(false);
+    expect(refused).toMatchObject({ released: false, reason: "inspect-failed", inspectedProject: null });
+    expect(refused.error?.message).toMatch(/no Compose project name can be derived/);
+    expect(rowFor(registryPath, "row1")).not.toBeNull();
+    expect(readFileSync(registryPath, "utf8")).toBe(before);
+    expect(down.calls).toHaveLength(0);
+  });
+
+  it("`--down` names the DERIVED project in the way out, so the operator's command works", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    const legacy = legacySentinelRow({ registryPath, dirName: "custom-name" });
+    rmSync(legacy.targetDir, { recursive: true, force: true });
+
+    // `docker compose -p cinatra down -v` would target NOTHING; the remediation
+    // must name the project the containers are actually labelled with.
+    await expect(
+      runInstall(["--down", "--instance", "row1", "--yes"], {
+        log: () => {},
+        deps: {
+          instanceRegistryPath: registryPath,
+          allocLockPath,
+          runComposeDown: recordingDown().fn,
+          inspectProjectLiveness: () => ({ containerRows: [{ Id: "live-1" }], volumeRows: [] }),
+        },
+      }),
+    ).rejects.toThrow(/docker compose -p custom-name down -v/);
     expect(rowFor(registryPath, "row1")).not.toBeNull();
   });
 
