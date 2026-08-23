@@ -61,7 +61,7 @@ describe("legacyBasenameProject (cinatra-cli#35)", () => {
     expect(legacyBasenameProject("/Users/me/Code/cinatra.dev")).toBe("cinatradev");
     expect(legacyBasenameProject("/Users/me/Code/My Instance")).toBe("myinstance");
     expect(legacyBasenameProject("/Users/me/Code/cinatra+two")).toBe("cinatratwo");
-    expect(legacyBasenameProject("/Users/me/Code/v1.2.3")).toBe("v123");
+    expect(legacyBasenameProject("/Users/me/Code/release.1.2.3")).toBe("release123");
   });
 
   // The other edge of the same rule: a purely LEADING invalid run agrees under
