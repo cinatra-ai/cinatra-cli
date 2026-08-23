@@ -2,6 +2,12 @@
 // release its reservation under ONE held alloc lock, and must be LOUD about a
 // registry it cannot read.
 //
+// cinatra-cli#243 (review round 2) — and the stack it tears down must be the
+// stack the operator was SHOWN. The row read under the lock is compared against
+// the classifier's pre-lock snapshot, and a difference REFUSES. The
+// `--teardown-existing` (`-v`) arm is pinned here too: it is the destructive
+// half of this executor and no test reached it before.
+//
 // The defect this pins (same family as cinatra-cli#232, which #235 released for
 // the teardown path): the `down` ran OUTSIDE the alloc lock, and the registry
 // read was wrapped in `try { … } catch { reg = null }`. A registry that could
@@ -74,7 +80,7 @@ const RESOLVED_CONFIG = {
   volumes: { "cinatra-postgres": { name: "cinatra_cinatra-postgres" } },
 };
 
-describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239)", () => {
+describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#243)", () => {
   let sandbox;
   let originRepo;
   let regPath;
@@ -157,10 +163,20 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239)",
     }
   }
 
-  const stopExistingArgv = (installDir) => [
+  const stopExistingArgv = (installDir, extra = []) => [
     "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
-    "--yes", "--no-install", "--on-conflict", "stop-existing",
+    "--yes", "--no-install", "--on-conflict", "stop-existing", ...extra,
   ];
+
+  // Rewrite the seeded row IN PLACE, as a concurrent install re-provisioning the
+  // slug at the same directory would: a new compose project and a new generated
+  // compose file, same `installDir`.
+  function reprovisionRow(slug, { project, files }) {
+    const reg = readInstanceRegistry(regPath).registry;
+    reg.instances[slug].composeProject = project;
+    reg.instances[slug].composeFiles = files;
+    writeInstanceRegistry(regPath, reg);
+  }
 
   it("runs the `down` while the alloc lock is HELD, and releases the stopped row's WHOLE reservation", async () => {
     const otherDir = path.join(sandbox, "held-holder");
@@ -243,12 +259,12 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239)",
     expect(existsSync(lockPath)).toBe(false);
   });
 
-  it("downs the row as it reads UNDER THE LOCK, not the classifier's pre-lock snapshot", async () => {
-    // Codex round 1, blocking: `holder` is resolved by the classifier BEFORE the
-    // lock is taken. If the slug is re-provisioned at the same directory in that
-    // window, its recorded compose project has moved on. Downing the stale
-    // project and then releasing the FRESH row leaves a live stack unregistered
-    // with its ports handed back — this leak inverted.
+  it("REFUSES when the row was re-provisioned while the confirmation was pending", async () => {
+    // cinatra-cli#243 (review round 2, blocking). `holder` is the classifier's
+    // snapshot, taken before the lock. A slug re-provisioned at the SAME
+    // directory in that window is a live, in-flight concurrent install — downing
+    // its stack and releasing its row destroys it. Adopting the fresher row (the
+    // behaviour this replaces) did exactly that.
     //
     // The window is injected deterministically rather than raced: the co-use
     // capability probe is the last seam to run before the executor takes the
@@ -257,30 +273,236 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239)",
     seedRemappedHolder("restaleother", otherDir);
 
     const downCalls = [];
-    const res = await runInstall(stopExistingArgv(path.join(sandbox, "restale-new")), {
+    await expect(
+      runInstall(stopExistingArgv(path.join(sandbox, "restale-new")), {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+          liveComposeInspect: holderOwns5434(otherDir),
+          probeCookiePrefixSupport: () => {
+            reprovisionRow("restaleother", {
+              project: "cinatra_restale_v2",
+              files: ["docker-compose.cinatra-isolated.v2.yml"],
+            });
+            return false;
+          },
+          runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
+        }),
+      }),
+    ).rejects.toThrow(
+      /instance "restaleother" was re-provisioned while the confirmation was pending \(confirmed cinatra_restaleother, registry now records cinatra_restale_v2\)/,
+    );
+
+    // Neither stack is touched: not the one that was confirmed, and certainly
+    // not the concurrent install's.
+    expect(downCalls).toEqual([]);
+    // And the concurrent install's row survives untouched — its reservation was
+    // never released out from under it.
+    const row = readInstanceRegistry(regPath).registry.instances.restaleother;
+    expect(row.composeProject).toBe("cinatra_restale_v2");
+    expect(row.composeFiles).toEqual(["docker-compose.cinatra-isolated.v2.yml"]);
+    const reserved = reservedPorts({ instanceRegistry: readInstanceRegistry(regPath).registry });
+    expect(reserved.has(16379)).toBe(true);
+    expect(reserved.has(3300)).toBe(true);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("REFUSES on a moved compose FILE SET even when the project name is unchanged", async () => {
+    // The review's remedy names project identity AND compose files: the file set
+    // decides which containers a `down` reaches just as much as `-p` does, so a
+    // re-provision that kept the project name but regenerated onto a different
+    // file must not be adopted either.
+    const otherDir = path.join(sandbox, "filedrift-holder");
+    seedRemappedHolder("filedrifter", otherDir);
+
+    const downCalls = [];
+    await expect(
+      runInstall(stopExistingArgv(path.join(sandbox, "filedrift-new")), {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+          liveComposeInspect: holderOwns5434(otherDir),
+          probeCookiePrefixSupport: () => {
+            reprovisionRow("filedrifter", {
+              project: "cinatra_filedrifter", // unchanged
+              files: ["docker-compose.yml", "docker-compose.cinatra-isolated.yml"],
+            });
+            return false;
+          },
+          runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
+        }),
+      }),
+    ).rejects.toThrow(/was re-provisioned while the confirmation was pending[\s\S]*compose files moved too/);
+
+    expect(downCalls).toEqual([]);
+  });
+
+  it("--teardown-existing REFUSES rather than `down -v` a project the confirm never displayed", async () => {
+    // The worst case of the same defect (review round 2, finding 2): the
+    // operator reads one project name, types `delete <slug>` against it, and the
+    // volumes destroyed belong to a project they were never shown. The typed
+    // confirm awaits a human, so the window is think-time — seconds to minutes —
+    // not a narrow race. Here the re-provision lands INSIDE the confirm, which
+    // is literally "while the confirmation was pending".
+    const otherDir = path.join(sandbox, "vdrift-holder");
+    seedRemappedHolder("vdrifter", otherDir);
+
+    const downCalls = [];
+    const prompts = [];
+    await expect(
+      runInstall(stopExistingArgv(path.join(sandbox, "vdrift-new"), ["--teardown-existing"]), {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+          liveComposeInspect: holderOwns5434(otherDir),
+          typedConfirm: async (question, phrase) => {
+            prompts.push({ question, phrase });
+            reprovisionRow("vdrifter", {
+              project: "cinatra_vdrift_v2",
+              files: ["docker-compose.cinatra-isolated.v2.yml"],
+            });
+            return true; // the operator confirmed — against the OLD project
+          },
+          runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
+        }),
+      }),
+    ).rejects.toThrow(
+      /instance "vdrifter" was re-provisioned while the confirmation was pending \(confirmed cinatra_vdrifter, registry now records cinatra_vdrift_v2\)/,
+    );
+
+    // The prompt named the project the operator was shown …
+    expect(prompts.length).toBe(1);
+    expect(prompts[0].question).toContain("cinatra_vdrifter");
+    expect(prompts[0].phrase).toBe("delete vdrifter");
+    // … and NO `down` ran at all, so no volumes were deleted.
+    expect(downCalls).toEqual([]);
+    // The refusal says why `-v` makes this the worst case, not just that it refused.
+    await expect(
+      runInstall(stopExistingArgv(path.join(sandbox, "vdrift-new2"), ["--teardown-existing"]), {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+          liveComposeInspect: holderOwns5434(otherDir),
+          typedConfirm: async () => {
+            reprovisionRow("vdrifter", {
+              project: "cinatra_vdrift_v3",
+              files: ["docker-compose.cinatra-isolated.v3.yml"],
+            });
+            return true;
+          },
+          runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
+        }),
+      }),
+    ).rejects.toThrow(/--teardown-existing is set, so continuing would have run `down -v`/);
+    expect(downCalls).toEqual([]);
+  });
+
+  it("--teardown-existing on a STABLE row downs with `-v` and releases the band", async () => {
+    // The plain `-v` happy path — `withVolumes` was never exercised at all
+    // before (review round 2, finding 3). It pins that the confirmed phrase is
+    // the slug's, that `-v` actually reaches `composeDown`, and that the
+    // reservation is still released whole.
+    const otherDir = path.join(sandbox, "vhappy-holder");
+    seedRemappedHolder("vhappy", otherDir);
+
+    const downCalls = [];
+    const prompts = [];
+    const res = await runInstall(stopExistingArgv(path.join(sandbox, "vhappy-new"), ["--teardown-existing"]), {
       log: () => {},
       deps: flowDeps({
         detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
         liveComposeInspect: holderOwns5434(otherDir),
-        probeCookiePrefixSupport: () => {
-          // Re-provisioned at the SAME dir under a new project + compose file.
-          const reg = readInstanceRegistry(regPath).registry;
-          reg.instances.restaleother.composeProject = "cinatra_restale_v2";
-          reg.instances.restaleother.composeFiles = ["docker-compose.cinatra-isolated.v2.yml"];
-          writeInstanceRegistry(regPath, reg);
-          return false;
+        typedConfirm: async (question, phrase) => {
+          prompts.push({ question, phrase });
+          return true;
+        },
+        runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts, lockHeld: allocLockHeld() }),
+      }),
+    });
+
+    expect(res.infraPlan).toBe("default");
+    expect(prompts).toEqual([
+      {
+        question: expect.stringContaining('will DELETE instance "vhappy"\'s data volumes (project cinatra_vhappy)'),
+        phrase: "delete vhappy",
+      },
+    ]);
+    expect(downCalls.length).toBe(1);
+    expect(downCalls[0].dir).toBe(otherDir);
+    expect(downCalls[0].composeProject).toBe("cinatra_vhappy");
+    expect(downCalls[0].volumes).toBe(true);
+    expect(downCalls[0].lockHeld).toBe(true);
+
+    const after = readInstanceRegistry(regPath).registry;
+    expect(after.instances.vhappy).toBeUndefined();
+    const afterReserved = reservedPorts({ instanceRegistry: after });
+    expect(afterReserved.has(16379)).toBe(false);
+    expect(afterReserved.has(3300)).toBe(false);
+  });
+
+  it("a LEGACY sentinel row is confirmed as what the `down` really targets, never as \"cinatra\"", async () => {
+    // cinatra-cli#243 (codex): `composeProjectArgForRow` returns null for the
+    // pre-#35 `"cinatra"` sentinel, so the `down` passes NO `-p` and Compose
+    // derives the project from the directory name. Printing the recorded
+    // "cinatra" would name a project the teardown never touches — and the typed
+    // `-v` confirm would then be taken against a stack that was never displayed,
+    // which is exactly the failure the refusal above exists to prevent, reached
+    // by a different road.
+    const otherDir = path.join(sandbox, "legacy-holder");
+    seedRemappedHolder("legacyrow", otherDir);
+    const reg = readInstanceRegistry(regPath).registry;
+    reg.instances.legacyrow.composeProject = "cinatra"; // the legacy sentinel
+    writeInstanceRegistry(regPath, reg);
+
+    const downCalls = [];
+    const prompts = [];
+    await runInstall(stopExistingArgv(path.join(sandbox, "legacy-new"), ["--teardown-existing"]), {
+      log: () => {},
+      deps: flowDeps({
+        detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+        liveComposeInspect: holderOwns5434(otherDir),
+        typedConfirm: async (question, phrase) => {
+          prompts.push({ question, phrase });
+          return true;
         },
         runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
       }),
     });
 
-    expect(res.infraPlan).toBe("default");
+    // The `down` really does omit `-p` …
     expect(downCalls.length).toBe(1);
-    // The stack that is actually up — not `cinatra_restaleother`.
-    expect(downCalls[0].composeProject).toBe("cinatra_restale_v2");
-    expect(downCalls[0].composeFiles).toEqual(["docker-compose.cinatra-isolated.v2.yml"]);
-    // And the row it downed is the row it released.
-    expect(readInstanceRegistry(regPath).registry.instances.restaleother).toBeUndefined();
+    expect(downCalls[0].composeProject).toBe(null);
+    expect(downCalls[0].volumes).toBe(true);
+    // … so the confirm must NOT claim a project named "cinatra", and must say
+    // where the name actually comes from.
+    expect(prompts.length).toBe(1);
+    expect(prompts[0].question).not.toMatch(/project cinatra\b/);
+    expect(prompts[0].question).toContain("no recorded Compose project");
+    expect(prompts[0].question).toContain(otherDir);
+  });
+
+  it("--teardown-existing DECLINED stops nothing", async () => {
+    // The typed confirm is the only gate on irreversible deletion; a refusal
+    // must not fall through to a volume-preserving `down` either.
+    const otherDir = path.join(sandbox, "vdecline-holder");
+    seedRemappedHolder("vdecline", otherDir);
+    const registryBefore = readFileSync(regPath, "utf8");
+
+    const downCalls = [];
+    await expect(
+      runInstall(stopExistingArgv(path.join(sandbox, "vdecline-new"), ["--teardown-existing"]), {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+          liveComposeInspect: holderOwns5434(otherDir),
+          typedConfirm: async () => false,
+          runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
+        }),
+      }),
+    ).rejects.toThrow(/Aborted: volume teardown of "vdecline" not confirmed/);
+
+    expect(downCalls).toEqual([]);
+    expect(readFileSync(regPath, "utf8")).toBe(registryBefore);
   });
 
   it("a MISSING registry is not a read failure — a label-proven holder still stops", async () => {

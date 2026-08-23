@@ -61,6 +61,43 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`cinatra install --on-conflict=stop-existing` no longer leaks the stopped
+  instance's ports, and no longer stops a stack the operator was never shown.**
+  Three operator-visible changes. First, the teardown and the release of the
+  stopped instance's registry row now run inside ONE held allocation lock,
+  teardown first: previously the `docker compose down` ran outside the lock, so
+  a concurrent install could be handed the very ports this install was about to
+  claim. Second, an instance registry that cannot be parsed now ABORTS the
+  command instead of being read as "there is no row to release". That silent
+  read left the stopped instance holding its whole port band while the CLI
+  reported the stack stopped. The registry is read BEFORE the teardown, so the
+  refusal costs no containers, and a MISSING registry is still not a read
+  failure: a holder proven by its Docker labels stops as before. Third, the row
+  read under the lock is now compared against the stack the operator was shown,
+  on both the Compose project and the Compose file set, and the command REFUSES
+  when they differ instead of adopting the newer row. A slug re-provisioned at
+  the same directory while the confirmation was pending is a live concurrent
+  install, and stopping it would destroy it. With `--teardown-existing` the
+  refusal also prevents a `down -v` deleting the named volumes of a project that
+  was never displayed in the typed confirm. Re-run the command to be shown, and
+  to confirm, the stack that is actually there. The confirm and the log line also
+  now name the project the teardown will REALLY reach: an instance recorded
+  before explicit Compose project names is torn down with no `-p` at all, so
+  Compose derives the project from the directory name, and printing the recorded
+  `cinatra` placeholder named a project the teardown never touches.
+
+- **A concurrent `cinatra` command now waits for a teardown instead of failing
+  ten seconds into it.** The allocation lock is now held across `docker compose
+  down`, and Docker's own default stop grace is ten seconds per container, so
+  the previous ten-second waiter deadline expired as the common case rather than
+  the tail. Waiters now block up to three minutes, print a "still waiting" line
+  where the command used to give up, and name the process that holds the lock. A
+  lock is still only ever taken from a holder whose process is gone. The
+  timed-out message also no longer advises deleting the lock file: that advice
+  named the wrong command for this path, and following it while a legitimate
+  teardown holds the lock removes the mutual exclusion protecting the port
+  registries. An abandoned lock needs no manual cleanup.
+
 - **An isolated install now states and provisions the endpoints it actually
   allocated.** Two endpoint defects shared one root cause: the per-instance port
   allocation was not threaded through to every place a port is spoken. The
