@@ -14,6 +14,7 @@
 
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { Readable, Writable } from "node:stream";
 import os from "node:os";
 import path from "node:path";
 
@@ -23,6 +24,8 @@ import {
   legacyBasenameProject,
   planInstanceTeardown,
   resolveTeardownTarget,
+  teardownIdentity,
+  teardownIdentityKey,
   teardownInstance,
   runInstall,
   rollbackIsolatedInstance,
@@ -142,6 +145,41 @@ function recordingDown() {
 const failingDown = () => {
   throw new Error("docker compose down failed (exit 1).");
 };
+
+/**
+ * Satisfy `typedConfirm` the way a real operator does: a real TTY stdin carrying
+ * the exact phrase. `typedConfirm` has no dependency seam and must not grow one —
+ * a dep that can turn the irreversible-volume gate into a pass is exactly the
+ * fail-open shape the reclaim gate's single-seam rule exists to prevent. So the
+ * test supplies a terminal rather than a bypass, and stdout is captured so the
+ * prompt the operator would have read can be asserted too.
+ */
+async function withTypedConfirmAnswer(phrase, fn) {
+  const stdinDesc = Object.getOwnPropertyDescriptor(process, "stdin");
+  const stdoutDesc = Object.getOwnPropertyDescriptor(process, "stdout");
+  const input = Readable.from([`${phrase}\n`]);
+  input.isTTY = true;
+  const written = [];
+  const output = new Writable({
+    write(chunk, _enc, cb) {
+      written.push(String(chunk));
+      cb();
+    },
+  });
+  output.isTTY = true;
+  Object.defineProperty(process, "stdin", { value: input, configurable: true });
+  Object.defineProperty(process, "stdout", { value: output, configurable: true });
+  try {
+    const outcome = await fn().then(
+      (value) => ({ value }),
+      (error) => ({ error }),
+    );
+    return { ...outcome, prompt: written.join("") };
+  } finally {
+    Object.defineProperty(process, "stdin", stdinDesc);
+    Object.defineProperty(process, "stdout", stdoutDesc);
+  }
+}
 
 // =========================================================================
 describe("cinatra-cli#232 — install → teardown → install reuses the band", () => {
@@ -752,6 +790,52 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
       }),
     ).rejects.toThrow(/not confirmed \(type "delete row1"\)/);
 
+    expect(down.calls).toHaveLength(0);
+    expect(rowFor(registryPath, "row1")).not.toBeNull();
+    expect(readFileSync(registryPath, "utf8")).toBe(before);
+  });
+
+  // The THIRD arm of the same guarantee, and the one that had no assertion: what
+  // the remedy says once the operator HAS armed `--teardown-existing` and HAS
+  // typed the phrase. `plan.volumes` is then true, so the refusal may name `-v` —
+  // it is prescribing the deletion the operator already authorised, not routing
+  // them around the gate. Pinning only the no-`-v` arms left the ternary's true
+  // branch free to say anything.
+  //
+  // Reaching it needs a real typed confirm, so the test supplies a terminal
+  // (`withTypedConfirmAnswer`) rather than a seam. Note this is NOT reachable via
+  // the confirmed-`volumes` thread alone: that thread carries the decision, it does
+  // not make the decision satisfiable — `plan.volumes` is still true only when the
+  // typed confirm passed.
+  it("once `--teardown-existing` IS typed-confirmed, the refusal's remedy carries `-v`", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    const inst = installIsolated({ registryPath, slug: "row1", appPort: 3300 });
+    rmSync(inst.targetDir, { recursive: true, force: true }); // the reclaim path
+    const before = readFileSync(registryPath, "utf8");
+    const down = recordingDown();
+
+    const { error, prompt } = await withTypedConfirmAnswer("delete row1", () =>
+      runInstall(["--down", "--instance", "row1", "--yes", "--teardown-existing"], {
+        log: () => {},
+        deps: {
+          instanceRegistryPath: registryPath,
+          allocLockPath,
+          runComposeDown: down.fn,
+          inspectProjectLiveness: () => ({ containerRows: [{ Id: "live-1" }], volumeRows: [] }),
+        },
+      }),
+    );
+
+    // The confirm really ran, and really was the irreversible-volume one.
+    expect(prompt).toContain('Type "delete row1" to confirm');
+    expect(prompt).toContain("IRREVERSIBLE");
+    // Past the confirm, the reclaim gate refused on its own terms.
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain("still exist");
+    // …and THIS remedy does carry `-v`, on the Compose-true project.
+    expect(error.message).toContain("Remove them (`docker compose -p cinatra_row1 down -v`)");
+    // A refusal is still a refusal: nothing down, nothing released, bytes intact.
     expect(down.calls).toHaveLength(0);
     expect(rowFor(registryPath, "row1")).not.toBeNull();
     expect(readFileSync(registryPath, "utf8")).toBe(before);
@@ -1628,5 +1712,198 @@ describe("cinatra-cli#232 — a failed real install leaves its band + app port r
     });
     expect(ok.infraPlan).toBe("isolated");
     expect(rowFor(registryPath, "isosixth").offset).toBe(10000);
+  });
+});
+
+// =========================================================================
+// The confirmed plan must BE the executed plan.
+//
+// `runInstallDown` reads the registry, plans, prints and confirms all OUTSIDE
+// the allocation lock; `teardownInstance` re-reads under it. Two reads, and the
+// SECOND one used to decide `-v`. The dangerous shape is not a directory move
+// (`expectInstallDir` already covers that, and `--instance` passes no directory
+// at all) but a same-slug, SAME-DIRECTORY replacement that flips `infraMode`:
+//
+//   • pre-lock the row is `external` → `plan.down === false` → the
+//     `--teardown-existing` typed confirm is never even reached, so a bare
+//     `--yes` satisfies the ordinary confirm;
+//   • another process releases the slug and reinstalls it install-owned (`new`)
+//     into the same checkout while the command queues on the lock;
+//   • the under-lock plan is built from THAT row, and the raw `--teardown-existing`
+//     flag turns it into `volumes: true`.
+//
+// A bare `--yes` would have deleted data volumes the operator was never warned
+// about. These tests drive the REAL `--down` path through REAL lock contention.
+describe("cinatra-cli#232 — a same-slug replacement cannot inherit a confirmation it never had", () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  async function holdAllocLock(allocLockPath) {
+    let release;
+    let acquired;
+    const held = new Promise((r) => (release = r));
+    const isAcquired = new Promise((r) => (acquired = r));
+    const done = withAllocLock(allocLockPath, async () => {
+      acquired();
+      await held;
+    });
+    await isAcquired;
+    return { release, done };
+  }
+
+  /** An EXTERNAL row: it points at operator-supplied infra, owns no stack, and
+   *  so can never plan a `down` — let alone a `down -v`. It still holds an
+   *  app-port reservation, which is what a teardown releases. */
+  function installExternal({ registryPath, slug, appPort }) {
+    const targetDir = mkTmp(`cli232-${slug}-ext-`);
+    const registry = requireUsableInstanceRegistry(registryPath);
+    let next = allocateInstance(registry, slug, {
+      mode: "dev",
+      installDir: targetDir,
+      composeProject: `cinatra_${slug.replace(/-/g, "_")}`,
+      composeFiles: ["docker-compose.yml"],
+      ports: {},
+      appPort,
+      offset: 0,
+      repoUrl: "https://github.com/cinatra-ai/cinatra.git",
+      ref: "main",
+      infraMode: "external",
+      state: "provisioning",
+    }).registry;
+    next = markInstanceReady(next, slug, { sha: "deadbeef", ports: {} });
+    writeInstanceRegistry(registryPath, next);
+    return { slug, targetDir, appPort };
+  }
+
+  /** Replace `slug` in place with an install-owned row on the SAME directory —
+   *  the shape a directory-only recheck cannot see. */
+  function replaceWithInstallOwned(registryPath, slug) {
+    const reg = requireUsableInstanceRegistry(registryPath);
+    reg.instances[slug].infraMode = "new";
+    reg.instances[slug].composeFiles = [ISOLATED_COMPOSE_FILENAME];
+    writeInstanceRegistry(registryPath, reg);
+  }
+
+  it("refuses, and never passes -v, when an external row becomes install-owned under the lock", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    const inst = installExternal({ registryPath, slug: "row1", appPort: 3300 });
+    // The generated compose file the replacement row claims, so the teardown's
+    // `down` path would find a real checkout to run from.
+    writeFileSync(path.join(inst.targetDir, ISOLATED_COMPOSE_FILENAME), "services: {}\n");
+    const down = recordingDown();
+
+    const lock = await holdAllocLock(allocLockPath);
+
+    // The operator's command. `--instance` passes NO expected directory, and the
+    // pre-lock row is external, so `--teardown-existing` never reaches the typed
+    // confirm — a bare `--yes` is the whole authorisation given here.
+    const teardown = runInstall(["--down", "--instance", "row1", "--yes", "--teardown-existing"], {
+      log: () => {},
+      deps: { instanceRegistryPath: registryPath, allocLockPath, runComposeDown: down.fn },
+    });
+    await sleep(150); // it has planned, confirmed, and is now queued on the lock
+
+    replaceWithInstallOwned(registryPath, "row1");
+    lock.release();
+    await lock.done;
+
+    await expect(teardown).rejects.toThrow(/CHANGED between the plan printed above/);
+    // The two guarantees, in order of consequence.
+    expect(down.calls, "a replaced row must never be `down`ed at all").toHaveLength(0);
+    for (const call of down.calls) expect(call.opts.volumes, "and never with -v").not.toBe(true);
+    // Nothing was released either: the row and its reservation are intact.
+    const row = rowFor(registryPath, "row1");
+    expect(row).not.toBeNull();
+    expect(row.infraMode).toBe("new");
+    expect(reservedPorts({ instanceRegistry: readInstanceRegistry(registryPath).registry }).has(3300)).toBe(true);
+  });
+
+  it("the refusal names the field that changed and what to do about it", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    const inst = installExternal({ registryPath, slug: "row1", appPort: 3300 });
+    writeFileSync(path.join(inst.targetDir, ISOLATED_COMPOSE_FILENAME), "services: {}\n");
+    const down = recordingDown();
+
+    const lock = await holdAllocLock(allocLockPath);
+    const teardown = runInstall(["--down", "--instance", "row1", "--yes", "--teardown-existing"], {
+      log: () => {},
+      deps: { instanceRegistryPath: registryPath, allocLockPath, runComposeDown: down.fn },
+    });
+    await sleep(150);
+    replaceWithInstallOwned(registryPath, "row1");
+    lock.release();
+    await lock.done;
+
+    const err = await teardown.then(
+      () => null,
+      (e) => e,
+    );
+    expect(err, "the teardown must refuse").not.toBeNull();
+    // WHAT changed — both bound fields the replacement touched, old → new.
+    expect(err.message).toMatch(/infraMode: "external" → "new"/);
+    expect(err.message).toContain(`composeFiles: ["docker-compose.yml"] → ["${ISOLATED_COMPOSE_FILENAME}"]`);
+    // …and WHAT TO DO.
+    expect(err.message).toMatch(/Re-run `cinatra install --down`/);
+    expect(err.message).toMatch(/read that new plan before confirming it/);
+  });
+
+  it("positive control: the same --instance --teardown-existing flow releases when the row stays put", async () => {
+    const { registryPath, allocLockPath } = newRegistryPaths();
+    writeInstanceRegistry(registryPath, { version: 1, instances: {} });
+    installExternal({ registryPath, slug: "row1", appPort: 3300 });
+    const down = recordingDown();
+
+    const lock = await holdAllocLock(allocLockPath);
+    const teardown = runInstall(["--down", "--instance", "row1", "--yes", "--teardown-existing"], {
+      log: () => {},
+      deps: { instanceRegistryPath: registryPath, allocLockPath, runComposeDown: down.fn },
+    });
+    await sleep(150);
+    lock.release(); // nothing changed under the lock this time
+    await lock.done;
+
+    expect(await teardown).toMatchObject({ down: true, released: true, slug: "row1" });
+    // Still external, so still nothing to bring down — and certainly no `-v`.
+    expect(down.calls).toHaveLength(0);
+    expect(rowFor(registryPath, "row1")).toBeNull();
+  });
+
+  it("the binding is on the safety-relevant fields, and only those", () => {
+    const row = {
+      slug: "row1",
+      mode: "dev",
+      state: "ready",
+      infraMode: "new",
+      composeProject: "cinatra_row1",
+      composeFiles: ["a.yml", "b.yml"],
+      installDir: "/tmp/x",
+      appPort: 3300,
+      ports: { postgres: [15434] },
+      createdResources: ["db"],
+    };
+    const key = (r) => teardownIdentityKey(teardownIdentity(r));
+
+    expect(Object.keys(teardownIdentity(row)).sort()).toEqual([
+      "composeFiles",
+      "composeProject",
+      "infraMode",
+      "installDir",
+    ]);
+
+    // Every bound field moves the key…
+    expect(key({ ...row, infraMode: "external" })).not.toBe(key(row));
+    expect(key({ ...row, composeProject: "other" })).not.toBe(key(row));
+    expect(key({ ...row, composeFiles: ["b.yml", "a.yml"] })).not.toBe(key(row)); // order is significant
+    expect(key({ ...row, installDir: "/tmp/y" })).not.toBe(key(row));
+
+    // …and the deliberately unbound ones do not: they are outputs of the release
+    // or status that churns, never inputs to an irreversible command.
+    for (const churn of [{ state: "degraded" }, { appPort: 3999 }, { ports: {} }, { mode: "prod" }, { createdResources: [] }]) {
+      expect(key({ ...row, ...churn })).toBe(key(row));
+    }
+
+    // installDir is compared resolved, so a trailing slash is not a refusal.
+    expect(key({ ...row, installDir: "/tmp/x/" })).toBe(key(row));
   });
 });

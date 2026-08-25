@@ -3660,6 +3660,102 @@ export function planInstanceTeardown(row, { volumes = false } = {}) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// cinatra-cli#232 — binding the CONFIRMED plan to the EXECUTED one.
+//
+// `runInstallDown` reads the registry, plans, prints and CONFIRMS all OUTSIDE
+// the allocation lock; `teardownInstance` then re-reads under the lock. Two
+// reads means two rows, and it is the SECOND one that runs `down` and decides
+// `-v`. Between them another process can release a slug and reinstall it — same
+// slug, different instance — and the operator's confirmation then authorises a
+// destruction of something they were never shown. The window is small and the
+// action is irreversible, which is exactly the combination that needs a gate
+// rather than an argument about likelihood.
+//
+// So the caller binds its snapshot to the row, and the bound value is a
+// FINGERPRINT of the identity below rather than a hand-written field-by-field
+// comparison. Three reasons:
+//   • It is TOTAL by construction. `teardownIdentityKey` is derived from the
+//     identity object's OWN keys, so a field added to `teardownIdentity` is
+//     bound automatically. A four-way `&&` chain has four chances to drift from
+//     the field list and gives a fifth field no check at all.
+//   • Normalisation lives WITH the field list, not with the comparison
+//     (`installDir` needs `path.resolve`, `composeFiles` is order-significant,
+//     an absent `composeProject` must unify with an explicit null). One
+//     normalisation means the gate and the operator-facing diff describe the
+//     same comparison, always.
+//   • It is one value across the API boundary and one `!==` at the gate.
+// The usual cost of a fingerprint — it cannot say WHAT changed — is paid off by
+// keeping both normalised identities and diffing them on the refusal path only,
+// where the cost does not matter.
+//
+// WHICH fields are safety-relevant, and why the rest are deliberately out:
+//   • `infraMode` — the single switch for `plan.down`, and therefore for
+//     `plan.volumes`. It is the exact field the dangerous path flips (an
+//     `external` row, whose plan can never carry `-v`, replaced by an
+//     install-owned `new` one, whose plan can). It also gates the co-use case.
+//   • `composeProject` — names the project the `down` targets (through
+//     `composeProjectArgForRow`) and the project the reclaim gate inspects
+//     (through `reclaimInspectProjectForRow`). A change means the `down` hits a
+//     different stack than the one printed and confirmed.
+//   • `composeFiles` — the service and named-volume set the `down` acts on,
+//     i.e. the blast radius itself.
+//   • `installDir` — the directory the `down` runs FROM (so, for a pre-#35
+//     sentinel row, the basename project Compose re-derives), and the directory
+//     whose marker + generated compose file the post-release cleanup removes.
+// Deliberately NOT bound:
+//   • `appPort` / `ports` — not inputs to any destructive command. They are
+//     what the release frees, and the release derives them from the very row it
+//     removes, under the lock, so it stays internally consistent whatever they
+//     are. Binding them would refuse a still-correct teardown over a number
+//     that only changed the "releases:" echo.
+//   • `state` — legitimately churns (`ready` → `degraded`) from commands that
+//     destroy nothing. Binding it would turn a status update into a refusal.
+//   • `mode` / `createdResources` — printed in the header and the co-use
+//     refusal; neither selects a command or a target, and `infraMode` already
+//     gates co-use.
+//   • `slug` — the lookup key. It cannot differ.
+// ---------------------------------------------------------------------------
+
+/** The safety-relevant identity of a teardown target, normalised for comparison.
+ *  Accepts a registry ROW or a plan from `planInstanceTeardown` — the plan copies
+ *  these four fields off the row verbatim, so both yield the same identity, and
+ *  passing the PLAN is what binds literally the object that was printed and
+ *  confirmed. */
+export function teardownIdentity(source) {
+  if (!source) return null;
+  return {
+    infraMode: source.infraMode ?? null,
+    composeProject: source.composeProject ?? null,
+    composeFiles: [...(source.composeFiles ?? [])],
+    installDir:
+      typeof source.installDir === "string" && source.installDir.trim() !== ""
+        ? path.resolve(source.installDir)
+        : null,
+  };
+}
+
+/** The comparison value for a `teardownIdentity`. Built from the identity's OWN
+ *  key set (sorted), so extending `teardownIdentity` extends the binding with no
+ *  second edit here — the gate can never fall behind the field list. */
+export function teardownIdentityKey(identity) {
+  if (!identity) return null;
+  return JSON.stringify(Object.keys(identity).sort().map((k) => [k, identity[k]]));
+}
+
+/** Field-level description of how two identities differ, for the refusal. Only
+ *  ever built on the failure path, so it can afford to be exhaustive. */
+function describeTeardownIdentityChange(expected, actual) {
+  const keys = [...new Set([...Object.keys(expected ?? {}), ...Object.keys(actual ?? {})])].sort();
+  const out = [];
+  for (const k of keys) {
+    const was = JSON.stringify(expected?.[k] ?? null);
+    const now = JSON.stringify(actual?.[k] ?? null);
+    if (was !== now) out.push(`${k}: ${was} → ${now}`);
+  }
+  return out;
+}
+
 /**
  * Tear down instance `slug` and release its reservations.
  *
@@ -3668,7 +3764,14 @@ export function planInstanceTeardown(row, { volumes = false } = {}) {
  * @param {string|null} [a.expectInstallDir] when set, the row is only touched if
  *        its recorded installDir resolves to this path (the cinatra-cli#39
  *        tightening: a slug collision must never release someone else's row).
+ * @param {object|null} [a.expectIdentity] a `teardownIdentity` the row must still
+ *        match under the lock — the snapshot the caller planned, printed and
+ *        confirmed against. Refuses (`identity-changed`) when it does not, so a
+ *        confirmation can never authorise a row it never described.
  * @param {boolean} [a.volumes] pass `-v` to the `down` (deletes the data volumes).
+ *        Callers that confirm interactively must pass their CONFIRMED plan's
+ *        `volumes`, never the raw flag: the flag is only a request, the plan is
+ *        the decision the operator was shown.
  * @param {boolean} [a.force]   release a row we cannot `down` ourselves (a co-use
  *        row, or a row whose checkout is gone while its project is still live —
  *        or whose liveness we could not determine because Docker errored).
@@ -3678,6 +3781,7 @@ export function planInstanceTeardown(row, { volumes = false } = {}) {
 export async function teardownInstance({
   slug,
   expectInstallDir = null,
+  expectIdentity = null,
   volumes = false,
   force = false,
   dryRun = false,
@@ -3715,6 +3819,26 @@ export async function teardownInstance({
     if (expectInstallDir != null && path.resolve(row.installDir) !== path.resolve(expectInstallDir)) {
       outcome = { released: false, reason: "dir-mismatch", plan: planInstanceTeardown(row, { volumes }), downRan: false };
       return;
+    }
+    // The row under the lock must still be the row the caller planned against.
+    // `expectInstallDir` is NOT this check: it is null for `--instance`, and even
+    // when set it compares the directory only, so a same-slug, same-directory
+    // replacement that flips `infraMode` walks straight past it. See the field
+    // rationale above `teardownIdentity`. Runs BEFORE the dry-run return too: a
+    // dry-run that printed a plan for a row that is no longer there would be
+    // reporting fiction.
+    if (expectIdentity) {
+      const actualIdentity = teardownIdentity(row);
+      if (teardownIdentityKey(actualIdentity) !== teardownIdentityKey(expectIdentity)) {
+        outcome = {
+          released: false,
+          reason: "identity-changed",
+          plan: planInstanceTeardown(row, { volumes }),
+          downRan: false,
+          identityChanges: describeTeardownIdentityChange(expectIdentity, actualIdentity),
+        };
+        return;
+      }
     }
 
     const plan = planInstanceTeardown(row, { volumes });
@@ -3990,12 +4114,28 @@ async function runInstallDown({ opts, log = console.log, deps = {} }) {
     throw new Error(`Aborted: teardown of "${row.slug}" not confirmed (pass --yes to run non-interactively).`);
   }
 
+  // Everything above ran on a registry read taken OUTSIDE the allocation lock;
+  // `teardownInstance` re-reads under it. The confirmation just given describes
+  // `plan`, so `plan` — not the raw flags, not a second read — is what the
+  // teardown must execute. Both halves of that are passed explicitly:
+  //   • `volumes: plan.volumes`, NOT `opts.teardownExisting`. The flag is a
+  //     request; `plan.volumes` is the decision the operator was shown and (for
+  //     an install-owned row) typed the phrase for. Passing the raw flag let the
+  //     under-lock plan re-derive `-v` from a row nobody confirmed: a pre-lock
+  //     `external` row plans `down === false`, so `--yes --teardown-existing`
+  //     never reaches `typedConfirm` at all, and an install-owned replacement
+  //     arriving before the lock would then have had its volumes deleted on a
+  //     bare `--yes`.
+  //   • `expectIdentity`, so that replacement is REFUSED rather than merely
+  //     stripped of its `-v`. Passing `plan` (not `row`) binds literally the
+  //     object printed above.
   const result = await teardownInstance({
     slug: row.slug,
     // Targeting by --instance is explicit; targeting by dir must only release a
     // row that still points at THAT dir.
     expectInstallDir: opts.instance ? null : byDir,
-    volumes: opts.teardownExisting === true,
+    expectIdentity: teardownIdentity(plan),
+    volumes: plan.volumes,
     force: opts.force === true,
     log,
     deps,
@@ -4046,6 +4186,14 @@ async function runInstallDown({ opts, log = console.log, deps = {} }) {
       `"${row.slug}" is a co-use instance: it owns a separate database (${(row.createdResources ?? []).join(", ") || "unknown"}) ` +
       `but no stack of its own. Drop that database yourself, then re-run with --force to release the row.`,
     "dir-mismatch": `the recorded row for "${row.slug}" no longer points at ${byDir} — refusing to release a row we did not resolve.`,
+    "identity-changed":
+      `the row recorded for "${row.slug}" CHANGED between the plan printed above and the allocation lock being ` +
+      `taken, so NOTHING was brought down and NOTHING was released. The confirmation you gave describes a ` +
+      `different instance than the one now recorded under that slug:\n` +
+      (result.identityChanges ?? []).map((c) => `    • ${c}`).join("\n") +
+      `\n  Another process released and re-created "${row.slug}" while this command waited for the lock. ` +
+      `Re-run \`cinatra install --down\` so the plan is built from the row that is actually there, and read ` +
+      `that new plan before confirming it.`,
     "not-found": `the row for "${row.slug}" disappeared before the lock was taken (nothing to release).`,
   }[result.reason] ?? `teardown did not release the row (${result.reason}).`;
   throw new Error(`Teardown of "${row.slug}" did not complete: ${why}`);
