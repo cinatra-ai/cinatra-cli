@@ -60,7 +60,11 @@ export const SEED_DB_NAME = "cinatra_seed";
 const REGISTRY_VERSION = 1;
 const LOCK_STALE_MS = 60_000; // steal a lock whose file mtime is older than this
 const LOCK_RETRY_MS = 100;
-const LOCK_TIMEOUT_MS = 10_000;
+// The DEFAULT waiter deadline: sized for the clone-registry critical sections,
+// which are a read plus one atomic rename. Callers whose critical section spans
+// a real subprocess pass their own (see ALLOC_LOCK_TIMEOUT_MS in
+// instance-alloc.mjs, cinatra-cli#243).
+export const LOCK_TIMEOUT_MS = 10_000;
 
 // --- slug / name / port ----------------------------------------------------
 
@@ -283,6 +287,20 @@ function lockHolderAlive(lockPath) {
   }
 }
 
+/** Describe the recorded holder of a lock file for a diagnostic message, as
+ *  ` (held by pid <pid> since <iso>)`. The lock body is written by the holder as
+ *  `<pid> <iso>`; anything unreadable degrades to the empty string, because a
+ *  diagnostic must never be the thing that throws. */
+function describeLockHolder(lockPath) {
+  try {
+    const [pid, ...rest] = readFileSync(lockPath, "utf8").trim().split(/\s+/);
+    if (!pid) return "";
+    return ` (held by pid ${pid}${rest.length ? ` since ${rest.join(" ")}` : ""})`;
+  } catch {
+    return "";
+  }
+}
+
 /**
  * Run `fn` while holding an exclusive lock on `<filePath>.lock`.
  *
@@ -293,11 +311,25 @@ function lockHolderAlive(lockPath) {
  * Best-effort, single-host: `openSync(..., "wx")` is the mutex; a lock whose
  * file mtime is older than LOCK_STALE_MS is considered abandoned and stolen.
  * `fn` may be async; the lock is always released in `finally`.
+ *
+ * `timeoutMs` is the WAITER deadline — how long THIS call blocks for a holder
+ * that is alive and working. It is deliberately a caller concern
+ * (cinatra-cli#243): the deadline has to be sized to the longest critical
+ * section a holder may legitimately run, and that length belongs to whoever
+ * defines the critical section, not to this file. It is NOT the staleness
+ * window — a holder is only ever robbed when its pid is GONE (LOCK_STALE_MS),
+ * so a longer deadline can never let a live holder be stolen from.
  */
-export async function withRegistryLock(filePath, fn) {
+export async function withRegistryLock(filePath, fn, { timeoutMs = LOCK_TIMEOUT_MS } = {}) {
   const lockPath = `${filePath}.lock`;
   mkdirSync(path.dirname(lockPath), { recursive: true });
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  // One-shot "still waiting" notice for the callers that block far longer than
+  // the default: a three-minute silent hang reads as a wedged CLI. Emitted at
+  // the OLD deadline, so the operator learns why the wait is long exactly where
+  // the command used to give up.
+  let noticed = timeoutMs <= LOCK_TIMEOUT_MS;
   let fd = null;
 
   while (fd === null) {
@@ -387,10 +419,26 @@ export async function withRegistryLock(filePath, fn) {
         }
         if (Date.now() > deadline) {
           throw new Error(
-            `Timed out after ${LOCK_TIMEOUT_MS}ms waiting for the clone registry lock ` +
-              `(${lockPath}). If no other 'cinatra clone' command is running, delete the ` +
-              `lock file and retry.`,
+            `Timed out after ${timeoutMs}ms waiting for the cinatra registry lock ` +
+              `(${lockPath})${describeLockHolder(lockPath)}. Another cinatra command is holding it — ` +
+              `an install holds this lock across \`docker compose up\`/\`down\`, which on a ` +
+              `multi-container stack takes minutes. Wait for that command to finish, then re-run. ` +
+              `Do NOT delete the lock file while another cinatra command is running — that ` +
+              `breaks the mutual exclusion protecting the port registries and lets two installs ` +
+              `claim the same ports. A lock whose holder process is GONE needs no manual cleanup: ` +
+              `it is reclaimed automatically ${LOCK_STALE_MS}ms after its last write.`,
           );
+        }
+        if (!noticed && Date.now() - startedAt > LOCK_TIMEOUT_MS) {
+          noticed = true;
+          try {
+            process.stderr.write(
+              `⏳ Waiting for the cinatra registry lock (${lockPath})${describeLockHolder(lockPath)} — ` +
+                `a teardown or bring-up holds it across its docker subprocess. Waiting up to ${timeoutMs}ms.\n`,
+            );
+          } catch {
+            /* diagnostics only */
+          }
         }
         await new Promise((r) => setTimeout(r, LOCK_RETRY_MS));
         continue;
