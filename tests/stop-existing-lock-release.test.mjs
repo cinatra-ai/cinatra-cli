@@ -152,7 +152,7 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
 
   // Is the alloc lock EXCLUSIVELY held right now? `openSync(path, "wx")` is the
   // very mutex `withRegistryLock` uses, so this asks the lock itself rather than
-  // merely noting that a file exists (codex round 2): EEXIST means a holder has
+  // merely noting that a file exists: EEXIST means a holder has
   // it; a successful open means it was free, and we hand the slot straight back.
   function allocLockHeld() {
     try {
@@ -283,7 +283,7 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
     seedRemappedHolder("faildother", otherDir);
     const registryBefore = readFileSync(regPath, "utf8");
     // The per-checkout hint describes a stack that is still up after a failed
-    // `down` — it must survive with the reservation (codex round 3).
+    // `down` — it must survive with the reservation.
     const marker = path.join(otherDir, ".cinatra", "instance.json");
     mkdirSync(path.dirname(marker), { recursive: true });
     writeFileSync(marker, JSON.stringify({ slug: "faildother" }), "utf8");
@@ -793,8 +793,8 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
   });
 
   it("a MISSING registry is not a read failure — a label-proven holder still stops", async () => {
-    // The loud read must not turn "no registry yet" into a refusal (codex round
-    // 3). `requireUsableInstanceRegistry` reads a missing file as an EMPTY
+    // The loud read must not turn "no registry yet" into a refusal.
+    // `requireUsableInstanceRegistry` reads a missing file as an EMPTY
     // registry, so a holder proven only by its labels still stops cleanly.
     const otherDir = path.join(sandbox, "noreg-holder");
     mkdirSync(otherDir, { recursive: true });
