@@ -42,6 +42,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  rmSync,
   writeFileSync,
   renameSync,
 } from "node:fs";
@@ -221,7 +222,20 @@ export function writeInstanceRegistry(filePath, data) {
     JSON.stringify({ ...data, version: data.version ?? REGISTRY_VERSION }, null, 2) + "\n";
   const tmp = path.join(dir, `.instances.${process.pid}.${Date.now()}.tmp`);
   writeFileSync(tmp, payload, { mode: 0o600 });
-  renameSync(tmp, filePath);
+  try {
+    renameSync(tmp, filePath);
+  } catch (err) {
+    // The rename is the commit point: if it fails, the registry still holds the
+    // PREVIOUS content (no torn write, no half-release) — but the temp file
+    // would otherwise be orphaned in the registry dir, once per failed attempt.
+    // Clean it up and rethrow so the caller still sees the failure.
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* best-effort */
+    }
+    throw err;
+  }
 }
 
 // --- slot operations (pure) ------------------------------------------------
