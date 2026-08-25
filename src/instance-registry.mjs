@@ -21,7 +21,19 @@
 //                                                  // can publish >1 host port
 //                                                  // (neo4j → 7474 AND 7687)
 //       appPort, repoUrl, ref, sha, infraMode, createdResources[], state,
-//       createdAt } } }
+//       createdAt, instanceNonce } } }
+//
+//   `instanceNonce` (cinatra-cli#243) is the row's IDENTITY: a random value
+//   minted when a row is CREATED. Everything else in the row is either derived
+//   from the slug (id, composeProject, composeFiles) or a wall-clock stamp that
+//   two creations inside one millisecond share (createdAt), so this is the one
+//   field that tells a row REPLACED by a concurrent same-slug install apart
+//   from the one an operator confirmed — which is what `stop-existing` needs.
+//   `allocateInstance` is its only writer and no caller rewrites it, but the
+//   patch helpers below CAN (they spread `...patch` after `...existing`), so
+//   that invariant is a convention documented at each of them rather than one
+//   the API enforces. OPTIONAL by design: rows written before the field existed
+//   carry none, and readers fall back to `createdAt`.
 //
 // Import-light: node builtins only + the lock/atomic-write discipline REUSED
 // from clone-registry. It never imports index.mjs (the heavy graph). The lock
@@ -38,10 +50,12 @@
 //   - Atomic temp+rename write; mode 0600.
 // ---------------------------------------------------------------------------
 
+import { randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
   readFileSync,
+  rmSync,
   writeFileSync,
   renameSync,
 } from "node:fs";
@@ -129,6 +143,12 @@ function isValidInstanceSlot(slug, slot) {
   if (slot.createdResources != null && !isStringArray(slot.createdResources)) return false;
   if (!INSTANCE_STATES.has(slot.state)) return false;
   if (typeof slot.createdAt !== "string" || slot.createdAt.length === 0) return false;
+  // cinatra-cli#243: OPTIONAL — rows written before the field existed carry
+  // none and stay valid. Present-but-not-a-non-empty-string is a malformed row,
+  // the same standard every other field is held to.
+  if (slot.instanceNonce != null && (typeof slot.instanceNonce !== "string" || slot.instanceNonce.length === 0)) {
+    return false;
+  }
   return true;
 }
 
@@ -223,7 +243,20 @@ export function writeInstanceRegistry(filePath, data) {
     JSON.stringify({ ...data, version: data.version ?? REGISTRY_VERSION }, null, 2) + "\n";
   const tmp = path.join(dir, `.instances.${process.pid}.${Date.now()}.tmp`);
   writeFileSync(tmp, payload, { mode: 0o600 });
-  renameSync(tmp, filePath);
+  try {
+    renameSync(tmp, filePath);
+  } catch (err) {
+    // The rename is the commit point: if it fails, the registry still holds the
+    // PREVIOUS content (no torn write, no half-release) — but the temp file
+    // would otherwise be orphaned in the registry dir, once per failed attempt.
+    // Clean it up and rethrow so the caller still sees the failure.
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* best-effort */
+    }
+    throw err;
+  }
 }
 
 // --- slot operations (pure) ------------------------------------------------
@@ -361,6 +394,15 @@ export function allocateInstance(registry, slug, fields) {
     createdResources: [...createdResources],
     state,
     createdAt: new Date().toISOString(),
+    // cinatra-cli#243: the row's IDENTITY, minted here and only here. `id` and
+    // `composeProject` are derived from the slug, so a same-slug re-provisioning
+    // reproduces them exactly; `createdAt` is wall-clock at millisecond
+    // resolution, so two creations inside one millisecond share it. A random
+    // value shares neither weakness, which is what lets `stop-existing` refuse
+    // to tear down a row that was REPLACED while it was between classification
+    // and the allocation lock. The idempotent return above is BEFORE this, so a
+    // re-run of the same install keeps its nonce.
+    instanceNonce: randomUUID(),
   };
   const next = cloneRegistryObject(registry);
   next.instances[slug] = slot;
@@ -369,7 +411,13 @@ export function allocateInstance(registry, slug, fields) {
 
 /** Flip a row to state "ready" after provisioning + health succeed. Optionally
  *  patch the resolved SHA / ports / createdResources discovered during bring-up.
- *  Returns a new registry. */
+ *  Returns a new registry.
+ *
+ *  `patch` is spread AFTER the existing row, so it CAN overwrite any field. Never
+ *  pass `createdAt` or `instanceNonce` through it: those two are the row's
+ *  identity (cinatra-cli#243) and rewriting one would make a live install look
+ *  like a different one to `stop-existing`, or two different installs look the
+ *  same. No caller does today. */
 export function markInstanceReady(registry, slug, patch = {}) {
   const existing = registry.instances[slug];
   if (!existing) {

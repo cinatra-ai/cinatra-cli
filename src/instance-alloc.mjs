@@ -117,6 +117,49 @@ export function reservedPorts({ cloneRegistry = null, instanceRegistry = null } 
 }
 
 /**
+ * The instance rows that currently HOLD a reservation, sorted by slug, as short
+ * human lines (the registry records no ordering the operator could rely on, so
+ * the listing is alphabetical and stable rather than insertion-ordered). cinatra-cli#232: an exhaustion error used to say only
+ * "release an instance" without saying WHICH — and the rows that exhaust the
+ * band are usually STALE (a torn-down instance whose row was never released), so
+ * the operator could not tell a live holder from a leftover. Naming the holders
+ * plus the release command turns the refusal into a remediation. Pure — takes
+ * the parsed registry, touches no filesystem (so it can never claim a row is
+ * stale; it reports the recorded dir and lets the operator judge).
+ *
+ * @param {object|null} instanceRegistry parsed instances.json (or null)
+ * @returns {string[]} one line per recorded instance (empty when none)
+ */
+export function describeInstanceReservations(instanceRegistry) {
+  const instances = instanceRegistry?.instances ?? {};
+  return Object.values(instances)
+    .filter((slot) => slot && typeof slot.slug === "string")
+    .sort((a, b) => String(a.slug).localeCompare(String(b.slug)))
+    .map((slot) => {
+      const bits = [`[${slot.state}]`];
+      if (Number.isInteger(slot.offset)) bits.push(`offset ${slot.offset}`);
+      if (Number.isInteger(slot.appPort)) bits.push(`app ${slot.appPort}`);
+      bits.push(`dir ${slot.installDir}`);
+      return `${slot.slug}  ${bits.join("  ")}`;
+    });
+}
+
+/** Append the recorded holders + the release command to an allocation-exhaustion
+ *  message. Kept in one place so the app-port and band refusals say the same
+ *  thing. Pure. */
+function withReservationRemediation(message, instanceRegistry) {
+  const lines = describeInstanceReservations(instanceRegistry);
+  if (lines.length === 0) return message;
+  return (
+    `${message}\n  Recorded instances holding a reservation:\n` +
+    lines.map((l) => `    • ${l}`).join("\n") +
+    `\n  Release one with \`cinatra install --down --instance <slug> --yes\` — that stops its recorded ` +
+    `compose project and frees its ports in one step. A row whose dir no longer exists is STALE ` +
+    `(a torn-down instance); the same command reclaims it (cinatra-cli#232).`
+  );
+}
+
+/**
  * Allocate the lowest free instance APP port in [min,max], skipping the default
  * app ports, the full static clone band, and every live reservation. Pure.
  * `exclude` is an extra Set of ports to skip (e.g. ports a live probe just
@@ -136,8 +179,11 @@ export function allocateAppPort({
     if (!reserved.has(p) && !skip.has(p)) return p;
   }
   throw new Error(
-    `No free instance app port in ${min}-${max} (all reserved by the default stack, clones, or other instances). ` +
-      `Pass --app-port <n> with a port you know is free, or release an instance.`,
+    withReservationRemediation(
+      `No free instance app port in ${min}-${max} (all reserved by the default stack, clones, or other instances). ` +
+        `Pass --app-port <n> with a port you know is free, or release an instance.`,
+      instanceRegistry,
+    ),
   );
 }
 
@@ -188,10 +234,39 @@ export function allocateBandOffset({
     }
   }
   throw new Error(
-    `Could not find a free infra band offset (${min}..${max}) for the isolated stack — ` +
-      `every candidate collides with a reserved port. Free some ports or release an instance.`,
+    withReservationRemediation(
+      `Could not find a free infra band offset (${min}..${max}) for the isolated stack — ` +
+        `every candidate collides with a reserved port. Free some ports or release an instance.`,
+      instanceRegistry,
+    ),
   );
 }
+
+/**
+ * How long a waiter blocks for the ALLOC lock before giving up.
+ *
+ * cinatra-cli#243: the clone-registry default (10s) was sized for a critical
+ * section that is a read plus one atomic rename. The alloc lock is not that any
+ * more — `executeStopExisting` holds it across `docker compose down` on a ready,
+ * multi-container stack, and the default bring-up holds it across `docker
+ * compose up`. Docker's own default stop grace alone is 10s PER CONTAINER before
+ * SIGKILL, so under the old deadline every concurrent install failed with a
+ * timeout as the COMMON case, not the tail.
+ *
+ * Three minutes covers a real teardown (a six-container stack at full stop grace
+ * plus named-volume removal) with margin. It is a WAITER deadline only: it can
+ * never let a live holder be robbed, because a lock is stolen only when its
+ * holder pid is gone (LOCK_STALE_MS). A cold bring-up that pulls images can
+ * still exceed it; that hold predates this change, and the honest position is
+ * that a waiter which has blocked three minutes should report rather than hang
+ * forever.
+ *
+ * A heartbeat (refreshing the lock file's mtime while `fn` runs, letting waiters
+ * extend) is the other shape and does NOT work here: `composeDown` runs through
+ * `spawnSync`, which blocks the event loop for the whole teardown, so no timer
+ * could fire to refresh anything.
+ */
+export const ALLOC_LOCK_TIMEOUT_MS = 180_000;
 
 /**
  * Run `fn` while holding the shared OUTER allocation lock. `fn` receives no
@@ -201,14 +276,14 @@ export function allocateBandOffset({
  * Reuses clone-registry's battle-tested lock implementation against the shared
  * `alloc.lock` path. NEVER nest a per-registry `withRegistryLock` inside `fn`.
  */
-export async function withAllocLock(lockPath, fn) {
+export async function withAllocLock(lockPath, fn, { timeoutMs = ALLOC_LOCK_TIMEOUT_MS } = {}) {
   // withRegistryLock takes a FILE path and locks `${path}.lock`; pass a base so
   // the effective lock file is `${lockPath}` → use the alloc lock path WITHOUT
   // the trailing `.lock` and let withRegistryLock append it. To make the
   // on-disk lock be exactly `alloc.lock`, hand withRegistryLock a base that
   // appends to. We standardise on locking `<dir>/alloc` → file `<dir>/alloc.lock`.
   const base = lockPath.endsWith(".lock") ? lockPath.slice(0, -".lock".length) : lockPath;
-  return withRegistryLock(base, fn);
+  return withRegistryLock(base, fn, { timeoutMs });
 }
 
 /** Validate an explicit `--app-port` value (operator-supplied) for SHAPE only —
@@ -291,8 +366,10 @@ export const __test = {
   BAND_OFFSET_MIN,
   BAND_OFFSET_MAX,
   defaultAllocLockPath,
+  ALLOC_LOCK_TIMEOUT_MS,
   staticCloneBandPorts,
   reservedPorts,
+  describeInstanceReservations,
   allocateAppPort,
   allocateBandOffset,
   withAllocLock,
