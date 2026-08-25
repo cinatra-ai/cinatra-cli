@@ -5822,8 +5822,12 @@ function rowMintedIdentity(row) {
  *  AND on the row's minted identity (`rowMintedIdentity`), which is what tells a
  *  REPLACED row apart from the one that was confirmed when the first two are
  *  reproduced exactly. Returns null when they are the same install, else a
- *  `{ filesClause, identityClause }` describing the difference for the refusal
- *  message.
+ *  `{ projectClause, filesClause, identityClause }` describing the difference
+ *  for the refusal message. Every clause is CONDITIONAL on its own field having
+ *  actually moved: an identity-only drift reproduces the compose project
+ *  exactly, and printing "confirmed X, registry now records X" would open the
+ *  refusal with a sentence that contradicts itself before the identity clause
+ *  explains the real difference (cinatra-cli#243).
  *
  *  The identity test is ASYMMETRIC, and that asymmetry is load-bearing (codex).
  *  Only `current` decides whether an identity is REQUIRED:
@@ -5860,6 +5864,10 @@ function stopTargetDrift(confirmed, current) {
     currentIdentity !== null && confirmedIdentity !== null && confirmedIdentity !== currentIdentity;
   if (!projectMoved && !filesMoved && !identityUnprovable && !identityReplaced) return null;
   return {
+    projectClause: projectMoved
+      ? ` (confirmed ${confirmed?.composeProject ?? "<none>"}, registry now records ` +
+        `${current?.composeProject ?? "<none>"})`
+      : "",
     filesClause: filesMoved
       ? ` Its compose files moved too (confirmed ${JSON.stringify(confirmed?.composeFiles ?? [])}; the ` +
         `registry now records ${JSON.stringify(current?.composeFiles ?? [])}).`

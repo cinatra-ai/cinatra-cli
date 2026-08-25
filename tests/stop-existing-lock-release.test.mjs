@@ -387,20 +387,33 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
 
     const downCalls = [];
     let stamps = null;
-    await expect(
-      runInstall(stopExistingArgv(path.join(sandbox, "reprov-new")), {
-        log: () => {},
-        deps: flowDeps({
-          detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
-          liveComposeInspect: holderOwns5434(otherDir),
-          probeCookiePrefixSupport: () => {
-            stamps = reprovisionSameSlug("reprovother", otherDir);
-            return false;
-          },
-          runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
-        }),
+    const refusal = await runInstall(stopExistingArgv(path.join(sandbox, "reprov-new")), {
+      log: () => {},
+      deps: flowDeps({
+        detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+        liveComposeInspect: holderOwns5434(otherDir),
+        probeCookiePrefixSupport: () => {
+          stamps = reprovisionSameSlug("reprovother", otherDir);
+          return false;
+        },
+        runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
       }),
-    ).rejects.toThrow(/instance "reprovother" was re-provisioned[\s\S]*The registry row itself was REPLACED/);
+    }).then(
+      () => null,
+      (err) => err,
+    );
+    expect(refusal?.message ?? "").toMatch(
+      /instance "reprovother" was re-provisioned[\s\S]*The registry row itself was REPLACED/,
+    );
+
+    // And it says so WITHOUT the twin-project pair. A re-provisioning
+    // reproduces the compose project exactly, so an unconditional "(confirmed
+    // X, registry now records X)" opened this refusal — the common case — with a
+    // sentence that contradicts itself, before the identity clause explained the
+    // real difference (cinatra-cli#243). The pair is conditional now, the way
+    // the files clause and the `-v` clause already were.
+    expect(refusal.message).not.toMatch(/confirmed cinatra_reprovother/);
+    expect(refusal.message).not.toMatch(/registry now records cinatra_reprovother/);
 
     // The premise the refusal has to survive on: project and files are IDENTICAL
     // across the two installs, so nothing but the minted identity distinguishes
