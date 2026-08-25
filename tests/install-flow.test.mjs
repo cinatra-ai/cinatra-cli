@@ -4249,8 +4249,11 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
   // CHANGELOG states ("only where the port disagrees") and against the whole
   // reason the infra keys are re-pointed from their OWN value.
   //
-  // The rule is now the infra rule, through the same two helpers: only the PORT
-  // is compared, and only the PORT is written.
+  // The rule is now the infra rule's TWO HELPERS: only the PORT is compared, and
+  // only the PORT is written. It is not the whole infra rule — since the
+  // round-11 predicate, an auth key must ALSO pass `isOwnBindOrigin` before
+  // either helper is consulted, which no infra key has to. The value below
+  // passes neither gate: it is https, and it already names the recorded port.
   it("leaves an auth URL with the recorded port alone, whatever its scheme, host and path", () => {
     const before =
       "PORT=3350\n" +
@@ -4260,25 +4263,31 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
     write(before);
     const res = repoint({ appPort: 3350, ports: { wayflow: [23010] }, restricted: true });
     // Byte-identical: the operator's auth front door is not this repair's business
-    // once it already names the port this instance publishes.
+    // once it already names the allocated app port.
     expect(read()).toBe(before);
     // …and nothing is announced, because nothing was written.
     expect(res).toBe(false);
   });
 
+  // The value carries userinfo, a path and a query, and it is an OWN-BIND origin
+  // (`http:` + a loopback literal + a port that is not a front-door one), so the
+  // repair owns it — and owning it means rewriting the PORT and nothing else.
+  // The round-10 spelling of this test used `https://…@auth.example.test:3005/`,
+  // which the round-11 predicate no longer touches at all; it is pinned as
+  // untouched in the boundary table below instead.
   it("re-points a DISAGREEING auth URL by its PORT alone, preserving every other component", () => {
     write(
       "PORT=3005\n" +
-        "BETTER_AUTH_URL=https://svc:pw@auth.example.test:3005/custom?tenant=a\n" +
+        "BETTER_AUTH_URL=http://svc:pw@127.0.0.1:3005/custom?tenant=a\n" +
         "NEXT_PUBLIC_BETTER_AUTH_URL=http://[::1]:3005/auth\n" +
         "WAYFLOW_BASE_URL=http://localhost:23010\n",
     );
     const res = repoint({ appPort: 3350, ports: { wayflow: [23010] }, restricted: true });
     const after = read();
     expect(after).toMatch(/^PORT=3350$/m);
-    // Scheme, userinfo, host, path and query all survive; only the port moved.
+    // Userinfo, host, path and query all survive; only the port moved.
     expect(after).toMatch(
-      /^BETTER_AUTH_URL=https:\/\/svc:pw@auth\.example\.test:3350\/custom\?tenant=a$/m,
+      /^BETTER_AUTH_URL=http:\/\/svc:pw@127\.0\.0\.1:3350\/custom\?tenant=a$/m,
     );
     // An IPv6 literal keeps its brackets, and its path.
     expect(after).toMatch(/^NEXT_PUBLIC_BETTER_AUTH_URL=http:\/\/\[::1\]:3350\/auth$/m);
@@ -4288,24 +4297,99 @@ describe("writeIsolatedAppEnv — the RESTRICTED re-point (cinatra#2654 round 7)
     expect(res).toEqual({ remapped: "app:3350" });
   });
 
-  // The default-port semantics this writer holds for EVERY URL key, stated for
-  // the auth keys too (round-10 review): a URL that names no port names its
-  // scheme's default. So `https://…/custom` agrees only when the recorded app
-  // port IS 443, and otherwise gains an explicit one — the single shape where
-  // the rewrite ADDS a component. The alternative, treating "states no port" as
-  // unjudgeable, would leave an isolated instance's auth URL naming a port the
-  // instance never publishes, which is the split brain this key exists to avoid.
-  it("reads an auth URL with NO port as its scheme's default, and writes one only on a disagreement", () => {
-    write("PORT=3350\nBETTER_AUTH_URL=https://auth.example.test/custom\nWAYFLOW_BASE_URL=http://localhost:23010\n");
-    repoint({ appPort: 3350, ports: { wayflow: [23010] }, restricted: true });
-    // 443 is not 3350 → an explicit port is written, and the path survives.
-    expect(read()).toMatch(/^BETTER_AUTH_URL=https:\/\/auth\.example\.test:3350\/custom$/m);
+  // ── round-11 review, BLOCKING ─────────────────────────────────────────────
+  // A RESTRICTED re-point may rewrite an auth self-URL only when it RECOGNISES
+  // that URL as an address of THIS instance's OWN port. The isolated app is a
+  // `pnpm dev` server on the host, serving PLAIN HTTP on the port this CLI
+  // allocated (3300-3399, or an explicit `--app-port` the allocator refuses
+  // below 1024).
+  // Anything it cannot recognise MAY be a front door the operator put there, and
+  // re-pointing one of those at the internal app port breaks a working sign-in on
+  // a start that regenerated some other service's map. So the predicate declines
+  // rather than guesses; the `PROXIED` name below is the reason it declines, not
+  // a claim that every row is provably behind a proxy.
+  //
+  // The round-10 rule judged by port alone, so it read `https://auth.example.test
+  // /custom` as 443 and wrote `https://auth.example.test:3350/custom`. That was
+  // net-new here: `main`'s regeneration route never touches these keys.
+  //
+  // The boundary, pinned shape by shape against a recorded app port of 3350.
+  // Every row that is NOT an own-bind origin must come back BYTE-IDENTICAL and
+  // must report nothing, because nothing was written.
+  const PROXIED = [
+    // 1. https, whatever the host — the app terminates no TLS, so a TLS front
+    //    door is something this CLI did not put there.
+    ["https://auth.example.test/custom", "https on a remote host, no port"],
+    ["https://auth.example.test:3350/custom", "…even when it already names the app port"],
+    ["https://auth.example.test:8443/x", "https with an explicit NON-443 port"],
+    ["https://localhost:3005/", "https on a LOOPBACK host is still TLS-terminated elsewhere"],
+    // 2. a host spelling this writer does not recognise — a LAN address, a DNS
+    //    name, an /etc/hosts alias. Any of those CAN reach a server that bound
+    //    every interface, so this is the cautious clause: the CLI cannot tell
+    //    such a name from a proxy's, so it leaves the operator's value alone.
+    ["http://auth.example.test:3005/x", "http on a remote host"],
+    ["http://192.168.1.5:3005", "http on a LAN address"],
+    // 3. a front-door port. `http://localhost/` and `http://localhost:80/` are
+    //    the SAME url and must get the same answer; no reachable app port is 80
+    //    or 443, so exempting them can never cost a repair the instance needed.
+    ["http://localhost/", "http on loopback naming 80 implicitly"],
+    ["http://localhost:80/", "…and the same URL spelled explicitly"],
+    ["http://localhost:443/", "http on loopback naming 443"],
+  ];
+  for (const [value, why] of PROXIED) {
+    it(`leaves a PROXIED auth origin alone — ${why}`, () => {
+      const before = `PORT=3350\nBETTER_AUTH_URL=${value}\nWAYFLOW_BASE_URL=http://localhost:23010\n`;
+      write(before);
+      const res = repoint({ appPort: 3350, ports: { wayflow: [23010] }, restricted: true });
+      expect(read()).toBe(before);
+      expect(res).toBe(false);
+    });
+  }
 
-    const agreeing = "PORT=443\nBETTER_AUTH_URL=https://auth.example.test/custom\nWAYFLOW_BASE_URL=http://localhost:23010\n";
-    write(agreeing);
-    // 443 IS the recorded port → the implicit default agrees, and nothing is written.
-    expect(repoint({ appPort: 443, ports: { wayflow: [23010] }, restricted: true })).toBe(false);
-    expect(read()).toBe(agreeing);
+  // The complement: every spelling in `OWN_BIND_HOSTS` IS repaired in the
+  // disagreeing shape below (http, an explicit non-front-door port), so the
+  // exemptions above are a boundary and not a quiet removal of the repair
+  // itself. This list holds one row per member of that set — if a host spelling
+  // is added there, this table must gain it too.
+  const OWN_BIND = [
+    "http://localhost:3005",
+    "http://127.0.0.1:3005",
+    "http://[::1]:3005",
+    "http://0.0.0.0:3005",
+    "http://[::]:3005",
+  ];
+  for (const value of OWN_BIND) {
+    it(`re-points an OWN-BIND auth origin — ${value}`, () => {
+      write(`PORT=3350\nBETTER_AUTH_URL=${value}\nWAYFLOW_BASE_URL=http://localhost:23010\n`);
+      const res = repoint({ appPort: 3350, ports: { wayflow: [23010] }, restricted: true });
+      expect(read()).toContain(`BETTER_AUTH_URL=${value.replace(":3005", ":3350")}`);
+      expect(res).toEqual({ remapped: "app:3350" });
+    });
+  }
+
+  // An own-bind origin that already NAMES the recorded port is agreement, not a
+  // rewrite — the no-churn rule this writer holds for every key.
+  it("leaves an OWN-BIND auth origin that already names the recorded app port alone", () => {
+    const before = "PORT=3350\nBETTER_AUTH_URL=http://127.0.0.1:3350/custom\nWAYFLOW_BASE_URL=http://localhost:23010\n";
+    write(before);
+    expect(repoint({ appPort: 3350, ports: { wayflow: [23010] }, restricted: true })).toBe(false);
+    expect(read()).toBe(before);
+  });
+
+  // The INFRA keys are OUT of the round-11 predicate and keep the default-port
+  // reading in full. `graphiti.internal` is a remote host naming 80 implicitly:
+  // an AUTH key of that shape is now left alone, but this one is still compared,
+  // found to disagree with the target 8000, and re-pointed. The `agrees` case
+  // for the same shape is pinned separately, a few tests above ("treats an
+  // IMPLICIT default port as agreement"). Narrowing the auth keys must not
+  // narrow these.
+  it("leaves the INFRA keys' default-port reading untouched by the auth predicate", () => {
+    write("GRAPHITI_URL=http://graphiti.internal/api\nCINATRA_AGENT_REGISTRY_URL=https://registry.example.test/\n");
+    const res = repoint({ ports: { graphiti: [8000], verdaccio: [24873] }, restricted: true });
+    // Read as 80, which is not 8000 → re-pointed, remote host and https alike.
+    expect(read()).toMatch(/^GRAPHITI_URL=http:\/\/graphiti\.internal:8000\/api$/m);
+    expect(read()).toMatch(/^CINATRA_AGENT_REGISTRY_URL=https:\/\/registry\.example\.test:24873\/$/m);
+    expect(res).toEqual({ remapped: "graphiti:8000 verdaccio:24873" });
   });
 
   // The same fail-open the infra keys keep: a value this CLI cannot parse is the

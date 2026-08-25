@@ -207,21 +207,42 @@ project adheres to [Semantic Versioning](https://semver.org/).
   `NEXT_PUBLIC_BETTER_AUTH_URL` describe the app, not the port map, so only a
   re-derive that MOVED the map can rewrite them, and only where the file already
   carries a value that disagrees with the recorded app port. `PORT` is a bare
-  number, so it disagrees when it names a different number. The two auth keys
-  hold URLs, and they follow the same rule as every other URL this command
-  re-points: only the PORT is compared, and only the PORT is written. An auth URL
-  that already names the recorded port is left exactly as it is, whatever its
-  scheme, host or path, so `https://auth.example.test:3350/custom` comes out of a
-  start untouched. An auth URL that names a different port keeps its scheme,
-  credentials, host, path and query, and gains the new port, in the normalised
-  spelling of the URL parser (an empty path gains its `/`). A URL that states no
-  port names its scheme's default (443 for `https://`), so it agrees only when
-  the recorded app port IS that default, and otherwise gains an explicit one. A
-  value the CLI cannot parse as a URL is left alone. The move is measured
-  on the file this run re-derived, before against after. A start that merely
-  verifies leaves all three exactly as the operator set them, and so does a
-  re-derive that moved no port, however far the registry row lags the compose
-  file for some other service.
+  number, so it disagrees when it names a different number.
+
+  The two auth keys hold URLs, and the repair claims only the ones it can
+  RECOGNISE as an address of the app's own port. The isolated app is a `pnpm dev`
+  server on the host, serving plain HTTP on the port this CLI allocated. So a
+  self-URL is repaired only when its scheme is `http:`, its host is one of
+  `localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0` or `[::]`, and the port it names
+  is not 80 or 443. Every other value is left byte-identical. So
+  `https://auth.example.test/custom` served by a proxy on 443,
+  `http://auth.example.test:3005/x` behind a reverse proxy, and
+  `http://localhost/` in front of a local nginx all come out of a start
+  unchanged, whatever the app port is. No opt-out key is needed, and none is
+  added.
+
+  The test is deliberately conservative, and it declines rather than guesses. An
+  `https://` origin can certainly REACH this instance, but it cannot BE the app's
+  own bind, because the app terminates no TLS. No app port is ever 80 or 443
+  either, since the allocator picks from 3300-3399 and `--app-port` is refused
+  below 1024. The host rule is the cautious one. A LAN address or a DNS name can
+  reach a server that bound every interface, so such a value MAY be the app
+  rather than a proxy, and this command cannot tell which. It leaves it alone.
+  The cost is that an operator who addresses the app that way repairs the port by
+  hand. The alternative cost was breaking a working sign-in, which is what the
+  previous rule did.
+
+  For a URL the repair does claim, only the PORT is compared and only the PORT is
+  written. One that already names the recorded port is left exactly as it is, so
+  `http://127.0.0.1:3350/custom` comes out of a start untouched. One that names a
+  different port keeps its credentials, host, path and query, and gains the new
+  port, in the normalised spelling of the URL parser (an empty path gains its
+  `/`). A value the CLI cannot parse as a URL is left alone. The infra keys below
+  are unaffected by all of this and keep reading a stated-no-port URL as its
+  scheme's default. The move is measured on the file this run re-derived, before
+  against after. A start that merely verifies leaves all three exactly as the
+  operator set them, and so does a re-derive that moved no port, however far the
+  registry row lags the compose file for some other service.
 
   Two consequences to know before running it. First, the re-point is not limited
   to WayFlow: `SUPABASE_DB_URL`, `REDIS_URL`, the two Nango URLs, the two agent

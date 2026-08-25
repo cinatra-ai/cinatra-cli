@@ -4556,6 +4556,74 @@ function rewriteUrlPort(existing, newPort, fallbackProto, fallbackPath = "") {
  *  WHATWG URL parser itself elides (`u.port` is "" for `http://h:80/`). */
 const DEFAULT_SCHEME_PORTS = { "http:": 80, "https:": 443, "ws:": 80, "wss:": 443 };
 
+/** The host spellings this writer RECOGNISES as a LOCAL address of the app's own
+ *  port: the IPv4 and IPv6 loopback literals, and the IPv4 and IPv6 any-address
+ *  literals a server reports when it binds every interface.
+ *
+ *  This is a RECOGNISER, not a claim about reachability. The isolated app is a
+ *  `pnpm dev` server on the HOST, not a compose service (`runInstall`, on the
+ *  app port: "it is NOT a compose-published port"), and whatever interface it
+ *  binds may equally be reached by a LAN address or by any DNS or `/etc/hosts`
+ *  name that resolves to this machine. None of those spellings is in this set,
+ *  and that is deliberate: this CLI cannot tell such a name from a reverse
+ *  proxy's, so it declines to judge it at all. See `isOwnBindOrigin`. */
+const OWN_BIND_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "0.0.0.0", "[::]"]);
+
+/**
+ * cinatra#2654 (round-11 review, BLOCKING) — could this existing self-URL be
+ * THIS instance's OWN bind?
+ *
+ * The app-port repair below exists for one purpose: to keep the app's own
+ * self-URL in step with its own bind port. So it may only rewrite a value it can
+ * RECOGNISE as that bind. Anything it cannot recognise MAY be a front door the
+ * operator put there, and re-pointing one of those at an internal app port
+ * breaks a working sign-in on a `cinatra start` that merely regenerated some
+ * other service's map. The predicate is therefore deliberately conservative: it
+ * answers "is this SHAPED like the app's own bind", not "is this a proxy", and
+ * it errs toward leaving the operator's value alone. Even a match is only a
+ * candidate — `http://localhost:3005` could be an unrelated local listener — but
+ * it is the shape this CLI itself writes, and the shape nothing else can claim
+ * more strongly.
+ *
+ * A value is RECOGNISED as this instance's own bind only when all three hold:
+ *
+ *   1. the scheme is `http:` — the isolated app serves PLAIN HTTP and terminates
+ *      no TLS, so an `https:`/`wss:` origin cannot be the app's own bind. It may
+ *      well reach the app, but only through a TLS terminator this CLI did not
+ *      put there;
+ *   2. the host is one of `OWN_BIND_HOSTS`. A LAN address or a DNS/`/etc/hosts`
+ *      name CAN reach a server that bound every interface, so such a value is
+ *      not necessarily a proxy — but it is not necessarily the app either, and
+ *      this CLI has no way to tell the two apart. It declines, and leaves it;
+ *   3. the port it NAMES — explicit, or its scheme's default when omitted — is
+ *      neither 80 nor 443. Those are the web front-door ports, and the app is
+ *      never on one: the allocator picks from 3300-3399
+ *      (`INSTANCE_APP_PORT_MIN/MAX`) and an explicit `--app-port` is refused
+ *      below 1024 (`validateAppPort`, src/instance-alloc.mjs). So this clause
+ *      can never suppress a repair the instance needed — no reachable app port
+ *      is 80 or 443 — while it does exempt the one shape a front door takes on
+ *      the loopback interface (a local nginx/Caddy on 80 in front of the app).
+ *      Reading the NAMED port rather than the written one keeps
+ *      `http://localhost/` and `http://localhost:80/` — the same URL, two
+ *      spellings — on the same answer; a rule that split them would be exactly
+ *      the spelling-dependent inconsistency the round-10 note argued against.
+ *
+ * Unparseable answers `false` too, so an operator value this CLI cannot read is
+ * left alone — the same fail-open `urlPortDiffers` keeps.
+ */
+function isOwnBindOrigin(existing) {
+  let u;
+  try {
+    u = new URL(String(existing));
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "http:") return false;
+  if (!OWN_BIND_HOSTS.has(u.hostname)) return false;
+  const named = u.port === "" ? DEFAULT_SCHEME_PORTS[u.protocol] : Number(u.port);
+  return named !== 80 && named !== 443;
+}
+
 /** Does this existing connection-URL name a DIFFERENT host port than `port`?
  *
  *  A value that is not a URL at all answers `false` — a restricted re-point
@@ -4712,31 +4780,53 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
     // under a RESTRICTED re-point only their PORT is this repair's business —
     // the same rule, through the same two helpers, the infra keys below use.
     // Comparing the WHOLE string against `http://localhost:${appPort}` replaced
-    // `BETTER_AUTH_URL=https://auth.example.test:3350/custom` — a value that
-    // already names the recorded port — with the canonical one, losing the
-    // operator's scheme, host and path on a start that had nothing to repair.
+    // `BETTER_AUTH_URL=http://127.0.0.1:3350/custom` — a value that already
+    // names the recorded port — with the canonical one, losing the operator's
+    // host and path on a start that had nothing to repair.
     //
-    // `urlPortDiffers` decides and `rewriteUrlPort` writes, so the semantics are
-    // the ones this writer already states for every other URL key, held here too:
-    //   - an explicit port that AGREES → left alone (`http://127.0.0.1:3350`);
-    //   - an explicit port that DISAGREES → the port alone is rewritten, and
-    //     scheme, userinfo, host, path and query survive;
-    //   - NO explicit port → the URL names its scheme's default (443 for
-    //     `https://auth.example.test/x`), so it agrees only when the recorded app
-    //     port IS that default, and otherwise gains an explicit one. This is the
-    //     one shape where the rewrite adds a component rather than replacing it,
-    //     and it is deliberate: an isolated instance whose app binds 3350 while
-    //     its own auth URL names 443 is cinatra-cli#231's split brain, and the
-    //     alternative — treating "states no port" as unjudgeable — would leave
-    //     `http://localhost/` pointing at a port this instance never publishes.
-    //   - not a URL at all → left alone, as `urlPortDiffers` answers `false`.
+    // cinatra#2654 (round-11 review, BLOCKING): and only a self-URL that could
+    // be the app's OWN BIND is this repair's business at all. The round-10 rule
+    // judged every auth value by its port alone, so
+    // `BETTER_AUTH_URL=https://auth.example.test/custom` — read as 443 — was
+    // "repaired" to `https://auth.example.test:3350/custom`, pointing an
+    // operator's sign-in callbacks and token minting at an internal port their
+    // proxy does not publish, on a start that merely regenerated some OTHER
+    // service's map. That was net-new here: `main`'s regeneration route never
+    // touches these keys.
     //
-    // Round-10 codex convergence, on the one case this costs: an operator who
-    // fronts the isolated app with a proxy on 443 has that URL re-pointed at the
-    // app port. That is NOT an argument for exempting the portless spelling —
-    // an explicit `https://…:443/` would be re-pointed just the same, so the
-    // exemption would be inconsistent AND incomplete. A proxied auth origin
-    // needs an explicit opt-out from app-port repair, which is not this item.
+    // The rule is now stated, not conceded (the round-10 comment said a proxied
+    // origin "needs an explicit opt-out", and no opt-out key is needed): this
+    // repair exists to keep the app's own self-URL in step with its own bind
+    // port, and the isolated app is a `pnpm dev` server on the host serving
+    // PLAIN HTTP on the port this CLI allocated. So a value this writer cannot
+    // RECOGNISE as that bind — any `https:` origin, any host outside
+    // `OWN_BIND_HOSTS`, any URL naming the front-door ports 80 or 443 — is left
+    // byte-identical. An `https:` origin genuinely cannot BE the bind, since the
+    // app terminates no TLS; the other two clauses are conservative rather than
+    // certain, and that is the point. `isOwnBindOrigin` states the predicate and
+    // its three reasons in full.
+    //
+    // For a value that IS an own-bind origin, `urlPortDiffers` decides and
+    // `rewriteUrlPort` writes, so the semantics are the ones this writer already
+    // states for every other URL key:
+    //   - a port that AGREES → left alone (`http://127.0.0.1:3350`);
+    //   - a port that DISAGREES → the port alone is rewritten, and scheme,
+    //     userinfo, host, path and query survive;
+    //   - not a URL at all → left alone, as `isOwnBindOrigin` answers `false`
+    //     for what it cannot parse, exactly as `urlPortDiffers` does.
+    // A portless own-bind origin cannot reach the rewrite: `http://localhost/`
+    // names 80, which clause 3 exempts. So the round-10 "adds a component"
+    // shape is gone from the auth keys — every rewrite here now replaces a port
+    // that was already spelled out. The INFRA keys below are untouched by all of
+    // this and keep the default-port reading in full (`GRAPHITI_URL=
+    // http://graphiti.internal/api` against a target of 80 is still agreement).
+    //
+    // Round-11 codex convergence, on what this costs: an operator who addresses
+    // the app directly by a LAN IP or an `/etc/hosts` alias on its allocated app
+    // port loses the automatic repair. That is the right trade — this CLI cannot
+    // tell that name from a proxy's, not repairing leaves them exactly where
+    // `main` leaves them, and repairing wrongly BREAKS a working sign-in. A
+    // narrower predicate is never worse than `main`; a wider one can be.
     //
     // What "only the PORT is written" means textually: `rewriteUrlPort` returns
     // the WHATWG serialization, so a rewritten URL is normalised (an empty path
@@ -4747,7 +4837,7 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
     // owns the file it just wrote.
     for (const key of ["BETTER_AUTH_URL", "NEXT_PUBLIC_BETTER_AUTH_URL"]) {
       if (restricted) {
-        if (cur[key] == null || !urlPortDiffers(cur[key], appPort)) continue;
+        if (cur[key] == null || !isOwnBindOrigin(cur[key]) || !urlPortDiffers(cur[key], appPort)) continue;
         body = upsertEnvKey(body, key, rewriteUrlPort(cur[key], appPort, "http", ""));
       } else {
         body = upsertEnvKey(body, key, baseUrl);
