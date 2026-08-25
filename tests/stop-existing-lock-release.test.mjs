@@ -2,7 +2,7 @@
 // release its reservation under ONE held alloc lock, and must be LOUD about a
 // registry it cannot read.
 //
-// cinatra-cli#243 (review round 2) — and the stack it tears down must be the
+// cinatra-cli#243 — and the stack it tears down must be the
 // stack the operator was SHOWN. The row read under the lock is compared against
 // the classifier's pre-lock snapshot, and a difference REFUSES. The
 // `--teardown-existing` (`-v`) arm is pinned here too: it is the destructive
@@ -171,7 +171,7 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
 
   // A GENUINE same-slug re-provisioning, the way `provisionIsolatedInstance`
   // does it: the old row is RELEASED and a fresh one is allocated for the same
-  // slug at the same directory. cinatra-cli#243 (review round 2, blocking) —
+  // slug at the same directory. cinatra-cli#243 —
   // the compose project and the compose file are DERIVED FROM THE SLUG
   // (`cinatra_<slug>` at src/install.mjs:2910; the single generated
   // `docker-compose.cinatra-isolated.yml` at :3120-3127), so a real
@@ -316,7 +316,7 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
   });
 
   it("REFUSES when the row was re-provisioned in the classify-to-lock window", async () => {
-    // cinatra-cli#243 (review round 2, blocking). `holder` is the classifier's
+    // cinatra-cli#243. `holder` is the classifier's
     // snapshot, taken before the lock. A slug re-provisioned at the SAME
     // directory in that window is a live, in-flight concurrent install — downing
     // its stack and releasing its row destroys it. Adopting the fresher row (the
@@ -346,7 +346,7 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
         }),
       }),
     ).rejects.toThrow(
-      // cinatra-cli#243 (review round 2, NEW 3): this argv carries NO
+      // cinatra-cli#243: this argv carries NO
       // `--teardown-existing`, so nothing prompted — the window is
       // classification-to-lock, and the message must say so rather than send a
       // scripted operator looking for a confirm that was never displayed. The
@@ -370,7 +370,7 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
   });
 
   it("REFUSES a same-slug RE-PROVISION that reproduces the project and the files exactly", async () => {
-    // cinatra-cli#243 (review round 2, THE blocking finding). The previous
+    // cinatra-cli#243. The previous
     // comparison read `composeProject` and the compose file paths only. Both are
     // derived from the slug, so provisioning the SAME slug twice mints a second,
     // completely different install that is byte-identical on both fields — the
@@ -466,7 +466,7 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
   });
 
   it("REFUSES a row that appears for a LABEL-PROVEN holder — it cannot be told apart from a concurrent install", async () => {
-    // cinatra-cli#243 (review round 2, codex): the hole in a SYMMETRIC identity
+    // cinatra-cli#243: the hole in a SYMMETRIC identity
     // rule. A label/marker-proven holder is a synthesized object with no
     // registry row behind it, so it carries no minted identity. "Compare only
     // when both sides have one" therefore DISABLES the identity check exactly
@@ -625,7 +625,7 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
   });
 
   it("--teardown-existing REFUSES rather than `down -v` a project the confirm never displayed", async () => {
-    // The worst case of the same defect (review round 2, finding 2): the
+    // The worst case of the same defect: the
     // operator reads one project name, types `delete <slug>` against it, and the
     // volumes destroyed belong to a project they were never shown. The typed
     // confirm awaits a human, so the window is think-time — seconds to minutes —
@@ -686,7 +686,7 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
 
   it("--teardown-existing on a STABLE row downs with `-v` and releases the band", async () => {
     // The plain `-v` happy path — `withVolumes` was never exercised at all
-    // before (review round 2, finding 3). It pins that the confirmed phrase is
+    // before. It pins that the confirmed phrase is
     // the slug's, that `-v` actually reaches `composeDown`, and that the
     // reservation is still released whole.
     const otherDir = path.join(sandbox, "vhappy-holder");

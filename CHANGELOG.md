@@ -97,8 +97,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
   there. The refusal names the window the row drifted in accurately:
   `--teardown-existing` waits on a typed confirm, and without it there is no
   prompt at all, only the interval between the port-conflict classification and
-  the allocation lock. One known gap is left open and tracked in
-  cinatra-cli#244: the release of the stopped instance's band and the
+  the allocation lock. One known gap is left open: the release of the stopped instance's band and the
   reservation of its replacement are still two transactions, so a crash between
   them leaves the default band unreserved with the old stack already gone. The
   ports are genuinely free and re-running `cinatra install` re-records the row.

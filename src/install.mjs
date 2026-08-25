@@ -5775,7 +5775,7 @@ function normalizedComposeFiles(row) {
  *  sources can never compare equal by accident, or null when the row carries
  *  neither.
  *
- *  cinatra-cli#243 (review round 2, blocking): the drift check compared only
+ *  cinatra-cli#243: the drift check compared only
  *  `composeProject` and the compose file paths, and BOTH are derived from the
  *  slug. An isolated provisioning for slug X picks `cinatra_<slug>` (`:2910`) and
  *  the one generated `docker-compose.cinatra-isolated.yml` (`:3120-3127`) every
@@ -5999,7 +5999,7 @@ async function executeStopExisting({ targetDir, opts, conflicts, classified, log
     const existing = getInstance(reg, holder.slug);
     const releasable = existing != null && path.resolve(existing.installDir) === path.resolve(holder.installDir);
 
-    // cinatra-cli#243 (review round 2, blocking): the row read under the lock
+    // cinatra-cli#243: the row read under the lock
     // must MATCH the stack the operator was shown, or this command refuses.
     //
     // `holder` is the classifier's snapshot, taken BEFORE the lock — and before
@@ -6019,8 +6019,8 @@ async function executeStopExisting({ targetDir, opts, conflicts, classified, log
     // re-confirms against the stack that is actually there, which is the only
     // safe way to consent to it.
     //
-    // Why the identity is REQUIRED and not belt-and-braces (review round 2,
-    // blocking): project and files are DERIVED FROM THE SLUG. A genuine isolated
+    // Why the identity is REQUIRED and not belt-and-braces: project and
+    // files are DERIVED FROM THE SLUG. A genuine isolated
     // re-provisioning of slug X picks `cinatra_<slug>` (`:2910`) and the one
     // generated `docker-compose.cinatra-isolated.yml` (`:3120-3127`) every time,
     // so the common case — a concurrent same-slug install that replaced this
