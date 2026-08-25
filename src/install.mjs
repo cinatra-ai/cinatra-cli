@@ -5900,7 +5900,12 @@ function stopTargetDrift(confirmed, current) {
  *  stopped instance holding its whole band.
  *
  *  cinatra-cli#243: the row read under the lock must MATCH the stack the
- *  operator was shown, or the command REFUSES (see `stopTargetDrift`). */
+ *  operator was shown, or the command REFUSES (see `stopTargetDrift`) — with
+ *  one exception, stated where it is enforced below: a row that has been
+ *  RE-HOMED to another directory, or has VANISHED, never reaches that
+ *  comparison at all, so a REGISTRY-BACKED holder refuses on the row leaving
+ *  this directory itself. A holder proven by labels/marker alone never had a
+ *  row to lose and still stops. */
 async function executeStopExisting({ targetDir, opts, conflicts, classified, log = console.log, deps = {} }) {
   if (classified.kind !== "other-cinatra") {
     throw new Error(
@@ -6049,27 +6054,104 @@ async function executeStopExisting({ targetDir, opts, conflicts, classified, log
     // therefore closes itself as installs are re-provisioned. In that residual
     // case the failure is the PRE-EXISTING one (adopt), never a new one.
     //
-    // A label/marker-proven holder has no row (or one pointing elsewhere), so
-    // there is nothing to compare: its own proof is the only description of the
-    // stack there is, and it is what was displayed.
+    // A label/marker-proven holder has no row of its own here, so there is
+    // nothing for the comparison to read: its own proof is the only description
+    // of the stack there is, and it is what was displayed.
+    //
+    // Name the window that ACTUALLY existed, the same way the `-v` clause is
+    // already conditional on `withVolumes`. Only `--teardown-existing` prompts:
+    // without it there is no typed confirm at all, just the log line at
+    // `:5866`, and the window the row drifted in is classification-to-lock, not
+    // human think-time at a prompt. Telling a scripted, non-interactive
+    // operator that a confirmation was pending sends them looking for a prompt
+    // that was never displayed.
+    const window = withVolumes
+      ? "while the confirmation was pending"
+      : "between the port-conflict classification and this command taking the allocation lock";
+
+    // THE DOOR THE COMPARISON BELOW DOES NOT COVER, and the one exception the
+    // invariant in this function's header carries. `stopTargetDrift` runs only
+    // while the row still maps to THIS directory (`releasable`). When the row
+    // maps somewhere ELSE, or is gone entirely, the comparison is skipped and
+    // the `down` still uses the holder's RECORDED project. For an isolated
+    // stack that project is `cinatra_<slug>` (`:2910`), derived from the slug,
+    // so a re-provisioning of the slug ANYWHERE reproduces it exactly — and
+    // Compose selects containers by project LABEL, not by working directory.
+    // The teardown then reaches the other install's containers.
+    //
+    // A holder that was itself REGISTRY-BACKED carries a minted identity
+    // (`rowMintedIdentity`), and that is positive evidence its row was at this
+    // directory when it was classified. So for such a holder, "the row is no
+    // longer here" — re-homed or vanished — means the row that was confirmed is
+    // GONE, and nothing left under the lock describes the stack the operator
+    // was shown. Refuse.
+    //
+    // Both arms of "no longer here" refuse, and the VANISHED arm is the
+    // judgement call, so state the argument (codex):
+    //
+    //  - RE-HOMED. `allocateInstance` refuses to alias a LIVE slug onto a
+    //    second directory but not to re-home a RELEASED one (`instance-registry
+    //    .mjs`), so a teardown plus a re-provision at another checkout is
+    //    representable in exactly this window. The row that is there now
+    //    belongs to that other install.
+    //  - VANISHED. "No row means no rival containers" would be true if the row
+    //    were always written before the bring-up. It is on the ISOLATED path
+    //    (`:3137`, then `:3213`) — but NOT on the DEFAULT one. There the `up`
+    //    runs at `:7128`, and `recordDefaultInstance` does not write the row
+    //    until `:7290`, with the whole dependency install and setup phase in
+    //    between; the write is also best-effort (`:3994`), so an unusable
+    //    registry leaves no row at all, permanently. Two checkouts whose
+    //    basenames derive the same slug compute the same default project
+    //    (`computeDefaultProject`), so a rival default bring-up owns containers
+    //    under that name, for minutes or forever, with no row to show for it.
+    //    Stopping on a vanished row would down that stack. So refuse there too.
+    //
+    // What the refusal costs, and why it is not a dead end (codex): a re-run
+    // re-classifies, finds no row for the slug at this directory, and therefore
+    // proves the holder from its Docker labels/marker. The executor then
+    // BACKFILLS an authoritative row for that proof (`backfillProvenInstance`,
+    // called at `:4497`), and the row it writes maps to the holder’s OWN
+    // directory — so `releasable` is TRUE on the re-run, this guard never
+    // reaches its second term, and the drift comparison below passes against
+    // the row that was just written. Should the backfill be skipped or fail (it
+    // is best-effort), the holder keeps its synthesized shape, carries no
+    // minted identity, and the guard does not fire on that account instead.
+    // Either way the stop proceeds against the stack that is actually there:
+    // the refusal is self-clearing, at the cost of one re-run. The exception is
+    // a MALFORMED registry, which refuses earlier and louder, and stays refused
+    // until it is repaired.
+    //
+    // A holder proven by labels/marker alone never had a row to lose, so it is
+    // NOT caught here: a missing or unrelated registry must keep stopping it,
+    // which is what `tests/stop-existing-lock-release.test.mjs` pins.
+    if (!releasable && rowMintedIdentity(holder) !== null) {
+      const rowFate =
+        existing != null
+          ? `the registry now records this slug at ${existing.installDir}`
+          : `the registry no longer records this slug at all`;
+      throw new Error(
+        `Refusing --on-conflict=stop-existing: the registry row for instance "${holder.slug}" that was ` +
+          `classified is GONE — it was read at ${holder.installDir}, identified by ` +
+          `${rowMintedIdentity(holder)}, and ${rowFate} ${window}. A re-provisioning of a slug reuses ` +
+          `its compose project wherever it lands, and Compose selects containers by project label ` +
+          `rather than by working directory, so stopping ${holder.composeProject ?? "<none>"} could ` +
+          `reach a DIFFERENT install's containers. Re-run \`cinatra install\` so the stack that is ` +
+          `actually there is the one you are shown and confirm.` +
+          (withVolumes
+            ? ` --teardown-existing is set, so continuing would have run \`down -v\` against a project ` +
+              `whose stack can no longer be shown to be the one you confirmed, deleting its named ` +
+              `volumes irreversibly.`
+            : "") +
+          ` Nothing was stopped and no registry row was changed.`,
+      );
+    }
+
     if (releasable) {
       const drift = stopTargetDrift(holder, existing);
       if (drift) {
-        // Name the window that ACTUALLY existed, the same way the `-v` clause
-        // below is already conditional on `withVolumes` (cinatra-cli#243, review
-        // round 2, NEW 3). Only `--teardown-existing` prompts: without it there
-        // is no typed confirm at all, just the log line at `:5866`, and the
-        // window the row drifted in is classification-to-lock, not human
-        // think-time at a prompt. Telling a scripted, non-interactive operator
-        // that a confirmation was pending sends them looking for a prompt that
-        // was never displayed.
-        const window = withVolumes
-          ? "while the confirmation was pending"
-          : "between the port-conflict classification and this command taking the allocation lock";
         throw new Error(
-          `Refusing --on-conflict=stop-existing: instance "${holder.slug}" was re-provisioned ${window} ` +
-            `(confirmed ${holder.composeProject ?? "<none>"}, registry now ` +
-            `records ${existing.composeProject ?? "<none>"}) — re-run \`cinatra install\` so the stack ` +
+          `Refusing --on-conflict=stop-existing: instance "${holder.slug}" was re-provisioned ${window}` +
+            `${drift.projectClause} — re-run \`cinatra install\` so the stack ` +
             `that is actually there is the one you are shown and confirm.${drift.filesClause}` +
             `${drift.identityClause}` +
             (withVolumes

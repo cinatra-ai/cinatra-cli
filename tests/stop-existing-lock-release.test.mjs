@@ -211,6 +211,34 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
     return { before: old.instanceNonce, after: reg.instances[slug].instanceNonce };
   }
 
+  // Release the slug and provision it again at a DIFFERENT directory, exactly
+  // as a teardown plus a fresh `--instance <slug>` install at another checkout
+  // does. `allocateInstance` refuses to ALIAS a live slug onto a second
+  // directory but not to re-home a RELEASED one, so this is representable. The
+  // compose project is derived from the slug, so the new install at the new
+  // directory carries the SAME `cinatra_<slug>` the holder recorded.
+  function reHomeSlug(slug, newDir) {
+    mkdirSync(newDir, { recursive: true });
+    const before = readInstanceRegistry(regPath).registry;
+    const old = before.instances[slug];
+    const { registry: released } = releaseInstance(before, slug);
+    let reg = allocateInstance(released, slug, {
+      mode: "dev",
+      installDir: newDir,
+      composeProject: old.composeProject,
+      composeFiles: [...old.composeFiles],
+      ports: { ...old.ports },
+      appPort: old.appPort,
+      repoUrl: "x",
+      ref: "main",
+      sha: "s",
+      infraMode: "new",
+    }).registry;
+    reg = markInstanceReady(reg, slug);
+    writeInstanceRegistry(regPath, reg);
+    return { old, next: reg.instances[slug] };
+  }
+
   // Make the seeded row look like one written by an OLDER cinatra-cli: before
   // `instanceNonce` existed (cinatra-cli#243), rows carried `createdAt` and
   // nothing else minted per row. Such a row must keep working — that is the
@@ -439,6 +467,135 @@ describe("stop-existing: down + release under ONE alloc lock (cinatra-cli#239/#2
     expect(reserved.has(15435)).toBe(true);
     expect(reserved.has(3300)).toBe(true);
     expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("REFUSES when the slug's row was RE-HOMED to another directory in that window", async () => {
+    // The door the drift comparison does not cover (cinatra-cli#243).
+    // `stopTargetDrift` runs only while the row still maps to the directory we
+    // are about to tear down. When the slug is torn down and installed again at
+    // ANOTHER checkout in the classify-to-lock window, the row points elsewhere,
+    // `releasable` is false and the comparison is skipped entirely — while the
+    // `down` still uses the holder's recorded `cinatra_<slug>`, which is the
+    // very project name the new install at the other directory now carries.
+    // Compose selects containers by project label, not by working directory, so
+    // that teardown reaches the other install's fresh stack.
+    //
+    // The holder here is REGISTRY-BACKED, which is what makes the refusal safe
+    // to make: its minted identity is positive evidence that its row was at
+    // this directory, so a row that is no longer here means the confirmed row is
+    // gone. A label-proven holder against a missing registry keeps stopping —
+    // pinned separately below.
+    const otherDir = path.join(sandbox, "rehome-holder");
+    const elsewhereDir = path.join(sandbox, "rehome-elsewhere");
+    seedRemappedHolder("rehomeother", otherDir);
+    const seeded = readInstanceRegistry(regPath).registry.instances.rehomeother;
+
+    const downCalls = [];
+    let moved = null;
+    await expect(
+      runInstall(stopExistingArgv(path.join(sandbox, "rehome-new")), {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+          liveComposeInspect: holderOwns5434(otherDir),
+          probeCookiePrefixSupport: () => {
+            moved = reHomeSlug("rehomeother", elsewhereDir);
+            return false;
+          },
+          runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
+        }),
+      }),
+    ).rejects.toThrow(
+      /registry row for instance "rehomeother" that was classified is GONE[\s\S]*registry now records this slug at/,
+    );
+
+    // The premise: the two installs are indistinguishable by compose project —
+    // that is exactly why the directory move has to be what refuses.
+    expect(moved.next.composeProject).toBe(seeded.composeProject);
+    expect(moved.next.installDir).toBe(elsewhereDir);
+    expect(path.resolve(seeded.installDir)).not.toBe(path.resolve(elsewhereDir));
+
+    // Nothing was torn down, and the other install's row and whole reservation
+    // survive. The lock the refusal threw inside is not leaked.
+    expect(downCalls).toEqual([]);
+    const after = readInstanceRegistry(regPath).registry.instances.rehomeother;
+    expect(after.installDir).toBe(elsewhereDir);
+    expect(after.instanceNonce).toBe(moved.next.instanceNonce);
+    const reserved = reservedPorts({ instanceRegistry: readInstanceRegistry(regPath).registry });
+    expect(reserved.has(16379)).toBe(true);
+    expect(reserved.has(15435)).toBe(true);
+    expect(reserved.has(3300)).toBe(true);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("REFUSES a REGISTRY-BACKED holder whose row VANISHED, and the re-run then stops it", async () => {
+    // The other half of the same door, and the judgement call (cinatra-cli#243).
+    // "No row means no rival containers" would hold if the row were always
+    // written before the bring-up. It is on the ISOLATED path, but NOT on the
+    // DEFAULT one: `recordDefaultInstance` writes its row AFTER the default `up`
+    // and best-effort, so a rival default bring-up can own containers under the
+    // slug-derived project while no row exists to show for it. A registry-backed
+    // holder that cannot find its own row therefore refuses rather than down a
+    // project it can no longer prove anything about.
+    const otherDir = path.join(sandbox, "vanish-holder");
+    seedRemappedHolder("vanishother", otherDir);
+    const seeded = readInstanceRegistry(regPath).registry.instances.vanishother;
+    expect(seeded.instanceNonce).toEqual(expect.any(String));
+
+    const downCalls = [];
+    await expect(
+      runInstall(stopExistingArgv(path.join(sandbox, "vanish-new")), {
+        log: () => {},
+        deps: flowDeps({
+          detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+          // Labelled as well as recorded: the classifier PREFERS the registry
+          // row, so this first run's holder is registry-backed (the refusal
+          // below proves it — a synthesized holder has no minted identity and
+          // would not have tripped the guard). The labels are what the RE-RUN
+          // then falls back to.
+          liveComposeInspect: holderOwns5434(otherDir, {
+            "ai.cinatra.managed": "true",
+            "ai.cinatra.kind": "instance",
+            "ai.cinatra.instance": "vanishother",
+            "ai.cinatra.project": "cinatra_vanishother",
+          }),
+          probeCookiePrefixSupport: () => {
+            const reg = readInstanceRegistry(regPath).registry;
+            writeInstanceRegistry(regPath, releaseInstance(reg, "vanishother").registry);
+            return false;
+          },
+          runComposeDown: (dir, opts) => downCalls.push({ dir, ...opts }),
+        }),
+      }),
+    ).rejects.toThrow(
+      /registry row for instance "vanishother" that was classified is GONE[\s\S]*no longer records this slug at all/,
+    );
+    expect(downCalls).toEqual([]);
+    expect(readInstanceRegistry(regPath).registry.instances.vanishother).toBeUndefined();
+    expect(existsSync(lockPath)).toBe(false);
+
+    // And the refusal is SELF-CLEARING, which is what makes it affordable: the
+    // re-run finds no row for the slug, so it proves the holder from its Docker
+    // labels instead. A synthesized holder carries no minted identity, the guard
+    // does not fire, and the stack the operator was shown is stopped.
+    const rerunDowns = [];
+    const res = await runInstall(stopExistingArgv(path.join(sandbox, "vanish-rerun")), {
+      log: () => {},
+      deps: flowDeps({
+        detectPortConflicts: async () => [{ service: "postgres", host: "127.0.0.1", port: 5434, holder: null }],
+        liveComposeInspect: holderOwns5434(otherDir, {
+          "ai.cinatra.managed": "true",
+          "ai.cinatra.kind": "instance",
+          "ai.cinatra.instance": "vanishother",
+          "ai.cinatra.project": "cinatra_vanishother",
+        }),
+        runComposeDown: (dir, opts) => rerunDowns.push({ dir, ...opts }),
+      }),
+    });
+    expect(res.infraPlan).toBe("default");
+    expect(rerunDowns.length).toBe(1);
+    expect(rerunDowns[0].dir).toBe(otherDir);
+    expect(rerunDowns[0].composeProject).toBe("cinatra_vanishother");
   });
 
   it("--teardown-existing REFUSES a same-slug RE-PROVISION rather than `down -v` it", async () => {
