@@ -359,7 +359,7 @@ describe("cinatra-cli#232 — the pre-existing stale rows operators already have
     expect(forced.released).toBe(true);
   });
 
-  // ── The review BLOCKER: the stale-row safety must not fail OPEN ──────────
+  // ── The stale-row safety must not fail OPEN ─────────────────────────────
   // The reclaim gate is a refusal-unless---force guarantee: release the row only
   // after PROVING no container of the project survives. If an inspection ERROR is
   // folded into "zero containers", the guarantee evaporates in exactly the case it
@@ -1205,7 +1205,7 @@ describe("cinatra-cli#232 — `cinatra install --down` wiring", () => {
 });
 
 // =========================================================================
-// Review gap 1 — the registry WRITE is the commit point of the release. The
+// The registry WRITE is the commit point of the release. The
 // containers are already down by the time it runs, so if it fails the row must
 // come through USABLE: still recorded, still holding its WHOLE reservation, and
 // releasable by a retry. The one state that must never exist is half-released —
@@ -1277,7 +1277,7 @@ describe("cinatra-cli#232 — a failed registry WRITE leaves the row usable, nev
 });
 
 // =========================================================================
-// Review gap 2 — `--dir` addressing is resolved OUTSIDE the alloc lock (the
+// `--dir` addressing is resolved OUTSIDE the alloc lock (the
 // registry read that maps a directory to a slug), but the release happens
 // INSIDE it. Between those two points another process can re-point that slug at
 // a different checkout. The `expectInstallDir` guard exists for exactly that
@@ -1360,7 +1360,7 @@ describe("cinatra-cli#232 — --dir cannot release a row whose directory moved u
 });
 
 // =========================================================================
-// Review gap 4 — the lost-update guarantee. temp+rename prevents a TORN write,
+// The lost-update guarantee. temp+rename prevents a TORN write,
 // not a lost one: two allocations that both read the empty registry both pick
 // offset 10000, and the second rename erases the first row. `withAllocLock` is
 // what prevents it, so the contenders here do read→allocate→write INSIDE the
@@ -1443,7 +1443,7 @@ describe("cinatra-cli#232 — two concurrent allocations cannot collide or lose 
 });
 
 // =========================================================================
-// Review gap 3 — the failed-install rollback, driven through the REAL install.
+// The failed-install rollback, driven through the REAL install.
 //
 // Calling `rollbackIsolatedInstance` directly (above) proves the rollback frees
 // what it is handed; it cannot prove the install actually REACHES it, nor that

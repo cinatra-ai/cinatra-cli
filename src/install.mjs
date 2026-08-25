@@ -3613,8 +3613,8 @@ function composeDown(targetDir, { composeFiles = null, composeProject = null, vo
 // gone while its ports stay reserved.
 //
 // The only real ordering question is the `down`, and it is answered the way
-// `rollbackIsolatedInstance` already answers it (review hardening #3): the
-// `down` runs FIRST and INSIDE the same held `alloc.lock` as the release.
+// `rollbackIsolatedInstance` already answers it: the `down` runs FIRST and
+// INSIDE the same held `alloc.lock` as the release.
 //   • `down` throws  → we return BEFORE touching the registry. The FULL
 //     reservation survives, so a retried `--down` finishes the job and a live
 //     stack is never left unregistered. A failed teardown cannot half-release.
@@ -3754,9 +3754,9 @@ export async function teardownInstance({
       // wording names both states rather than claiming every counted container
       // is running.
       //
-      // An inspection ERROR is NOT an answer (review blocker: the safety failed
-      // OPEN). Docker being down, unreadable or unparseable tells us NOTHING
-      // about whether containers are live — folding it into "zero containers"
+      // An inspection ERROR is NOT an answer, and reading it as one fails this
+      // safety OPEN. Docker being down, unreadable or unparseable tells us NOTHING
+      // about whether containers are live: folding that into "zero containers"
       // would reclaim the row, skip the `down`, and hand a live stack's ports to
       // the next install, i.e. void the refusal guarantee exactly when it is
       // needed. So we distinguish three states, not two:
