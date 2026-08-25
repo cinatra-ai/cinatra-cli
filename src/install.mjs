@@ -2429,7 +2429,7 @@ export function composeConfigForFiles(targetDir, composeFiles, deps = {}, { allP
   // same frozen file. `--no-env-resolution` keeps `env_file:` in the resolved
   // document, so the generated isolated compose REFERENCES the narrow file and
   // reads its content at `up` time — which is exactly what the base compose
-  // specifies for wayflow/nango-server/knowledge-graph-mcp/plane-mcp ("an empty
+  // specifies for wayflow/nango-server/graphiti/plane-mcp ("an empty
   // `environment:` value OVERRIDES an env_file value on the same key, so the key
   // must NOT appear in `environment:`"). It also keeps a rotated token
   // propagating and stops the render persisting host secrets in the file.
@@ -3589,7 +3589,7 @@ function assertScrubbedKeysSupplied(targetDir, scrubbedKeys = []) {
  *       bring-up writes (or, on the documented fallback render, carries a
  *       non-empty token value);
  *    3. ALL FOUR of the checkout's declared narrow-env-file services
- *       (wayflow, nango-server, knowledge-graph-mcp, plane-mcp) keep their
+ *       (wayflow, nango-server, graphiti, plane-mcp) keep their
  *       wiring on BOTH routes — the reference when this Compose preserves it,
  *       and otherwise every VALUE their env file supplies. Check 1 cannot do
  *       this on the fallback route: an inlining render has already stripped the
@@ -3605,7 +3605,7 @@ function isolatedEnvWiringGaps({ doc, sourceDoc, targetDir, envFilesPreserved, w
   const wayflowEnvFilePath = path.join(targetDir, WAYFLOW_ENV_FILE);
   // cinatra#2654 D1 (round 3): the key reader is GENERIC. It used to answer only
   // for `.wayflow.env` and `null` for every other path, which silently disabled
-  // the per-service precedence check for nango-server / knowledge-graph-mcp /
+  // the per-service precedence check for nango-server / graphiti /
   // plane-mcp in production — their protection existed only in a unit test that
   // passed its own reader. wayflow still goes through the injectable
   // `wayflowEnvSuppliedKeys` seam so existing dep injection keeps working.

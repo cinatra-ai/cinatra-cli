@@ -107,14 +107,22 @@ project adheres to [Semantic Versioning](https://semver.org/).
   render-time invariant now checks the *path* the wayflow service references
   (not merely that some `env_file:` is present), rejects an explicitly EMPTY
   `environment:` value that would override the file it points at, and covers
-  `nango-server`, `knowledge-graph-mcp` and `plane-mcp` on the same terms by
-  requiring every `env_file:` the resolved source carried to survive into the
-  generated document — and, because an inlining Compose has already stripped
-  those references from the source document before that rule can look, it also
-  checks all four services against the env files the checkout itself declares:
-  the reference when this Compose preserves it, and otherwise every VALUE those
-  files supply. The empty-override rejection reads each service's own env file
-  off disk, so it protects all four in production rather than only `wayflow`.
+  `nango-server`, `graphiti` and `plane-mcp` on the same terms by requiring
+  every `env_file:` the resolved source carried to survive into the generated
+  document — and, because an inlining Compose has already stripped those
+  references from the source document before that rule can look, it also checks
+  all four services against the env files the checkout itself declares: the
+  reference when this Compose preserves it, and otherwise every VALUE those
+  files supply. Each service is named by its COMPOSE SERVICE KEY, so the
+  knowledge-graph service is `graphiti`; a name the compose does not declare is
+  skipped, which would disable the arm for that service in silence, and a test
+  now holds every entry against the resolved compose. The empty-override
+  rejection reads each service's own env file off disk, so it protects all four
+  in production rather than only `wayflow`. The three siblings reach that
+  coverage only when their env file EXISTS in the checkout: a CLI-driven install
+  provisions `.wayflow.env` alone, so they are covered when the operator
+  generated the other three from the checkout first, not on every install.
+  Provisioning them from the CLI stays a follow-up.
   The generated `docker-compose.cinatra-isolated.yml` now
   states in a header comment that it is CLI-owned and re-derived in full on
   every run — it never preserved an operator edit, and a file it could not parse
@@ -144,10 +152,11 @@ project adheres to [Semantic Versioning](https://semver.org/).
   opted out of provisioning the env file. On a Compose that inlines, the file was
   never written, so nothing carried a bridge token into the render and the check
   aborted an install that had explicitly asked for no agent runtime. The opt-out
-  gates only the WayFlow arm — `nango-server`, `knowledge-graph-mcp` and
-  `plane-mcp` stay protected unconditionally — and it applies to the reconcile
-  paths too, including the validation of a recorded compose that cannot be
-  re-derived in place.
+  gates only the WayFlow arm — `nango-server`, `graphiti` and `plane-mcp` keep
+  whatever protection they already have, on their own terms (each still needs
+  its env file present in the checkout) — and it applies to the reconcile paths
+  too, including the validation of a recorded compose that cannot be re-derived
+  in place.
 
   The plain reconcile — a bare `cinatra install` on a checkout already recorded
   as isolated — now provisions that env file BEFORE it re-renders, as the first

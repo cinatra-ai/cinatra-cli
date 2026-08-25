@@ -28,7 +28,7 @@
 //      has no route for the token — including the precedence trap where an
 //      EMPTY `environment:` value overrides a present `env_file:`, and the case
 //      where the reference points at some other file,
-//   4. the same invariant covers `nango-server`, `knowledge-graph-mcp` and
+//   4. the same invariant covers `nango-server`, `graphiti` and
 //      `plane-mcp`, which read narrow generated env files the same way,
 //   5. a reconcile re-renders the generated compose (the matrix proved its mtime
 //      was unchanged across one) and a regeneration FAILURE is loud,
@@ -147,14 +147,18 @@ function baseComposeDoc() {
  *  file rather than from `environment:` — the same contract as wayflow, and the
  *  same reason (an empty `environment:` value would override the file).
  *
- *  Paths read off `cinatra-ai/cinatra`'s own `docker-compose.yml` `env_file:`
- *  blocks (round 3 — the earlier fixture guessed `docker/kg-mcp/.kg.env` and
- *  `docker/plane-mcp/.plane.env`, neither of which the checkout declares), and
- *  they MUST equal the production table `CHECKOUT_ENV_FILE_SERVICES` — asserted
- *  below, so the fixture cannot drift away from what the CLI actually protects. */
+ *  Keys are COMPOSE SERVICE KEYS, and paths are read off `cinatra-ai/cinatra`'s
+ *  own `docker-compose.yml` `env_file:` blocks (round 3 — the earlier fixture
+ *  guessed `docker/kg-mcp/.kg.env` and `docker/plane-mcp/.plane.env`, neither of
+ *  which the checkout declares; round 5 — the knowledge-graph service is keyed
+ *  `graphiti` there, and the earlier `knowledge-graph-mcp` was the upstream
+ *  project's name, which that file carries only in comments and in its image
+ *  reference). They MUST equal the production table `CHECKOUT_ENV_FILE_SERVICES`
+ *  — asserted below, so the fixture cannot drift away from what the CLI actually
+ *  protects. */
 const SIBLING_ENV_FILE_SERVICES = {
   "nango-server": "docker/nango/.nango.env",
-  "knowledge-graph-mcp": "docker/graphiti/.graphiti.env",
+  "graphiti": "docker/graphiti/.graphiti.env",
   "plane-mcp": "docker/plane-mcp/.plane-mcp.env",
 };
 
@@ -166,7 +170,7 @@ const SIBLING_ENV_FILE_KEYS = {
   // The app's OpenAI key lives in the app DATABASE, not `.env.local` —
   // gen-graphiti-env.mjs resolves it from there (see the checkout's compose
   // comment), so it is NOT on the scrub allowlist.
-  "knowledge-graph-mcp": { key: "OPENAI_API_KEY", value: "graphiti-only-openai-key", inEnvLocal: false },
+  "graphiti": { key: "OPENAI_API_KEY", value: "graphiti-only-openai-key", inEnvLocal: false },
   // The Plane PAT is minted into the env file by provision-plane.mjs.
   "plane-mcp": { key: "PLANE_API_TOKEN", value: "plane-only-pat", inEnvLocal: false },
 };
@@ -914,7 +918,7 @@ describe("four-service protection is ACTIVE in production (cinatra#2654 D1)", ()
       postgres: [15434],
       wayflow: [13010],
       "nango-server": [13003],
-      "knowledge-graph-mcp": [13004],
+      "graphiti": [13004],
       "plane-mcp": [13005],
     },
     appPort: 3300,
@@ -1005,12 +1009,100 @@ describe("four-service protection is ACTIVE in production (cinatra#2654 D1)", ()
     });
   });
 
+  // ── THE TABLE IS CHECKED AGAINST THE COMPOSE IT IS READ FROM (round 5) ────
+  //
+  // The round-5 blocker: the table named the knowledge-graph service
+  // `knowledge-graph-mcp`, which is the UPSTREAM PROJECT's name. The checkout's
+  // compose keys that service `graphiti` and carries `knowledge-graph-mcp` only
+  // in comments and in its `zepai/knowledge-graph-mcp:…` image reference.
+  // `composeEnvWiringGaps` SKIPS a table entry whose service the document does
+  // not declare, so on the fallback route — every inlining engine, the CI runner
+  // included — the "every VALUE this env file supplies must still reach the
+  // container" check never ran for that service, silently.
+  //
+  // The pin above compares the table with a hand-written fixture map. It cannot
+  // catch this, because a rename copied into both stays consistent. The two
+  // resolved-document tests below pin the MECHANISM — an entry the document
+  // does not declare is silently inert, on both routes — but their document is
+  // built FROM the fixture map, so a rename copied into the table AND the map
+  // would still pass them. The verbatim-snapshot assertion after them is the
+  // independent anchor that turns red in exactly that case.
+
+  it("every table entry names a service the resolved compose DECLARES", () => {
+    const tableServices = CHECKOUT_ENV_FILE_SERVICES.map((e) => e.service);
+    // An empty table would pass the loop below without comparing anything.
+    expect(tableServices.length).toBeGreaterThan(0);
+    // Both routes: the resolved document differs between them, and an entry has
+    // to be found in whichever one the render actually produced.
+    for (const preserveEnvFiles of [true, false]) {
+      const resolved = fourServiceConfig()(dir, [ISOLATED_COMPOSE_FILENAME], undefined, { preserveEnvFiles });
+      const declared = Object.keys(resolved.services ?? {});
+      // A miss means that service's arm is INERT, not that it failed — so name
+      // the missing service rather than assert a bare boolean.
+      expect({ preserveEnvFiles, missing: tableServices.filter((s) => !declared.includes(s)) }).toEqual({
+        preserveEnvFiles,
+        missing: [],
+      });
+    }
+    // NOT a false positive on a legitimately optional service: an entry only has
+    // to be DECLARED, which `required: false` and a profile both still are. What
+    // it cannot tolerate is an entry the fixture checkout does not declare at
+    // all, so a future profile-gated service must be added to the fixture
+    // deliberately rather than pass by being invisible.
+  });
+
+  it("a table entry the compose does not declare protects NOTHING (why the above matters)", () => {
+    // The mechanism, stated as a test: the same lost value, the same document,
+    // the same reader; only the name in the table differs. The real name reports
+    // the gap, a name the document does not declare reports none.
+    writeSiblingEnvFiles(dir);
+    const doc = fourServiceConfig()(dir, [], undefined, { preserveEnvFiles: false });
+    const { key } = SIBLING_ENV_FILE_KEYS.graphiti;
+    doc.services.graphiti.environment[key] = ""; // the empty override that wins
+    const gapsFor = (service) =>
+      composeEnvWiringGaps(doc, {
+        envFilesPreserved: false,
+        wayflow: false,
+        declaredEnvFiles: [{ service, path: path.join(dir, SIBLING_ENV_FILE_SERVICES.graphiti) }],
+        envFileKeysAt: (p) => envFileSuppliedKeys(p),
+      });
+    expect(gapsFor("graphiti").join("\n")).toMatch(
+      new RegExp(`"graphiti" would start with NO value for ${key}`),
+    );
+    expect(gapsFor("knowledge-graph-mcp")).toEqual([]);
+  });
+
+  /** VERBATIM snapshot of the `env_file:`-carrying services of
+   *  `cinatra-ai/cinatra` `docker-compose.yml` at `ba168b740` (origin/main,
+   *  2026-08-25) — exactly four services carry the directive there. Hand-carried
+   *  from that file, NOT derived from the production table or the fixture map
+   *  above; that independence is the point. A stale service rename copied into
+   *  the table AND the fixture map keeps every fixture-derived test green, and
+   *  only a comparison against something neither of them feeds can catch it.
+   *  The residual is snapshot staleness against the application repository,
+   *  which a unit test in THIS repository cannot close: when the application
+   *  compose moves an `env_file:` declaration, refresh this map and the SHA. */
+  const APP_COMPOSE_ENV_FILE_DECLARATIONS = {
+    "nango-server": "docker/nango/.nango.env",
+    "graphiti": "docker/graphiti/.graphiti.env",
+    "wayflow": "docker/wayflow/.wayflow.env",
+    "plane-mcp": "docker/plane-mcp/.plane-mcp.env",
+  };
+
+  it("the production table matches the application compose's own env_file declarations (independent snapshot)", () => {
+    expect(
+      Object.fromEntries(
+        CHECKOUT_ENV_FILE_SERVICES.map((e) => [e.service, e.file.split(path.sep).join("/")]),
+      ),
+    ).toEqual(APP_COMPOSE_ENV_FILE_DECLARATIONS);
+  });
+
   it("checkoutDeclaredEnvFiles lists only files that EXIST (drift is fail-open)", () => {
     expect(checkoutDeclaredEnvFiles(dir)).toEqual([]);
     writeWayflowEnvFile(dir);
     writeSiblingEnvFiles(dir);
     expect(checkoutDeclaredEnvFiles(dir).map((e) => e.service).sort()).toEqual([
-      "knowledge-graph-mcp",
+      "graphiti",
       "nango-server",
       "plane-mcp",
       "wayflow",
@@ -1074,7 +1166,7 @@ describe("four-service protection is ACTIVE in production (cinatra#2654 D1)", ()
     // A key `.env.local` does NOT supply cannot be re-symbolised — `${KEY}` would
     // resolve BLANK (cinatra-cli#57). It is frozen as its literal instead, which
     // is the documented cost of the fallback route (the file is written 0600).
-    expect(doc.services["knowledge-graph-mcp"].environment.OPENAI_API_KEY).toBe("graphiti-only-openai-key");
+    expect(doc.services["graphiti"].environment.OPENAI_API_KEY).toBe("graphiti-only-openai-key");
     expect(doc.services["plane-mcp"].environment.PLANE_API_TOKEN).toBe("plane-only-pat");
     // wayflow's own full key set survives too, as placeholders.
     expect(doc.services.wayflow.environment.CINATRA_BRIDGE_TOKEN).toBe("${CINATRA_BRIDGE_TOKEN}");

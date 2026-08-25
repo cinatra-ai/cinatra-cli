@@ -1010,7 +1010,7 @@ export function generateIsolatedCompose({
 // ── cinatra#2654 D1 — the generated-compose env-file wiring invariants ───────
 //
 // Four services in the checkout's compose (`wayflow`, `nango-server`,
-// `knowledge-graph-mcp`, `plane-mcp`) take host secrets from a NARROW generated
+// `graphiti`, `plane-mcp`) take host secrets from a NARROW generated
 // env file rather than from `environment:`:
 //
 //   env_file: [{ path: ./docker/wayflow/.wayflow.env, required: false }]
@@ -1042,11 +1042,20 @@ export function generateIsolatedCompose({
 // and its `.gitignore`. All FOUR are GENERATED and gitignored — none is
 // repo-committed:
 //
-//   service              file                              written by
-//   wayflow              docker/wayflow/.wayflow.env        scripts/gen-wayflow-env.mjs
-//   nango-server         docker/nango/.nango.env            scripts/gen-nango-env.mjs
-//   knowledge-graph-mcp  docker/graphiti/.graphiti.env      scripts/gen-graphiti-env.mjs
-//   plane-mcp            docker/plane-mcp/.plane-mcp.env    scripts/fixtures/provision-plane.mjs
+//   service       file                             written by
+//   wayflow       docker/wayflow/.wayflow.env      scripts/gen-wayflow-env.mjs
+//   nango-server  docker/nango/.nango.env          scripts/gen-nango-env.mjs
+//   graphiti      docker/graphiti/.graphiti.env    scripts/gen-graphiti-env.mjs
+//   plane-mcp     docker/plane-mcp/.plane-mcp.env  scripts/fixtures/provision-plane.mjs
+//
+// EACH `service` IS THE COMPOSE SERVICE KEY, not the upstream project's name.
+// The knowledge-graph service is keyed `graphiti` in the checkout's compose;
+// `knowledge-graph-mcp` is the upstream project, and appears in that file only
+// in comments and in the `zepai/knowledge-graph-mcp:…` image reference. A table
+// entry naming a service the document does not declare is SKIPPED below, so the
+// wrong spelling disables this whole arm for that service in silence — round 5
+// shipped exactly that. `tests/wayflow-isolated-env-file.test.mjs` now asserts
+// every entry against the resolved compose, so the next rename cannot repeat it.
 //
 // WHY THIS TABLE EXISTS, given the generic source-driven rule below. On the
 // PRESERVING route the resolved source document still carries every `env_file:`,
@@ -1072,10 +1081,18 @@ export function generateIsolatedCompose({
 // <mode>` directly). Their `env_file:` entries are `required: false`, so a
 // bring-up without them is bootable-but-degraded — the app's own documented
 // state, not something this change introduces.
+//
+// SO THE SIBLING COVERAGE IS CONDITIONAL, on a plain CLI install. Because the
+// CLI provisions only `.wayflow.env`, and `checkoutDeclaredEnvFiles` keeps only
+// entries whose file EXISTS, `nango-server` / `graphiti` / `plane-mcp` reach
+// this arm only when the operator generated their files from the checkout
+// first. On an install that did not, those three drop out and only `wayflow` is
+// covered here. Provisioning them from the CLI is the named follow-up; until it
+// lands, read the three siblings as protected WHEN PRESENT, not always.
 export const CHECKOUT_ENV_FILE_SERVICES = [
   { service: "wayflow", file: path.join("docker", "wayflow", ".wayflow.env") },
   { service: "nango-server", file: path.join("docker", "nango", ".nango.env") },
-  { service: "knowledge-graph-mcp", file: path.join("docker", "graphiti", ".graphiti.env") },
+  { service: "graphiti", file: path.join("docker", "graphiti", ".graphiti.env") },
   { service: "plane-mcp", file: path.join("docker", "plane-mcp", ".plane-mcp.env") },
 ];
 
@@ -1177,7 +1194,7 @@ function serviceEnvObject(svc) {
  *   consumed. Every service that carried `env_file:` there must still carry the
  *   same paths here — that is the check that catches a render (or a future
  *   generator change) silently inlining or dropping a reference, and it covers
- *   `nango-server` / `knowledge-graph-mcp` / `plane-mcp` exactly as it covers
+ *   `nango-server` / `graphiti` / `plane-mcp` exactly as it covers
  *   `wayflow`, with no per-service table.
  * @param {string}  [opts.wayflowEnvFilePath]  the absolute path the wayflow
  *   service is expected to reference (`<targetDir>/docker/wayflow/.wayflow.env`).
@@ -1198,7 +1215,7 @@ function serviceEnvObject(svc) {
  *   env files the CHECKOUT declares for its four narrow-env-file services, as
  *   absolute paths, already filtered to the ones present on disk
  *   (`checkoutDeclaredEnvFiles`). This is the PRODUCTION coverage for
- *   nango-server / knowledge-graph-mcp / plane-mcp on the FALLBACK route, where
+ *   nango-server / graphiti / plane-mcp on the FALLBACK route, where
  *   `sourceDoc` has already lost its `env_file:` directives to the inlining
  *   render and so can protect nothing. See the table above for why it is a table.
  * @param {string}  [opts.baseDir]  the checkout root, used to resolve a
@@ -1295,7 +1312,7 @@ export function composeEnvWiringGaps(doc, {
   // all four services, on BOTH routes (cinatra#2654 D1, round 3). Check (1) is
   // driven by the resolved SOURCE document, which on the fallback route has
   // already had its `env_file:` directives destroyed by the inlining render — so
-  // without this, nango-server / knowledge-graph-mcp / plane-mcp were protected
+  // without this, nango-server / graphiti / plane-mcp were protected
   // only on the route that never needed protecting.
   const declared = Array.isArray(declaredEnvFiles) ? declaredEnvFiles : [];
   const readKeys = (absPath) => (typeof envFileKeysAt === "function" ? envFileKeysAt(absPath) : null);
