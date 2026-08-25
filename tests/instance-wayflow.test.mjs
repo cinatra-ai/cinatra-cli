@@ -12,10 +12,13 @@
 // a missing CINATRA_BRIDGE_TOKEN, so `start` runs the checkout's generator
 // first and must ABORT when the generator exists and fails.
 
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import { describe, it, expect } from "vitest";
 
+import { findInstanceByInstallDir } from "../src/instance-registry.mjs";
 import {
   composeWayflowArgs,
   ensureWayflowBridgeEnv,
@@ -85,6 +88,40 @@ describe("composeWayflowArgs — recorded project + compose files", () => {
   });
 });
 
+// cinatra#2654 (round 4) — the `up` must carry `--env-file .env.local`. An
+// ISOLATED instance whose generated compose was rendered on a Compose that could
+// not preserve `env_file:` carries the bridge token as a `${CINATRA_BRIDGE_TOKEN}`
+// placeholder; without the flag compose finds nothing in the ambient environment,
+// substitutes the EMPTY STRING, and the runtime starts tokenless — the very crash
+// loop this issue fixed, re-introduced by the command that restarts the runtime.
+describe("composeWayflowArgs — the env file the placeholders resolve from", () => {
+  it("start passes --env-file as a TOP-LEVEL flag, before the subcommand", () => {
+    const args = composeWayflowArgs("start", {
+      project: "cinatra_demo",
+      composeFiles: ["docker-compose.cinatra-isolated.yml"],
+      envFile: ".env.local",
+    });
+    expect(args.slice(0, 3)).toEqual(["compose", "--env-file", ".env.local"]);
+    expect(args.indexOf("--env-file")).toBeLessThan(args.indexOf("up"));
+    // …and it did not displace the recorded project or files.
+    expect(args).toContain("cinatra_demo");
+    expect(args).toContain("docker-compose.cinatra-isolated.yml");
+  });
+
+  it("stop passes it too, so `rm` addresses an identically interpolated document", () => {
+    const args = composeWayflowArgs("stop", { project: "cinatra_demo", envFile: ".env.local" });
+    expect(args.slice(0, 3)).toEqual(["compose", "--env-file", ".env.local"]);
+    expect(args.indexOf("--env-file")).toBeLessThan(args.indexOf("rm"));
+  });
+
+  it("no env file → compose's normal `.env` discovery is left alone", () => {
+    expect(composeWayflowArgs("start", { envFile: null })).not.toContain("--env-file");
+    // The pre-existing default-argument shape is unchanged.
+    expect(composeWayflowArgs("start")[0]).toBe("compose");
+    expect(composeWayflowArgs("start")[1]).toBe("-f");
+  });
+});
+
 describe("wayflowComposeContext", () => {
   const ROW = {
     slug: "demo",
@@ -109,6 +146,48 @@ describe("wayflowComposeContext", () => {
     });
     expect(ctx.project).toBe(effectiveComposeProjectName("/tmp/my-checkout"));
     expect(ctx.source).toBe("fallback");
+  });
+
+  // cinatra#2654 D1 (round 4) — the two cases above inject `findByInstallDir`,
+  // so they assert the CONTRACT (a bare row in, the recorded context out) and
+  // could never see that PRODUCTION passed something else. It did: the registry's
+  // real finder returns a `{slug, slot}` ENVELOPE, so every field read as
+  // undefined and a row that WAS found still fell back to the checkout basename
+  // and the base compose pair — reporting `source: "registry"` while doing it.
+  // `wayflow start` then addressed a second, empty project instead of the
+  // instance's recorded (for an isolated install, GENERATED) compose. These two
+  // use the REAL finder.
+  describe("with the REAL registry finder (no injected shape)", () => {
+    it("returns the RECORDED project and compose files, not the basename fallback", () => {
+      const registry = { version: 1, instances: { demo: ROW } };
+      const ctx = wayflowComposeContext(ROW.installDir, {
+        readRegistry: () => registry,
+        findByInstallDir: (reg, dir) => findInstanceByInstallDir(reg, dir)?.slot ?? null,
+      });
+      expect(ctx.source).toBe("registry");
+      expect(ctx.project).toBe("cinatra_demo");
+      expect(ctx.composeFiles).toEqual(ROW.composeFiles);
+      // The failure this pins: a fallback that CLAIMS to have read the registry.
+      expect(ctx.project).not.toBe(effectiveComposeProjectName(ROW.installDir));
+    });
+
+    it("matches a checkout reached through a SYMLINK (getRepoRoot returns a realpath)", () => {
+      // The recorded `installDir` keeps the spelling `--dir` was given; callers
+      // look up by `getRepoRoot()`, which resolves through `git rev-parse
+      // --show-toplevel` and so hands over a realpath. Two strings, one directory.
+      const tmp = mkdtempSync(path.join(os.tmpdir(), "x2654-wf-ctx-"));
+      try {
+        const real = path.join(tmp, "real");
+        const link = path.join(tmp, "link");
+        mkdirSync(real, { recursive: true });
+        symlinkSync(real, link, "dir");
+        const row = { ...ROW, installDir: link };
+        const found = findInstanceByInstallDir({ version: 1, instances: { demo: row } }, real);
+        expect(found?.slot?.composeProject).toBe("cinatra_demo");
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
   });
 });
 

@@ -6,6 +6,7 @@ import {
   classifyPortHolder,
   generateIsolatedCompose,
   renderIsolatedComposeYaml,
+  parseIsolatedComposeDoc,
   assertComposeHostUrlsRemapped,
   __test,
 } from "../src/install-isolation.mjs";
@@ -432,10 +433,20 @@ describe("generateIsolatedCompose (T7)", () => {
     expect(JSON.stringify(resolvedConfig)).toBe(before);
   });
 
-  it("renders valid JSON (a JSON-in-.yml compose file)", () => {
+  it("renders a CLI-ownership header + valid JSON (a JSON-in-.yml compose file)", () => {
     const { doc } = generateIsolatedCompose({ resolvedConfig, offset: 10000, projectName: "cinatra_alpha", slug: "alpha" });
     const yaml = renderIsolatedComposeYaml(doc);
-    expect(() => JSON.parse(yaml)).not.toThrow();
+    // cinatra#2654 D1 operator-edits policy: the file states, in itself, that it
+    // is CLI-owned and re-derived in full — there is no preservation to imply.
+    expect(yaml.startsWith("# GENERATED FILE — DO NOT EDIT.")).toBe(true);
+    expect(yaml).toContain("re-derives it in full on every");
+    expect(yaml).toContain("preserves NOTHING");
+    // The header is YAML comments, so the body is still the JSON document, and
+    // the CLI's own reader round-trips it.
+    expect(() => JSON.parse(yaml)).toThrow();
+    expect(parseIsolatedComposeDoc(yaml)).toEqual(doc);
+    // A hand-authored YAML compose file is NOT a CLI-generated document.
+    expect(parseIsolatedComposeDoc("services:\n  wayflow:\n    image: hand-edited\n")).toBeNull();
   });
 
   // ── cinatra-cli#97 — self-advertised host-URL remap ─────────────────────────

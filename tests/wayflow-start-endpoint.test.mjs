@@ -18,21 +18,26 @@
 // (so the pin is against the shape an install actually writes, envelope unwrap
 // included), and nothing here touches Docker, the network or a real checkout.
 
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   allocateInstance,
   findInstanceByInstallDir,
   markInstanceReady,
+  writeInstanceRegistry,
 } from "../src/instance-registry.mjs";
+import { writeIsolatedComposeFile } from "../src/install-isolation.mjs";
 import {
   DEFAULT_WAYFLOW_HOST_PORT,
   findInstanceRowByInstallDir,
   recordedWayflowHostPort,
+  reconcileIsolatedWayflowRoute,
+  runDevWayflow,
   wayflowEndpointForCheckout,
   wayflowEndpointForRecordedPorts,
 } from "../src/index.mjs";
@@ -215,5 +220,391 @@ describe("runDevWayflow — the printed endpoint is derived, not hardcoded", () 
 
   it("the hardcoded module constant is gone for good", () => {
     expect(INDEX_SRC).not.toMatch(/\bWAYFLOW_LOCAL_URL\b/);
+  });
+});
+
+// ===========================================================================
+// cinatra#2654 round 6, NB1 — STATIC pin on the route-repair CALL SITE.
+//
+// `reconcileIsolatedWayflowRoute` has direct behavioural coverage
+// (install-flow.test.mjs), but nothing pinned that `runDevWayflow` still CALLS
+// it, or where. Its position is the whole contract: AFTER the bridge-token
+// provisioning gate (the re-derive must see the file it is about to reference
+// or inline) and BEFORE the `up` (a repair that lands after the container
+// starts repairs nothing this run). Delete the call, or move it either side of
+// those two, and every behavioural test in the suite still passes.
+// ===========================================================================
+describe("runDevWayflow — the isolated WayFlow route repair is wired, in order", () => {
+  const body = INDEX_SRC.slice(INDEX_SRC.indexOf("async function runDevWayflow")).split("\n}\n")[0];
+
+  // cinatra#2654 (round-9 review, NB 2): the call is resolved through the
+  // command's `deps` seam now (`deps.reconcileIsolatedWayflowRoute ?? …`), so
+  // the CALL itself is spelled `await reconcile({`. That seam is what lets the
+  // BEHAVIOURAL test at the bottom of this file drive the same wiring for real;
+  // these offsets stay because they still catch a REORDER cheaply.
+  const RECONCILE_CALL = "await reconcile({";
+  // Both of these are ALSO resolved through the seam now, so the needles name
+  // the call rather than the identifier that used to precede it.
+  const BRIDGE_ENV_GATE = "ensureWayflowBridgeEnv)(repoRoot)";
+  const LAUNCH = '("docker", args';
+
+  const at = (needle) => {
+    const i = body.indexOf(needle);
+    expect(i, `runDevWayflow no longer contains ${needle}`).toBeGreaterThan(-1);
+    return i;
+  };
+
+  it("calls the reconcile at all", () => {
+    expect(body).toMatch(/deps\.reconcileIsolatedWayflowRoute \?\? reconcileIsolatedWayflowRoute/);
+    expect(body).toMatch(/await reconcile\(\{/);
+  });
+
+  it("runs it AFTER the bridge-token provisioning gate and BEFORE the compose `up`", () => {
+    // The env file must exist before the re-derive: on a Compose that inlines,
+    // what the render inlines IS the wiring.
+    expect(at(BRIDGE_ENV_GATE)).toBeLessThan(at(RECONCILE_CALL));
+    // …and the repaired file must be the one the `up` reads.
+    expect(at(RECONCILE_CALL)).toBeLessThan(at("composeWayflowArgs(verb"));
+    expect(at(RECONCILE_CALL)).toBeLessThan(at(LAUNCH));
+  });
+
+  // ── round-7 review, NB4 ─────────────────────────────────────────────────
+  // The reconcile REPORTS what it re-pointed (`envRepointed` / `repointed`) and
+  // nothing in production read it — a return value with no consumer documents a
+  // contract nobody has to keep. `.env.local` is the operator's own file, and a
+  // command that rewrites keys in it and then starts containers should say so.
+  it("CONSUMES the reconcile's result and reports the .env.local re-point (NB4)", () => {
+    // The result is bound, not discarded.
+    expect(body).toMatch(/const\s+\w+\s*=\s*await reconcile\(\{/);
+    const binding = /const\s+(\w+)\s*=\s*await reconcile\(\{/.exec(body)[1];
+    // …read for what the writer DID…
+    expect(body).toContain(`${binding}?.envRepointed`);
+    // …and reported on a line that names what moved.
+    const reportAt = body.indexOf(`${binding}?.envRepointed`);
+    expect(reportAt).toBeGreaterThan(-1);
+    const report = body.slice(reportAt, reportAt + 500);
+    expect(report).toMatch(/console\.log\(/);
+    expect(report).toMatch(/\.env\.local/);
+    expect(report).toContain(`${binding}.repointed`);
+    // …before the `up`, so the operator reads it as part of THIS start.
+    expect(reportAt).toBeLessThan(at(LAUNCH));
+  });
+
+  // ── round-8 review, re-weighting ────────────────────────────────────────
+  // The reconcile clears its convergence gate against a SNAPSHOT, and this run
+  // then rewrites `.env.local` and the registry row before it hands the file to
+  // Compose. That window is time in which the file can change, and `up` binds
+  // whatever it says at THAT moment. The install path closes the same gap with
+  // `assertIsolatedPortsStillConverge` immediately before its bring-up; this
+  // command must too, and the position is the whole point of it.
+  it("RE-GATES on the compose file immediately before the `up` (round-8 review)", () => {
+    expect(body).toContain("assertIsolatedPortsStillConverge");
+    // After the reconcile — it re-reads what the reconcile may have rewritten…
+    expect(at(RECONCILE_CALL)).toBeLessThan(at("assertIsolatedPortsStillConverge({"));
+    // …and before the `up`, with the argv construction after it, so nothing
+    // this command does can invalidate the verdict it launches on.
+    expect(at("assertIsolatedPortsStillConverge({")).toBeLessThan(at("composeWayflowArgs(verb"));
+    expect(at("assertIsolatedPortsStillConverge({")).toBeLessThan(at(LAUNCH));
+    // …and it judges with the offset the RECONCILE speaks, not the row's, which
+    // a re-derive this run may already have replaced (round-9 review, NB 4).
+    // The reconcile's own side of that parity is pinned behaviourally in
+    // install-flow.test.mjs ("the offset a REGENERATION derived …").
+    expect(body).toMatch(/offset: Number\.isInteger\(route\.offset\)/);
+    expect(body).not.toMatch(/offset: Number\.isInteger\(row\.offset\)/);
+  });
+
+  it("runs on the `start` verb ONLY — `stop` never rewrites the recorded compose", () => {
+    const call = at(RECONCILE_CALL);
+    // Walk back to the nearest enclosing `if (verb === "start") {` and confirm
+    // the call is genuinely INSIDE it (brace depth never returns to 0 between
+    // the guard and the call), rather than merely preceded by one.
+    const guard = body.lastIndexOf('if (verb === "start") {', call);
+    expect(guard, "the reconcile call is not guarded by a `start`-verb branch").toBeGreaterThan(-1);
+    let depth = 0;
+    for (const ch of body.slice(guard + 'if (verb === "start") {'.length, call)) {
+      if (ch === "{") depth += 1;
+      else if (ch === "}") depth -= 1;
+      expect(depth, "the reconcile call sits OUTSIDE the `start`-verb branch").toBeGreaterThanOrEqual(0);
+    }
+  });
+});
+
+// ===========================================================================
+// cinatra#2654 (round-9 review, NB 2) — the last gate before the `up`, pinned by
+// BEHAVIOUR rather than by source-text offsets.
+//
+// The offsets above prove the gate is CALLED between the reconcile and the
+// launch. They cannot prove it still REFUSES: the call is guarded on the
+// reconcile having returned a map (`route?.ports`), which the `absent`,
+// `unparseable` and `not-isolated` arms deliberately do not, so any later change
+// that stops an arm returning one disables the gate silently and every one of
+// those tests stays green.
+//
+// So this drives the real command, with the real reconcile, and rewrites the
+// compose file inside the window the reconcile opens — a sibling cinatra
+// process, an editor writing out a buffer, a regeneration in another checkout.
+// `docker compose up` would bind whatever the file says at THAT moment, so the
+// launch must refuse. Nothing here touches Docker: the launch itself is the one
+// boundary the seam replaces, and the assertion is that it is never reached.
+// ===========================================================================
+describe("runDevWayflow — the pre-`up` re-gate refuses a compose rewritten inside the window", () => {
+  const GATE_SLUG = "x2654-gate";
+  const OFFSET = 20000;
+  const PG_PORT = 25434;
+  const WF_PORT = 3010 + OFFSET;
+  let dir;
+  let registryPath;
+  let priorRegistryEnv;
+
+  const composeDoc = (pgPort) => ({
+    name: "cinatra_gate",
+    services: {
+      postgres: {
+        image: "postgres:16",
+        ports: [{ published: String(pgPort), target: 5432, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+      },
+      // Wired: it carries the bridge-token route, so the reconcile takes its
+      // already-wired arm and no regeneration runs.
+      wayflow: {
+        image: "cinatra-wayflow:local",
+        environment: { CINATRA_BRIDGE_TOKEN: "${CINATRA_BRIDGE_TOKEN}" },
+        ports: [{ published: String(WF_PORT), target: 3010, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+      },
+    },
+  });
+
+  const isoPath = () => path.join(dir, "docker-compose.cinatra-isolated.yml");
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cin-r9-gate-"));
+    writeIsolatedComposeFile(isoPath(), composeDoc(PG_PORT));
+    // An `.env.local` that already names what the file publishes, so the
+    // reconcile's own re-point has nothing to write and this test is about the
+    // gate alone.
+    writeFileSync(
+      path.join(dir, ".env.local"),
+      `PORT=3350\nWAYFLOW_BASE_URL=http://localhost:${WF_PORT}\n`,
+      { mode: 0o600 },
+    );
+    const { registry } = allocateInstance({ version: 1, instances: {} }, GATE_SLUG, {
+      mode: "dev",
+      installDir: dir,
+      composeProject: "cinatra_gate",
+      composeFiles: ["docker-compose.cinatra-isolated.yml"],
+      ports: { postgres: [PG_PORT], wayflow: [WF_PORT] },
+      appPort: 3350,
+      offset: OFFSET,
+      repoUrl: "https://github.com/cinatra-ai/cinatra.git",
+      ref: "main",
+      sha: "1b820b7c22c18f4b79da89e033fbbceca841db7a",
+      infraMode: "new",
+    });
+    registryPath = path.join(dir, "instances.json");
+    writeInstanceRegistry(registryPath, markInstanceReady(registry, GATE_SLUG));
+    priorRegistryEnv = process.env.CINATRA_INSTANCE_REGISTRY;
+    process.env.CINATRA_INSTANCE_REGISTRY = registryPath;
+  });
+
+  afterEach(() => {
+    if (priorRegistryEnv === undefined) delete process.env.CINATRA_INSTANCE_REGISTRY;
+    else process.env.CINATRA_INSTANCE_REGISTRY = priorRegistryEnv;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** The command, with only its outermost boundaries replaced. `mutate` runs
+   *  after the REAL reconcile returns — i.e. inside the window. */
+  const start = async ({ mutate = () => {} } = {}) => {
+    const launches = [];
+    await runDevWayflow(["start"], {
+      isComposeAvailable: () => true,
+      getRepoRoot: () => dir,
+      ensureWayflowBridgeEnv: () => true,
+      reconcileIsolatedWayflowRoute: async (args) => {
+        const route = await reconcileIsolatedWayflowRoute(args);
+        mutate();
+        return route;
+      },
+      spawnSync: (cmd, cmdArgs) => {
+        launches.push([cmd, cmdArgs]);
+        return { status: 0 };
+      },
+    });
+    return launches;
+  };
+
+  it("launches when the file the reconcile judged is still the file on disk", async () => {
+    const launches = await start();
+    // The positive control: without a mutation the gate clears and the `up` runs.
+    expect(launches).toHaveLength(1);
+    expect(launches[0][0]).toBe("docker");
+    expect(launches[0][1]).toContain("up");
+  });
+
+  it("REFUSES the launch when the compose is rewritten between the reconcile and the `up`", async () => {
+    const launches = [];
+    const err = await start({
+      mutate: () => writeIsolatedComposeFile(isoPath(), composeDoc(35434)),
+    }).then(
+      (l) => {
+        launches.push(...l);
+        return null;
+      },
+      (e) => e,
+    );
+    // It refuses, naming the service and both ports…
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(new RegExp(`Refusing to bring up isolated instance "${GATE_SLUG}"`));
+    expect(err.message).toContain('"postgres"');
+    expect(err.message).toContain(String(PG_PORT));
+    expect(err.message).toContain("35434");
+    // …and nothing was started: the whole point of gating BEFORE the `up`.
+    expect(launches).toEqual([]);
+  });
+});
+
+// ===========================================================================
+// cinatra#2654 (round-10 review, NB 2) — what the operator READS for an APP-ONLY
+// re-point, asserted on the real command.
+//
+// The re-point can write the app-identity keys and NO infra key at all: a
+// re-derive that ENLARGES the map onto an `.env.local` that already names every
+// service the file publishes. The round-9 command called that "this instance's
+// own infra ports" and said nothing about the app. The writer's summary is
+// pinned directly (`tests/install-flow.test.mjs`), and the command's use of
+// `route.repointed` was pinned only by SOURCE TEXT — so the one thing the
+// operator actually sees for this arm was never asserted end to end.
+//
+// This drives the real command, the real reconcile and the real writer over a
+// real `.env.local`, and replaces exactly two boundaries: the regeneration
+// (which would need a checkout and a generator) and the launch.
+// ===========================================================================
+describe("runDevWayflow — the line the operator reads for an APP-ONLY re-point", () => {
+  const SLUG_APP = "x2654-apponly";
+  const OFFSET_APP = 20000;
+  const PG_APP = 25434;
+  const WF_APP = 3010 + OFFSET_APP;
+  const RECORDED_APP_PORT = 3350;
+  const HAND_SET_APP_PORT = 3005;
+  let dir;
+  let registryPath;
+  let priorRegistryEnv;
+
+  const isoPath = () => path.join(dir, "docker-compose.cinatra-isolated.yml");
+
+  /** The map the FILE publishes before the re-derive: postgres only, and no
+   *  bridge-token route, so the reconcile regenerates rather than short-circuit. */
+  const preRepairDoc = () => ({
+    name: "cinatra_apponly",
+    services: {
+      postgres: {
+        image: "postgres:16",
+        ports: [{ published: String(PG_APP), target: 5432, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+      },
+    },
+  });
+
+  /** What the re-derive publishes: the SAME postgres port, plus a wired wayflow
+   *  the file never had. The map is ENLARGED — the one arm that may write the
+   *  app keys (`regenMovedMap`, src/index.mjs). */
+  const regeneratedDoc = () => ({
+    name: "cinatra_apponly",
+    services: {
+      ...preRepairDoc().services,
+      wayflow: {
+        image: "cinatra-wayflow:local",
+        environment: { CINATRA_BRIDGE_TOKEN: "${CINATRA_BRIDGE_TOKEN}" },
+        ports: [{ published: String(WF_APP), target: 3010, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" }],
+      },
+    },
+  });
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cin-r10-apponly-"));
+    writeIsolatedComposeFile(isoPath(), preRepairDoc());
+    // Every INFRA key this env carries already names what the re-derive will
+    // publish, so the re-point has no infra key to write. Only `PORT` is the
+    // operator's own and disagrees with the recorded app port.
+    writeFileSync(
+      path.join(dir, ".env.local"),
+      `PORT=${HAND_SET_APP_PORT}\nWAYFLOW_BASE_URL=http://localhost:${WF_APP}\n`,
+      { mode: 0o600 },
+    );
+    const { registry } = allocateInstance({ version: 1, instances: {} }, SLUG_APP, {
+      mode: "dev",
+      installDir: dir,
+      composeProject: "cinatra_apponly",
+      composeFiles: ["docker-compose.cinatra-isolated.yml"],
+      // The row records the pre-repair map: no wayflow entry at all.
+      ports: { postgres: [PG_APP] },
+      appPort: RECORDED_APP_PORT,
+      offset: OFFSET_APP,
+      repoUrl: "https://github.com/cinatra-ai/cinatra.git",
+      ref: "main",
+      sha: "1b820b7c22c18f4b79da89e033fbbceca841db7a",
+      infraMode: "new",
+    });
+    registryPath = path.join(dir, "instances.json");
+    writeInstanceRegistry(registryPath, markInstanceReady(registry, SLUG_APP));
+    priorRegistryEnv = process.env.CINATRA_INSTANCE_REGISTRY;
+    process.env.CINATRA_INSTANCE_REGISTRY = registryPath;
+  });
+
+  afterEach(() => {
+    if (priorRegistryEnv === undefined) delete process.env.CINATRA_INSTANCE_REGISTRY;
+    else process.env.CINATRA_INSTANCE_REGISTRY = priorRegistryEnv;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("says `(app:<port>)`, and the app keys are what it actually wrote", async () => {
+    const launches = [];
+    const lines = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((...a) => lines.push(a.join(" ")));
+    try {
+      await runDevWayflow(["start"], {
+        isComposeAvailable: () => true,
+        getRepoRoot: () => dir,
+        ensureWayflowBridgeEnv: () => true,
+        // The REAL reconcile, with only the generator boundary replaced: it
+        // writes the enlarged document the reconcile then re-reads and gates on.
+        reconcileIsolatedWayflowRoute: (args) =>
+          reconcileIsolatedWayflowRoute({
+            ...args,
+            deps: {
+              regenerateIsolatedCompose: () => {
+                writeIsolatedComposeFile(isoPath(), regeneratedDoc());
+                return {
+                  regenerated: true,
+                  ports: { postgres: [PG_APP], wayflow: [WF_APP] },
+                  offset: OFFSET_APP,
+                };
+              },
+            },
+          }),
+        spawnSync: (cmd, cmdArgs) => {
+          launches.push([cmd, cmdArgs]);
+          return { status: 0 };
+        },
+      });
+    } finally {
+      spy.mockRestore();
+    }
+
+    // THE LINE. It names the app, so it cannot be read as an infra re-point —
+    // and the parenthetical answers the sentence it is attached to.
+    const repointLine = lines.find((l) => l.startsWith("Re-pointed .env.local"));
+    expect(repointLine).toBe(
+      `Re-pointed .env.local at the ports this instance publishes before starting (app:${RECORDED_APP_PORT}).`,
+    );
+    // Nothing infra is claimed, because nothing infra was written.
+    expect(repointLine).not.toContain("wayflow:");
+
+    // …and the file backs the claim: the app port was written, the WayFlow
+    // endpoint the env already named was left byte-identical.
+    const after = readFileSync(path.join(dir, ".env.local"), "utf8");
+    expect(after).toMatch(new RegExp(`^PORT=${RECORDED_APP_PORT}$`, "m"));
+    expect(after).toMatch(new RegExp(`^WAYFLOW_BASE_URL=http://localhost:${WF_APP}$`, "m"));
+    // The start still happened: this is the reporting of a successful re-point.
+    expect(launches).toHaveLength(1);
+    expect(launches[0][1]).toContain("up");
   });
 });

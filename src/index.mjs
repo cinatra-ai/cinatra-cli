@@ -46,6 +46,7 @@ import {
   defaultInstanceRegistryPath as instanceRegistryDefaultPath,
   findInstanceByInstallDir as instanceRowByInstallDir,
   readInstanceRegistry as readInstanceRegistryFile,
+  recordedWayflowChoice,
 } from "./instance-registry.mjs";
 // cinatra#2654: the WayFlow agent runtime is part of every install-owned local
 // stack. The lifecycle command and the doctor assertion both address the
@@ -56,9 +57,22 @@ import {
   WAYFLOW_RUNTIME_EXTERNAL,
   WAYFLOW_RUNTIME_KEY,
   WAYFLOW_RUNTIME_OFF,
+  WAYFLOW_ENV_FILE,
   normalizeWayflowRuntimeMode,
   resolveRecordedComposeContext,
 } from "./wayflow-runtime.mjs";
+// cinatra#2654 (round 5) — the isolated-compose wiring primitives `instance
+// wayflow start` reuses to detect (never re-derive) whether the RECORDED
+// generated compose already carries a bridge-token route. Import-light (node
+// builtins only, no `index.mjs` graph — see the module's own header), so a
+// static import here carries none of `install.mjs`'s startup cost.
+import {
+  ISOLATED_COMPOSE_FILENAME,
+  WAYFLOW_SERVICE_NAME,
+  WAYFLOW_TOKEN_KEY,
+  composeEnvWiringGaps,
+  parseIsolatedComposeDoc,
+} from "./install-isolation.mjs";
 // cinatra-cli#233 — agent AVAILABILITY. A runtime that answers `/.health` `ok`
 // while mounting 0 agents is not agent-ready; the doctor compares the agent
 // sources on disk against what the runtime actually serves.
@@ -11981,6 +11995,22 @@ function readInstanceRegistrySafe() {
 // finder directly is the bug; call this instead.
 function findInstanceRowByInstallDir(registry, installDir) {
   try {
+    // UNWRAP (cinatra#2654 D1, round 4, merged with cinatra-cli#230's own fix
+    // to the same function). `findInstanceByInstallDir` returns the registry's
+    // `{slug, slot}` envelope, but `resolveRecordedComposeContext` reads
+    // `composeProject` / `composeFiles` off the ROW — as this function's own
+    // name promises. Returning the envelope meant every field read as
+    // undefined, so a row that WAS found still fell back to the checkout
+    // basename and the base compose pair: `cinatra instance wayflow start`
+    // addressed a second, empty project instead of the instance's recorded
+    // (for an isolated install, GENERATED) compose — the exact failure the
+    // recorded-context lookup was added to prevent. It reported
+    // `source: "registry"` while doing it, which is why it went unseen; the
+    // unit tests inject a `findByInstallDir` that already returns a bare row.
+    // The flat slot alone drops `slug`, which upgrade-preflight, upgrade-major
+    // and refresh's version-ledger capture all read off this same return
+    // value — so the slug is carried forward onto the unwrapped row rather
+    // than discarded with the envelope.
     const hit = instanceRowByInstallDir(registry, installDir);
     if (!hit || typeof hit !== "object") return null;
     const slot = hit.slot && typeof hit.slot === "object" ? hit.slot : hit;
@@ -11990,11 +12020,31 @@ function findInstanceRowByInstallDir(registry, installDir) {
   }
 }
 
-function composeWayflowArgs(verb, { project = null, composeFiles = null } = {}) {
+// cinatra#2654 (round 4) — this `up` must be given the SAME `--env-file
+// .env.local` every other bring-up of a recorded stack passes. The compose file
+// it ups is the recorded one, and for an ISOLATED instance rendered on a Compose
+// that could not preserve `env_file:` (the documented FALLBACK route) the
+// wayflow service's bridge token is a `${CINATRA_BRIDGE_TOKEN}` placeholder that
+// only `.env.local` resolves. Without the flag compose interpolates it from the
+// ambient environment, finds nothing, substitutes the EMPTY STRING, and the
+// agent runtime starts tokenless — the exact crash loop this issue fixed,
+// re-introduced by the one command an operator runs to bring the runtime back.
+// The default (non-isolated) compose needs it for the same reason
+// (cinatra-cli#144: `${NANGO_ENCRYPTION_KEY}` and friends carry no default).
+// Passed on BOTH verbs so `rm` addresses a document interpolated identically to
+// the one `up` created.
+function composeWayflowArgs(verb, { project = null, composeFiles = null, envFile = null } = {}) {
   const files = composeFiles && composeFiles.length
     ? composeFiles
     : ["docker-compose.yml", "docker-compose.dev.yml"];
-  const base = ["compose", ...(project ? ["-p", project] : []), ...files.flatMap((f) => ["-f", f])];
+  // `--env-file`/`-p`/`-f`/`--profile` are top-level compose flags (before the
+  // subcommand), mirroring install.mjs' `composeArgsFor`.
+  const base = [
+    "compose",
+    ...(envFile ? ["--env-file", envFile] : []),
+    ...(project ? ["-p", project] : []),
+    ...files.flatMap((f) => ["-f", f]),
+  ];
   return verb === "start"
     ? [...base, "--profile", WAYFLOW_PROFILE, "up", "-d", "--build", WAYFLOW_SERVICE]
     : [...base, "rm", "-sf", WAYFLOW_SERVICE];
@@ -12038,8 +12088,477 @@ function ensureWayflowBridgeEnv(
   return true;
 }
 
+/**
+ * cinatra#2654 (round 5) — `instance wayflow start` is the documented hand-start
+ * for a runtime the install did not start (`--no-wayflow`), or one an operator
+ * is restarting. On the FALLBACK compose-render route (this Docker Compose has
+ * no `config --no-env-resolution` — `install.mjs`'s `resolveIsolatedComposeConfig`,
+ * "the ONE resolution the isolated paths use, and the one place that decides
+ * which env-file route this Compose can give us") an install rendered under
+ * `--no-wayflow` never got a bridge-token route baked into the recorded
+ * compose at all: reference preservation on the PRESERVING route is generic —
+ * driven by the compose SOURCE, not the flag — but the fallback route's
+ * `environment:` placeholder is explicitly gated on `wayflow` being in scope
+ * at RENDER time (`install-isolation.mjs`'s `composeEnvWiringGaps`, arm (2)).
+ * So a `--no-wayflow` FALLBACK install's `wayflow` service carries neither an
+ * `env_file:` reference nor a token value, and `--env-file .env.local` at `up`
+ * time can only supply a placeholder that is ALREADY there — it cannot restore
+ * a directive the render never wrote.
+ *
+ * Detects that state HONESTLY and reuses the existing machinery rather than
+ * inventing a parallel detector: the same wiring-gap check
+ * `assertGeneratedEnvWiring` asserts at generation time
+ * (`composeEnvWiringGaps`), run here against the RECORDED document — but
+ * NEVER gated on the live Compose engine's capability (cinatra#2654 round-5
+ * review, codex convergence). The live probe answers what a render started
+ * NOW would produce; it says nothing about which route the document ON DISK
+ * actually took, possibly at an earlier `cinatra install` against a
+ * different Compose version, so classifying the recorded document by it
+ * misclassifies an already-healthy document across an engine change. Instead
+ * the check runs the invariant under BOTH possible interpretations of the
+ * document and treats it as already wired if EITHER one finds nothing
+ * missing — the route-agnostic, file-shape-only answer. Regeneration runs
+ * ONLY when NEITHER interpretation is satisfied: a preserving-route install
+ * (the `env_file:` reference is always present, whatever the wayflow flag
+ * was) and a fallback install that already carries its placeholder (wayflow
+ * was in scope when it was rendered) are both no-ops here, so today's
+ * behavior is unchanged for every install this bug does not reach.
+ *
+ * `wayflow: true` is passed EXPLICITLY, never left to the regenerator's
+ * default — this command IS the act of turning the runtime on, so demanding
+ * the token route is what it must do. Contrast the `instance a2a` self-heal,
+ * which now threads the install's RECORDED WayFlow choice instead
+ * (`recordedWayflowChoice(row)` — cinatra#2654 round-6 review, BLOCKING B):
+ * that instance may never have asked to run wayflow at all, and the old
+ * `wayflow = true` default there demanded a route a `--no-wayflow` install
+ * never needed. Here the explicit `true` is not a default threaded blindly; it
+ * is what the command means.
+ *
+ * A non-isolated row (default/attach/external/co-use), or one with no on-disk
+ * generated compose to read, skips the whole detection — not merely a no-op.
+ *
+ * `.env.local` is reconciled against the effective port map through the install
+ * path's own `writeIsolatedAppEnv` before the caller's `up` runs — on EVERY
+ * start, not only behind a regeneration, and writing only keys the file already
+ * carries plus the one credential-free key whose ABSENCE is itself the leak. See
+ * `repointEnv` below (cinatra#2654 round-6 review BLOCKING A, round-7 review
+ * BLOCKING A + B, round-8 review BLOCKING 2).
+ *
+ * That effective map is the map the FILE this start is about to bring up
+ * PUBLISHES, never the recorded row — and when the two genuinely disagree this
+ * REFUSES rather than adopting either. See `convergedPorts` below (round-8
+ * review, BLOCKING 1).
+ *
+ * A row that recorded the install's `--no-wayflow` opt-out has it CLEARED here:
+ * this command is the act of turning the runtime on (round-7 review, NB1).
+ *
+ * `ports` is that effective map on both arms that read a compose document, so
+ * the caller can re-gate on it immediately before the `up` (round-8 review).
+ *
+ * @returns {Promise<{ regenerated: boolean, reason: string, skipped?: string|null,
+ *                     ports?: object|null, envRepointed?: boolean, repointed?: string }>}
+ */
+async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log = console.log, deps = {} } = {}) {
+  const isolatedFilename = deps.ISOLATED_COMPOSE_FILENAME ?? ISOLATED_COMPOSE_FILENAME;
+
+  /**
+   * cinatra#2654 (round 7 review, NB1) — this command TURNS THE RUNTIME ON, so a
+   * row still recording the install's `--no-wayflow` opt-out is now recording
+   * something untrue. Left there, the LATER `instance a2a` self-heal reads it
+   * (`recordedWayflowChoice`) and skips demanding the bridge-token route for an
+   * instance that runs the runtime — the exact assertion this command re-derives
+   * the compose to satisfy. Recorded at the point the command changes it,
+   * through the install path's own IDENTITY-CHECKED writer.
+   *
+   * Called on EVERY path this reconcile RETURNS from (round-7 codex
+   * convergence, rounds 1 and 2): the caller's `up` proceeds whether the route
+   * was repaired, needed no repair, or could not be read at all, so a row left
+   * claiming the opt-out on any of those would mislead the self-heal exactly as
+   * before. It is deliberately NOT called ahead of the regeneration: a
+   * regeneration that THROWS aborts the command without starting anything, and
+   * an aborted start must not leave the row claiming a runtime this run never
+   * provisioned.
+   *
+   * A row that never opted out is left completely alone — no lock, no registry
+   * write, not even the `install.mjs` import.
+   */
+  const clearRecordedOptOut = async () => {
+    if (!row || recordedWayflowChoice(row) !== false) return;
+    const installMod = await import("./install.mjs");
+    const record = deps.recordWayflowChoiceOnRow ?? installMod.recordWayflowChoiceOnRow;
+    await record({ row, wayflow: true, log, deps });
+  };
+
+  // cinatra#2654 (round-8 review, the "every return arm" overstatement): the
+  // NOT-ISOLATED return is a return arm too, and the `up` runs after it exactly
+  // as it does after the others. A default/attach/external/co-use row can carry
+  // the install's recorded `--no-wayflow` opt-out just as an isolated one can —
+  // `persistRecordedWayflowChoice` records the choice on whatever row the
+  // install wrote, not only on isolated rows — and this command is still the act
+  // of turning that runtime on. A checkout with NO row at all has nothing to
+  // clear, which `clearRecordedOptOut` answers by itself.
+  if (!row || !Array.isArray(composeFiles) || !composeFiles.includes(isolatedFilename)) {
+    await clearRecordedOptOut();
+    return { regenerated: false, reason: "not-isolated" };
+  }
+  const existsImpl = deps.existsSync ?? existsSync;
+  const isoPath = path.join(repoRoot, isolatedFilename);
+
+  if (!existsImpl(isoPath)) {
+    await clearRecordedOptOut();
+    return { regenerated: false, reason: "absent" };
+  }
+
+  const readFileImpl = deps.readFileSync ?? readFileSync;
+  const parseDoc = deps.parseIsolatedComposeDoc ?? parseIsolatedComposeDoc;
+  /** Read + parse the recorded compose AS IT STANDS. Null when either fails. */
+  const readComposeDoc = () => {
+    try {
+      return parseDoc(readFileImpl(isoPath, "utf8"));
+    } catch {
+      return null;
+    }
+  };
+  const doc = readComposeDoc();
+  // Cannot parse it → cannot tell. This leaves whatever `docker compose up`
+  // already does with an unparseable file UNCHANGED — this fix targets the
+  // diagnosed fallback+--no-wayflow chain, not a corrupted checkout; the
+  // in-place regenerator's own operator-edits policy is the right place for
+  // that, and it already runs on every OTHER recorded-compose reconcile path.
+  //
+  // cinatra#2654 round-6 review, NB2 (considered, deliberately NOT unified with
+  // `isGeneratedComposeShape` in install.mjs): the two guards answer DIFFERENT
+  // questions. That one asks "is this a CLI-generated document I can diff the
+  // re-render against", so it also demands a `services` map. This one asks only
+  // "can I read the file at all", and a document with no `services` map must
+  // keep FALLING THROUGH to the regeneration below — a compose that declares no
+  // wayflow service is exactly the legacy shape the round-2 fix exists to
+  // repair, and adopting the stricter predicate here would turn that repair
+  // back into a silent no-op. An array document differs only in spelling: it
+  // has no `services` either, so it reaches the same regeneration by the same
+  // route. Unifying them would cost behaviour, not buy it.
+  //
+  // cinatra#2654 (round 7 review, C) — failing open is the right behaviour and
+  // the WRONG silence. `parseIsolatedComposeDoc` also returns null for a
+  // hand-written YAML compose (it reads the CLI's own JSON-shaped output), so an
+  // operator-edited file reaches this line, the check is skipped, and the `up`
+  // two steps later starts whatever that file declares — including a `wayflow`
+  // service carrying no bridge token, which crash-loops with no explanation of
+  // why THIS command did not repair it. Say so, loudly, before the `up`.
+  if (!doc || typeof doc !== "object") {
+    log(
+      `  ⚠ Could not read ${path.join(repoRoot, isolatedFilename)} as a cinatra-generated compose document ` +
+        `(hand-edited or hand-written YAML is not re-derivable). SKIPPING the WayFlow bridge-token check: if that ` +
+        `file's "${WAYFLOW_SERVICE_NAME}" service carries no ${WAYFLOW_TOKEN_KEY} route, the runtime this start ` +
+        `is about to launch will come up WITHOUT a token and crash-loop. Re-run \`cinatra install\` on this ` +
+        `checkout to have the CLI re-derive the file, or restore the generated compose from the install.`,
+    );
+    await clearRecordedOptOut();
+    return { regenerated: false, reason: "unparseable" };
+  }
+
+  // cinatra#2654 round-5 review (codex convergence): do NOT classify the
+  // RECORDED document by the LIVE Compose engine's capability. The live probe
+  // answers what a render started NOW would produce; it says nothing about
+  // which route the document ON DISK actually took, possibly at an earlier
+  // `cinatra install` against a different Compose version. Gating the gap
+  // check on it misclassified an already-healthy document whenever the
+  // engine changed since install (or the probe transiently failed) —
+  // "preserving doc, engine downgraded" and "fallback doc, engine upgraded"
+  // both read as a gap that is not really there, turning the promised no-op
+  // into an unwanted regeneration or refusal.
+  //
+  // Ask the SAME invariant `assertGeneratedEnvWiring` runs under BOTH
+  // possible interpretations of the document instead: it already carries a
+  // working route if EITHER reading finds nothing missing. That is the
+  // route-agnostic, file-shape-only answer to "is this document already
+  // wired" — no live dependency, and no probe subprocess, in the common case
+  // where nothing needs to change.
+  //
+  // cinatra#2654 round-5 review (codex convergence, round 2): the wayflow
+  // ARM of `composeEnvWiringGaps` only runs when `services.wayflow` exists
+  // and is an object (install-isolation.mjs's own guard) — a document with
+  // no `wayflow` service AT ALL (a LEGACY recorded compose predating
+  // cinatra-cli#113's profile-gated-service baking; `isolated-endpoint-
+  // offset.test.mjs`'s own fixtures carry exactly this shape) produces NO
+  // gap under EITHER interpretation, and would have read as "already wired"
+  // — the opposite of true, since a document with no route for a service
+  // that is not even IN it plainly needs re-deriving. Checked explicitly,
+  // ahead of and independent from the two interpretations.
+  const wayflowSvc = doc.services && typeof doc.services === "object" ? doc.services[WAYFLOW_SERVICE_NAME] : undefined;
+  const wayflowServicePresent = !!wayflowSvc && typeof wayflowSvc === "object" && !Array.isArray(wayflowSvc);
+
+  const wiringGaps = deps.composeEnvWiringGaps ?? composeEnvWiringGaps;
+  const wayflowGapsAs = (envFilesPreserved) =>
+    wiringGaps(doc, {
+      wayflowEnvFilePath: path.join(repoRoot, WAYFLOW_ENV_FILE),
+      wayflow: true,
+      envFilesPreserved,
+      baseDir: repoRoot,
+    }).filter((g) => g.includes(`"${WAYFLOW_SERVICE_NAME}"`));
+  const alreadyWired =
+    wayflowServicePresent && (wayflowGapsAs(true).length === 0 || wayflowGapsAs(false).length === 0);
+
+  /**
+   * cinatra#2654 (round 7 review, BLOCKING B) — the recovery is NOT atomic, so
+   * the env re-point is idempotent and runs on EVERY start rather than only
+   * behind a regeneration.
+   *
+   * The regenerator persists the compose file AND the enlarged port map on the
+   * registry row durably; the `.env.local` re-point happens after it. A crash
+   * (or a `^C`) in that window leaves an install whose compose and row are
+   * already REPAIRED while the env file still names the old port — and the next
+   * `instance wayflow start` reads that repaired compose, answers
+   * "already-wired", and returns before ever reaching the re-point. The stale
+   * env then survives every subsequent start: the app keeps dialling the
+   * DEFAULT :3010 (a dead port, or worse, another instance's runtime) forever.
+   *
+   * So the recorded map and the env file are reconciled on every start. What it
+   * may write is deliberately narrow (BLOCKING A, `writeIsolatedAppEnv`'s
+   * `restricted` mode): a key the env file already CARRIES is re-pointed at the
+   * port the file publishes, and a key it does not carry is written only for
+   * `wayflow`, whose absence IS the leak this repair exists to close. A repair
+   * never invents a connection string the operator did not have — for a key they
+   * rely on the runtime's own default for, a synthesized URL would carry no
+   * credentials and break it.
+   */
+  const repointEnv = async (effectivePorts, { appKeys = false } = {}) => {
+    const none = { envRepointed: false, repointed: "" };
+    if (!effectivePorts || typeof effectivePorts !== "object") return none;
+    // `writeIsolatedAppEnv` is a silent no-op without the file; skip the import too.
+    if (!existsImpl(path.join(repoRoot, ".env.local"))) return none;
+    const install = await import("./install.mjs");
+    const repoint = deps.writeIsolatedAppEnv ?? install.writeIsolatedAppEnv;
+    const written = repoint({
+      targetDir: repoRoot,
+      // cinatra#2654 (round-9 review, BLOCKING 1) — the app-identity keys belong
+      // to an APP move, and the ONLY thing on this route that can move the app is
+      // this run's OWN re-derive. So the caller decides (`appKeys`), and it says
+      // yes on exactly one arm: the regeneration below, whose enlarged map IS the
+      // install path's full re-point reached through this command. The
+      // every-start verify says no.
+      //
+      // Round 8 handed that decision to the writer, keyed on a per-service
+      // `movedServices` set — and in the SAME commit that set became FILE-vs-ROW
+      // (see `convergedPorts`), so it was non-empty exactly when the row lagged
+      // the file for any service. That is the crash-window state this repair
+      // exists for: an infra-only lag then rewrote `PORT`, `BETTER_AUTH_URL` and
+      // `NEXT_PUBLIC_BETTER_AUTH_URL` on a start where nothing about the app had
+      // moved, from the RECORDED row — the source this same commit ruled may not
+      // decide the map, and with no file to check it against, since the app is
+      // not a compose service. The recorded `appPort` describes the app, not the
+      // port map, and rewriting an operator's PORT on every start of an install
+      // nothing moved is not a repair.
+      //
+      // A FILE-vs-ROW set may not license the rewrite: a lag this run did not
+      // produce says nothing about the app (round-9 codex convergence). The
+      // caller compares the map BEFORE its re-derive with the map AFTER it,
+      // which is the only reading of "the app's own install moved" this route
+      // has. So this call site computes no such set at all any more — it passes
+      // the mode marker the writer actually reads (round-10 review, NB 1): the
+      // set was dead compute under a comment that still explained the decision
+      // role this commit's predecessor removed, which is how the round-9 blocker
+      // came to be written in the first place.
+      appPort: appKeys ? (row.appPort ?? null) : null,
+      ports: effectivePorts,
+      log,
+      restricted: true,
+    });
+    return { envRepointed: !!written, repointed: (written && written.remapped) || "" };
+  };
+
+  /**
+   * cinatra#2654 (round-9 review, NB 4) — the OFFSET this run speaks, tracked the
+   * way the install path tracks it (`reconvergeIsolated`, src/install.mjs): the
+   * recorded one until a regeneration DERIVES and PERSISTS a different one, and
+   * that one afterwards. The gates read it to explain a divergence ("its band
+   * offset also moved"), so a legacy row that carried none, repaired by the
+   * re-derive below, would otherwise leave every later gate — this reconcile's
+   * own second gate and the caller's last one before the `up` — judging with an
+   * offset this run has already replaced. Stricter, and fail-closed, but it
+   * reads an in-band gain as a disagreement; the install path does not, and the
+   * two run the same function on the same file.
+   */
+  let effectiveOffset = Number.isInteger(row.offset) && row.offset > 0 ? row.offset : null;
+
+  /**
+   * cinatra#2654 (round-8 review, BLOCKING 1) — the map this command SPEAKS is
+   * the map the FILE it is about to bring up publishes, never the recorded row.
+   *
+   * The re-point above rewrites the operator's `.env.local`. Handed the ROW, it
+   * rewrites a CORRECT env to ports the `up` will not publish whenever the row
+   * lags the file — which is not hypothetical: the regenerator's own
+   * concurrent-row-move abort raises AFTER the compose was written
+   * (`composeFileMayBeRewritten`), and a hand-edited generated compose is never
+   * regenerated by the already-wired arm at all. That is the exact defect this
+   * PR exists to remove, produced by the repair. The rule the repo already
+   * states for the install path is the rule here (`reconvergeIsolated`,
+   * src/install.mjs): "the ports this re-converge speaks are the ports the file
+   * it is about to bring up publishes — never a recorded map that lags it".
+   *
+   * So the effective map is derived from the PARSED document, through the
+   * install path's own `effectiveIsolatedPortsFromDoc` — one spelling of the
+   * interpolated-port semantics, not two: a service the file publishes
+   * statically is the file's, a service whose published port defers to a `${VAR}`
+   * falls back per-service to the row, and a service absent from the file is
+   * absent from the map.
+   *
+   * And when the two genuinely DISAGREE — a shared service publishing a port the
+   * row does not hold — this REFUSES, through the same
+   * `assertIsolatedPortsConverge` every other isolated route runs, before
+   * anything is written. Adopting the file's port silently could launch this
+   * stack onto a port another instance owns; adopting the ROW's is the defect
+   * above. The refusal names the service, both ports and the three recoveries.
+   * It runs BEFORE the env write, the row write and the `up`, so its promise
+   * ("nothing was started, and nothing was changed") holds — which is also why
+   * this reconcile does not repair the row here: a write is the one thing the
+   * pre-mutation gate may not do, and the lagging row is corrected by the
+   * install path (`persistIsolatedPortRepair`) on the next `cinatra install`.
+   *
+   * ORDER, for the same reason the install path states it (`reconvergeIsolated`,
+   * cinatra-cli#237 round-2 finding 3): the gate runs on the document EXACTLY as
+   * it stands, BEFORE the regeneration below. The in-place regeneration rewrites
+   * the compose file AND the registry row, and it re-derives the ports from the
+   * checkout at the RECORDED offset — so a regeneration allowed to run first
+   * could rewrite an operator's divergent port away entirely, masking the
+   * disagreement so the abort never fired, and any refusal AFTER it would be
+   * claiming "nothing was changed" about a file and a row it had already
+   * written. It then runs a SECOND time on the re-read file, which is the
+   * belt-and-braces gate `persistIsolatedPortRepair` runs for the same reason.
+   *
+   * The refusal SAYS so precisely (round-8 codex convergence, round 2). This
+   * command re-provisions the bridge-token env file before the reconcile
+   * (`ensureWayflowBridgeEnv`, so the re-derive can see it), so the gate's
+   * default promise — "nothing was changed" — would be an overstatement here by
+   * one file. That file is idempotent, belongs to this checkout alone and holds
+   * no port; the clause below names what the refusal really guarantees instead
+   * of claiming more than this command has earned.
+   */
+  const convergedPorts = async (docNow, fallbackPorts) => {
+    const install = await import("./install.mjs");
+    const fromDoc = deps.effectiveIsolatedPortsFromDoc ?? install.effectiveIsolatedPortsFromDoc;
+    const converge = deps.assertIsolatedPortsConverge ?? install.assertIsolatedPortsConverge;
+    const base = fallbackPorts && typeof fallbackPorts === "object" ? fallbackPorts : (row.ports ?? {});
+    const effective = docNow ? fromDoc(docNow, base) : base;
+    converge({
+      slug: row.slug,
+      recordedPorts: row.ports ?? {},
+      ports: effective,
+      composeProject: row.composeProject,
+      registryPath: deps.instanceRegistryPath,
+      offset: effectiveOffset,
+      unchangedClause:
+        `Nothing was started, and nothing about this instance's ports was changed: not ` +
+        `${isolatedFilename}, not its registry row, not .env.local. (This command re-provisions this ` +
+        `checkout's ${WAYFLOW_ENV_FILE} before it checks; that file holds the bridge token and no ports.)`,
+    });
+    return effective;
+  };
+
+  // The PRE-MUTATION gate, on the document as it stands: it must clear before
+  // the regeneration below is allowed to rewrite the very file it judges.
+  const preRepairPorts = await convergedPorts(doc, row.ports ?? {});
+
+  if (alreadyWired) {
+    // The every-start VERIFY: no regeneration ran, so nothing about the app can
+    // have moved, so the app-identity keys are out of scope (round-9 review,
+    // BLOCKING 1). The infra keys are decided as before, by what the file
+    // publishes and what the env already carries.
+    const env = await repointEnv(preRepairPorts);
+    await clearRecordedOptOut();
+    return {
+      regenerated: false,
+      reason: "already-wired",
+      ports: preRepairPorts,
+      offset: effectiveOffset,
+      ...env,
+    };
+  }
+
+  log(
+    `  ↻ The recorded ${isolatedFilename} carries no WayFlow bridge-token route for "${WAYFLOW_SERVICE_NAME}" ` +
+      "under EITHER render route — re-deriving it now that `instance wayflow start` is turning the runtime on.",
+  );
+  const regenerate =
+    deps.regenerateIsolatedCompose ?? (await import("./install.mjs")).regenerateIsolatedCompose;
+  const regen = await regenerate({ targetDir: repoRoot, row, log, wayflow: true, deps });
+
+  // cinatra#2654 (round 6, BLOCKING A) — a regeneration can ENLARGE the port
+  // map, and the app must be re-pointed at what it enlarged it to.
+  //
+  // The legacy case this repair exists for is a recorded compose with NO
+  // `wayflow` service at all (pre-cinatra-cli#113 profile-gated-service baking).
+  // Re-deriving it ADDS that service, on this instance's ISOLATED host port
+  // (`3010 + offset`), and `regenerateIsolatedComposeInPlace` persists the
+  // enlarged map to the registry row. `.env.local`, however, still names the
+  // DEFAULT `:3010` in WAYFLOW_BASE_URL — the file was written when the map
+  // held no wayflow entry, so the install's own re-point had nothing to write.
+  // The `up` two steps below then starts the runtime on the remapped port while
+  // the app dials the default one: a dead port, or — with a default stack also
+  // running — ANOTHER instance's runtime, which is the worse failure because it
+  // answers. That is cinatra-cli#231's defect, reached through this command.
+  //
+  // The install path closes it by re-pointing `.env.local` from the EFFECTIVE
+  // port map (`writeIsolatedAppEnv`, src/install.mjs). This runs the SAME
+  // writer, on the same map, so the two routes cannot disagree — and only when
+  // the map actually MOVED, so the common "regenerated, nothing changed"
+  // reconcile still leaves the operator's env file untouched.
+  const regenPorts = regen.regenerated && regen.ports && typeof regen.ports === "object" ? regen.ports : null;
+  // `envRepointed` is what the writer DID, never what we asked it to do
+  // (round-6 codex convergence): a checkout with no `.env.local` is a silent
+  // no-op inside `writeIsolatedAppEnv`, and reporting a re-point that never
+  // happened is the same shape of false success this issue exists to remove.
+  // A regeneration that did not move the map still goes through the same
+  // reconcile as a start with no regeneration at all (BLOCKING B) — which is
+  // why it is one call on one effective map, not two spellings of the rule.
+  //
+  // cinatra#2654 (round-8 review, BLOCKING 1): re-READ the file the regeneration
+  // just wrote and speak what IT publishes, rather than the map the regenerator
+  // reports (or, when it validly SKIPPED, the recorded row — the lagging-row
+  // case in full). Same rule, same helper and same refusal as the already-wired
+  // arm above; the regenerator's map only answers for what the re-read cannot.
+  // The offset a regeneration DERIVED and persisted this run supersedes the
+  // recorded one for every gate after it, exactly as on the install path
+  // (`reconvergeIsolated`, src/install.mjs — round-9 review, NB 4).
+  if (regen.regenerated && Number.isInteger(regen.offset) && regen.offset > 0) effectiveOffset = regen.offset;
+  const ports = await convergedPorts(readComposeDoc(), regenPorts ?? preRepairPorts);
+  // The app keys belong to a re-derive that actually MOVED this install's map:
+  // the enlarged map is the one thing on this route that can leave the app's own
+  // keys behind, and it is the install path's own full re-point reached through
+  // this command (round-9 review, BLOCKING 1).
+  //
+  // The comparison is BEFORE-vs-AFTER the re-derive, on the two maps the FILE
+  // published, and never the file against the ROW (round-9 codex convergence):
+  // a row that already lagged on some unrelated service describes a state this
+  // run did not create, and reading it as a move rewrites the operator's app
+  // keys for a regeneration that moved nothing — the round-8 defect, narrowed to
+  // this arm rather than removed from it.
+  const sameMaps = deps.samePortMaps ?? (await import("./install.mjs")).samePortMaps;
+  const regenMovedMap = !!regen.regenerated && !sameMaps(preRepairPorts ?? {}, ports ?? {});
+  const env = await repointEnv(ports, { appKeys: regenMovedMap });
+  await clearRecordedOptOut();
+  return {
+    regenerated: !!regen.regenerated,
+    skipped: regen.skipped ?? null,
+    reason: "route-repaired",
+    ports,
+    offset: effectiveOffset,
+    ...env,
+  };
+}
+
 // `argv` is the legacy rest (argv.slice(2)); its first token is the start|stop verb.
-async function runDevWayflow(argv = []) {
+//
+// `deps` is the test seam (cinatra#2654 round-9 review, NB 2): the four
+// boundaries this command crosses before the `up` — the compose-availability
+// probe, the checkout root, the bridge-token provisioning and the route
+// reconcile — plus the launch itself. It exists so the LAST gate before the `up`
+// can be exercised BEHAVIOURALLY: a test lets the REAL reconcile run, rewrites
+// the compose file inside the window that reconcile opened, and asserts this
+// command then refuses to launch. Pinning that gate by source-text ordering
+// alone left a later arm change free to stop returning a map and silently
+// disable it with every test still green. Production passes nothing.
+async function runDevWayflow(argv = [], deps = {}) {
   rejectTailscaleAuthkeyFlag(argv);
   const verb = String(argv[0] ?? "").trim();
   if (verb !== "start" && verb !== "stop") {
@@ -12058,25 +12577,89 @@ async function runDevWayflow(argv = []) {
         `Expected: cinatra instance wayflow <start|stop>.`,
     );
   }
-  if (!isComposeAvailable()) {
+  if (!(deps.isComposeAvailable ?? isComposeAvailable)()) {
     throw new Error(
       "`docker compose` is not available on PATH. Install Docker + the compose plugin, then retry.",
     );
   }
-  const repoRoot = getRepoRoot();
-  if (verb === "start" && !ensureWayflowBridgeEnv(repoRoot)) {
+  const repoRoot = (deps.getRepoRoot ?? getRepoRoot)();
+  if (verb === "start" && !(deps.ensureWayflowBridgeEnv ?? ensureWayflowBridgeEnv)(repoRoot)) {
     process.exitCode = 1;
     return;
   }
   const { project, composeFiles } = wayflowComposeContext(repoRoot);
-  const args = composeWayflowArgs(verb, { project, composeFiles });
+  if (verb === "start") {
+    // cinatra#2654 (round 5): re-derive the recorded isolated compose's
+    // wayflow token route AFTER the provisioning above succeeded, when (and
+    // only when) it is missing — see reconcileIsolatedWayflowRoute. A second,
+    // cheap read of the small registry file for THIS checkout's row, mirroring
+    // `wayflowEndpointForCheckout` just above.
+    const row = findInstanceRowByInstallDir(readInstanceRegistrySafe().registry, repoRoot);
+    const reconcile = deps.reconcileIsolatedWayflowRoute ?? reconcileIsolatedWayflowRoute;
+    const route = await reconcile({ repoRoot, composeFiles, row });
+    // cinatra#2654 (round 7 review, NB4): REPORT the re-point. `.env.local` is
+    // the operator's own file and this command may have just rewritten keys in
+    // it — silently changing a hand-maintained file and then starting
+    // containers is not something an operator should have to diff for. Naming
+    // the `svc:port` pairs also tells them which endpoints this start moved.
+    // cinatra#2654 (round-9 review, BLOCKING 1): the line says what it
+    // re-pointed, not what it usually re-points. The re-point can write the
+    // app-identity keys and no infra key at all (a re-derive that enlarged the
+    // map onto an env already naming every service correctly), and this line
+    // called that "this instance's own infra ports". The writer now names the
+    // app port in the summary too, so the parenthetical answers the sentence.
+    if (route?.envRepointed) {
+      console.log(
+        `Re-pointed .env.local at the ports this instance publishes before starting` +
+          `${route.repointed ? ` (${route.repointed})` : ""}.`,
+      );
+    }
+    // cinatra#2654 (round-8 review, re-weighting) — RE-GATE on the file as it
+    // stands RIGHT NOW, with nothing left between this check and the `up`.
+    //
+    // The reconcile above cleared its convergence gate against a SNAPSHOT of the
+    // compose, and then this run did real work with that verdict in hand: it may
+    // have re-derived the document, rewritten `.env.local` and written the
+    // registry row. Everything in that window is time in which the file can
+    // change — a sibling cinatra process, an editor writing out a buffer, a
+    // regeneration in another checkout — and `docker compose up` binds whatever
+    // the file says at THAT moment, which nothing has checked. This is the same
+    // check-then-use gap the install path closes immediately before its own
+    // bring-up (`assertIsolatedPortsStillConverge`, src/install.mjs), and it is
+    // closed here by the same function rather than a second spelling of it.
+    //
+    // Gated on the reconcile having produced a map at all: the `absent`,
+    // `unparseable` and `not-isolated` arms deliberately let the `up` proceed on
+    // a document this CLI could not audit, and turning that documented fail-open
+    // into a refusal is not this item.
+    if (route?.ports && row?.slug) {
+      const { assertIsolatedPortsStillConverge } = await import("./install.mjs");
+      assertIsolatedPortsStillConverge({
+        slug: row.slug,
+        targetDir: repoRoot,
+        ports: route.ports,
+        composeProject: row.composeProject,
+        // The offset the RECONCILE speaks, not the row's (round-9 review, NB 4):
+        // a re-derive that repaired a legacy row's missing offset persisted the
+        // new one, and this gate must judge with the same offset the reconcile's
+        // own gates did — the parity the install path already keeps
+        // (`reconvergeIsolated`, src/install.mjs).
+        offset: Number.isInteger(route.offset) && route.offset > 0 ? route.offset : null,
+      });
+    }
+  }
+  // Relative, resolved against `cwd: repoRoot` below — which also keeps the
+  // echoed command copy-pasteable from the checkout. A checkout with no
+  // `.env.local` keeps compose's normal `.env` discovery (null envFile).
+  const envFile = existsSync(path.join(repoRoot, ".env.local")) ? ".env.local" : null;
+  const args = composeWayflowArgs(verb, { project, composeFiles, envFile });
   const shownCmd = `docker ${args.join(" ")}`;
   console.log(
     verb === "start"
       ? `Starting the WayFlow agent runtime (${shownCmd}) ...`
       : `Stopping the WayFlow agent runtime (${shownCmd}) ...`,
   );
-  const result = spawnSync("docker", args, {
+  const result = (deps.spawnSync ?? spawnSync)("docker", args, {
     cwd: repoRoot,
     stdio: ["ignore", "inherit", "inherit"],
   });
@@ -14752,6 +15335,16 @@ export {
   effectiveComposeProjectName,
   wayflowComposeContext,
   wayflowHealthUrlFromEnv,
+  // cinatra#2654 (round 5) — the fallback-route wayflow-token-route detector +
+  // regeneration `instance wayflow start` runs after provisioning. Exported so
+  // it can be exercised directly against a real generated isolated compose
+  // (the fail-first regression coverage), not only through the live spawn.
+  reconcileIsolatedWayflowRoute,
+  // cinatra#2654 (round-9 review, NB 2) — the command itself, exported with its
+  // `deps` seam so the LAST gate before the `up` is pinned by BEHAVIOUR: the
+  // compose file is rewritten inside the window the reconcile opens, and the
+  // launch must refuse rather than bind whatever the file now says.
+  runDevWayflow,
   // cinatra-cli#240 — the printed start endpoint, derived from the instance's
   // recorded port map instead of a hardcoded default.
   recordedWayflowHostPort,

@@ -11,7 +11,7 @@
 // So this file drives the REAL `bringUpInfra` with `node:child_process` mocked,
 // and asserts on the ORDER of what it did and on the file it left behind.
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -63,6 +63,17 @@ describe("bringUpInfra reconciles NANGO_SECRET_KEY after Nango is healthy", () =
     procControl.psqlStdout = `${SEEDED}\n`;
     dir = mkdtempSync(path.join(os.tmpdir(), "cli211-wiring-"));
     envPath = path.join(dir, ".env.local");
+    // cinatra#2654 D1: the bring-up refuses to start WayFlow unless the narrow
+    // env file the container reads actually carries the REQUIRED key set (the
+    // bridge token and the context attest key) — so this checkout fixture holds
+    // the file a real bring-up has by this point, in full.
+    mkdirSync(path.join(dir, "docker", "wayflow"), { recursive: true });
+    writeFileSync(
+      path.join(dir, "docker", "wayflow", ".wayflow.env"),
+      "CINATRA_BRIDGE_TOKEN=fixture-bridge-token\nCINATRA_CONTEXT_ATTEST_KEY=fixture-attest-key\n" +
+        "WAYFLOW_BASE_URL=http://localhost:3010/\n",
+      { mode: 0o600 },
+    );
     logged = [];
   });
 

@@ -1613,6 +1613,18 @@ describe("cinatra-cli#232 — a failed real install leaves its band + app port r
       detectPortConflicts: conflictOnDefaultBand,
       runComposeDown: () => {},
       bringUpInfra: () => {},
+      // cinatra#2654 D1 (merge of origin/main into the #2654 branch): the
+      // isolated executor now PROVISIONS the WayFlow bridge-token env file
+      // before it resolves the compose, and judges that step by the file rather
+      // than by the generator's exit code — so it ABORTS on a checkout that
+      // cannot produce one. This sandbox fixture has no `scripts/` tree, so the
+      // step is stubbed here exactly as `bringUpInfra` is, and for the same
+      // reason: these tests own the band/app-port RESERVATION, not the agent
+      // runtime. Identical to the stub `tests/install-flow.test.mjs` carries;
+      // the gate's real behaviour is owned by
+      // `tests/wayflow-isolated-env-file.test.mjs` and by install-flow's
+      // "the SAME install WITHOUT --no-wayflow still aborts" case.
+      generateWayflowEnv: () => ({ ok: true, skipped: true, reason: null }),
       ...extra,
     };
   }

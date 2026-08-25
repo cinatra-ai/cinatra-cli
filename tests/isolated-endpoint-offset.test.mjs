@@ -41,6 +41,8 @@ import {
 } from "../src/install-isolation.mjs";
 import { isolatedComposeHasA2aPeers, missingIsolatedServices } from "../src/isolated-a2a.mjs";
 import { DEFAULT_APP_PORT as ALLOCATOR_DEFAULT_APP_PORT } from "../src/instance-alloc.mjs";
+// cinatra#2654 (round 6) — the ONE reader of a row's recorded WayFlow choice.
+import { recordedWayflowChoice } from "../src/instance-registry.mjs";
 import {
   DEFAULT_WAYFLOW_PORT,
   WAYFLOW_RUNTIME_LOCAL,
@@ -934,10 +936,12 @@ describe("cinatra-cli#231 — an A2A-ERA compose still gains a LATER-baked servi
     expect(res.infraPlan).toBe("isolated");
     expect(lines.join("\n")).toContain("converging on its own stack");
 
-    // The regeneration ran and SAID which service the file did not carry.
+    // The regeneration ran (cinatra#2654 D1: a reconcile ALWAYS re-renders, so
+    // the tail no longer names WHICH service was missing — it reports whether
+    // the re-derived content actually changed, which it did here).
     const regenLine = lines.find((l) => l.includes("Regenerated docker-compose.cinatra-isolated.yml"));
     expect(regenLine).toBeDefined();
-    expect(regenLine).toContain("wayflow");
+    expect(regenLine).toContain("content updated");
 
     // The file gained the runtime, at the recorded band offset.
     const { doc } = readGeneratedCompose(installDir);
@@ -982,8 +986,14 @@ describe("cinatra-cli#231 — an A2A-ERA compose still gains a LATER-baked servi
     writeFileSync(process.env.CINATRA_INSTANCE_REGISTRY, JSON.stringify(reg, null, 2) + "\n");
 
     const { lines } = await reconverge(installDir);
-    // No regeneration: the file was current, which is the whole point.
-    expect(lines.find((l) => l.includes("Regenerated docker-compose.cinatra-isolated.yml"))).toBeUndefined();
+    // cinatra#2654 D1: a reconcile ALWAYS re-renders now (never skips on a
+    // service-presence "up to date" test — that test is exactly what let a
+    // stale/broken compose survive a reconcile), so a regeneration line is
+    // still printed here; it just reports no CONTENT change, which is the
+    // real point this test protects: the file needed no repair, only the row.
+    const regenLine = lines.find((l) => l.includes("Regenerated docker-compose.cinatra-isolated.yml"));
+    expect(regenLine).toBeDefined();
+    expect(regenLine).toContain("content unchanged");
 
     const runtimeLine = lines.find((l) => l.includes("Agent runtime:"));
     expect(runtimeLine).toContain(`http://localhost:${EXPECTED_WAYFLOW_PORT}`);
@@ -1516,18 +1526,48 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
   // while keeping the repair for a genuinely IN-BAND gain (a lagging row).
   it("round-4 blocker: a shared service that GAINS an IN-BAND port in the file repairs the row instead of aborting", async () => {
     const installDir = await freshIsolatedInstall("iso237r4-gained-inband");
-    const { doc } = readGeneratedCompose(installDir);
     // OFFSET=20000, BAND_OFFSET_STEP=10000 → the instance's band is
     // [20000, 30000). This stays well inside it.
     const extraPort = RECORDED_REDIS + 100;
     expect(extraPort).toBeLessThan(OFFSET + 10000);
-    // Keeps the recorded port AND publishes a second one — a superset, not a
-    // move.
+    // cinatra#2654 D1: a reconcile ALWAYS re-renders the generated compose (no
+    // "already has every service" no-op). But the in-place regenerator's OWN
+    // determinism guard (`sharedServicePortsAgree`) is strict-length, not
+    // band-gated: it exists to stop a re-render from silently RELOCATING a
+    // shared service, so a resolved config that would produce a different port
+    // COUNT for redis than the recorded row holds makes it SKIP the write
+    // entirely (leaving the file exactly as it stands) rather than adopt the
+    // gain itself. So the gain has to reach the FILE the way it can actually
+    // arise post-D1 — a sibling process (or, before this run, a still-running
+    // one) already regenerated it — and the checkout's own resolved config is
+    // given the same gain, so the skip fires instead of a silent overwrite back
+    // to the row's stale single-port shape. The BAND-GATED adoption this test
+    // is really about happens one layer up, in `persistIsolatedPortRepair`,
+    // which reads the file (not the resolved config) once the skip leaves it be.
+    const { doc } = readGeneratedCompose(installDir);
     doc.services.redis.ports = [`${RECORDED_REDIS}:6379`, `${extraPort}:6380`];
     writeCompose(installDir, doc);
 
+    const resolvedConfigWithGain = {
+      ...RESOLVED_CONFIG,
+      services: {
+        ...RESOLVED_CONFIG.services,
+        redis: {
+          ...RESOLVED_CONFIG.services.redis,
+          ports: [
+            ...RESOLVED_CONFIG.services.redis.ports,
+            { published: String(extraPort - OFFSET), target: 6380, host_ip: "127.0.0.1", protocol: "tcp", mode: "host" },
+          ],
+        },
+      },
+    };
+
     let bringUpCalled = false;
-    const deps = { ...isolatedDeps(), bringUpInfra: () => { bringUpCalled = true; } };
+    const deps = {
+      ...isolatedDeps(),
+      composeConfigForFiles: () => resolvedConfigWithGain,
+      bringUpInfra: () => { bringUpCalled = true; },
+    };
     const res = await runInstall(
       ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"],
       { log: () => {}, deps },
@@ -1816,11 +1856,15 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
     expect(err).toBeInstanceOf(Error);
     expect(err.message).toMatch(/another|concurrent/i);
     expect(err.message).toMatch(/chang|mov/i);
-    // round-4 non-blocking 2: `persistIsolatedPortRepair` throws BEFORE writing
-    // anything (unlike `regenerateIsolatedComposeInPlace`, which already wrote
-    // the compose file by the time ITS lock-compare can throw) — "nothing was
-    // changed" is literally true on THIS path, so it keeps saying so.
-    expect(err.message).toMatch(/nothing was started, and nothing was\s+changed/i);
+    // cinatra#2654 D1: a reconcile ALWAYS re-renders now (the "file is already
+    // complete, so regeneration stays a no-op" premise above no longer holds —
+    // that is exactly the up-to-date-test D1 removed), so it is
+    // `regenerateIsolatedComposeInPlace`'s OWN lock-compare that fires here, not
+    // `persistIsolatedPortRepair`'s: the compose file is already REWRITTEN on
+    // disk by the time this throw fires, so the message says so rather than
+    // claiming "nothing was changed" (still true of the REGISTRY: the write
+    // below is never reached).
+    expect(err.message).toMatch(/regenerated docker-compose\.cinatra-isolated\.yml may already be rewritten on disk/i);
     // The whole point: a run that lost the race must never reach `startInfra` —
     // that is the route that would advertise this run's stale port while the
     // registry holds the other writer's new one.
@@ -2078,5 +2122,459 @@ describe("cinatra-cli#237 round 3 — the gate cannot be laundered, skipped or r
         ),
       ).toBe(false);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cinatra#2654 round 6, BLOCKING B — a command that re-derives the generated
+// compose for its OWN reason must reproduce the install the operator asked for.
+//
+// `regenerateIsolatedComposeInPlace` renders under a `wayflow` flag whose
+// DEFAULT is `true`, and the `instance a2a` self-heal passed no flag at all. On
+// a `--no-wayflow` install that default DEMANDS a bridge-token route the install
+// deliberately never provisioned: the re-derive fails the wiring invariant, the
+// self-heal swallows that as a warning, and `instance a2a start` then dead-ends
+// on "the isolated compose does not include the a2a-peers services and could not
+// be regenerated in place" — for an instance whose compose is exactly what its
+// own install wrote. The choice is now RECORDED on the registry row at
+// allocation and threaded through that caller.
+// ---------------------------------------------------------------------------
+describe("cinatra#2654 round 6 — the a2a self-heal reproduces the install's recorded WayFlow choice", () => {
+  let sandbox;
+  let originRepo;
+
+  beforeAll(() => {
+    sandbox = mkdtempSync(path.join(os.tmpdir(), "cin-2654r6-"));
+    originRepo = buildFixtureOrigin(sandbox);
+  });
+  afterAll(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    const d = mkdtempSync(path.join(sandbox, "home-"));
+    process.env.CINATRA_INSTANCE_REGISTRY = path.join(d, "instances.json");
+    process.env.CINATRA_ALLOC_LOCK = path.join(d, "alloc.lock");
+  });
+
+  function registryRow(installDir) {
+    const reg = JSON.parse(readFileSync(process.env.CINATRA_INSTANCE_REGISTRY, "utf8"));
+    const slug = Object.keys(reg.instances).find(
+      (s) => path.resolve(reg.instances[s].installDir) === path.resolve(installDir),
+    );
+    return { reg, slug, row: reg.instances[slug] };
+  }
+
+  // A Compose that INLINES `env_file:` — the route on which the WayFlow arm of
+  // the wiring invariant has real teeth, because only an explicit non-empty
+  // value can carry the token and the fixture's `wayflow` service carries none.
+  // (That is precisely a `--no-wayflow` install: nothing ever wrote
+  // `docker/wayflow/.wayflow.env`, so nothing could be inlined from it.)
+  const inliningDeps = (extra = {}) => ({
+    ...isolatedDeps(),
+    composeSupportsNoEnvResolution: () => false,
+    ...extra,
+  });
+
+  // The peers are genuinely MISSING from the recorded document (installed with
+  // the plain fixture), so `instance a2a start` has a real self-heal to run.
+  const peerAwareDeps = (extra = {}) =>
+    inliningDeps({
+      composeConfigForFiles: () => RESOLVED_CONFIG_WITH_PEERS,
+      composePublishedPortsForTarget: () => DEFAULT_BAND_WITH_PEERS,
+      // `runIsolatedA2aPeers` reads `deps.isComposeAvailable`, not the
+      // `composeAvailable` key the install route uses — without it this falls
+      // through to a REAL `docker compose version` probe.
+      isComposeAvailable: () => true,
+      ...extra,
+    });
+
+  async function leanIsolatedInstall(name) {
+    const installDir = path.join(sandbox, name);
+    const res = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", name,
+        "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+        "--no-wayflow",
+      ],
+      { log: () => {}, deps: inliningDeps() },
+    );
+    expect(res.infraPlan).toBe("isolated");
+    return installDir;
+  }
+
+  const readIsoDoc = (installDir) =>
+    JSON.parse(
+      readFileSync(path.join(installDir, "docker-compose.cinatra-isolated.yml"), "utf8")
+        .split("\n")
+        .filter((l) => !l.trimStart().startsWith("#"))
+        .join("\n"),
+    );
+
+  it("records the OPT-OUT on the registry row (an install that did not opt out records nothing)", async () => {
+    const lean = await leanIsolatedInstall("iso2654r6-recorded-lean");
+    expect(registryRow(lean).row.wayflow).toBe(false);
+
+    // The default install is byte-identical to what it always recorded: an
+    // ABSENT field, which every reader takes as "wayflow was in scope".
+    const fullDir = path.join(sandbox, "iso2654r6-recorded-full");
+    await runInstall(
+      [
+        "--dir", fullDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso2654r6recfull",
+        "--port-offset", String(OFFSET + 10000), "--app-port", String(APP_PORT + 1),
+      ],
+      { log: () => {}, deps: isolatedDeps() },
+    );
+    const fullRow = registryRow(fullDir).row;
+    expect(fullRow.wayflow).toBeUndefined();
+    expect(recordedWayflowChoice(fullRow)).toBe(true);
+    expect(recordedWayflowChoice(registryRow(lean).row)).toBe(false);
+    // A row from before the field existed reads as "in scope" too.
+    expect(recordedWayflowChoice({ slug: "legacy" })).toBe(true);
+  });
+
+  // ── round-6 codex convergence ─────────────────────────────────────────────
+  // `allocateInstance` returns an EXISTING same-directory row unchanged (its
+  // idempotence contract), so a re-install never reached the field. Both
+  // transitions were silently lost, and each breaks a LATER `instance a2a`
+  // self-heal rather than the install that made them. The LATEST install
+  // decides, exactly like the ports and offset it also re-records.
+  it("a --no-wayflow RE-install of a recorded row records the opt-out (allocateInstance never sees it)", async () => {
+    const installDir = path.join(sandbox, "iso2654r6-reinstall-optout");
+    const args = (extra) => [
+      "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+      "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso2654r6reoptout",
+      "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ...extra,
+    ];
+    // (1) a normal install: nothing recorded, which reads as "wayflow in scope".
+    await runInstall(args([]), { log: () => {}, deps: isolatedDeps() });
+    expect(registryRow(installDir).row.wayflow).toBeUndefined();
+
+    // (2) the operator changes their mind and re-installs lean.
+    await runInstall(args(["--no-wayflow"]), { log: () => {}, deps: isolatedDeps() });
+    const row = registryRow(installDir).row;
+    expect(row.wayflow).toBe(false);
+    expect(recordedWayflowChoice(row)).toBe(false);
+    // …and nothing else about the row moved.
+    expect(row.appPort).toBe(APP_PORT);
+    expect(row.offset).toBe(OFFSET);
+    expect(row.ports.wayflow).toEqual([DEFAULT_WAYFLOW_PORT + OFFSET]);
+  });
+
+  it("a re-install WITHOUT the opt-out clears a recorded opt-out (the key is DELETED, not written `true`)", async () => {
+    const installDir = path.join(sandbox, "iso2654r6-reinstall-optin");
+    const args = (extra) => [
+      "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+      "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso2654r6reoptin",
+      "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ...extra,
+    ];
+    await runInstall(args(["--no-wayflow"]), { log: () => {}, deps: inliningDeps() });
+    expect(registryRow(installDir).row.wayflow).toBe(false);
+
+    await runInstall(args([]), { log: () => {}, deps: isolatedDeps() });
+    const row = registryRow(installDir).row;
+    // A default row is byte-identical to what every previous version wrote:
+    // ABSENT, never a literal `true`.
+    expect(row.wayflow).toBeUndefined();
+    expect("wayflow" in row).toBe(false);
+    expect(recordedWayflowChoice(row)).toBe(true);
+  });
+
+  // ── round-6 codex convergence, round 2 ───────────────────────────────────
+  // The alloc lock serialises WRITERS; it does not stop a slug from changing
+  // hands. `cinatra instance remove x` plus a fresh install that re-uses the
+  // slug for a DIFFERENT checkout leaves a re-install holding a slug that now
+  // names someone else's row — and writing the choice onto it would flip THAT
+  // instance's WayFlow setting. The write is identity-checked: same immutable
+  // `id`, same install directory, or it is skipped.
+  it("a slug that changed hands mid-run is NOT re-recorded (identity, not just the lock)", async () => {
+    const installDir = path.join(sandbox, "iso2654r6-slug-reuse");
+    const slug = "iso2654r6slugreuse";
+    const args = (extra) => [
+      "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+      "--yes", "--no-install", "--on-conflict", "isolated", "--instance", slug,
+      "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ...extra,
+    ];
+    // This checkout opted out, so a later re-install WITHOUT the flag wants to
+    // DELETE the key — the destructive direction, and the one that silently
+    // turns another instance's runtime back on.
+    await runInstall(args(["--no-wayflow"]), { log: () => {}, deps: isolatedDeps() });
+    expect(registryRow(installDir).row.wayflow).toBe(false);
+
+    // Mid-run, another process removes the slug and re-uses it for a DIFFERENT
+    // checkout that ALSO opted out. Fired from the re-render log line, so it
+    // lands after this run read its row and before the choice is persisted.
+    const registryFile = process.env.CINATRA_INSTANCE_REGISTRY;
+    const otherDir = path.join(sandbox, "iso2654r6-slug-reuse-other");
+    let swapped = false;
+    const swap = () => {
+      const reg = JSON.parse(readFileSync(registryFile, "utf8"));
+      reg.instances[slug] = {
+        ...reg.instances[slug],
+        id: "inst_someone_else",
+        installDir: otherDir,
+        wayflow: false,
+      };
+      writeFileSync(registryFile, JSON.stringify(reg, null, 2) + "\n");
+      swapped = true;
+    };
+
+    // …and THIS run does not opt out, so its persist would delete that key.
+    await runInstall(args([]), {
+      log: (l) => {
+        if (!swapped && String(l).includes("Regenerated docker-compose.cinatra-isolated.yml")) swap();
+      },
+      deps: isolatedDeps(),
+    });
+    expect(swapped).toBe(true);
+
+    // The OTHER instance's opt-out stands: this run did not delete it, and did
+    // not write its own choice onto a row it no longer owns.
+    const after = JSON.parse(readFileSync(registryFile, "utf8")).instances[slug];
+    expect(after.id).toBe("inst_someone_else");
+    expect(after.installDir).toBe(otherDir);
+    expect(after.wayflow).toBe(false);
+  });
+
+  // ── round-6 codex convergence, round 3 ───────────────────────────────────
+  // The `id` cannot see a remove-and-reallocate of the SAME checkout under the
+  // SAME slug: an allocation derives the id deterministically as
+  // `inst_<slug>`, so the replacement row carries the identical one and the
+  // directory matches too. `createdAt` — stamped once at allocation, never
+  // rewritten by any patch writer — is what tells the two allocations apart.
+  it("a slug REMOVED and re-allocated for the same checkout mid-run is a different allocation, and is left alone", async () => {
+    const installDir = path.join(sandbox, "iso2654r6-realloc");
+    const slug = "iso2654r6realloc";
+    const args = (extra) => [
+      "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+      "--yes", "--no-install", "--on-conflict", "isolated", "--instance", slug,
+      "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ...extra,
+    ];
+    await runInstall(args(["--no-wayflow"]), { log: () => {}, deps: isolatedDeps() });
+    const first = registryRow(installDir).row;
+    expect(first.wayflow).toBe(false);
+
+    const registryFile = process.env.CINATRA_INSTANCE_REGISTRY;
+    let realloced = false;
+    const realloc = () => {
+      const reg = JSON.parse(readFileSync(registryFile, "utf8"));
+      // Removed and re-created: same slug, same checkout, same derived id — a
+      // NEW allocation, and only `createdAt` says so.
+      reg.instances[slug] = { ...reg.instances[slug], createdAt: "2099-01-01T00:00:00.000Z", wayflow: false };
+      writeFileSync(registryFile, JSON.stringify(reg, null, 2) + "\n");
+      realloced = true;
+    };
+
+    // This run does NOT opt out, so its persist would delete the new
+    // allocation's opt-out.
+    await runInstall(args([]), {
+      log: (l) => {
+        if (!realloced && String(l).includes("Regenerated docker-compose.cinatra-isolated.yml")) realloc();
+      },
+      deps: isolatedDeps(),
+    });
+    expect(realloced).toBe(true);
+
+    const after = JSON.parse(readFileSync(registryFile, "utf8")).instances[slug];
+    expect(after.id).toBe(first.id); // the id genuinely could not tell them apart
+    expect(after.createdAt).toBe("2099-01-01T00:00:00.000Z");
+    expect(after.wayflow).toBe(false);
+  });
+
+  // The promotion standing immediately after the choice write was older, and
+  // slug-only: a hand-over during the bring-up marked the REPLACEMENT row ready
+  // and overwrote its recorded SHA with this run's.
+  it("the ready-promotion is identity-checked too: a PROVISIONING row that changed hands is not promoted", async () => {
+    const installDir = path.join(sandbox, "iso2654r6-promote");
+    const slug = "iso2654r6promote";
+    await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", slug,
+        "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ],
+      { log: () => {}, deps: isolatedDeps() },
+    );
+    // The PLAIN re-run (no --on-conflict): the route whose tail carries the
+    // ready-promotion under test.
+    const reRun = ["--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main", "--yes", "--no-install"];
+
+    const registryFile = process.env.CINATRA_INSTANCE_REGISTRY;
+    const otherDir = path.join(sandbox, "iso2654r6-promote-other");
+    // Put the row back into `provisioning` so the re-run reaches the promotion.
+    {
+      const reg = JSON.parse(readFileSync(registryFile, "utf8"));
+      reg.instances[slug] = { ...reg.instances[slug], state: "provisioning", sha: "aaaaaaa" };
+      writeFileSync(registryFile, JSON.stringify(reg, null, 2) + "\n");
+    }
+
+    let swapped = false;
+    const swap = () => {
+      const reg = JSON.parse(readFileSync(registryFile, "utf8"));
+      reg.instances[slug] = {
+        ...reg.instances[slug],
+        id: "inst_someone_else",
+        installDir: otherDir,
+        state: "provisioning",
+        sha: "bbbbbbb",
+      };
+      writeFileSync(registryFile, JSON.stringify(reg, null, 2) + "\n");
+      swapped = true;
+    };
+
+    await runInstall(reRun, {
+      log: (l) => {
+        if (!swapped && String(l).includes("Regenerated docker-compose.cinatra-isolated.yml")) swap();
+      },
+      deps: isolatedDeps(),
+    });
+    expect(swapped).toBe(true);
+
+    const after = JSON.parse(readFileSync(registryFile, "utf8")).instances[slug];
+    // The other instance is NOT reported ready by this run, and keeps its SHA.
+    expect(after.state).toBe("provisioning");
+    expect(after.sha).toBe("bbbbbbb");
+  });
+
+  it("BLOCKING B: `instance a2a start` self-heals a --no-wayflow install WITHOUT demanding a bridge-token route", async () => {
+    const installDir = await leanIsolatedInstall("iso2654r6-a2a-lean");
+
+    // The install this reaches: lean by request. The `wayflow` service is
+    // rendered (every profile-gated service is, so it can be enabled later) but
+    // carries no token route, and nothing on disk could give it one.
+    const before = readIsoDoc(installDir);
+    expect(before.services.wayflow).toBeDefined();
+    expect(before.services.wayflow.environment?.CINATRA_BRIDGE_TOKEN).toBeUndefined();
+    expect(isolatedComposeHasA2aPeers(before)).toBe(false);
+
+    let upCalled = false;
+    const err = await runIsolatedA2aPeers(["start"], {
+      targetDir: installDir,
+      log: () => {},
+      deps: peerAwareDeps({ runCompose: () => { upCalled = true; return { status: 0 }; } }),
+    }).then(() => null, (e) => e);
+
+    // THE FIX: the self-heal reproduces the install's own choice, so it
+    // regenerates cleanly and the peers actually start.
+    expect(err).toBe(null);
+    expect(upCalled).toBe(true);
+
+    const after = readIsoDoc(installDir);
+    expect(isolatedComposeHasA2aPeers(after)).toBe(true);
+    // …and the instance is still LEAN: the self-heal did not turn the agent
+    // runtime on behind the operator's back by baking in a route for it.
+    expect(after.services.wayflow.environment?.CINATRA_BRIDGE_TOKEN).toBeUndefined();
+  });
+
+  it("BLOCKING B, the other direction: a row that did NOT opt out still has the WayFlow route demanded", async () => {
+    // Same inlining Compose, same tokenless fixture — but this install never
+    // opted out, so the wiring invariant's WayFlow arm must still refuse. This
+    // is the over-fix guard: threading `false` unconditionally (or dropping the
+    // arm from this caller) would silently self-heal a BROKEN runtime into
+    // place for an instance that does want one.
+    const installDir = path.join(sandbox, "iso2654r6-a2a-full");
+    await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso2654r6a2afull",
+        "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ],
+      // The install itself runs on a PRESERVING Compose (so it completes: the
+      // `env_file:` reference carries the route). The a2a run below then meets
+      // an INLINING one — an engine downgrade, or a different machine.
+      { log: () => {}, deps: isolatedDeps() },
+    );
+    expect(registryRow(installDir).row.wayflow).toBeUndefined();
+
+    const err = await runIsolatedA2aPeers(["start"], {
+      targetDir: installDir,
+      log: () => {},
+      deps: peerAwareDeps({
+        runCompose: () => {
+          throw new Error("runCompose must not be reached: the WayFlow route is still demanded for this row");
+        },
+      }),
+    }).then(() => null, (e) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/a2a-peers services and could not be regenerated/i);
+  });
+
+  // ── round-7 review, NB2 ───────────────────────────────────────────────────
+  // The re-record ran AFTER the bring-up on both re-install routes, so a failed
+  // `up` left the row describing the PREVIOUS install's choice while the compose
+  // on disk was already re-rendered for this one. The later `instance a2a`
+  // self-heal reads that row, and the disagreement is invisible until it
+  // demands (or skips) a bridge-token route for the wrong reason. The field
+  // describes the RENDER, so it is written next to the regeneration it
+  // describes — before the bring-up that can fail.
+  const failingUpDeps = (extra = {}) =>
+    inliningDeps({
+      captureDeployedVersions: () => ({ ok: true, versions: {} }),
+      bringUpInfra: () => {
+        throw new Error("docker compose up failed (simulated)");
+      },
+      ...extra,
+    });
+
+  it("NB2: a FAILED bring-up on the RE-CONVERGE route still leaves the choice recorded", async () => {
+    const installDir = path.join(sandbox, "iso2654r7-nb2-reconverge");
+    const args = (extra) => [
+      "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+      "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso2654r7nb2rec",
+      "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ...extra,
+    ];
+    // (1) a normal install: nothing recorded, which reads as "wayflow in scope".
+    await runInstall(args([]), { log: () => {}, deps: isolatedDeps() });
+    expect(registryRow(installDir).row.wayflow).toBeUndefined();
+
+    // (2) the operator re-installs LEAN — a plain re-run (no --on-conflict), so
+    //     runInstall routes through the isolated re-converge — and the `up`
+    //     fails after the compose has already been re-rendered without a
+    //     WayFlow route.
+    const err = await runInstall(
+      [
+        "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+        "--yes", "--no-install", "--no-wayflow",
+      ],
+      { log: () => {}, deps: failingUpDeps() },
+    ).then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(Error);
+
+    // THE FIX: the row describes the compose that WAS rendered, not the
+    // bring-up that failed after it.
+    const row = registryRow(installDir).row;
+    expect(row.wayflow).toBe(false);
+    expect(recordedWayflowChoice(row)).toBe(false);
+  });
+
+  it("NB2: a FAILED bring-up on the EXPLICIT --on-conflict=isolated re-run still leaves the choice recorded", async () => {
+    const installDir = path.join(sandbox, "iso2654r7-nb2-explicit");
+    const args = (extra) => [
+      "--dir", installDir, "--repo-url", `file://${originRepo}`, "--ref", "main",
+      "--yes", "--no-install", "--on-conflict", "isolated", "--instance", "iso2654r7nb2exp",
+      "--port-offset", String(OFFSET), "--app-port", String(APP_PORT),
+      ...extra,
+    ];
+    await runInstall(args([]), { log: () => {}, deps: isolatedDeps() });
+    expect(registryRow(installDir).row.wayflow).toBeUndefined();
+    expect(registryRow(installDir).row.state).toBe("ready");
+
+    // The idempotent re-run of a recorded READY row: it re-renders the compose,
+    // then brings the stack up — and that `up` fails.
+    const err = await runInstall(args(["--no-wayflow"]), { log: () => {}, deps: failingUpDeps() })
+      .then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(Error);
+
+    const row = registryRow(installDir).row;
+    expect(row.wayflow).toBe(false);
+    expect(recordedWayflowChoice(row)).toBe(false);
   });
 });

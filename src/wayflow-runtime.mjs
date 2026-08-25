@@ -21,7 +21,7 @@
 
 import path from "node:path";
 import { spawnSync as nodeSpawnSync } from "node:child_process";
-import { existsSync as nodeExistsSync } from "node:fs";
+import { existsSync as nodeExistsSync, readFileSync as nodeReadFileSync } from "node:fs";
 
 /** The compose service name AND the compose profile that gates it. */
 export const WAYFLOW_SERVICE = "wayflow";
@@ -102,6 +102,104 @@ export function wayflowStatusLines(mode, { endpoint = `http://localhost:${DEFAUL
   return [`  Agent runtime: WayFlow started with the stack (${endpoint}).`];
 }
 
+/** The narrow, generated container env the `wayflow` service reads through its
+ *  compose `env_file` (`required: false`). Path is repo-relative — it lives
+ *  INSIDE the checkout the install owns, next to the compose file that
+ *  references it. */
+export const WAYFLOW_ENV_FILE = path.join("docker", "wayflow", ".wayflow.env");
+
+/** The one key whose absence crash-loops the runtime ("[agent_loader] FATAL:
+ *  CINATRA_BRIDGE_TOKEN is unset or empty … Refusing to start."). */
+export const WAYFLOW_BRIDGE_TOKEN_KEY = "CINATRA_BRIDGE_TOKEN";
+
+// cinatra#2654 D1 — the generator postcondition is graded, and each tier says
+// why it is the tier it is. `gen-wayflow-env.mjs` derives this file from
+// `.env.local`; a file that is missing keys is a BROKEN GENERATOR RUN, not an
+// operator choice, so the check is on the file rather than on the exit code.
+//
+//   REQUIRED  — the install must not proceed without these. Both are minted
+//               unconditionally into `.env.local` for EVERY mode by
+//               ensureEnvLocal, so a generated file lacking one cannot be a
+//               legitimate configuration; and each disables the runtime:
+//               CINATRA_BRIDGE_TOKEN makes the loader refuse to start at all,
+//               CINATRA_CONTEXT_ATTEST_KEY makes the app fail CLOSED on the
+//               composed-child context path (a runtime that starts and then
+//               rejects every context callback).
+//   EXPECTED  — warn, do not block. WAYFLOW_BASE_URL is the runtime's own
+//               self-URL; the container has a compose-level default and an
+//               instance whose file predates the key still runs, so an install
+//               that would otherwise succeed is not worth failing. Naming it is
+//               what makes a stale generator visible.
+//   OPTIONAL  — never checked. OPENAI_API_KEY is legitimately unset on a fresh
+//               install (it is carried empty from `.env.example`).
+
+/** Keys whose absence from the generated file ABORTS the install. */
+export const WAYFLOW_ENV_REQUIRED_KEYS = ["CINATRA_BRIDGE_TOKEN", "CINATRA_CONTEXT_ATTEST_KEY"];
+/** Keys whose absence is reported but not fatal. */
+export const WAYFLOW_ENV_EXPECTED_KEYS = ["WAYFLOW_BASE_URL"];
+
+/**
+ * The NON-EMPTY keys ANY narrow env file supplies, or null when it is absent /
+ * unreadable. Key NAMES only — never a value, and nothing here is logged.
+ *
+ * cinatra#2654 D1 (round 3). This is the generic form of the wayflow-only reader
+ * below, and it is what lets the PRODUCTION wiring invariant reason about the
+ * checkout's OTHER narrow env files (`docker/nango/.nango.env`,
+ * `docker/graphiti/.graphiti.env`, `docker/plane-mcp/.plane-mcp.env`) instead of
+ * only wayflow's. The parse is `scripts/gen-wayflow-env.mjs`'s own dotenv shape,
+ * which every one of those generators writes.
+ *
+ * @returns {Set<string>|null}
+ */
+export function envFileSuppliedKeys(absPath, { readImpl = nodeReadFileSync } = {}) {
+  let body;
+  try {
+    body = String(readImpl(absPath, "utf8"));
+  } catch {
+    return null;
+  }
+  const supplied = new Set();
+  for (const line of body.split("\n")) {
+    const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+    if (!match) continue;
+    if (match[2].replace(/^["']|["']$/g, "").trim() !== "") supplied.add(match[1]);
+  }
+  return supplied;
+}
+
+/**
+ * Parse the narrow generated env file and report WHICH of the keys the runtime
+ * needs it actually supplies with a non-empty value. This is the POSTCONDITION
+ * of the generator, checked independently of it: the install may only promise a
+ * runtime once the wiring actually reached the file the container reads.
+ *
+ * Parsing mirrors `scripts/gen-wayflow-env.mjs`'s own dotenv regex (same shape,
+ * same quote stripping) so the two never disagree about what "supplied" means.
+ * Returns key NAMES only — never a value, and nothing here is logged.
+ *
+ * @returns {{ exists: boolean, supplied: Set<string>, missingRequired: string[], missingExpected: string[] }}
+ */
+export function inspectWayflowEnvFile({ targetDir, readImpl = nodeReadFileSync } = {}) {
+  const read = envFileSuppliedKeys(path.join(targetDir, WAYFLOW_ENV_FILE), { readImpl });
+  // absent / unreadable — the container would start tokenless
+  const exists = read !== null;
+  const supplied = read ?? new Set();
+  return {
+    exists,
+    supplied,
+    missingRequired: WAYFLOW_ENV_REQUIRED_KEYS.filter((k) => !supplied.has(k)),
+    missingExpected: WAYFLOW_ENV_EXPECTED_KEYS.filter((k) => !supplied.has(k)),
+  };
+}
+
+/** The NON-EMPTY keys the generated env file supplies, or null when it is absent
+ *  / unreadable. Feeds the generated-compose precedence invariant (an
+ *  `environment:` key set EMPTY overrides the file's value on the same key). */
+export function wayflowEnvSuppliedKeys({ targetDir, readImpl = nodeReadFileSync } = {}) {
+  const seen = inspectWayflowEnvFile({ targetDir, readImpl });
+  return seen.exists ? seen.supplied : null;
+}
+
 /**
  * The WayFlow endpoint THIS install's operator must actually open, derived from
  * the SAME per-instance port allocation that `.env.local`'s `WAYFLOW_BASE_URL` is
@@ -131,9 +229,15 @@ export function wayflowEndpointForPorts(ports) {
  * make. It MUST run before the compose `up`: the runtime reads
  * `CINATRA_BRIDGE_TOKEN` from that file and crash-loops without it.
  *
- * A checkout without the generator (an older tree) is a WARN, not a failure —
- * compose tolerates the missing `env_file` and the container still fails loud
- * on a missing token. A generator that EXISTS and FAILS aborts the caller.
+ * HONESTY (cinatra#2654 D1). The result is judged by the FILE, not by the
+ * generator's exit code: a `.wayflow.env` that does not exist, or that does not
+ * supply the full REQUIRED key set (WAYFLOW_ENV_REQUIRED_KEYS), is `ok: false` —
+ * the caller must abort rather than start a runtime that cannot authenticate its
+ * callbacks and then report a ready instance. That is the same loud, attributable
+ * shape the broken-image-build path already has. A missing EXPECTED key warns by
+ * name (see the tier rationale above). A checkout without the generator (an older
+ * tree) is a WARN only when an already-usable `.wayflow.env` is on disk; without
+ * one there is no route for the wiring into the container, so it is a failure too.
  *
  * @returns {{ ok: boolean, skipped: boolean, reason: string|null }}
  */
@@ -142,13 +246,42 @@ export function generateWayflowEnv({
   log = console.log,
   spawnImpl = nodeSpawnSync,
   existsImpl = nodeExistsSync,
+  readImpl = nodeReadFileSync,
   execPath = process.execPath,
 } = {}) {
+  const inspect = () => inspectWayflowEnvFile({ targetDir, readImpl });
+  /** The one place that turns a file inspection into a verdict, so the
+   *  generator-absent and generator-ran paths can never disagree about what
+   *  "produced" means. Reports the EXPECTED-but-missing keys as a warning. */
+  const judge = (context) => {
+    const seen = inspect();
+    if (seen.missingRequired.length > 0) {
+      return {
+        ok: false,
+        skipped: false,
+        reason:
+          `${context} and ${WAYFLOW_ENV_FILE} does not supply ${seen.missingRequired.join(", ")} ` +
+          "(the file the container reads is the authority, not the exit code)",
+      };
+    }
+    if (seen.missingExpected.length > 0) {
+      log(
+        `  ⚠ ${WAYFLOW_ENV_FILE} does not supply ${seen.missingExpected.join(", ")}. The runtime starts ` +
+          "(the bridge token and the attest key are present) but falls back to the compose default for it; " +
+          "update the checkout so `scripts/gen-wayflow-env.mjs` writes the full key set.",
+      );
+    }
+    return null;
+  };
+
   const generator = path.join(targetDir, "scripts", "gen-wayflow-env.mjs");
   if (!existsImpl(generator)) {
+    const bad = judge("scripts/gen-wayflow-env.mjs is absent from this checkout");
+    if (bad) return bad;
     log(
-      "  ⚠ scripts/gen-wayflow-env.mjs is absent from this checkout — starting WayFlow without " +
-        "regenerating docker/wayflow/.wayflow.env. If agent replies stay empty, the bridge token is missing.",
+      "  ⚠ scripts/gen-wayflow-env.mjs is absent from this checkout — starting WayFlow with the " +
+        `${WAYFLOW_ENV_FILE} already on disk (it supplies ${WAYFLOW_ENV_REQUIRED_KEYS.join(", ")}). ` +
+        "Update the checkout to keep a rotated token propagating.",
     );
     return { ok: true, skipped: true, reason: "generator-absent" };
   }
@@ -165,7 +298,22 @@ export function generateWayflowEnv({
       reason: `gen-wayflow-env.mjs failed (exit ${status})${result?.error ? `: ${result.error.message}` : ""}`,
     };
   }
+  const bad = judge("gen-wayflow-env.mjs exited 0");
+  if (bad) return bad;
   return { ok: true, skipped: false, reason: null };
+}
+
+/** The error an unproducible bridge-token env raises. Names the file, the real
+ *  reason, and BOTH recoveries — the same shape as a failed image build, because
+ *  it is the same class of failure: a runtime that cannot start. */
+export function wayflowEnvFailureMessage(reason) {
+  return (
+    `Refusing to start the WayFlow agent runtime — ${reason}. ` +
+    "Without CINATRA_BRIDGE_TOKEN the runtime crash-loops and every agent run fails; without " +
+    "CINATRA_CONTEXT_ATTEST_KEY it starts and then rejects every context callback. " +
+    "Fix .env.local (re-run `cinatra install --reset-env` to mint the secrets), " +
+    "or re-run with `--no-wayflow` to install without the agent runtime."
+  );
 }
 
 /**

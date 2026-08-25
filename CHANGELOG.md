@@ -119,6 +119,268 @@ project adheres to [Semantic Versioning](https://semver.org/).
   teardown holds the lock removes the mutual exclusion protecting the port
   registries. An abandoned lock needs no manual cleanup.
 
+- **An isolated install no longer starts an agent runtime that cannot boot, and
+  a re-run finally repairs one that already exists.** An isolated install writes
+  its own flattened compose file and brings the stack up from that file alone.
+  It rendered that file with `docker compose config`, which *resolves* every
+  service `env_file:` — it copies whatever the file held at that moment into
+  `environment:` and drops the reference. The WayFlow runtime takes its bridge
+  token from exactly such a file, `docker/wayflow/.wayflow.env`, and the
+  bring-up writes that file one second *after* the render. A first install on a
+  clean directory therefore froze the runtime with three static keys and no
+  `CINATRA_BRIDGE_TOKEN`: the container refused to start ("FATAL:
+  CINATRA_BRIDGE_TOKEN is unset or empty"), every agent run failed with
+  ECONNREFUSED, and the install still exited 0, printed complete and recorded
+  the instance as ready. A *second* install on the same directory worked, purely
+  because the first attempt's file was on disk by then — so the failure only
+  ever hit a real operator's first install. The isolated render now asks compose
+  not to resolve service env files, so the generated compose *references*
+  `docker/wayflow/.wayflow.env` and reads its content when the stack comes up —
+  which is what the checkout's own compose file specifies for this service, and
+  what keeps a rotated token propagating instead of freezing a copy of it into a
+  generated file. A reconcile (`cinatra install` re-run, the recovery the
+  failure message and the doctor both name) now re-renders that generated
+  compose instead of skipping the work, so an instance installed by the broken
+  path is repaired in place rather than carrying the defect forever. And the
+  install now judges the bridge-token step by the file it was supposed to
+  produce rather than by the generator's exit code: when the token cannot be
+  produced, the install stops with a named, attributable failure — nothing
+  built, nothing started, no instance marked ready — exactly as a broken runtime
+  image build already did. A runtime that is observed restarting is reported as
+  a crash loop with the command that shows why, not as a slow cold start.
+
+  Whether Compose keeps the reference (`config --no-env-resolution`) is now
+  PROBED — by rendering a throwaway compose and checking whether `env_file:`
+  actually survived, not by looking for the flag in `--help` or comparing a
+  version to a floor. Those are different questions, and they disagree in
+  practice: Compose 2.38.2 lists the flag, accepts it, exits 0 — and inlines the
+  env file anyway. A spelling check would have called that supported and frozen a
+  snapshot, which is the original defect. On a Compose that does not keep the
+  reference the install says so, names the version, and takes a stated fallback:
+  the env file
+  is provisioned before the render either way, so what compose inlines is the
+  real wiring, and the generator re-symbolises those secrets to `${KEY}` values
+  the isolated `up` resolves from `.env.local` — no secret is written into the
+  generated file, and a rotated token still reaches the container. The
+  render-time invariant now checks the *path* the wayflow service references
+  (not merely that some `env_file:` is present), rejects an explicitly EMPTY
+  `environment:` value that would override the file it points at, and covers
+  `nango-server`, `graphiti` and `plane-mcp` on the same terms by requiring
+  every `env_file:` the resolved source carried to survive into the generated
+  document — and, because an inlining Compose has already stripped those
+  references from the source document before that rule can look, it also checks
+  all four services against the env files the checkout itself declares: the
+  reference when this Compose preserves it, and otherwise every VALUE those
+  files supply. Each service is named by its COMPOSE SERVICE KEY, so the
+  knowledge-graph service is `graphiti`; a name the compose does not declare is
+  skipped, which would disable the arm for that service in silence, and a test
+  now holds every entry against the resolved compose. The empty-override
+  rejection reads each service's own env file off disk, so it protects all four
+  in production rather than only `wayflow`. The three siblings reach that
+  coverage only when their env file EXISTS in the checkout: a CLI-driven install
+  provisions `.wayflow.env` alone, so they are covered when the operator
+  generated the other three from the checkout first, not on every install.
+  Provisioning them from the CLI stays a follow-up.
+  The generated `docker-compose.cinatra-isolated.yml` now
+  states in a header comment that it is CLI-owned and re-derived in full on
+  every run — it never preserved an operator edit, and a file it could not parse
+  is regenerated rather than skipped, which had made corrupting the file the way
+  to pin a defective compose in place. A reconcile that *fails* to regenerate
+  now aborts instead of quietly bringing the old file up. The two cases where a
+  generated compose genuinely *cannot* be re-derived — an ambiguous legacy band
+  offset, a shifted base band — no longer warn and start the recorded file
+  either: that file may be the exact tokenless compose the reconcile exists to
+  repair, so it is VALIDATED against the same wiring invariant first. If it
+  passes, the bring-up proceeds and says it was checked; if it fails (or cannot
+  be parsed), the bring-up is REFUSED with the recovery named, rather than
+  starting a runtime already known to have no bridge token.
+
+  An install directory reached through a SYMLINK no longer fails that invariant.
+  `docker compose config` emits every `env_file:` path as a realpath, while the
+  paths the check compares them against are built from the directory the operator
+  named — so a symlinked checkout (a linked home volume, a symlinked `TMPDIR`,
+  `~/src/app` pointing elsewhere) produced two different spellings of the same
+  file, and all four references read as missing. On the Compose versions that
+  keep the reference — the route this release adds — that aborted the install
+  outright. Both sides are now canonicalised by resolving symlinks, tolerating a
+  path whose file does not exist yet (the wayflow env file is compared before a
+  dry-run creates it) by canonicalising the nearest existing ancestor.
+
+  `--no-wayflow` now opts out of that invariant's WayFlow arm, as it already
+  opted out of provisioning the env file. On a Compose that inlines, the file was
+  never written, so nothing carried a bridge token into the render and the check
+  aborted an install that had explicitly asked for no agent runtime. The opt-out
+  gates only the WayFlow arm — `nango-server`, `graphiti` and `plane-mcp` keep
+  whatever protection they already have, on their own terms (each still needs
+  its env file present in the checkout) — and it applies to the reconcile paths
+  too, including the validation of a recorded compose that cannot be re-derived
+  in place.
+
+  The plain reconcile — a bare `cinatra install` on a checkout already recorded
+  as isolated — now provisions that env file BEFORE it re-renders, as the first
+  install does. On a Compose that inlines, what the render inlines *is* the
+  wiring, so with the file absent the re-derived compose carried no bridge token
+  and the wiring invariant refused — which dead-ended the recovery, because
+  re-running the install is exactly what every one of those failures prescribes.
+  And that refusal now names what an operator can do about it (provision the file
+  and re-run, or install with `--no-wayflow`) instead of ending at "this is an
+  internal invariant violation; please report it" — which is kept as the last
+  resort rather than the only one.
+
+  `cinatra instance wayflow start` now passes `--env-file .env.local` to the
+  `up`, like every other bring-up of a recorded stack. It ups the instance's
+  RECORDED compose file, and for an isolated instance rendered on a Compose that
+  could not preserve `env_file:` the bridge token in that file is a
+  `${CINATRA_BRIDGE_TOKEN}` placeholder only `.env.local` resolves — without the
+  flag compose substituted the empty string and the runtime came back up
+  tokenless, which is the crash loop this release fixes, re-introduced by the one
+  command an operator runs to restart it. `stop` passes it too, so `rm` addresses
+  an identically interpolated document.
+
+  That command can now also REWRITE the recorded compose, and can REFUSE to
+  start. `cinatra instance wayflow start` is the documented hand-start for an
+  install that opted out of the runtime, and a `--no-wayflow` install's recorded
+  compose never had a bridge-token route rendered into it at all — the render
+  invariant is gated on the same opt-out that skipped provisioning the env file.
+  A placeholder already IN the file can be resolved by `--env-file .env.local`;
+  a directive the render never wrote cannot be. So the command now re-derives
+  that generated file, with WayFlow in scope, once the env file is provisioned
+  and before the `up` — the ONLY moment at which the repair reaches the
+  container this run starts. It runs on `start` only, never on `stop`, and only
+  when the recorded document carries no working route under either render route:
+  a document that is already wired is left byte-identical and no regeneration
+  runs at all. Because the re-derive can ENLARGE the instance's port map — a
+  compose predating the profile-gated services gains a `wayflow` service on this
+  instance's own offset host port — the command also re-points `.env.local` at
+  what it allocated, through the same writer the install path uses. Without that
+  the runtime would start on the offset port while the app kept dialling the
+  default one: a dead port, or, with a default stack also up, ANOTHER instance's
+  runtime, which is worse because it answers.
+
+  That re-point now runs on EVERY start, not only behind a re-derive. The
+  compose file, the registry row and `.env.local` are written at three different
+  moments, so a run interrupted between them leaves an install whose file and row
+  are already repaired while the env still names the old port; every later start
+  read the repaired file, answered "already wired", and returned before it got
+  to the env. What the re-point may write stays narrow. A key `.env.local`
+  already carries is re-pointed from its OWN value, so credentials, database
+  name, scheme and path survive. A key that already names the right port is left
+  alone, so a start with nothing to repair leaves the file byte-identical. Only
+  one absent key is ever written from nothing: `WAYFLOW_BASE_URL`, whose URL
+  carries no credentials and whose absence IS the leak, since the app then dials
+  the default `:3010`.
+
+  The app-identity keys are narrower still. `PORT`, `BETTER_AUTH_URL` and
+  `NEXT_PUBLIC_BETTER_AUTH_URL` describe the app, not the port map, so only a
+  re-derive that MOVED the map can rewrite them, and only where the file already
+  carries a value that disagrees with the recorded app port. `PORT` is a bare
+  number, so it disagrees when it names a different number.
+
+  The two auth keys hold URLs, and the repair claims only the ones it can
+  RECOGNISE as an address of the app's own port. The isolated app is a `pnpm dev`
+  server on the host, serving plain HTTP on the port this CLI allocated. So a
+  self-URL is repaired only when its scheme is `http:`, its host is one of
+  `localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0` or `[::]`, and the port it names
+  is not 80 or 443. Every other value is left byte-identical. So
+  `https://auth.example.test/custom` served by a proxy on 443,
+  `http://auth.example.test:3005/x` behind a reverse proxy, and
+  `http://localhost/` in front of a local nginx all come out of a start
+  unchanged, whatever the app port is. No opt-out key is needed, and none is
+  added.
+
+  The test is deliberately conservative, and it declines rather than guesses. An
+  `https://` origin can certainly REACH this instance, but it cannot BE the app's
+  own bind, because the app terminates no TLS. No app port is ever 80 or 443
+  either, since the allocator picks from 3300-3399 and `--app-port` is refused
+  below 1024. The host rule is the cautious one. A LAN address or a DNS name can
+  reach a server that bound every interface, so such a value MAY be the app
+  rather than a proxy, and this command cannot tell which. It leaves it alone.
+  The cost is that an operator who addresses the app that way repairs the port by
+  hand. The alternative cost was breaking a working sign-in, which is what the
+  previous rule did.
+
+  For a URL the repair does claim, only the PORT is compared and only the PORT is
+  written. One that already names the recorded port is left exactly as it is, so
+  `http://127.0.0.1:3350/custom` comes out of a start untouched. One that names a
+  different port keeps its credentials, host, path and query, and gains the new
+  port, in the normalised spelling of the URL parser (an empty path gains its
+  `/`). A value the CLI cannot parse as a URL is left alone. The infra keys below
+  are unaffected by all of this and keep reading a stated-no-port URL as its
+  scheme's default. The move is measured on the file this run re-derived, before
+  against after. A start that merely verifies leaves all three exactly as the
+  operator set them, and so does a re-derive that moved no port, however far the
+  registry row lags the compose file for some other service.
+
+  Two consequences to know before running it. First, the re-point is not limited
+  to WayFlow: `SUPABASE_DB_URL`, `REDIS_URL`, the two Nango URLs, the two agent
+  registry URLs and `NEO4J_URI` are re-pointed as well when the file carries them
+  and their port disagrees with what this instance publishes. `.env.local` is a
+  file operators maintain by hand, so the command now also PRINTS the
+  `service:port` pairs it re-pointed, before the `up` — and `app:<port>` when it
+  wrote the app keys, so the line can never call an app-only re-point an infra
+  one. Second, the ports it speaks are the ports the generated compose it is
+  about to bring up PUBLISHES, never a recorded row that lags that file. When a
+  shared service's recorded port disagrees with what the file publishes, the
+  command refuses the start, names the service and both ports, and changes
+  nothing; it re-reads the file once more immediately before the `up`, so the
+  launch is never authorised by a reading its own writes have had time to
+  invalidate.
+
+  The command also CLEARS a recorded `--no-wayflow` opt-out on the instance's
+  registry row, on every path it returns from, because starting the runtime by
+  hand is the act of turning it on. `cinatra instance a2a` reads that record when
+  it self-heals a stale compose; left in place it would skip the bridge-token
+  assertion for an instance that does run the runtime. A row that never opted out
+  is not rewritten at all.
+  And when the file genuinely cannot be re-derived in place (an ambiguous legacy
+  band offset, a shifted base band) the recorded document is validated against
+  the same wiring invariant rather than started on trust — so this command can
+  now FAIL an operator's start, attributably and with the recovery named,
+  instead of bringing up a runtime already known to have no bridge token.
+
+  `cinatra instance a2a start` no longer turns the agent runtime back on for an
+  install that asked for none. That command self-heals a stale isolated compose
+  by re-deriving it (so the a2a-peer services it needs are present), and the
+  re-derive demanded a WayFlow bridge-token route unconditionally — a route a
+  `--no-wayflow` install deliberately never provisioned. On a Compose that
+  inlines env files the re-derive therefore failed the wiring invariant, the
+  self-heal swallowed that as a warning, and the command dead-ended on "the
+  isolated compose does not include the a2a-peers services and could not be
+  regenerated in place" for an instance whose compose is exactly what its own
+  install wrote. An isolated install now RECORDS its WayFlow choice on the
+  registry row, and the self-heal reproduces it: a lean install stays lean, and
+  every instance that did not opt out — including every instance recorded before
+  this field existed — keeps the route demanded exactly as before.
+
+  Two things found while recording that command's real-run transcript, both of
+  which had to be fixed for it to reach the right stack at all. `cinatra instance
+  wayflow start` looks its instance up by install directory: the registry records
+  whatever `--dir` was given, while the lookup uses the checkout root — which
+  resolves through git and so is a realpath — so a checkout reached through a
+  symlink never matched itself. And the lookup's result was the registry's
+  `{slug, slot}` envelope while its caller read `composeProject` / `composeFiles`
+  off a bare row, so even a row that WAS found produced undefined fields and fell
+  back to the checkout basename and the base compose pair, while still reporting
+  that it had read the registry. Either one meant the command built a container
+  in a second, empty project rather than the instance's recorded — for an
+  isolated install, generated — compose. The same install-directory
+  canonicalisation is applied to the check that routes a plain re-run to its own
+  isolated stack, which a symlinked checkout had likewise failed.
+
+  **Behaviour change beyond the isolated path.** Because `bringUpInfra` is the
+  single seam every local bring-up uses, judging the bridge-token step by the
+  file rather than the exit code also changes the DEFAULT install: a checkout
+  that cannot produce `docker/wayflow/.wayflow.env` with a non-empty
+  `CINATRA_BRIDGE_TOKEN` and `CINATRA_CONTEXT_ATTEST_KEY` now ABORTS where it
+  previously warned and continued. This is intended. The warn-and-continue path
+  ended in exactly the failure this release fixes — a crash-looping runtime
+  behind an install that exited 0 and reported ready — and it was never
+  isolated-specific. `--no-wayflow` installs without the agent runtime, and the
+  failure names both recoveries. That non-zero exit is proven by running the
+  real `bin/cinatra.mjs` as a subprocess against a fixture checkout whose
+  generator breaks, and reading its actual exit status, the rollback it logged
+  and the ready marker it did not write.
+
 - **An isolated install now states and provisions the endpoints it actually
   allocated.** Two endpoint defects shared one root cause: the per-instance port
   allocation was not threaded through to every place a port is spoken. The
