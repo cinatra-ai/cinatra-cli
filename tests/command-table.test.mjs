@@ -408,6 +408,12 @@ describe("command table — descriptor snapshot", () => {
           "match": "command+mode",
         },
         {
+          "command": "instance verify-exposure",
+          "hidden": false,
+          "id": "dev.verify-exposure",
+          "match": "command+mode",
+        },
+        {
           "command": "instance start",
           "hidden": false,
           "id": "dev.start",

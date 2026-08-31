@@ -488,6 +488,13 @@ export const COMMAND_DESCRIPTORS = [
     summary: "Manage the dev-main Tailscale Funnel (start|stop|status).",
   },
   {
+    id: "dev.verify-exposure",
+    path: ["instance", "verify-exposure"],
+    match: "command+mode",
+    summary:
+      "Admit ONLY the app's /api/mcp callback path on its own tunnel, behind a loopback access-logging proxy that refuses every other path (up|status|check|down) — use this for a real from-the-outside verification check; use `instance tunnel` when you need the whole dev app published.",
+  },
+  {
     id: "dev.start",
     path: ["instance", "start"],
     match: "command+mode",
