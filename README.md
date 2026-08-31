@@ -94,11 +94,58 @@ checkout live under `cinatra instance …`:
     cinatra instance clone new <name>     # create an isolated deep-fork clone
     cinatra instance refresh              # reconcile deps + dev DB to your checkout
     cinatra instance tunnel start         # manage the dev Tailscale Funnel
+    cinatra instance verify-exposure up   # publish ONLY /api/mcp for a verification check
+    cinatra instance verify-exposure check  # prove that mapping admits nothing else
     cinatra instance backup create        # take a local backup bundle
     cinatra instance reset --yes          # reset the development environment
 
 Run `cinatra --help` for the top-level command list, or `cinatra instance --help`
 for the full local-bootstrap command list.
+
+### Which tunnel command do I want?
+
+Two commands publish this instance on a public tunnel, and they are for
+different jobs:
+
+* `cinatra instance tunnel start|stop|status` is the **general dev tunnel**. It
+  publishes the WHOLE local app, every path, and it is what `cinatra instance
+  setup dev` and `cinatra doctor --fix` bring up for you. Reach for it when you
+  need the app itself reachable from outside.
+* `cinatra instance verify-exposure up|status|check|down` is the **verification
+  exposure mode**. It admits exactly ONE path — the app's `/api/mcp` callback
+  path — and nothing else, on a tunnel with its own runtime state, so the two
+  never collide. Reach for it when something outside needs to reach that one
+  endpoint and nothing more.
+
+The verification exposure mode puts a loopback access-logging proxy between the
+tunnel and the app. Every request it forwards to the app is recorded as a JSON
+line (method, path, marker, status) in a log whose location `status` prints; a
+request it refuses is never forwarded and leaves no line at all. (If the log
+itself cannot be written — a full disk, say — the request is still answered, and
+the missing record makes `check` fail rather than pass.)
+
+    cinatra instance verify-exposure up       # publish /api/mcp, start the proxy
+    cinatra instance verify-exposure status   # identity, mapping, proxy, log location
+    cinatra instance verify-exposure check    # prove the mapping admits only /api/mcp
+    cinatra instance verify-exposure down     # take it down (safe when nothing is up)
+
+Where the exact match is enforced matters, so the mode states it plainly: a
+tunnel serve-config handler key is a **mount point**, so the tunnel edge also
+forwards the key's descendants (`/api/mcp/anything`). The exact match is
+therefore enforced one hop later, by the access-logging proxy itself: a request
+whose path is not exactly `/api/mcp` is refused there, is never forwarded to the
+app, and leaves no line in the access log. Paths with no mount point at all
+(`/`, `/sign-in`, `/sign-up`) never reach the proxy: the edge refuses them
+itself, at whatever status your tunnel edge uses — pass `--refused-status <n>`
+if yours differs from the default the check expects.
+
+`check` drives an unauthenticated `GET` at the public origin for `/`,
+`/sign-in`, `/sign-up`, `/api/mcp/anything` and `/api/mcp`, each tagged with its
+own marker, and asserts that every path but `/api/mcp` comes back refused at its
+fixed status AND never appears in the access log at all — proof it was refused
+before the app rather than answered by it — while `/api/mcp` does appear in the
+log and answers the status the app documents for an unauthenticated call. `down`
+is idempotent: running it when nothing is published exits 0 and says so.
 
 ## Running more than one instance
 

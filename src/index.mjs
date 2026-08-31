@@ -250,6 +250,35 @@ import {
   devTunnelRuntimeSlug,
   claimDevTunnelRuntimeDir,
 } from "./dev-tunnel-identity.mjs";
+// cinatra-cli#246 — the verification exposure mode. Pure leaf (builtins only):
+// the path-scoped mapping builder, this mode's own runtime paths, the loopback
+// access-logging proxy, and the built-in check's assertion logic. Safe to
+// import statically on an extension-empty checkout.
+import {
+  VERIFICATION_EXPOSURE_APP_UNAUTHENTICATED_STATUS,
+  VERIFICATION_EXPOSURE_HEALTH_PATH,
+  VERIFICATION_EXPOSURE_MAPPED_PATH,
+  VERIFICATION_EXPOSURE_MARKER_HEADER,
+  VERIFICATION_EXPOSURE_PROXY_PORT_DEFAULT,
+  VERIFICATION_EXPOSURE_PROXY_REFUSED_STATUS,
+  VERIFICATION_EXPOSURE_UNMAPPED_STATUS,
+  acquireVerificationExposureLock,
+  buildVerificationProbePlan,
+  decideVerificationExposureProxyPort,
+  describeVerificationExposureDownOutcome,
+  evaluateVerificationExposureCheck,
+  listVerificationExposureArtifacts,
+  readAccessLogWithDiagnostics,
+  verificationExposureAccessLogPath,
+  verificationExposureComposePath,
+  verificationExposureComposeProjectName,
+  verificationExposureLockPath,
+  verificationExposureProxyStatePath,
+  verificationExposureRuntimeDir,
+  verificationExposureServePath,
+  verificationExposureTailscaleHostname,
+  writeScopedTailscaleServeConfig,
+} from "./verification-exposure.mjs";
 // Auto-declaration of the reserved main identity for a canonical install. Pure
 // decision module (no filesystem, no extensions tree) — see the module header
 // for the five gates and why each one keeps the fail-closed protection intact.
@@ -898,6 +927,15 @@ Usage:
   cinatra instance db upgrade-major --service <name> [--instance <slug>] [--target <version>] [--backup-dir <dir>] [--yes] [--json]
   cinatra instance refresh [--docker=auto|always|--no-docker] [--with-dev-apps]
   cinatra instance tunnel start
+  cinatra instance verify-exposure up [--proxy-port <n>]
+  cinatra instance verify-exposure status
+  cinatra instance verify-exposure check [--origin <url>] [--refused-status <n>]
+  cinatra instance verify-exposure down
+                               # Publishes ONLY the app's /api/mcp callback path on a
+                               # tunnel of its own, behind a loopback access-logging
+                               # proxy, for a real from-the-outside verification check.
+                               # Reach for \`instance tunnel\` instead when you need the
+                               # WHOLE dev app published for general dev use.
   cinatra instance tunnel stop
   cinatra instance tunnel status
   cinatra instance start
@@ -12911,6 +12949,863 @@ function tearDownDevTunnelSidecar({ projectName, composePath }) {
 }
 
 // ---------------------------------------------------------------------------
+// `cinatra instance verify-exposure <up|status|down|check>` (cinatra-cli#246).
+//
+// The verification exposure mode. Where `instance tunnel` publishes the WHOLE
+// local app for general dev use, this publishes exactly ONE path — the app's
+// MCP callback prefix `/api/mcp` — so an external verification check can reach
+// that endpoint from the public internet without every other page coming along
+// with it.
+//
+// A DEDICATED command, never a flag that narrows `instance tunnel`:
+// `instance setup dev`'s auto-bring-up and `cinatra doctor --fix` both call the
+// general command today expecting its whole-app mapping, and a shared runtime
+// directory would let the two lifecycles overwrite each other. This mode keeps
+// its own runtime directory, its own compose project and its own Tailscale
+// device hostname (see src/verification-exposure.mjs).
+//
+// The mapping points at a LOOPBACK ACCESS-LOGGING PROXY, not at the app: every
+// request the tunnel forwards is appended to a JSON log (method, path, marker,
+// status) at a location `status` prints, and THAT log is what makes the check's
+// central claim checkable — a path being absent from it is the proof the edge
+// refused the request rather than the app answering it.
+//
+// The mapping is path-scoped only. Whichever methods the app exposes on that
+// path travel through as the app answers them; nothing here filters methods,
+// and the app's own authentication gate stays the real admission control.
+//
+// WHERE THE EXACT MATCH IS ENFORCED. A serve-config handler key is a MOUNT
+// POINT at the tunnel edge, not an exact path: the edge resolves a request by
+// looking up its full path and then walking its parents, so a `/api/mcp`
+// handler also catches `/api/mcp/anything`. The exact match is therefore
+// enforced one hop later, by the proxy itself, which answers any path that is
+// not exactly the mapped one with the refusal status and forwards nothing — so
+// a descendant reaches neither the app nor the access log.
+//
+// It shares the general command's identity gate, its dev-only refusal, its
+// Docker/Tailscale provisioning helpers and its ownership manifest by direct
+// call — nothing is forked.
+const VERIFY_EXPOSURE_ACTIONS = ["up", "status", "down", "check"];
+
+/**
+ * Flags for the mode. All optional; the defaults are the documented ones.
+ *   --proxy-port <n>      loopback port for the access-logging proxy
+ *   --origin <url>        public origin for `check` (default: the live Funnel URL)
+ *   --refused-status <n>  the exact status the edge answers for an unmapped
+ *                         path, for an operator whose measured value differs
+ *                         from the pinned default
+ */
+function parseVerifyExposureFlags(argv) {
+  const out = {
+    proxyPort: VERIFICATION_EXPOSURE_PROXY_PORT_DEFAULT,
+    // Whether the operator NAMED a port. A named port that contradicts a proxy
+    // already running is a refusal, not something to reconcile silently.
+    proxyPortExplicit: false,
+    origin: null,
+    refusedStatus: VERIFICATION_EXPOSURE_UNMAPPED_STATUS,
+  };
+  // A number flag takes a WHOLE integer and nothing else: `--proxy-port 3399x`
+  // is a typo, and parsing it as 3399 would publish the mapping at a port the
+  // operator never named.
+  const wholeInteger = (raw, flag) => {
+    const text = String(raw ?? "").trim();
+    if (!/^[0-9]+$/.test(text)) {
+      throw new Error(`${flag} expects a whole number, got "${raw ?? ""}".`);
+    }
+    return Number.parseInt(text, 10);
+  };
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === "--proxy-port") {
+      out.proxyPort = wholeInteger(argv[i + 1], "--proxy-port");
+      out.proxyPortExplicit = true;
+      i += 1;
+    } else if (token === "--origin") {
+      out.origin = String(argv[i + 1] ?? "").trim() || null;
+      i += 1;
+    } else if (token === "--refused-status") {
+      out.refusedStatus = wholeInteger(argv[i + 1], "--refused-status");
+      i += 1;
+    } else {
+      // Neither a known flag nor a positional: this verb takes NO positional
+      // arguments after its sub-command, and silently ignoring one would let a
+      // mistyped flag pass for an accepted default.
+      throw new Error(
+        `Unexpected 'cinatra instance verify-exposure' argument "${token}". ` +
+          `Expected: [--proxy-port <n>] [--origin <url>] [--refused-status <n>].`,
+      );
+    }
+  }
+  if (!Number.isInteger(out.proxyPort) || out.proxyPort <= 0 || out.proxyPort > 65535) {
+    throw new Error(`--proxy-port expects a port in 1..65535.`);
+  }
+  if (!Number.isInteger(out.refusedStatus) || out.refusedStatus < 100 || out.refusedStatus > 599) {
+    throw new Error(`--refused-status expects an HTTP status in 100..599.`);
+  }
+  return out;
+}
+
+/** The recorded proxy process, or null when none was ever started. */
+function readVerifyExposureProxyState(statePath) {
+  try {
+    const parsed = JSON.parse(readFileSync(statePath, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Is the process listening on this port OUR proxy?
+ *
+ * A pid alone cannot answer that: pids are recycled, so a recorded pid can be
+ * alive and belong to something else entirely — and this mode both REPORTS
+ * that process as its proxy and SIGNALS it. The proxy therefore answers a
+ * loopback-only health path with the nonce minted for it, and that nonce is
+ * the ownership proof: no nonce match, no claim and no signal.
+ */
+async function verifyExposureProxyIsOurs({ proxyPort, nonce, timeoutMs = 1_000 }) {
+  if (!Number.isInteger(proxyPort) || typeof nonce !== "string" || nonce.length === 0) {
+    return false;
+  }
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${proxyPort}${VERIFICATION_EXPOSURE_HEALTH_PATH}`,
+      { signal: AbortSignal.timeout(timeoutMs) },
+    );
+    if (!response.ok) return false;
+    const body = await response.json();
+    return body?.nonce === nonce;
+  } catch {
+    return false;
+  }
+}
+
+/** The recorded proxy, and whether it is still provably ours. */
+async function readVerifyExposureProxy(statePath) {
+  const state = readVerifyExposureProxyState(statePath);
+  const pid = typeof state?.pid === "number" ? state.pid : null;
+  if (!pid || !isPidAlive(pid)) return { state, pid, live: false, ours: false };
+  const ours = await verifyExposureProxyIsOurs({
+    proxyPort: state?.proxyPort,
+    nonce: state?.nonce,
+  });
+  return { state, pid, live: true, ours };
+}
+
+/**
+ * Stop the recorded proxy. `stopped` is true only when a proven-ours, live
+ * proxy was actually signalled — a recorded pid that is already gone is not a
+ * teardown, and `down` must not claim one. A live pid that does NOT answer
+ * with our nonce is `indeterminate`: it is never signalled (it may be an
+ * unrelated process that inherited the pid) and its record is kept so the
+ * operator can see it.
+ */
+async function stopVerifyExposureProxy(statePath) {
+  const { pid, live, ours } = await readVerifyExposureProxy(statePath);
+  if (live && !ours) {
+    return { stopped: false, indeterminate: true, pid };
+  }
+  let stopped = false;
+  if (live && ours) {
+    try {
+      process.kill(pid, "SIGTERM");
+      stopped = true;
+    } catch {
+      stopped = false;
+    }
+  }
+  try {
+    rmSync(statePath, { force: true });
+  } catch {
+    // The record is a convenience; its removal failing changes nothing.
+  }
+  return { stopped, indeterminate: false, pid };
+}
+
+/**
+ * Start the access-logging proxy as a DETACHED child and record it. The parent
+ * is a one-shot CLI that exits on event-loop drain, so the child is unref'd and
+ * given its own stdio.
+ *
+ * IT DOES NOT RETURN UNTIL THE CHILD HAS PROVED IT IS LISTENING. A spawn that
+ * "succeeded" proves nothing: if the port were already taken the child would
+ * die on EADDRINUSE, and publishing the mapping anyway would point the public
+ * tunnel at whatever process DOES hold that port — bypassing the access log
+ * that is this mode's whole evidence base. So `up` waits for the child to
+ * answer its loopback health path with the nonce minted here, and a child that
+ * never does is killed and the failure raised BEFORE any mapping is written.
+ */
+async function startVerifyExposureProxy({
+  statePath,
+  logPath,
+  proxyPort,
+  upstreamPort,
+  readyTimeoutMs = 15_000,
+}) {
+  const runner = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "verification-exposure-proxy.mjs",
+  );
+  const nonce = randomUUID();
+  const child = spawn(process.execPath, [runner], {
+    detached: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      CINATRA_VERIFY_EXPOSURE_UPSTREAM_PORT: String(upstreamPort),
+      CINATRA_VERIFY_EXPOSURE_PROXY_PORT: String(proxyPort),
+      CINATRA_VERIFY_EXPOSURE_LOG_PATH: logPath,
+      CINATRA_VERIFY_EXPOSURE_NONCE: nonce,
+      CINATRA_VERIFY_EXPOSURE_REFUSED_STATUS: String(VERIFICATION_EXPOSURE_PROXY_REFUSED_STATUS),
+    },
+  });
+  child.unref();
+
+  const killChild = () => {
+    try {
+      if (child.pid) process.kill(child.pid, "SIGTERM");
+    } catch {
+      // Already gone.
+    }
+  };
+
+  const deadline = Date.now() + readyTimeoutMs;
+  let ready = false;
+  while (Date.now() < deadline) {
+    if (await verifyExposureProxyIsOurs({ proxyPort, nonce })) {
+      ready = true;
+      break;
+    }
+    if (child.exitCode !== null || child.signalCode !== null) break;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  if (!ready) {
+    killChild();
+    throw new Error(
+      `The access-logging proxy did not come up on 127.0.0.1:${proxyPort}. ` +
+        `Most often that port is already in use by something else — pass ` +
+        `--proxy-port <n> to choose another. Nothing was published: the mapping ` +
+        `is written only once the proxy has proved it is listening.`,
+    );
+  }
+
+  try {
+    mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
+    writeFileSync(
+      statePath,
+      `${JSON.stringify(
+        {
+          pid: child.pid ?? null,
+          nonce,
+          proxyPort,
+          upstreamPort,
+          logPath,
+          startedAt: new Date().toISOString(),
+        },
+        null,
+        2,
+      )}\n`,
+      { mode: 0o600 },
+    );
+  } catch (err) {
+    // An unrecorded detached proxy is an orphan nothing can stop by name.
+    killChild();
+    throw err;
+  }
+  return child.pid ?? null;
+}
+
+/**
+ * Drive one marked, unauthenticated GET per planned path at the public origin.
+ * A request that cannot be driven at all records `status: null`, which the
+ * evaluator treats as a FAILURE — an unreachable origin proves nothing about
+ * whether a path is refused.
+ */
+async function driveVerificationProbes({ origin, plan, timeoutMs = 15_000 }) {
+  const probes = [];
+  for (const probe of plan) {
+    let status = null;
+    try {
+      const response = await fetch(new URL(probe.path, origin), {
+        method: "GET",
+        redirect: "manual",
+        headers: { [VERIFICATION_EXPOSURE_MARKER_HEADER]: probe.marker },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      status = response.status;
+      await response.arrayBuffer().catch(() => null);
+    } catch {
+      status = null;
+    }
+    probes.push({ ...probe, status });
+  }
+  return probes;
+}
+
+/**
+ * `down` with no resolvable identity.
+ *
+ * Saying "nothing was running" here is only honest when nothing IS running:
+ * an identity helper that disappeared AFTER a successful `up` leaves the slug
+ * unnameable while the Funnel is still live, and a cheerful exit 0 over that
+ * would be a lie told about a public exposure. So the mode's own runtime root
+ * is scanned first: no artifacts, no exposure, and the message stands;
+ * artifacts, and the operator is told exactly where they are and refused.
+ */
+function reportVerifyExposureDownWithoutIdentity() {
+  const artifacts = listVerificationExposureArtifacts();
+  if (artifacts.length === 0) {
+    console.log(
+      describeVerificationExposureDownOutcome({
+        identityResolvable: false,
+        sidecarTornDown: false,
+        proxyStopped: false,
+      }).message,
+    );
+    return;
+  }
+  for (const artifact of artifacts) {
+    console.error(
+      `  ${artifact.dir}${artifact.hasCompose ? " (tunnel compose file)" : ""}${
+        artifact.hasProxy ? " (proxy record)" : ""
+      }`,
+    );
+  }
+  throw new Error(
+    "cinatra instance verify-exposure down cannot resolve this instance's tunnel " +
+      "identity, but a verification exposure IS published for it (listed above), so " +
+      "it will not report that nothing was running. Reinstall the identity helper " +
+      "(`cinatra instance setup dev`) and run this verb again.",
+  );
+}
+
+async function runVerificationExposure(argv) {
+  const action = String(argv[0] ?? "").trim();
+  if (!VERIFY_EXPOSURE_ACTIONS.includes(action)) {
+    throw new Error(
+      `Unknown 'cinatra instance verify-exposure' sub-command "${argv[0] ?? ""}". ` +
+        `Expected: cinatra instance verify-exposure <${VERIFY_EXPOSURE_ACTIONS.join("|")}>.`,
+    );
+  }
+  const flags = parseVerifyExposureFlags(argv.slice(1));
+
+  const repoRoot = getRepoRoot();
+  const env = collectEnvironment(repoRoot);
+
+  // Dev-only HARD REFUSAL, before any Docker / Nango / filesystem work — the
+  // same gate the general-purpose command carries, for the same reason: a
+  // production main must never be Funnel-exposed by a CLI verb.
+  if (readConfiguredRuntimeMode(env) !== "development") {
+    throw new Error(
+      "cinatra instance verify-exposure is development-only. Set " +
+        "CINATRA_RUNTIME_MODE=development (this publishes a Tailscale Funnel " +
+        "sidecar for the local dev main; a production main must use the " +
+        "operator-supplied public URL at /configuration/development?tab=tunnel).",
+    );
+  }
+
+  const mainDbUrl = env.SUPABASE_DB_URL ?? process.env.SUPABASE_DB_URL ?? null;
+  const mainSchema = env.SUPABASE_SCHEMA || process.env.SUPABASE_SCHEMA || "cinatra";
+  const declaredMainDatabase =
+    env.CINATRA_DEV_MAIN_DATABASE ?? process.env.CINATRA_DEV_MAIN_DATABASE ?? null;
+
+  // --- identity gate (all four sub-actions, before ANY side effect) --------
+  // Identical posture to the general command: an instance whose identity is
+  // unknowable is never guessed at. `status` reports, `down` says plainly that
+  // nothing was running, `up` / `check` refuse.
+  let helperModule = null;
+  try {
+    helperModule = await loadTailscaleHostnameModule();
+  } catch (err) {
+    if (err?.cinatraDevCliDeclarerMissing !== true) throw err;
+    if (action === "status") {
+      console.log("cinatra instance verify-exposure — status");
+      console.log("  tunnel identity: (indeterminate — identity helper not installed)");
+      console.log(
+        "  Run `cinatra instance setup dev` to populate the extensions tree, then retry.",
+      );
+      return;
+    }
+    if (action === "down") {
+      reportVerifyExposureDownWithoutIdentity();
+      return;
+    }
+    throw new Error(
+      `cinatra instance verify-exposure ${action} cannot resolve this instance's ` +
+        `tunnel identity: no installed extension provides the identity helper. ` +
+        `Refusing to act on shared tunnel state without knowing which instance ` +
+        `owns it. Run \`cinatra instance setup dev\` first.`,
+    );
+  }
+
+  const identity = classifyDevTunnelIdentityFromModule(helperModule, {
+    dbUrl: mainDbUrl,
+    schema: mainSchema,
+    mainDatabase: declaredMainDatabase,
+  });
+  if (!identity.ok) {
+    const refusal =
+      typeof helperModule.describeDevTailscaleIdentityRefusal === "function"
+        ? helperModule.describeDevTailscaleIdentityRefusal(identity, mainDbUrl)
+        : (identity.reason ?? "This dev instance has no sanctioned tunnel identity.");
+    if (action === "status") {
+      console.log("cinatra instance verify-exposure — status");
+      console.log(`  tunnel identity: NONE (${identity.code})`);
+      console.log(refusal);
+      return;
+    }
+    if (action === "down") {
+      reportVerifyExposureDownWithoutIdentity();
+      return;
+    }
+    throw new Error(refusal);
+  }
+
+  // This mode's own runtime state, keyed by the SAME derived identity but laid
+  // out under its own root so it can never collide with `instance tunnel`'s.
+  const slug = devTunnelRuntimeSlug(identity);
+  const runtimeDir = verificationExposureRuntimeDir(slug);
+  const composePath = verificationExposureComposePath(slug);
+  const servePath = verificationExposureServePath(slug);
+  const logPath = verificationExposureAccessLogPath(slug);
+  const proxyStatePath = verificationExposureProxyStatePath(slug);
+  const projectName = verificationExposureComposeProjectName(slug);
+  const tailscaleHostname = verificationExposureTailscaleHostname(identity.hostname);
+  const nextjsPort = Number(env.PORT) || 3000;
+
+  // THE LOCK COMES FIRST — before the ownership check and before any state is
+  // read. Every decision below is made from a snapshot, so taking that snapshot
+  // outside the lock would let a concurrent `down` invalidate it between the
+  // read and the act: `up` would reuse a proxy that no longer exists and
+  // publish its port, and `down` would decide there was nothing to tear down
+  // while an `up` finished behind it. The verbs that MUTATE state (`up`,
+  // `down`) hold the lock across the whole decision; `status` and `check` only
+  // observe. The lock file lives OUTSIDE the runtime directory, so taking it
+  // never conjures an ownerless directory the ownership rules would then
+  // refuse (see verificationExposureLockPath).
+  const mutates = action === "up" || action === "down";
+  const releaseLifecycleLock = mutates
+    ? acquireVerificationExposureLock(verificationExposureLockPath(slug))
+    : null;
+  try {
+    return await actOnVerificationExposureState();
+  } finally {
+    if (releaseLifecycleLock) releaseLifecycleLock();
+  }
+
+  async function actOnVerificationExposureState() {
+    // The ownership manifest is the general command's, reused by direct call:
+    // one identity, one directory, and a directory that proves another owner is
+    // refused rather than shared.
+    //
+    // A runtime directory whose manifest is unreadable is a REFUSAL for `up` and
+    // `check` — acting on state whose owner cannot be proven is exactly what the
+    // manifest exists to prevent. For `status` and `down` it must not be a crash
+    // when there is demonstrably nothing to act on: a crashed `up` can leave the
+    // directory without a readable manifest, and `down` on that state has to say
+    // plainly that nothing was running (criterion 3's "every reachable no-tunnel
+    // state"). When artifacts DO exist under an unprovable owner the refusal
+    // stands: this verb will not tear down state it cannot prove is its own.
+    try {
+      assertDevTunnelRuntimeDirOwnership({ runtimeDir, identity });
+    } catch (err) {
+      const hasArtifacts = existsSync(composePath) || existsSync(proxyStatePath);
+      if (hasArtifacts || (action !== "status" && action !== "down")) throw err;
+      if (action === "status") {
+        console.log("cinatra instance verify-exposure — status");
+        console.log(`  tunnel identity:   ${identity.kind} (${identity.key})`);
+        console.log(`  runtime directory: ${runtimeDir} (ownership not provable)`);
+        console.log("  nothing is published for this instance.");
+        return;
+      }
+      console.log(
+        describeVerificationExposureDownOutcome({
+          identityResolvable: true,
+          sidecarTornDown: false,
+          proxyStopped: false,
+        }).message,
+      );
+      return;
+    }
+
+    const proxy = await readVerifyExposureProxy(proxyStatePath);
+    const proxyState = proxy.state;
+    const proxyAlive = proxy.live && proxy.ours;
+    const composeRendered = existsSync(composePath);
+    // Whether the sidecar's state is KNOWABLE at all: an unavailable-or-hung
+    // docker probe means "unknown", never "not running".
+    const composeProbeUsable = isComposeAvailable();
+    const sidecarUp = composeRendered && composeProbeUsable && isComposeProjectUp(projectName);
+
+    if (action === "status") {
+      console.log("cinatra instance verify-exposure — status");
+      console.log(`  tunnel identity:      ${identity.kind} (${identity.key})`);
+      console.log(`  runtime slug:         ${slug}`);
+      console.log(`  runtime directory:    ${runtimeDir}`);
+      console.log(
+        `  published path:       ${VERIFICATION_EXPOSURE_MAPPED_PATH} (exact match, enforced at the proxy)`,
+      );
+      console.log(
+        `  tunnel sidecar:       ${
+          sidecarUp
+            ? "running"
+            : composeRendered && !composeProbeUsable
+              ? "unknown (docker did not answer)"
+              : composeRendered
+                ? "not running (per docker)"
+                : "not running"
+        }`,
+      );
+      console.log(
+        `  access-logging proxy: ${
+          proxyAlive
+            ? `running (pid ${proxyState.pid}, 127.0.0.1:${proxyState.proxyPort})`
+            : proxy.live
+              ? `unknown — pid ${proxy.pid} is alive but did not identify itself as this proxy; it will NOT be signalled`
+              : "not running"
+        }`,
+      );
+      console.log(`  access log:           ${logPath}`);
+      console.log(`  serve config:         ${servePath}`);
+      console.log(
+        "  Run `cinatra instance verify-exposure check` to prove the mapping " +
+          "admits only the published path.",
+      );
+      return;
+    }
+
+    if (action === "down") {
+      return await runVerifyExposureDown();
+    }
+
+    async function runVerifyExposureDown() {
+        // Idempotent by construction: nothing here throws when nothing is running,
+        // and the message says so rather than reporting a teardown that never
+        // happened.
+        //
+        // The teardown is driven by the RENDERED COMPOSE FILE, not by the "is it
+        // up?" probe: that probe answers false both for "not running" and for
+        // "docker did not answer", and skipping the teardown on the ambiguous case
+        // would leave a live Funnel behind while this verb reported success. The
+        // shared helper is bounded and reports honestly what happened.
+        let sidecarTornDown = false;
+        if (composeRendered) {
+          if (!tearDownDevTunnelSidecar({ projectName, composePath })) {
+            throw new Error(
+              "cinatra instance verify-exposure down could not complete the tunnel " +
+                "teardown, so a Tailscale node may still be publishing this instance. " +
+                "Fix the docker error above and run this verb again.",
+            );
+          }
+          // Proven down now. Whether it HAD been running is only knowable when the
+          // probe was usable; when it was not, say a teardown happened rather than
+          // claim nothing was running.
+          sidecarTornDown = sidecarUp || !composeProbeUsable;
+          // AND THE RENDERED FILE GOES WITH IT. `docker compose down` leaves
+          // compose.yml on disk, and that file is exactly what a later,
+          // identity-less `down` scans to decide whether an exposure is still
+          // published. Leaving it behind would make an already-torn-down instance
+          // look live forever and break this verb's idempotency (criterion 3).
+          // Every `up` re-renders it, so removing it costs nothing.
+          try {
+            rmSync(composePath, { force: true });
+          } catch {
+            // Still torn down; a leftover file only makes the next scan cautious.
+          }
+        }
+        const proxyOutcome = await stopVerifyExposureProxy(proxyStatePath);
+        if (proxyOutcome.indeterminate) {
+          console.warn(
+            `  A process (pid ${proxyOutcome.pid}) is recorded as this mode's proxy but did ` +
+              `not identify itself as one, so it was NOT signalled — a pid can be reused by ` +
+              `an unrelated process. Its record is kept at ${proxyStatePath}.`,
+          );
+        }
+        const outcome = describeVerificationExposureDownOutcome({
+          identityResolvable: true,
+          sidecarTornDown,
+          proxyStopped: proxyOutcome.stopped,
+        });
+        console.log(outcome.message);
+    }
+
+    if (action === "check") {
+      let origin = flags.origin;
+      if (!origin) {
+        if (!sidecarUp) {
+          throw new Error(
+            "cinatra instance verify-exposure check needs a public origin: nothing " +
+              "is published for this instance. Run `cinatra instance verify-exposure up` " +
+              "first, or pass --origin <url>.",
+          );
+        }
+        const tailscaleFunnel = await waitForTailscaleFunnelUrl({
+          projectName,
+          composePath,
+          composeEnv: process.env,
+          timeoutMs: 10_000,
+        });
+        origin = tailscaleFunnel?.url ?? null;
+        if (!origin) {
+          throw new Error(
+            "cinatra instance verify-exposure check could not resolve the published " +
+              "origin from the running sidecar. Pass --origin <url>.",
+          );
+        }
+      }
+
+      // The marker set is per-run, so a previous run's log lines can never be
+      // mistaken for this run's evidence.
+      const plan = buildVerificationProbePlan({ marker: `verify-${randomUUID()}` });
+      const probes = await driveVerificationProbes({ origin, plan });
+      const log = readAccessLogWithDiagnostics(logPath);
+      const outcome = evaluateVerificationExposureCheck({
+        probes,
+        logEntries: log.entries,
+        malformedLogLines: log.malformedLines,
+        unmappedStatus: flags.refusedStatus,
+        proxyRefusedStatus: VERIFICATION_EXPOSURE_PROXY_REFUSED_STATUS,
+        appStatus: VERIFICATION_EXPOSURE_APP_UNAUTHENTICATED_STATUS,
+      });
+
+      console.log(`cinatra instance verify-exposure check — ${origin}`);
+      console.log(`  access log: ${logPath}`);
+      for (const result of outcome.results) {
+        console.log(
+          `  ${result.ok ? "ok  " : "FAIL"}  ${result.path}  status=${
+            result.observedStatus ?? "(none)"
+          } expected=${result.expectedStatus} reached-app=${result.reachedApp ? "yes" : "no"}`,
+        );
+      }
+      if (!outcome.ok) {
+        for (const failure of outcome.failures) console.error(`  - ${failure}`);
+        throw new Error(
+          `cinatra instance verify-exposure check FAILED: the published mapping does ` +
+            `not admit only ${VERIFICATION_EXPOSURE_MAPPED_PATH}.`,
+        );
+      }
+      console.log(
+        `  PASS — only ${VERIFICATION_EXPOSURE_MAPPED_PATH} is admitted; every other probed ` +
+          `path was refused (${flags.refusedStatus} at the edge, ` +
+          `${VERIFICATION_EXPOSURE_PROXY_REFUSED_STATUS} at the proxy for a descendant of the ` +
+          `mapped prefix) and none of them reached the app.`,
+      );
+      return;
+    }
+
+    // --- action === "up" ----------------------------------------------------
+
+    if (sidecarUp && proxyAlive) {
+      console.log(`cinatra instance verify-exposure already up for ${slug}.`);
+      return;
+    }
+
+    return await bringVerificationExposureUp();
+
+    async function bringVerificationExposureUp() {
+      if (!isComposeAvailable()) {
+        throw new Error("`docker compose` is not available on PATH.");
+      }
+      ensureWayflowImage({ repoRoot });
+
+      let tsAuthkey = process.env.TS_AUTHKEY ?? "";
+      if (tsAuthkey.length > 0) {
+        validateTailscaleAuthkey(tsAuthkey);
+      } else {
+        const { TailscaleApiError } = await loadTailscaleApiModule();
+        let mintedFromNango = null;
+        try {
+          mintedFromNango = await autoMintTailscaleAuthKeyFromNango(mainDbUrl);
+        } catch (err) {
+          // SECRET BOUNDARY: both typed errors carry a sanitised code/message.
+          if (err instanceof TailscaleApiError || err?.tailscale === true) {
+            throw new Error(
+              `No Tailscale auth-key: Nango mint failed (${err.code} — ${err.message}). ` +
+                `Set TS_AUTHKEY or connect Tailscale at /connectors/tailscale.`,
+            );
+          }
+          throw new Error(
+            `No Tailscale auth-key: Nango mint failed (${err?.name ?? "unknown error"}). ` +
+              `Set TS_AUTHKEY or connect Tailscale at /connectors/tailscale.`,
+          );
+        }
+        if (!mintedFromNango) {
+          throw new Error(
+            "No Tailscale auth-key: set TS_AUTHKEY or connect Tailscale at /connectors/tailscale.",
+          );
+        }
+        validateTailscaleAuthkey(mintedFromNango);
+        tsAuthkey = mintedFromNango;
+      }
+
+      claimDevTunnelRuntimeDir({ runtimeDir, identity });
+
+      // The proxy comes up BEFORE the mapping does: the mapping must never point
+      // at a port with nothing listening on it, and every request the tunnel
+      // forwards has to be logged from the very first one.
+      if (proxy.live && !proxyAlive) {
+        throw new Error(
+          `A process (pid ${proxy.pid}) is recorded as this instance's access-logging ` +
+            `proxy but does not identify itself as one. Run ` +
+            `\`cinatra instance verify-exposure down\` and check that process before retrying.`,
+        );
+      }
+
+      // WHICH PORT THE MAPPING NAMES. When a verified proxy is already running (the
+      // sidecar was stopped, the proxy was not), its OWN recorded port is the only
+      // port the mapping may name — writing the flag default there would publish
+      // the tunnel at a port this mode never verified, possibly the app itself,
+      // which would hand every descendant path straight past the exact match.
+      const effectiveProxyPort = decideVerificationExposureProxyPort({
+        live: proxyAlive,
+        recorded: proxyState,
+        requestedPort: flags.proxyPort,
+        portWasExplicit: flags.proxyPortExplicit,
+        upstreamPort: nextjsPort,
+      });
+
+      let startedProxy = false;
+      if (!proxyAlive) {
+        const pid = await startVerifyExposureProxy({
+          statePath: proxyStatePath,
+          logPath,
+          proxyPort: effectiveProxyPort,
+          upstreamPort: nextjsPort,
+        });
+        startedProxy = true;
+        console.log(
+          `Access-logging proxy started (pid ${pid ?? "?"}) on 127.0.0.1:${effectiveProxyPort} ` +
+            `-> 127.0.0.1:${nextjsPort}.`,
+        );
+      }
+
+      // From here on the proxy is running. ANY failure before the sidecar is
+      // provisioned must take it back down again if THIS run started it —
+      // otherwise a missing compose template or a failed render leaves a detached
+      // orphan behind that nothing will stop by name.
+      try {
+        await publishVerificationExposureMapping();
+      } catch (err) {
+        if (startedProxy) await stopVerifyExposureProxy(proxyStatePath);
+        throw err;
+      }
+      return;
+
+    async function publishVerificationExposureMapping() {
+        // The path-scoped mapping: ONE handler, keyed on the callback path, pointed
+        // at the proxy rather than at the app.
+        writeScopedTailscaleServeConfig({
+          servePath,
+          proxyPort: effectiveProxyPort,
+          hostNetwork: false,
+        });
+
+        const templatePath = path.join(
+          repoRoot,
+          "docker",
+          "wayflow",
+          "compose.clone.template.yml",
+        );
+        if (!existsSync(templatePath)) {
+          throw new Error(
+            `Per-clone compose template missing at ${templatePath}. Is the clone runtime template present?`,
+          );
+        }
+        const VERIFY_EXPOSURE_UNUSED_WAYFLOW_PORT = 39998;
+        renderCloneComposeTemplate({
+          templatePath,
+          outPath: composePath,
+          vars: {
+            NEXTJS_PORT: effectiveProxyPort,
+            // Deliberately-unused: only the `tailscale` service is brought up.
+            WAYFLOW_PORT: VERIFY_EXPOSURE_UNUSED_WAYFLOW_PORT,
+            WORKTREE_PATH: repoRoot,
+            TS_HOSTNAME: tailscaleHostname,
+            CLONE_STATE_DIR: runtimeDir,
+            TAILSCALE_NETWORK_MODE: "bridge",
+          },
+        });
+
+        const composeEnv = { ...process.env, TS_AUTHKEY: tsAuthkey };
+        await runPostSidecarProvisioning(
+          async (markProvisioned) => {
+            const upResult = spawnSync(
+              "docker",
+              ["compose", "-p", projectName, "-f", composePath, "up", "-d", "tailscale"],
+              {
+                env: composeEnv,
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "pipe"],
+                timeout: COMPOSE_UP_TIMEOUT_MS,
+              },
+            );
+            const upStdout = scrubTailscaleAuthkey(upResult.stdout ?? "", tsAuthkey);
+            const upStderr = scrubTailscaleAuthkey(upResult.stderr ?? "", tsAuthkey);
+            if (upStdout) process.stdout.write(upStdout);
+            if (upStderr) process.stderr.write(upStderr);
+            if (upResult.error || upResult.status !== 0) {
+              throw new Error(
+                `docker compose up failed${
+                  upResult.error?.code === "ETIMEDOUT" ? " (timed out)" : ` (exit ${upResult.status})`
+                }.`,
+              );
+            }
+            const tailscaleFunnel = await waitForTailscaleFunnelUrl({
+              projectName,
+              composePath,
+              composeEnv,
+              timeoutMs: 60_000,
+            });
+            // The durable outcome is the published sidecar itself. This mode
+            // deliberately writes NOTHING into the app DB: the publicBaseUrl row
+            // belongs to `instance tunnel` and to the operator-supplied URL surface,
+            // and a narrow verification exposure must not be mistaken for the app's
+            // real public URL.
+            markProvisioned();
+            const funnelUrl = tailscaleFunnel?.url ?? null;
+            if (funnelUrl) {
+              console.log(`Verification exposure origin: ${funnelUrl}`);
+              console.log(`  Published path: ${funnelUrl.replace(/\/$/, "")}${VERIFICATION_EXPOSURE_MAPPED_PATH}`);
+            } else {
+              console.warn(
+                "Tailscale sidecar started but did not surface a Funnel URL within 60s.",
+              );
+            }
+          },
+          async (cause) => {
+            console.warn(
+              `  Provisioning failed after the Tailscale sidecar came up (${
+                cause?.code ?? cause?.name ?? "error"
+              }) — tearing the sidecar down so nothing is left half-up.`,
+            );
+            if (!tearDownDevTunnelSidecar({ projectName, composePath })) {
+              console.warn(
+                "  Sidecar teardown did not complete — a Tailscale node may still be " +
+                  "running for this instance. Run `cinatra instance verify-exposure down`.",
+              );
+            }
+            await stopVerifyExposureProxy(proxyStatePath);
+          },
+        );
+
+        console.log("");
+        console.log(`cinatra instance verify-exposure up for ${slug}.`);
+        console.log(
+          `  Only ${VERIFICATION_EXPOSURE_MAPPED_PATH} is admitted — every other path is either ` +
+            `unmapped at the edge or refused at the proxy, and neither reaches the app.`,
+        );
+        console.log(`  Access log: ${logPath}`);
+        console.log(
+          "  Prove it with `cinatra instance verify-exposure check`; take it down with " +
+            "`cinatra instance verify-exposure down`.",
+        );
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // `cinatra instance tunnel <start|stop|status>`.
 //
 // This is a CLI verb, not a dev-boot hook: explicit, no surprise sidecars,
@@ -15678,6 +16573,9 @@ function buildHandlers() {
     },
     "dev.tunnel": async (rest) => {
       await runDevTunnel(rest);
+    },
+    "dev.verify-exposure": async (rest) => {
+      await runVerificationExposure(rest);
     },
     "dev.start": async (rest) => {
       await runDevStart(rest);
