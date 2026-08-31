@@ -7,7 +7,7 @@
 // runner RECORDS every argv so we can assert on the exact commands — this is how
 // the three hard-NEVERs (AC7) are asserted structurally.
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -40,6 +40,23 @@ const {
   usedPreviewHostPorts,
   allocatePreviewHostPort,
   validatePreviewPort,
+  // cinatra-cli#248
+  PREVIEW_BIND_HOST_ENV,
+  PREVIEW_BIND_HOST_DEFAULT,
+  PREVIEW_BUILD_CACHE_ENV,
+  PREVIEW_BUILD_CACHE_DIR_ENV,
+  validateBindHost,
+  resolveBindHost,
+  previewReachHost,
+  bindAwareProbePort,
+  dockerBuildxDriver,
+  dockerBuildxCacheCapable,
+  acquireBuildCacheLock,
+  releaseBuildCacheLock,
+  resolveBuildCacheMode,
+  previewBuildCacheDir,
+  dockerBuildxAvailable,
+  previewBuildDockerArgs,
   readRegistry,
   writeRegistry,
   getPreview,
@@ -2534,5 +2551,630 @@ describe("preview — the restore/degraded messages say only what was OBSERVED (
     await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(
       /docker did not answer a state probe, so whether it is still up is UNKNOWN/,
     );
+  });
+});
+
+// --------------------------------------------------------------------------
+// cinatra-cli#248 AC1 — the publish bind address
+// --------------------------------------------------------------------------
+
+describe("preview — the publish bind address (cinatra-cli#248 AC1)", () => {
+  const OK = { status: 200, body: '{"status":"ok"}' };
+
+  function seedReadyBound({ bind = "127.0.0.1", hostPort = 3400 } = {}) {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: {
+        main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort, bind, now: () => "T0" }),
+      },
+    });
+  }
+
+  it("validates the SHAPE and returns the form `docker run -p` parses", () => {
+    expect(validateBindHost("127.0.0.1")).toBe("127.0.0.1");
+    expect(validateBindHost("  0.0.0.0  ")).toBe(PREVIEW_BIND_HOST_DEFAULT);
+    // An IPv6 literal is BRACKETED: `-p ::1:3400:3000` is ambiguous to docker's
+    // own colon-separated publish parser, `-p [::1]:3400:3000` is not.
+    expect(validateBindHost("::1")).toBe("[::1]");
+    expect(validateBindHost("[::1]")).toBe("[::1]");
+  });
+
+  it("refuses a HOSTNAME — docker publishes on an IP literal only", () => {
+    // Measured against a real engine (server 29.7.2), not assumed:
+    //   $ docker run -p localhost:34995:80 alpine/curl ...
+    //   docker: invalid IP address: localhost
+    // Accepting a name here would spend a whole build before docker said that.
+    for (const name of ["localhost", "example.test", "host.docker.internal", "my-host"]) {
+      expect(() => validateBindHost(name)).toThrow(/--bind/);
+      expect(() => validateBindHost(name)).toThrow(/IP/);
+    }
+  });
+
+  it("rejects the values that must never reach `docker run`, naming the lever", () => {
+    for (const bad of [
+      "",
+      "   ",
+      "127.0.0.1:3400",
+      "http://127.0.0.1",
+      "256.256.256.256",
+      "1.2.3",
+      "a b",
+      "127.0.0.1,0.0.0.0",
+      undefined,
+      null,
+      42,
+    ]) {
+      expect(() => validateBindHost(bad)).toThrow(/--bind/);
+    }
+  });
+
+  it("the FLAG wins over the env, and neither set means UNCHANGED (null)", () => {
+    expect(resolveBindHost({ rest: [], env: {} })).toBe(null);
+    expect(resolveBindHost({ rest: [], env: { [PREVIEW_BIND_HOST_ENV]: "127.0.0.1" } })).toBe("127.0.0.1");
+    expect(resolveBindHost({ rest: ["--bind", "10.0.0.5"], env: { [PREVIEW_BIND_HOST_ENV]: "127.0.0.1" } })).toBe("10.0.0.5");
+    expect(resolveBindHost({ rest: ["--bind=10.0.0.5"], env: {} })).toBe("10.0.0.5");
+    // A PRESENT env value is validated, blank included: `FOO=$UNSET` expands to
+    // the empty string, and reading that as "unset" would publish on EVERY
+    // interface at the moment the operator believed they had narrowed it.
+    expect(() => resolveBindHost({ rest: [], env: { [PREVIEW_BIND_HOST_ENV]: "  " } })).toThrow(/--bind/);
+    expect(() => resolveBindHost({ rest: [], env: { [PREVIEW_BIND_HOST_ENV]: "" } })).toThrow(/--bind/);
+    // A bare `--bind` with no value is a typo, not "unset".
+    expect(() => resolveBindHost({ rest: ["--bind"], env: {} })).toThrow(/--bind/);
+  });
+
+  it("UNSET publishes byte-identically to the pre-#248 argv (the default is unchanged)", async () => {
+    const { deps, fake } = makeDeps({ sha: SHA_A, health: OK });
+    const out = await runPreviewCreate(["--slug", "main"], deps);
+    const run = fake.calls.find((c) => c[0] === "run");
+    expect(run[run.indexOf("-p") + 1]).toBe(`${out.hostPort}:3000`);
+  });
+
+  it("`--bind` narrows the publish to one interface", async () => {
+    const { deps, fake } = makeDeps({ sha: SHA_A, health: OK });
+    const out = await runPreviewCreate(["--slug", "main", "--bind", "127.0.0.1"], deps);
+    const run = fake.calls.find((c) => c[0] === "run");
+    expect(run[run.indexOf("-p") + 1]).toBe(`127.0.0.1:${out.hostPort}:3000`);
+    expect(run).not.toContain(`${out.hostPort}:3000`);
+  });
+
+  it("CINATRA_PREVIEW_BIND_HOST reaches the same argv — and never the container env", async () => {
+    const { deps, fake } = makeDeps(
+      { sha: SHA_A, health: OK },
+      { env: { [ENCRYPTION_KEY_ENV]: KEY_64, [PREVIEW_BIND_HOST_ENV]: "127.0.0.1" } },
+    );
+    const out = await runPreviewCreate(["--slug", "main"], deps);
+    const run = fake.calls.find((c) => c[0] === "run");
+    expect(run[run.indexOf("-p") + 1]).toBe(`127.0.0.1:${out.hostPort}:3000`);
+    // It is an INVOCATION lever, not part of the container contract.
+    expect(run.join(" ")).not.toContain(PREVIEW_BIND_HOST_ENV);
+  });
+
+  it("an invalid address is refused BEFORE any docker call and before any claim", async () => {
+    const { deps, fake } = makeDeps({ sha: SHA_A, health: OK });
+    await expect(runPreviewCreate(["--slug", "main", "--bind", "127.0.0.1:3400"], deps)).rejects.toThrow(/--bind/);
+    expect(fake.calls).toEqual([]);
+  });
+
+  it("the bind is PERSISTED on the registry row and carried forward by `refresh`", async () => {
+    const { deps } = makeDeps({ sha: SHA_A, health: OK });
+    await runPreviewCreate(["--slug", "main", "--bind", "127.0.0.1"], deps);
+    expect(getPreview(readRegistry(registryPath).registry, "main").bind).toBe("127.0.0.1");
+
+    const { deps: deps2, fake: fake2 } = makeDeps({ sha: SHA_B, health: OK });
+    const out = await runPreviewRefresh(["--slug", "main"], deps2);
+    const run = fake2.calls.find((c) => c[0] === "run");
+    expect(run[run.indexOf("-p") + 1]).toBe(`127.0.0.1:${out.hostPort}:3000`);
+    expect(getPreview(readRegistry(registryPath).registry, "main").bind).toBe("127.0.0.1");
+  });
+
+  it("`start --recreate` reuses the recorded bind exactly as it reuses the recorded port", async () => {
+    seedReadyBound();
+    const { deps, fake } = makeDeps({
+      sha: SHA_A,
+      health: OK,
+      containerRunning: true,
+      images: new Set([previewImageTag(SHA_A)]),
+    });
+    const out = await runPreviewStart(["--slug", "main", "--recreate"], deps);
+    expect(out.hostPort).toBe(3400);
+    const run = fake.calls.find((c) => c[0] === "run");
+    expect(run[run.indexOf("-p") + 1]).toBe("127.0.0.1:3400:3000");
+  });
+
+  it("a row written before #248 (no `bind`) still publishes the unchanged default", async () => {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: { ...makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) } },
+    });
+    const reg = readRegistry(registryPath).registry;
+    delete reg.previews.main.bind; // exactly the legacy row shape
+    writeRegistry(registryPath, reg);
+    const { deps, fake } = makeDeps({
+      sha: SHA_A,
+      health: OK,
+      containerRunning: true,
+      images: new Set([previewImageTag(SHA_A)]),
+    });
+    await runPreviewStart(["--slug", "main", "--recreate"], deps);
+    const run = fake.calls.find((c) => c[0] === "run");
+    expect(run[run.indexOf("-p") + 1]).toBe("3400:3000");
+  });
+});
+
+// --------------------------------------------------------------------------
+// cinatra-cli#248 AC2 — the DEPLOYMENT-registry env keys
+// --------------------------------------------------------------------------
+
+describe("preview — deployment-registry env forwarding (cinatra-cli#248 AC2)", () => {
+  const KEYS = [
+    "CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_URL",
+    "CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_READ_TOKEN",
+    "CINATRA_DEPLOYMENT_REGISTRY_ROUTING_MODE",
+    "CINATRA_DEPLOYMENT_REGISTRY_ALLOW_FIXTURE",
+  ];
+  const VALUES = {
+    CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_URL: "https://deployments.example.test",
+    CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_READ_TOKEN: "read-only-token",
+    CINATRA_DEPLOYMENT_REGISTRY_ROUTING_MODE: "hosted",
+    CINATRA_DEPLOYMENT_REGISTRY_ALLOW_FIXTURE: "false",
+  };
+
+  it("all four keys are in the passthrough set", () => {
+    for (const k of KEYS) expect(PASSTHROUGH_ENV_KEYS).toContain(k);
+  });
+
+  it("they reach the container env VERBATIM when set on the host", () => {
+    const args = buildPreviewRunEnvArgs({
+      encryptionKey: KEY_64,
+      env: { [ENCRYPTION_KEY_ENV]: KEY_64, ...VALUES },
+    });
+    const joined = args.join(" ");
+    for (const k of KEYS) expect(joined).toContain(`${k}=${VALUES[k]}`);
+  });
+
+  it("NOTHING is forwarded when they are unset — or set empty", () => {
+    const args = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env: { [ENCRYPTION_KEY_ENV]: KEY_64 } });
+    for (const k of KEYS) expect(args.join(" ")).not.toContain(k);
+    const empty = buildPreviewRunEnvArgs({
+      encryptionKey: KEY_64,
+      env: { [ENCRYPTION_KEY_ENV]: KEY_64, CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_URL: "" },
+    });
+    expect(empty.join(" ")).not.toContain("CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_URL");
+  });
+
+  it("the PUBLIC url is NOT container-rewritten — 'PUBLIC' means externally reachable", () => {
+    for (const k of KEYS) expect(CONTAINER_REWRITE_ENV_KEYS).not.toContain(k);
+    const args = buildPreviewRunEnvArgs({
+      encryptionKey: KEY_64,
+      env: { [ENCRYPTION_KEY_ENV]: KEY_64, CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_URL: "http://127.0.0.1:4400" },
+    });
+    expect(args.join(" ")).toContain("CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_URL=http://127.0.0.1:4400");
+    expect(args.join(" ")).not.toContain(`CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_URL=http://${CONTAINER_HOST_GATEWAY}`);
+  });
+
+  it("they reach the real `docker run` argv through `instance preview create`", async () => {
+    const { deps, fake } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' } },
+      { env: { [ENCRYPTION_KEY_ENV]: KEY_64, ...VALUES } },
+    );
+    await runPreviewCreate(["--slug", "main"], deps);
+    const run = fake.calls.find((c) => c[0] === "run").join(" ");
+    for (const k of KEYS) expect(run).toContain(`${k}=${VALUES[k]}`);
+  });
+});
+
+// --------------------------------------------------------------------------
+// cinatra-cli#248 AC3 — a warm build cache through buildx
+// --------------------------------------------------------------------------
+
+describe("preview — warm build cache (cinatra-cli#248 AC3)", () => {
+  it("the buildx probe trusts only an answer that IDENTIFIES buildx", () => {
+    expect(
+      dockerBuildxAvailable({ runDocker: () => ({ status: 0, stdout: "github.com/docker/buildx v0.17.1", stderr: "" }) }),
+    ).toBe(true);
+    // A daemon that answers 0 with nothing is NOT proof buildx is there.
+    expect(dockerBuildxAvailable({ runDocker: () => ({ status: 0, stdout: "", stderr: "" }) })).toBe(false);
+    expect(
+      dockerBuildxAvailable({ runDocker: () => ({ status: 1, stdout: "", stderr: "docker: 'buildx' is not a docker command" }) }),
+    ).toBe(false);
+    expect(dockerBuildxAvailable({ runDocker: () => { throw new Error("no docker"); } })).toBe(false);
+  });
+
+  it("with NO cache dir the build argv is byte-identical to the classic one", () => {
+    expect(
+      previewBuildDockerArgs({
+        tag: "cinatra-preview:local-x",
+        contextDir: "/ctx",
+        buildArgs: ["--build-arg", "CI=true"],
+        provenance: "local-image:x",
+        sha: "x",
+      }),
+    ).toEqual([
+      "build",
+      "-t",
+      "cinatra-preview:local-x",
+      "--build-arg",
+      "CI=true",
+      "--label",
+      "cinatra.preview.provenance=local-image:x",
+      "--label",
+      "cinatra.preview.sha=x",
+      "/ctx",
+    ]);
+  });
+
+  it("with a cache dir it builds through buildx, caching in BOTH directions", () => {
+    const args = previewBuildDockerArgs({ tag: "t", contextDir: "/ctx", buildArgs: [], cacheDir: "/cache" });
+    expect(args.slice(0, 2)).toEqual(["buildx", "build"]);
+    // `--load` puts the result back in the local image store the rest of the
+    // lifecycle inspects; `--progress=plain` is what makes the CACHED lines
+    // AC3's proof greps for visible at all.
+    expect(args).toContain("--load");
+    expect(args).toContain("--progress=plain");
+    expect(args).toContain("--cache-from=type=local,src=/cache");
+    expect(args).toContain("--cache-to=type=local,dest=/cache,mode=max");
+    expect(args[args.length - 1]).toBe("/ctx");
+  });
+
+  it("the cache mode defaults to auto and fails CLOSED on a typo", () => {
+    expect(resolveBuildCacheMode({})).toBe("auto");
+    expect(resolveBuildCacheMode({ [PREVIEW_BUILD_CACHE_ENV]: "  " })).toBe("auto");
+    expect(resolveBuildCacheMode({ [PREVIEW_BUILD_CACHE_ENV]: "OFF" })).toBe("off");
+    expect(() => resolveBuildCacheMode({ [PREVIEW_BUILD_CACHE_ENV]: "yes" })).toThrow(PREVIEW_BUILD_CACHE_ENV);
+  });
+
+  it("the cache directory is overridable and defaults under the CLI's own state root", () => {
+    expect(previewBuildCacheDir({ [PREVIEW_BUILD_CACHE_DIR_ENV]: "/tmp/x" })).toBe("/tmp/x");
+    expect(previewBuildCacheDir({})).toContain(".cinatra");
+  });
+
+  it("a build with buildx present runs `buildx build` with the local cache, and CREATES the cache dir", () => {
+    const calls = [];
+    const cacheDir = path.join(tmp, "bx-cache");
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: path.join(tmp, "ctx"),
+      sha: SHA_A,
+      provenance: previewProvenance(SHA_A),
+      deps: {
+        log: () => {},
+        buildControlEnv: { [PREVIEW_BUILD_CACHE_DIR_ENV]: cacheDir },
+        runDocker: (args) => {
+          calls.push(args);
+          if (args[0] === "buildx" && args[1] === "version") {
+            return { status: 0, stdout: "github.com/docker/buildx v0.17.1", stderr: "" };
+          }
+          if (args[0] === "buildx" && args[1] === "inspect") {
+            return { status: 0, stdout: "Name: builder\nDriver: docker-container\n", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+    });
+    const build = calls.find((c) => c[0] === "buildx" && c[1] === "build");
+    expect(build).toBeTruthy();
+    expect(build.join(" ")).toContain(`--cache-from=type=local,src=${cacheDir}`);
+    expect(build.join(" ")).toContain(`--cache-to=type=local,dest=${cacheDir},mode=max`);
+    expect(existsSync(cacheDir)).toBe(true);
+    // The image content is untouched: the same tag, labels and context.
+    expect(build).toContain(previewImageTag(SHA_A));
+    expect(build[build.length - 1]).toBe(path.join(tmp, "ctx"));
+  });
+
+  it("falls back to the classic builder, UNCHANGED, when buildx is not there", () => {
+    const calls = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: path.join(tmp, "ctx"),
+      sha: SHA_A,
+      deps: {
+        log: () => {},
+        buildControlEnv: {},
+        runDocker: (args) => {
+          calls.push(args);
+          if (args[0] === "buildx") return { status: 1, stdout: "", stderr: "unknown command" };
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+    });
+    expect(calls.some((c) => c[0] === "buildx" && c[1] === "build")).toBe(false);
+    const build = calls.find((c) => c[0] === "build");
+    expect(build).toBeTruthy();
+    expect(build.join(" ")).not.toContain("--cache-from");
+    expect(build.join(" ")).not.toContain("--progress=plain");
+  });
+
+  it("CINATRA_PREVIEW_BUILD_CACHE=off keeps the classic builder even where buildx IS present", () => {
+    const calls = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: path.join(tmp, "ctx"),
+      sha: SHA_A,
+      deps: {
+        log: () => {},
+        buildControlEnv: { [PREVIEW_BUILD_CACHE_ENV]: "off" },
+        runDocker: (args) => {
+          calls.push(args);
+          if (args[0] === "buildx" && args[1] === "version") {
+            return { status: 0, stdout: "github.com/docker/buildx v0.17.1", stderr: "" };
+          }
+          if (args[0] === "buildx" && args[1] === "inspect") {
+            return { status: 0, stdout: "Name: builder\nDriver: docker-container\n", stderr: "" };
+          }
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      },
+    });
+    expect(calls.some((c) => c[0] === "buildx")).toBe(false);
+    expect(calls.find((c) => c[0] === "build")).toBeTruthy();
+  });
+
+  it("a typo'd cache mode is refused BEFORE the slug claim, like every other build lever", async () => {
+    const { deps, fake } = makeDeps(
+      { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' } },
+      { buildControlEnv: { [PREVIEW_BUILD_CACHE_ENV]: "sometimes" } },
+    );
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(PREVIEW_BUILD_CACHE_ENV);
+    expect(fake.calls).toEqual([]);
+  });
+});
+
+
+// --------------------------------------------------------------------------
+// cinatra-cli#248 — convergence round: the defects a codex review found
+// --------------------------------------------------------------------------
+
+describe("preview — bind: what the CLI DIALS follows what docker PUBLISHES (cinatra-cli#248)", () => {
+  const OK = { status: 200, body: '{"status":"ok"}' };
+
+  it("previewReachHost is localhost for unset and for every wildcard spelling", () => {
+    expect(previewReachHost(null)).toBe("localhost");
+    expect(previewReachHost("0.0.0.0")).toBe("localhost");
+    expect(previewReachHost("[::]")).toBe("localhost");
+    expect(previewReachHost("127.0.0.1")).toBe("127.0.0.1");
+    expect(previewReachHost("[::1]")).toBe("[::1]");
+  });
+
+  it("a preview bound to ONE non-loopback interface is health-gated THERE, not on localhost", async () => {
+    const { deps } = makeDeps({ sha: SHA_A, health: OK });
+    const urls = [];
+    deps.probeHealth = async (url) => {
+      urls.push(url);
+      return OK;
+    };
+    const out = await runPreviewCreate(["--slug", "main", "--bind", "10.0.0.5"], deps);
+    // localhost never reaches a publish narrowed to another interface — gating
+    // there would time out and tear down a container that was in fact healthy.
+    expect(urls).toEqual([`http://10.0.0.5:${out.hostPort}/api/health`]);
+  });
+
+  it("the UNSET path still gates on localhost, byte for byte", async () => {
+    const { deps } = makeDeps({ sha: SHA_A, health: OK });
+    const urls = [];
+    deps.probeHealth = async (url) => {
+      urls.push(url);
+      return OK;
+    };
+    const out = await runPreviewCreate(["--slug", "main"], deps);
+    expect(urls).toEqual([`http://localhost:${out.hostPort}/api/health`]);
+  });
+
+  it("an IPv6 bind is probed on ITS OWN address as well as the wide one", async () => {
+    const probed = [];
+    const probe = async (port, host = "0.0.0.0") => {
+      probed.push(`${host}:${port}`);
+      // 3400 is held by an IPv6-only socket; IPv4 3400 is free.
+      return !(host === "::1" && port === 3400);
+    };
+    const bound = bindAwareProbePort({ probe, bind: "[::1]" });
+    expect(await bound(3400)).toBe(false);
+    expect(await bound(3401)).toBe(true);
+    expect(probed).toContain("::1:3400");
+    // No bind (and a wildcard) leaves the probe exactly as it was.
+    expect(bindAwareProbePort({ probe, bind: null })).toBe(probe);
+    expect(bindAwareProbePort({ probe, bind: "0.0.0.0" })).toBe(probe);
+  });
+});
+
+describe("preview — bind: the row never claims an interface the container is not on (cinatra-cli#248)", () => {
+  const OK = { status: 200, body: '{"status":"ok"}' };
+
+  it("a FAILED refresh leaves the row on the bind the still-running container has", async () => {
+    const { deps } = makeDeps({ sha: SHA_A, health: OK });
+    await runPreviewCreate(["--slug", "main"], deps); // wide publish, bind null
+    expect(getPreview(readRegistry(registryPath).registry, "main").bind).toBe(null);
+
+    const { deps: deps2 } = makeDeps({ sha: SHA_B, health: OK, buildFails: true });
+    await expect(runPreviewRefresh(["--slug", "main", "--bind", "127.0.0.1"], deps2)).rejects.toThrow(/build/i);
+    const row = getPreview(readRegistry(registryPath).registry, "main");
+    // The old container was never replaced — it is still published on every
+    // interface, so a row saying 127.0.0.1 would be a lie the operator acts on.
+    expect(row.state).toBe("ready");
+    expect(row.bind).toBe(null);
+  });
+
+  it("`start` WITHOUT --recreate neither applies nor records a new bind — and says so", async () => {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: {
+        main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, bind: null, now: () => "T0" }),
+      },
+    });
+    const { deps, fake, logs } = makeDeps({
+      sha: SHA_A,
+      health: OK,
+      containerRunning: true,
+      images: new Set([previewImageTag(SHA_A)]),
+    });
+    await runPreviewStart(["--slug", "main", "--bind", "127.0.0.1"], deps);
+    // Nothing was re-materialized: docker cannot move a running publish.
+    expect(fake.calls.some((c) => c[0] === "run")).toBe(false);
+    expect(getPreview(readRegistry(registryPath).registry, "main").bind).toBe(null);
+    expect(logs.join("\n")).toMatch(/--bind 127\.0\.0\.1 was NOT applied/);
+    expect(logs.join("\n")).toMatch(/--recreate/);
+  });
+
+  it("`start --recreate` DOES apply and record it", async () => {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: {
+        main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, bind: null, now: () => "T0" }),
+      },
+    });
+    const { deps, fake } = makeDeps({
+      sha: SHA_A,
+      health: OK,
+      containerRunning: true,
+      images: new Set([previewImageTag(SHA_A)]),
+    });
+    await runPreviewStart(["--slug", "main", "--bind", "127.0.0.1", "--recreate"], deps);
+    const run = fake.calls.find((c) => c[0] === "run");
+    expect(run[run.indexOf("-p") + 1]).toBe("127.0.0.1:3400:3000");
+    expect(getPreview(readRegistry(registryPath).registry, "main").bind).toBe("127.0.0.1");
+  });
+});
+
+describe("preview — the build cache only runs on a builder that can hold one (cinatra-cli#248)", () => {
+  const buildxThen = (inspect) => (args) => {
+    if (args[0] === "buildx" && args[1] === "version") {
+      return { status: 0, stdout: "github.com/docker/buildx v0.17.1", stderr: "" };
+    }
+    if (args[0] === "buildx" && args[1] === "inspect") return inspect;
+    return { status: 0, stdout: "", stderr: "" };
+  };
+
+  it("reads the builder's driver, and reads an unanswerable probe as UNKNOWN", () => {
+    expect(
+      dockerBuildxDriver({ runDocker: buildxThen({ status: 0, stdout: "Name: default\nDriver: docker\n", stderr: "" }) }),
+    ).toBe("docker");
+    expect(
+      dockerBuildxDriver({
+        runDocker: buildxThen({ status: 0, stdout: "Name: builder\nDriver: docker-container\n", stderr: "" }),
+      }),
+    ).toBe("docker-container");
+    expect(dockerBuildxDriver({ runDocker: buildxThen({ status: 1, stdout: "", stderr: "no builder" }) })).toBe(null);
+  });
+
+  it("the DEFAULT `docker` driver cannot export a local cache, so it is not cache-capable", () => {
+    const docker = { runDocker: buildxThen({ status: 0, stdout: "Name: default\nDriver: docker\n", stderr: "" }) };
+    expect(dockerBuildxCacheCapable(docker)).toBe(false);
+    expect(
+      dockerBuildxCacheCapable({
+        runDocker: buildxThen({ status: 0, stdout: "Name: b\nDriver: docker-container\n", stderr: "" }),
+      }),
+    ).toBe(true);
+  });
+
+  it("buildx PRESENT on the default driver still builds classic — a cache is not worth a failed build", () => {
+    const calls = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: path.join(tmp, "ctx"),
+      sha: SHA_A,
+      deps: {
+        log: () => {},
+        buildControlEnv: { [PREVIEW_BUILD_CACHE_DIR_ENV]: path.join(tmp, "no-cache-here") },
+        runDocker: (args) => {
+          calls.push(args);
+          return buildxThen({ status: 0, stdout: "Name: default\nDriver: docker\n", stderr: "" })(args);
+        },
+      },
+    });
+    // `--cache-to=type=local` fails outright on that driver; the classic builder
+    // is the answer that is only slower, never broken.
+    expect(calls.some((c) => c[0] === "buildx" && c[1] === "build")).toBe(false);
+    const build = calls.find((c) => c[0] === "build");
+    expect(build.join(" ")).not.toContain("--cache-from");
+    expect(existsSync(path.join(tmp, "no-cache-here"))).toBe(false);
+  });
+
+  it("an UNWRITABLE cache directory degrades to classic instead of dying mid-build", () => {
+    const cacheDir = path.join(tmp, "ro-cache");
+    mkdirSync(cacheDir, { recursive: true });
+    chmodSync(cacheDir, 0o500); // exists, and `mkdirSync` is happy — only a write proves it
+    const calls = [];
+    try {
+      buildPreviewImage({
+        tag: previewImageTag(SHA_A),
+        contextDir: path.join(tmp, "ctx"),
+        sha: SHA_A,
+        deps: {
+          log: () => {},
+          buildControlEnv: { [PREVIEW_BUILD_CACHE_DIR_ENV]: cacheDir },
+          runDocker: (args) => {
+            calls.push(args);
+            return buildxThen({ status: 0, stdout: "Name: b\nDriver: docker-container\n", stderr: "" })(args);
+          },
+        },
+      });
+    } finally {
+      chmodSync(cacheDir, 0o700);
+    }
+    expect(calls.some((c) => c[0] === "buildx" && c[1] === "build")).toBe(false);
+    expect(calls.find((c) => c[0] === "build")).toBeTruthy();
+  });
+
+  it("only ONE concurrent build exports the cache; the others still READ it", () => {
+    const cacheDir = path.join(tmp, "lock-cache");
+    mkdirSync(cacheDir, { recursive: true });
+    const held = acquireBuildCacheLock(cacheDir);
+    expect(held).toBeTruthy();
+    // A second build cannot take it — a local cache destination written twice at
+    // once loses one of the two exports.
+    expect(acquireBuildCacheLock(cacheDir)).toBe(null);
+
+    const calls = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: path.join(tmp, "ctx"),
+      sha: SHA_A,
+      deps: {
+        log: () => {},
+        buildControlEnv: { [PREVIEW_BUILD_CACHE_DIR_ENV]: cacheDir },
+        runDocker: (args) => {
+          calls.push(args);
+          return buildxThen({ status: 0, stdout: "Name: b\nDriver: docker-container\n", stderr: "" })(args);
+        },
+      },
+    });
+    const build = calls.find((c) => c[0] === "buildx" && c[1] === "build");
+    expect(build.join(" ")).toContain(`--cache-from=type=local,src=${cacheDir}`);
+    expect(build.join(" ")).not.toContain("--cache-to");
+
+    releaseBuildCacheLock(held);
+    // Released: the next build exports again, and the release is idempotent.
+    const second = acquireBuildCacheLock(cacheDir);
+    expect(second).toBeTruthy();
+    releaseBuildCacheLock(second);
+    releaseBuildCacheLock(second);
+  });
+
+  it("a build that HOLDS the lock releases it even when docker fails", () => {
+    const cacheDir = path.join(tmp, "fail-cache");
+    expect(() =>
+      buildPreviewImage({
+        tag: previewImageTag(SHA_A),
+        contextDir: path.join(tmp, "ctx"),
+        sha: SHA_A,
+        deps: {
+          log: () => {},
+          buildControlEnv: { [PREVIEW_BUILD_CACHE_DIR_ENV]: cacheDir },
+          runDocker: (args) => {
+            if (args[0] === "buildx" && args[1] === "build") return { status: 1, stdout: "", stderr: "build boom" };
+            return buildxThen({ status: 0, stdout: "Name: b\nDriver: docker-container\n", stderr: "" })(args);
+          },
+        },
+      }),
+    ).toThrow(/build/i);
+    // The lock is free again: a dead build must not wedge every later one.
+    const after = acquireBuildCacheLock(cacheDir);
+    expect(after).toBeTruthy();
+    releaseBuildCacheLock(after);
+  });
+
+  it("the read-only argv carries --cache-from and NO --cache-to", () => {
+    const args = previewBuildDockerArgs({ tag: "t", contextDir: "/ctx", cacheDir: "/cache", cacheWrite: false });
+    expect(args).toContain("--cache-from=type=local,src=/cache");
+    expect(args.join(" ")).not.toContain("--cache-to");
   });
 });

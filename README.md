@@ -85,6 +85,61 @@ Accepted range **1000 .. 21600000** ms (1 second .. 6 hours). Notes:
   step starts over from the beginning. So if a *single* step takes longer than
   the budget, retrying will never get past it; raise the budget instead.
 
+### Where a preview publishes its port
+
+A preview container publishes its app port to a host port, and by default that
+publish is on **every interface** (`0.0.0.0`) — docker's own default, unchanged.
+On a host that builds previews for review, the firewall is then the only thing
+keeping an unauthenticated preview off the public interface. To narrow it:
+
+    cinatra instance preview create --bind 127.0.0.1
+    cinatra install --mode preview --bind 127.0.0.1
+    CINATRA_PREVIEW_BIND_HOST=127.0.0.1 cinatra instance preview create
+
+The flag wins over the environment variable, anything that is not an IP literal
+is rejected before anything is built or booted (docker publishes on an IP only —
+it answers `invalid IP address: localhost` for a name), and the resolved bind is
+**recorded on the preview's registry row** — so `refresh` and
+`start --recreate` re-publish on the same interface instead of quietly widening
+it — and on `start` a *changed* bind is applied (and recorded) only with
+`--recreate`, because docker cannot move a running container's publish. The
+health probe follows the bind: `localhost` for the unchanged wide publish and for
+a loopback one, and the bound address itself when the publish names one
+interface, so a preview bound to a LAN address is health-gated where it actually
+listens.
+
+### The preview build cache and what it costs on disk
+
+A preview build is the checkout's whole multi-stage Dockerfile, and without a
+cache **two builds of the very same commit share nothing** — a rebuild costs the
+full time again. When `docker buildx` is installed, the CLI builds through it
+with a local layer cache, so a rebuild whose earlier steps are unchanged reuses
+them; run a build and look for `CACHED` in its output (the build already runs
+`--progress=plain` on that path, which is what makes those lines visible):
+
+    cinatra instance preview refresh --slug <slug> --rebuild 2>&1 | grep CACHED
+
+Without buildx the classic builder runs exactly as before — the CLI says which
+builder it used on every build, so this is never a guess. `CINATRA_PREVIEW_BUILD_CACHE=off`
+pins the classic builder even where buildx is present.
+
+**Disk.** Preview builds are large. A spike measured roughly **18 GB of
+intermediate layers per built commit** on one verification host — an approximate
+figure for planning, not a promise — and the buildx cache is *additional* to
+that, growing with every distinct build. There is no `preview prune` verb yet, so
+cleanup is manual:
+
+    du -sh ~/.cinatra/preview-build-cache   # measure the layer cache
+    rm -rf ~/.cinatra/preview-build-cache   # prune it (a later build refills it)
+    docker system df                        # measure images + build cache
+    docker image ls 'cinatra-preview:*'     # the per-SHA preview images
+
+`cinatra instance preview refresh` already removes the image it supersedes once
+the new one is healthy, and pruning a preview removes its image when no other
+preview references it — so the images that accumulate are the ones belonging to
+previews you still have. `CINATRA_PREVIEW_BUILD_CACHE_DIR` moves the layer cache
+to a bigger disk.
+
 The other local host/monorepo bootstrap commands you run from inside a Cinatra
 checkout live under `cinatra instance …`:
 

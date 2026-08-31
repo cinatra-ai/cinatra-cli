@@ -567,6 +567,31 @@ export function previewSlugArgs({ instanceSlug = null, rest = [] } = {}) {
   return Array.isArray(rest) ? rest : [];
 }
 
+/**
+ * The `--bind` argv the front door hands the preview lifecycle (cinatra-cli#248).
+ *
+ * `runInstallPreviewBootstrap` builds a FRESH argv for `runPreviewCreate`
+ * (`--slug` + `--ref`) instead of forwarding `rest` verbatim the way the
+ * refresh/start continuations do — so a flag that is not extracted here is
+ * silently dropped, and `--bind` would appear to work on refresh/start while
+ * doing nothing on the create the front door actually performs.
+ *
+ * The VALUE is deliberately left unvalidated: `resolveBindHost` inside
+ * `runPreviewCreate` is the single validator, and a second copy of its rules here
+ * is exactly how the two drift. A bare trailing `--bind` is forwarded with an
+ * EMPTY value so that validator refuses it, rather than being dropped here and
+ * silently widening the publish.
+ */
+export function previewBindArgs({ rest = [] } = {}) {
+  if (!Array.isArray(rest)) return [];
+  for (let i = 0; i < rest.length; i++) {
+    const token = String(rest[i]);
+    if (token === "--bind") return ["--bind", rest[i + 1] === undefined ? "" : String(rest[i + 1])];
+    if (token.startsWith("--bind=")) return ["--bind", token.slice("--bind=".length)];
+  }
+  return [];
+}
+
 // --- orchestration ---------------------------------------------------------
 
 /**
@@ -706,7 +731,9 @@ export async function runInstallPreviewBootstrap({
     deps,
   });
 
-  const result = await runPreviewCreate(["--slug", slug, "--ref", ref], {
+  // cinatra-cli#248: `--bind` is forwarded EXPLICITLY, because this argv is
+  // reconstructed rather than passed through (see `previewBindArgs`).
+  const result = await runPreviewCreate(["--slug", slug, "--ref", ref, ...previewBindArgs({ rest })], {
     ...injected,
     checkoutDir: targetDir,
     // The pre-port env: enough for create's fail-fast encryption-key gate; the
@@ -999,6 +1026,7 @@ export const __test = {
   continuationImplicitEndpointLines,
   previewHandoffLines,
   previewSlugArgs,
+  previewBindArgs,
   decidePreviewAction,
   previewSkipReportLines,
   previewInFlightReportLines,
