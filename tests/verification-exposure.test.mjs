@@ -811,6 +811,14 @@ describe("verification exposure — reusing, recovering and serialising the life
       // The lock names its owner the moment it exists — never an empty file a
       // second process could read as an ownerless leftover.
       expect(JSON.parse(readFileSync(lockPath, "utf8")).pid).toBe(process.pid);
+      // …and it names its owner IN the record, as a token: that token, and not
+      // the file's identity on disk, is what release() checks. An inode number
+      // is reusable the moment its file is unlinked, so a lock removed and
+      // re-created by someone else can land on the very same identity — which
+      // is why ownership has to be readable out of the content.
+      const recordedOwner = JSON.parse(readFileSync(lockPath, "utf8")).owner;
+      expect(typeof recordedOwner).toBe("string");
+      expect(recordedOwner.length).toBeGreaterThan(0);
       // A second holder is refused while the first holds it.
       expect(() => acquireVerificationExposureLock(lockPath)).toThrow(/in flight/);
 
@@ -825,8 +833,24 @@ describe("verification exposure — reusing, recovering and serialising the life
       writeFileSync(lockPath, "");
       expect(() => acquireVerificationExposureLock(lockPath)).toThrow(/lifecycle lock/);
 
-      // And OUR release removes nothing once the file at the path is no longer
-      // the lock we took — a DIFFERENT file, not merely different contents.
+      // And OUR release removes nothing once the RECORD at the path is no
+      // longer the one we wrote. Both overwrites above were made IN PLACE, so
+      // the file's identity on disk is still the one we linked there — an
+      // identity check would call it ours and delete it. It is not ours: the
+      // record cannot be read as an owner record at all.
+      release();
+      expect(existsSync(lockPath)).toBe(true);
+
+      // The same holds for a perfectly readable record that names a DIFFERENT
+      // owner, again written in place at the same identity.
+      writeFileSync(
+        lockPath,
+        `${JSON.stringify({ owner: `not-${recordedOwner}`, pid: process.pid, at: "x" })}\n`,
+      );
+      release();
+      expect(existsSync(lockPath)).toBe(true);
+
+      // …and for a DIFFERENT file at the path, not merely different contents.
       rmSync(lockPath, { force: true });
       writeFileSync(lockPath, `${JSON.stringify({ pid: process.pid, at: "someone-else" })}\n`);
       release();

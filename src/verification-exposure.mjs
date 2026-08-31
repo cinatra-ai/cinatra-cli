@@ -45,6 +45,7 @@
 // `instance tunnel`.
 // ---------------------------------------------------------------------------
 
+import { randomUUID } from "node:crypto";
 import { createServer, request as httpRequest } from "node:http";
 import {
   appendFileSync,
@@ -760,30 +761,35 @@ export function acquireVerificationExposureLock(lockPath) {
   // private temp file and LINKED into place, so the lock never exists as an
   // empty, ownerless file, and a second claimant fails EEXIST rather than
   // overwriting.
-  const fingerprintOf = (target) => {
-    try {
-      const stats = statSync(target);
-      return `${stats.dev}:${stats.ino}`;
-    } catch {
-      return null;
-    }
-  };
-
+  //
+  // OWNERSHIP IS A TOKEN IN THE RECORD, NEVER THE FILE'S IDENTITY. The record
+  // carries a random owner token, and that token — read back out of the file's
+  // own content — is the only thing release() will accept as proof the lock is
+  // still ours. A filesystem identity (device plus inode) cannot carry that
+  // proof: an inode number is reusable the moment the file holding it is
+  // unlinked, so a lock removed and re-created by SOMEONE ELSE can land on the
+  // very same identity, and an identity check would then read another run's
+  // lock as our own and delete it. That is not a narrow timing window, it is
+  // the ordinary behaviour of an inode allocator, and it is exactly the
+  // guarantee this verb publishes. Content answers it; identity cannot.
   const scratch = `${lockPath}.${process.pid}.${Date.now()}`;
-  writeFileSync(scratch, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`, {
-    mode: 0o600,
-  });
-  let token = null;
+  const owner = randomUUID();
+  writeFileSync(
+    scratch,
+    `${JSON.stringify({ owner, pid: process.pid, at: new Date().toISOString() })}\n`,
+    { mode: 0o600 },
+  );
+  let held = false;
   try {
     linkSync(scratch, lockPath);
-    token = fingerprintOf(scratch);
+    held = true;
   } catch (err) {
     if (err?.code !== "EEXIST") throw err;
   } finally {
     rmSync(scratch, { force: true });
   }
 
-  if (!token) {
+  if (!held) {
     let holder = null;
     try {
       holder = JSON.parse(readFileSync(lockPath, "utf8"))?.pid ?? null;
@@ -804,19 +810,19 @@ export function acquireVerificationExposureLock(lockPath) {
   }
 
   return () => {
-    // Release only what we still hold. Nothing here ever takes a lock away
-    // automatically, so the only way this check can fail to match is an
-    // operator who removed ours by hand — in which case there is nothing to
-    // remove.
+    // Release only what we still hold, and prove it from the record itself: a
+    // record we cannot read, one that carries no owner token, and one that
+    // carries somebody else's are all "not ours", and all three leave the file
+    // alone. Nothing here ever takes a lock away automatically.
     //
-    // KNOWN RESIDUAL, stated rather than hidden: the check and the unlink are
-    // two calls, and Node exposes no inode-guarded unlink to fuse them. An
+    // KNOWN RESIDUAL, stated rather than hidden: the read and the unlink are
+    // two calls, and Node exposes no content-guarded unlink to fuse them. An
     // operator who deletes this lock by hand in the microseconds between them,
     // while another run claims the path in the same window, would have that
-    // run's lock removed. It needs a hand-deletion of a live lock to happen at
+    // run's lock removed. It needs a hand-deletion of a LIVE lock to happen at
     // all, and its cost is two concurrent dev-only lifecycle runs — the same
     // state the operator's own deletion was asking for.
-    if (fingerprintOf(lockPath) !== token) return;
+    if (readLockOwnerToken(lockPath) !== owner) return;
     try {
       rmSync(lockPath, { force: true });
     } catch {
@@ -824,6 +830,23 @@ export function acquireVerificationExposureLock(lockPath) {
       // rather than guessing — the safe direction.
     }
   };
+}
+
+/**
+ * The owner token recorded IN the lock file, or null when the file cannot be
+ * read as an owner record at all. Null is never equal to a live token, so
+ * every unreadable, empty or foreign record answers "not yours".
+ *
+ * @param {string} lockPath
+ * @returns {string | null}
+ */
+function readLockOwnerToken(lockPath) {
+  try {
+    const recorded = JSON.parse(readFileSync(lockPath, "utf8"))?.owner;
+    return typeof recorded === "string" && recorded.length > 0 ? recorded : null;
+  } catch {
+    return null;
+  }
 }
 
 function lockHolderIsAlive(pid) {
