@@ -168,7 +168,7 @@ import {
 // cinatra-cli#194: the preview image-build budget lever. `preview.mjs` is plain
 // ESM over node builtins (importable from the light CLI core), and only the pure
 // validator is used here — the lifecycle itself stays lazy-imported below.
-import { resolveBuildTimeoutMs, buildPreviewBuildArgs } from "./preview.mjs";
+import { resolveBuildTimeoutMs, buildPreviewBuildArgs, resolveBuildCacheMode, resolveBindHost } from "./preview.mjs";
 // cinatra#2654: the WayFlow agent runtime starts with every install-owned local
 // stack. The decision, the operator-facing status text, and the two pre-`up`
 // steps (bridge-token env, image build) live in their own builtins-only module
@@ -437,6 +437,7 @@ const VALUE_TAKING_INSTALL_FLAGS = new Set([
   "--infra",
   "--on-conflict",
   "--instance",
+  "--bind", // cinatra-cli#248 (preview-only; its value is an address, not a mode)
   "--execution-mode",
   "--sandbox-broker-url",
   "--sandbox-broker-secret",
@@ -716,7 +717,32 @@ export function parseInstallArgs(argv = []) {
   if (surfaceMode === PREVIEW_SURFACE_MODE_VALUE) {
     resolveBuildTimeoutMs(process.env);
     buildPreviewBuildArgs(process.env);
+    resolveBuildCacheMode(process.env); // cinatra-cli#248
   }
+
+  // cinatra-cli#248: `--bind <address>` names the interface the PREVIEW
+  // container publishes its host port on, so it is preview-only — silently
+  // accepting it on a dev/prod/demo install would let an operator believe they
+  // narrowed something. Validated HERE, in the same "before any side effect"
+  // position as the build levers above, so a typo costs nothing instead of
+  // costing a whole install.
+  const previewBindOpt = readOption(argv, "--bind");
+  if (previewBindOpt != null && surfaceMode !== PREVIEW_SURFACE_MODE_VALUE) {
+    throw new Error(
+      `--bind applies only to \`install --mode preview\` — it names the interface the preview ` +
+        `container publishes on, and a ${surfaceMode} install publishes no preview container.`,
+    );
+  }
+  // The ENV form has to be resolved HERE as well. The front door hands the
+  // lifecycle a RECONSTRUCTED argv and a COMPOSED env (`plan.preEnv`, built from
+  // the install's own values), so an ambient CINATRA_PREVIEW_BIND_HOST never
+  // reaches `runPreviewCreate`'s own resolver — without this line
+  // `CINATRA_PREVIEW_BIND_HOST=127.0.0.1 cinatra install --mode preview` would
+  // publish on every interface while the operator believed it was narrowed.
+  // `resolveBindHost` is the SAME single resolver+validator the lifecycle uses,
+  // so the flag still wins over the env and a bad value is refused identically.
+  const previewBind =
+    surfaceMode === PREVIEW_SURFACE_MODE_VALUE ? resolveBindHost({ rest: argv, env: process.env }) : null;
 
   return {
     dir: dirOpt, // null → resolved later (prompt on TTY, else default).
@@ -729,6 +755,9 @@ export function parseInstallArgs(argv = []) {
     // never as an install mode.
     surfaceMode,
     previewFrontDoor: surfaceMode === PREVIEW_SURFACE_MODE_VALUE,
+    // cinatra-cli#248: the validated preview publish bind, or null for docker's
+    // unchanged default. Handed to the preview lifecycle as its own `--bind`.
+    previewBind,
     yes: argv.includes("--yes"),
     force: argv.includes("--force"),
     resetEnv: argv.includes("--reset-env"),
@@ -9408,7 +9437,8 @@ async function bootstrapPreviewFrontDoor({
     // cinatra-cli#197 — this instance's effective local-infra endpoints, for the
     // container-dialed keys the install leaves implicit in `.env.local`.
     effectiveEndpoints,
-    rest: [],
+    // cinatra-cli#248 — the only lifecycle flag the front door forwards.
+    rest: opts.previewBind ? ["--bind", opts.previewBind] : [],
     log,
     deps: deps.previewDeps ?? {},
   });

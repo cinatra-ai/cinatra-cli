@@ -307,6 +307,42 @@ export const SUPERSEDED_CONTAINER_SUFFIX = ".superseded";
 export const PREVIEW_HOST_PORT_MIN = 3400;
 export const PREVIEW_HOST_PORT_MAX = 3499;
 
+// cinatra-cli#248: the INTERFACE the host port is published on. `docker run -p`
+// takes an optional bind address in front of the host port (`-p
+// 127.0.0.1:3400:3000`); with none, docker publishes on 0.0.0.0 — every
+// interface, so a preview on a host with a briefly-disabled firewall is an
+// unauthenticated instance on the public one.
+//
+// The DEFAULT is deliberately UNCHANGED. Nothing else in this file defaults a
+// listen address to loopback-only, and narrowing it here would silently break
+// every operator who reaches a preview from another machine — a behaviour change
+// no flag asked for. The safer bind is an explicit opt-in: `--bind 127.0.0.1`,
+// or CINATRA_PREVIEW_BIND_HOST for the front door and for a host that sets it
+// once. The FLAG wins over the env (an invocation is more specific than a
+// profile), and the resolved value is PERSISTED on the preview's registry row so
+// `refresh` and `start --recreate` re-publish on the same interface rather than
+// quietly widening it back to every one.
+export const PREVIEW_BIND_HOST_ENV = "CINATRA_PREVIEW_BIND_HOST";
+export const PREVIEW_BIND_HOST_DEFAULT = "0.0.0.0";
+
+// cinatra-cli#248: the image-build CACHE. A plain `docker build` against the
+// classic builder reused NOTHING between two builds of the same source in the
+// measurement that motivated this (a cold build and an immediate rebuild of the
+// same commit both ran full length, with zero `Using cache` lines) — each build
+// materializes its context in a FRESH temp directory, and the classic builder's
+// cache key is sensitive to that. BuildKit's cache is content-keyed instead, so
+// it is immune to the path churn, which is why the fix here is to build THROUGH
+// buildx with an explicit local cache rather than to try to stabilize the
+// context path under a builder whose keying this repo cannot verify.
+//
+// `auto` (the default) uses buildx WHEN THE PROBE FINDS IT and otherwise falls
+// back to the byte-identical classic invocation — an optional tool, degraded
+// gracefully, exactly as the rest of this file treats one. `off` pins the
+// classic builder even where buildx exists.
+export const PREVIEW_BUILD_CACHE_ENV = "CINATRA_PREVIEW_BUILD_CACHE";
+export const PREVIEW_BUILD_CACHE_DIR_ENV = "CINATRA_PREVIEW_BUILD_CACHE_DIR";
+export const PREVIEW_BUILD_CACHE_MODES = ["auto", "off"];
+
 // The runtime env keys a preview container inherits from the ambient
 // environment when present (the operator supplies DB / auth / redis via env or
 // an --env-file, exactly like the prod-boot-e2e boot case). The encryption key
@@ -352,6 +388,26 @@ export const PASSTHROUGH_ENV_KEYS = [
   // hosted default still applies (#190 AC6).
   "CINATRA_AGENT_REGISTRY_URL",
   "CINATRA_AGENT_REGISTRY_UI_URL",
+  // cinatra-cli#248: the DEPLOYMENT registry. A DIFFERENT registry from the
+  // agent (Verdaccio) package registry above: that one decides where a package
+  // is fetched FROM, these four decide whether an INSTALLED package is TRUSTED.
+  // Without them the app's store-install path refuses with "no deployment
+  // registry config" whenever it runs in production mode — which a preview
+  // container ALWAYS does (CINATRA_RUNTIME_MODE=production is forced here), so
+  // before #248 nothing in the preview lifecycle could supply the values that
+  // clear it and a preview could never be pointed at a deployment registry.
+  //
+  // Forwarded VERBATIM, never rewritten: none of the four is in
+  // CONTAINER_REWRITE_ENV_KEYS. "PUBLIC" in the URL's own name says it is an
+  // externally reachable address, unlike the DB/Redis/Nango endpoints that array
+  // rewrites, and this repository cannot confirm the registry's own source
+  // either way — so the conservative reading (forward what the operator set) is
+  // what ships. An operator whose registry really does sit on the host's
+  // loopback can still name CONTAINER_HOST_GATEWAY explicitly.
+  "CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_URL",
+  "CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_READ_TOKEN",
+  "CINATRA_DEPLOYMENT_REGISTRY_ROUTING_MODE",
+  "CINATRA_DEPLOYMENT_REGISTRY_ALLOW_FIXTURE",
 ];
 
 // The container-side name for "the operator's host" (cinatra-cli#190). Docker
@@ -1031,8 +1087,15 @@ export function listPreviews(registry) {
  * Build a fresh (create) preview slot record. Pure — the caller persists it.
  * `history` seeds with the initial sha/tag so a later `refresh` records
  * old→new without ever silently overwriting (AC3).
+ *
+ * `bind` (cinatra-cli#248) records the interface this preview publishes on, the
+ * same way `hostPort` records the port: it is part of HOW the preview is
+ * reachable, so every later boot of the row (refresh, start --recreate) can
+ * re-publish identically instead of widening back to every interface. `null` is
+ * the recorded value for "docker's default", which is also what a row written
+ * before #248 reads as.
  */
-export function makePreviewSlot({ slug, ref, sha, hostPort, state = "ready", now }) {
+export function makePreviewSlot({ slug, ref, sha, hostPort, bind = null, state = "ready", now }) {
   if (!isValidSlug(slug)) throw new Error(`Invalid preview slug "${slug}".`);
   if (!isImmutableSha(sha)) throw new Error(`makePreviewSlot requires a 40-hex SHA (got ${JSON.stringify(sha)}).`);
   const at = (now ?? (() => new Date().toISOString()))();
@@ -1047,6 +1110,7 @@ export function makePreviewSlot({ slug, ref, sha, hostPort, state = "ready", now
     containerName: previewContainerName(slug),
     volumeName: previewVolumeName(slug),
     hostPort: hostPort ?? null,
+    bind: bind ?? null, // cinatra-cli#248
     state,
     createdAt: at,
     refreshedAt: at,
@@ -1060,7 +1124,7 @@ export function makePreviewSlot({ slug, ref, sha, hostPort, state = "ready", now
  * logs old→new. The volumeName/containerName are stable (the durable volume is
  * REUSED, AC4). Pure — returns a new slot.
  */
-export function refreshPreviewSlot(slot, { ref, sha, hostPort, state = "ready", now }) {
+export function refreshPreviewSlot(slot, { ref, sha, hostPort, bind, state = "ready", now }) {
   if (!isImmutableSha(sha)) throw new Error(`refreshPreviewSlot requires a 40-hex SHA (got ${JSON.stringify(sha)}).`);
   const at = (now ?? (() => new Date().toISOString()))();
   const imageTag = previewImageTag(sha);
@@ -1072,6 +1136,11 @@ export function refreshPreviewSlot(slot, { ref, sha, hostPort, state = "ready", 
     provenance: previewProvenance(sha),
     runtimeMode: PREVIEW_RUNTIME_MODE,
     hostPort: hostPort ?? slot.hostPort ?? null,
+    // cinatra-cli#248: UNDEFINED means "this refresh said nothing about the
+    // bind", which CARRIES THE ROW'S OWN VALUE FORWARD; an explicit null is a
+    // caller resetting it to docker's default. `??` alone could not tell those
+    // apart and would silently widen the publish on every refresh.
+    bind: bind !== undefined ? (bind ?? null) : (slot.bind ?? null),
     state,
     refreshedAt: at,
     history: [...(slot.history ?? []), { sha, imageTag, at }],
@@ -1152,9 +1221,16 @@ function defaultPrepareContext({ sha, checkoutDir }) {
 
 /**
  * Real host-port probe: resolves true iff `port` can be bound on 0.0.0.0 — the
- * interface `docker run -p <host>:3000` publishes on. A bind error (EADDRINUSE /
- * EACCES) means the port is busy. Best-effort; used only as defense-in-depth on
- * top of the registry-recorded per-preview ports.
+ * interface `docker run -p <host>:3000` publishes on when no bind address is
+ * given. A bind error (EADDRINUSE / EACCES) means the port is busy. Best-effort;
+ * used only as defense-in-depth on top of the registry-recorded per-preview
+ * ports.
+ *
+ * cinatra-cli#248 deliberately leaves this on 0.0.0.0 even when the operator
+ * asked for a NARROWER publish. The wide probe is the conservative one: a port
+ * bindable on every interface is bindable on any single one, while a port that
+ * is free on 127.0.0.1 may still be held on another interface — so probing the
+ * narrow address would hand out a port `docker run` then fails on.
  */
 function defaultProbePort(port, host = "0.0.0.0") {
   return new Promise((resolve) => {
@@ -1457,6 +1533,174 @@ export function dockerfileDeclaredBuildArgs(contextDir) {
 }
 
 /**
+ * Resolve the build-cache mode (cinatra-cli#248). Absent / all-whitespace means
+ * `auto`; anything outside the enum is a hard error naming the variable, the
+ * same fail-closed treatment every other build lever gets — a typo'd `of` must
+ * not silently read as "cache on".
+ */
+export function resolveBuildCacheMode(env = {}) {
+  const raw = env?.[PREVIEW_BUILD_CACHE_ENV];
+  if (raw === undefined || raw === null || String(raw).trim().length === 0) return "auto";
+  const value = String(raw).trim().toLowerCase();
+  if (!PREVIEW_BUILD_CACHE_MODES.includes(value)) {
+    throw new Error(
+      `Invalid ${PREVIEW_BUILD_CACHE_ENV} ${JSON.stringify(raw)}. ` +
+        `Use one of: ${PREVIEW_BUILD_CACHE_MODES.join(" | ")} (default: auto, which uses ` +
+        `\`docker buildx\` when it is available and the classic builder when it is not).`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Where the buildx local cache lives (cinatra-cli#248). Under the CLI's own
+ * state root by default, so it is one directory an operator can measure and
+ * delete; `CINATRA_PREVIEW_BUILD_CACHE_DIR` moves it to a bigger disk.
+ */
+export function previewBuildCacheDir(env = {}) {
+  const override = env?.[PREVIEW_BUILD_CACHE_DIR_ENV];
+  if (typeof override === "string" && override.trim().length > 0) return override.trim();
+  return path.join(os.homedir(), ".cinatra", "preview-build-cache");
+}
+
+/**
+ * True iff `docker buildx` is really there (cinatra-cli#248).
+ *
+ * The probe requires the answer to NAME buildx, not merely to exit 0. A status
+ * code alone is not evidence: a wrapper, a shim, or an injected runner can
+ * return 0 for a subcommand it never ran, and treating that as "buildx is here"
+ * would route every build onto a builder that does not exist. `docker buildx
+ * version` prints `github.com/docker/buildx v...`, so the name IS the evidence.
+ * Anything else — a non-zero exit, a timeout, a throw — reads as absent and the
+ * caller degrades to the classic builder.
+ */
+export function dockerBuildxAvailable(deps) {
+  try {
+    const r = deps.runDocker(["buildx", "version"], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+    if (!r || r.error || r.timedOut || r.status !== 0) return false;
+    return /buildx/i.test(String(r.stdout ?? ""));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The buildx BUILDER's driver, lowercased — or null when it cannot be read
+ * (cinatra-cli#248).
+ */
+export function dockerBuildxDriver(deps) {
+  try {
+    const r = deps.runDocker(["buildx", "inspect"], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+    if (!r || r.error || r.timedOut || r.status !== 0) return null;
+    const m = /^[ \t]*Driver:[ \t]*(\S+)/im.exec(String(r.stdout ?? ""));
+    return m ? m[1].toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True iff the SELECTED buildx builder can actually export a local cache
+ * (cinatra-cli#248).
+ *
+ * An installed plugin is not the same claim. Docker's DEFAULT `docker` driver
+ * cannot export cache to `type=local` (it refuses with "Cache export is not
+ * supported for the docker driver" unless the containerd image store is
+ * enabled), so choosing buildx on that driver would turn a build that used to
+ * SUCCEED into one that fails — the exact regression a graceful degradation
+ * exists to avoid. A driver that cannot be read counts as incapable: the classic
+ * builder is the answer that is never wrong, only slower.
+ */
+export function dockerBuildxCacheCapable(deps) {
+  const driver = dockerBuildxDriver(deps);
+  return driver !== null && driver !== "docker";
+}
+
+/**
+ * Take the cache-EXPORT lock (cinatra-cli#248), or null when another build holds
+ * it.
+ *
+ * A local cache destination cannot be written by two builds at once without one
+ * export overwriting the other's index, so exactly one concurrent build writes
+ * the cache; the others still READ it (`--cache-from` alone), which is where
+ * nearly all of the saving is anyway. A lock older than the whole build budget
+ * belonged to a build that died and is taken over rather than blocking the host
+ * forever.
+ */
+export function acquireBuildCacheLock(cacheDir, { staleMs = 6 * 60 * 60 * 1000, now = () => Date.now() } = {}) {
+  const lockPath = path.join(cacheDir, ".cinatra-export.lock");
+  const take = () => {
+    closeSync(openSync(lockPath, "wx"));
+    return lockPath;
+  };
+  try {
+    return take();
+  } catch (err) {
+    if (err?.code !== "EEXIST") return null;
+    try {
+      const st = statSync(lockPath);
+      if (now() - st.mtimeMs > staleMs) {
+        unlinkSync(lockPath);
+        return take();
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+}
+
+/** Release a lock taken by `acquireBuildCacheLock`. Never throws. */
+export function releaseBuildCacheLock(lockPath) {
+  if (!lockPath) return;
+  try {
+    unlinkSync(lockPath);
+  } catch {
+    /* already gone — nothing to undo */
+  }
+}
+
+/**
+ * The exact `docker ...` argv a preview build runs (cinatra-cli#248), as a pure
+ * function so both shapes are assertable without a docker.
+ *
+ * `cacheDir` null is the CLASSIC invocation, byte-identical to the pre-#248 one
+ * — same verb, same order, same labels, same trailing context. With a cacheDir
+ * it is `docker buildx build` with a local cache read AND written (`mode=max`
+ * keeps the intermediate stages, which is what makes the dependency-install
+ * layers reusable rather than just the final one), `--load` so the result lands
+ * in the local image store the rest of this lifecycle inspects, and
+ * `--progress=plain` so the per-step `CACHED` lines are visible in the build
+ * output at all — that log IS the acceptance proof for a warm rebuild.
+ *
+ * The cache changes only how layers are OBTAINED, never what they contain: the
+ * tag, the build args, the labels and the context are the same either way.
+ */
+export function previewBuildDockerArgs({
+  tag,
+  contextDir,
+  buildArgs = [],
+  provenance,
+  sha,
+  cacheDir = null,
+  cacheWrite = true,
+}) {
+  const args = cacheDir
+    ? ["buildx", "build", "--load", "--progress=plain", "-t", tag, ...buildArgs]
+    : ["build", "-t", tag, ...buildArgs];
+  if (cacheDir) {
+    args.push(`--cache-from=type=local,src=${cacheDir}`);
+    // `cacheWrite` false is a concurrent build that did not get the export lock:
+    // it READS the warm cache and leaves the writing to the build that holds it.
+    if (cacheWrite) args.push(`--cache-to=type=local,dest=${cacheDir},mode=max`);
+  }
+  if (provenance) args.push("--label", `cinatra.preview.provenance=${provenance}`);
+  if (sha) args.push("--label", `cinatra.preview.sha=${sha}`);
+  args.push(contextDir);
+  return args;
+}
+
+/**
  * Build the preview image at `tag` from `contextDir` using the checkout's OWN
  * multi-stage Dockerfile (the same one build-image.yml uses: acquire-prod +
  * OAS-seed + presence-aware manifest regen + `next build` standalone + runtime
@@ -1541,14 +1785,68 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
       );
     }
   }
-  const args = ["build", "-t", tag, ...build.args];
-  if (provenance) args.push("--label", `cinatra.preview.provenance=${provenance}`);
-  if (sha) args.push("--label", `cinatra.preview.sha=${sha}`);
-  args.push(contextDir);
-  const r = deps.runDocker(args, {
-    timeoutMs,
-    stdio: ["ignore", "inherit", "inherit"],
+  // cinatra-cli#248: the warm build cache. Probed, never assumed — an absent
+  // buildx degrades to the classic invocation instead of failing the build — and
+  // ALWAYS logged, for the same reason every other build lever is: an operator
+  // reading a build that took an hour must be able to see whether it had a cache
+  // at all.
+  const cacheMode = resolveBuildCacheMode(buildEnv);
+  let cacheDir = null;
+  let cacheWrite = true;
+  let cacheLock = null;
+  // The plugin AND a builder that can export to it — see `dockerBuildxCacheCapable`.
+  const buildxUsable = cacheMode !== "off" && dockerBuildxAvailable(deps) && dockerBuildxCacheCapable(deps);
+  if (buildxUsable) {
+    cacheDir = previewBuildCacheDir(buildEnv);
+    try {
+      mkdirSync(cacheDir, { recursive: true });
+      // An EXISTING but unwritable directory passes `mkdirSync` — a real write is
+      // the only proof, and finding out here costs nothing while finding out
+      // mid-build costs the whole build.
+      const marker = path.join(cacheDir, `.cinatra-writable-${process.pid}`);
+      writeFileSync(marker, "");
+      unlinkSync(marker);
+    } catch {
+      // An unusable cache directory is not a reason to fail a build — it is a
+      // reason not to have a cache. Fall back rather than strand the operator.
+      cacheDir = null;
+    }
+    if (cacheDir) {
+      cacheLock = acquireBuildCacheLock(cacheDir);
+      cacheWrite = cacheLock !== null;
+    }
+  }
+  deps.log?.(
+    cacheDir
+      ? `  build cache: buildx local cache at ${cacheDir} ` +
+          `(${cacheWrite ? "--cache-from / --cache-to, mode=max" : "--cache-from only — another build holds the export lock"}). ` +
+          `A rebuild whose earlier layers are unchanged reports CACHED for them under --progress=plain. ` +
+          `It GROWS with every distinct build — measure it with \`du -sh ${cacheDir}\` and prune it by ` +
+          `deleting that directory (${PREVIEW_BUILD_CACHE_DIR_ENV} moves it; ${PREVIEW_BUILD_CACHE_ENV}=off ` +
+          `disables it).`
+      : cacheMode === "off"
+        ? `  build cache: DISABLED (${PREVIEW_BUILD_CACHE_ENV}=off) — the classic builder runs.`
+        : `  build cache: none — \`docker buildx\` did not answer, so the classic builder runs and this ` +
+          `build reuses nothing from an earlier one. Install the docker buildx plugin to get one.`,
+  );
+  const args = previewBuildDockerArgs({
+    tag,
+    contextDir,
+    buildArgs: build.args,
+    provenance,
+    sha,
+    cacheDir,
+    cacheWrite,
   });
+  let r;
+  try {
+    r = deps.runDocker(args, {
+      timeoutMs,
+      stdio: ["ignore", "inherit", "inherit"],
+    });
+  } finally {
+    releaseBuildCacheLock(cacheLock);
+  }
   if (r.timedOut || r.error || r.status !== 0) {
     throw new Error(
       `docker build of ${tag} failed` +
@@ -1843,9 +2141,14 @@ function resolveRuntimeEnv({ deps, env, hostPort }) {
  * (cinatra-cli#190) so the rewritten host-loopback endpoints in the boot env
  * resolve on a Linux engine too (Docker Desktop already provides the name).
  *
+ * `bind` (cinatra-cli#248) is the interface the host port is published on. It is
+ * already-validated (`validateBindHost`) or null; NULL means "unchanged", and
+ * emits the pre-#248 publish argument verbatim rather than an equivalent
+ * spelling of it, so the default path stays byte-identical.
+ *
  * @returns {string} the container name
  */
-export function bootPreviewContainer({ slug, tag, hostPort, encryptionKey, provenance, sha, deps }) {
+export function bootPreviewContainer({ slug, tag, hostPort, bind = null, encryptionKey, provenance, sha, deps }) {
   assertNotProductionImageTag(tag);
   const containerName = previewContainerName(slug);
   const volumeName = previewVolumeName(slug);
@@ -1855,7 +2158,9 @@ export function bootPreviewContainer({ slug, tag, hostPort, encryptionKey, prove
     "--name", containerName,
     "--add-host", `${CONTAINER_HOST_GATEWAY}:host-gateway`,
     "-v", `${volumeName}:${EXTENSION_DATA_ROOT_IN_CONTAINER}`,
-    "-p", `${hostPort}:3000`,
+    // cinatra-cli#248: an explicit bind narrows the publish to ONE interface;
+    // unset is the byte-identical pre-#248 argument (docker's own 0.0.0.0).
+    "-p", bind ? `${bind}:${hostPort}:3000` : `${hostPort}:3000`,
     ...envArgs,
   ];
   if (provenance) args.push("--label", `cinatra.preview.provenance=${provenance}`);
@@ -1968,6 +2273,116 @@ export function validatePreviewPort(value) {
 }
 
 /**
+ * Validate an operator-supplied publish BIND address (cinatra-cli#248) and
+ * return the form `docker run -p` parses.
+ *
+ * SHAPE only, exactly like `validatePreviewPort` above: whether the address
+ * actually exists on this host is docker's answer to give at run time, and
+ * pre-empting it here would need a bind probe that lies on a host with a
+ * transient interface. What this refuses is the class of value that must never
+ * reach `docker run` at all — empty/whitespace, a value carrying its own port or
+ * scheme (`127.0.0.1:3400`, `http://...`), a separator, a list, or a dotted quad
+ * that is not a valid IPv4 address. Those are the operator typos that would
+ * otherwise be swallowed into docker's colon-separated publish parser and
+ * surface as an unrelated failure — or, worse, as a publish on an interface
+ * nobody asked for.
+ *
+ * An IPv6 literal comes back BRACKETED: `-p ::1:3400:3000` is ambiguous to that
+ * same parser and `-p [::1]:3400:3000` is not.
+ */
+export function validateBindHost(value) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  const bad = (why) =>
+    new Error(
+      `Invalid preview bind address ${JSON.stringify(value)} (--bind / ${PREVIEW_BIND_HOST_ENV}) — ${why}. ` +
+        `Pass an interface ADDRESS docker can publish on: an IPv4 literal ` +
+        `(127.0.0.1 for loopback-only, ${PREVIEW_BIND_HOST_DEFAULT} for every interface, which is the ` +
+        `unchanged default) or an IPv6 literal (::1, bracketed or not) — never a hostname, a port, ` +
+        `a URL or a list.`,
+    );
+  if (raw.length === 0) throw bad("it is empty");
+  if (/[\s,/\\'"]/.test(raw)) throw bad("it contains whitespace or a separator");
+  const unbracketed = /^\[.+\]$/.test(raw) ? raw.slice(1, -1) : raw;
+  const version = net.isIP(unbracketed);
+  if (version === 6) return `[${unbracketed}]`;
+  if (version === 4) return unbracketed;
+  // Not an IP literal — and docker accepts NOTHING else in this position.
+  // Measured against a real engine (server 29.7.2) rather than assumed:
+  //   $ docker run -p localhost:34995:80 ...
+  //   docker: invalid IP address: localhost
+  // So a hostname is refused HERE, in the same breath as a port or a URL,
+  // instead of being carried through a whole build and dying on `docker run`.
+  if (/^[0-9.]+$/.test(raw)) throw bad("it looks like an IPv4 address but is not a valid one");
+  throw bad(
+    raw.includes(":")
+      ? "it is not a valid IP literal — a port or a URL does not belong in this value"
+      : "it is not an IP address — docker publishes on an IP literal only and refuses a name with " +
+        "`invalid IP address`",
+  );
+}
+
+/**
+ * The publish bind for THIS invocation (cinatra-cli#248): an explicit `--bind`
+ * wins over `CINATRA_PREVIEW_BIND_HOST`, and neither set returns `null` —
+ * "unchanged", which is what keeps the unset `docker run` argv byte-identical to
+ * the pre-#248 one rather than merely equivalent to it.
+ *
+ * A bare `--bind` with no value is a TYPO, not "unset": it is refused here
+ * rather than silently falling through to the env (or to the default), because
+ * an operator who typed the flag asked for a narrower publish and must not get a
+ * wider one in silence. A PRESENT but blank env value is the same typo wearing
+ * different clothes — `CINATRA_PREVIEW_BIND_HOST=$SOME_UNSET_VAR` expands to the
+ * empty string, and reading that as "unset" would publish on every interface at
+ * the exact moment the operator believed they had narrowed it.
+ */
+export function resolveBindHost({ rest = [], env = {} } = {}) {
+  const flagged = Array.isArray(rest) && rest.some((t) => t === "--bind" || String(t).startsWith("--bind="));
+  if (flagged) return validateBindHost(readOption(rest, "--bind"));
+  const fromEnv = env?.[PREVIEW_BIND_HOST_ENV];
+  if (typeof fromEnv === "string") return validateBindHost(fromEnv); // blank included: see above
+  return null;
+}
+
+// The bind values that mean "every interface" — docker's own default, spelled
+// three ways. `previewReachHost` treats them as the wide publish they are.
+const PREVIEW_BIND_WILDCARDS = new Set(["0.0.0.0", "::", "[::]", "[::0]", "0:0:0:0:0:0:0:0"]);
+
+/**
+ * The host the CLI must DIAL to reach a preview that publishes on `bind`
+ * (cinatra-cli#248).
+ *
+ * The health gate and every printed URL used to say `localhost` unconditionally,
+ * which is right for the wide publish and for a loopback one — and wrong for a
+ * publish narrowed to one non-loopback interface: `--bind 10.0.0.5` publishes
+ * ONLY there, `http://localhost:<port>` never answers, and the gate would time
+ * out and tear down a container that was in fact healthy. So the dialled host
+ * follows the bind, and stays `localhost` (byte-identical output) whenever the
+ * bind is unset or wildcard. An IPv6 literal is already bracketed by
+ * `validateBindHost`, which is also the form a URL needs.
+ */
+export function previewReachHost(bind) {
+  if (!bind || PREVIEW_BIND_WILDCARDS.has(bind)) return "localhost";
+  return bind;
+}
+
+/**
+ * The port probe for an allocation whose publish will name a SPECIFIC interface
+ * (cinatra-cli#248).
+ *
+ * Probing 0.0.0.0 is conservative for an IPv4 publish — a port bindable on every
+ * IPv4 interface is bindable on any single one — but it says nothing about IPv6:
+ * a socket holding `[::1]:3400` leaves IPv4 3400 free, so the wide probe alone
+ * would hand out a port `docker run -p [::1]:3400:3000` then fails on. The
+ * specific address is therefore probed IN ADDITION to the wide one, never
+ * instead of it.
+ */
+export function bindAwareProbePort({ probe, bind }) {
+  if (!bind || PREVIEW_BIND_WILDCARDS.has(bind)) return probe;
+  const host = /^\[.+\]$/.test(bind) ? bind.slice(1, -1) : bind;
+  return async (port) => (await probe(port)) && (await probe(port, host));
+}
+
+/**
  * `cinatra instance preview create` (AC1, AC2, AC5, AC6, AC7): resolve the git
  * ref to an immutable SHA, build the image at that SHA, boot it with production
  * runtime semantics + recorded provenance, and health-gate to a terminal state.
@@ -1995,6 +2410,8 @@ export async function runPreviewCreate(rest, injected = {}) {
   // nothing, not surface an hour into a build (or, worse, only after the
   // slug/port/volume state was claimed).
   buildPreviewBuildArgs(deps.buildControlEnv ?? process.env);
+  // cinatra-cli#248: the build-cache mode is one of those levers too.
+  resolveBuildCacheMode(deps.buildControlEnv ?? process.env);
   // cinatra-cli#219: the endpoint-ownership mode lever gets the SAME fail-fast
   // treatment — a typo'd value must be rejected before any state is claimed,
   // never silently downgrade the gate.
@@ -2007,6 +2424,11 @@ export async function runPreviewCreate(rest, injected = {}) {
   const slug = deriveSlug({ rest, checkoutDir });
   const ref = readOption(rest, "--ref") ?? "main";
   const explicitPort = readOption(rest, "--port");
+  // cinatra-cli#248 AC1: resolved AND validated HERE — before the slug claim,
+  // the port allocation, the volume probe and any docker call at all — so a
+  // typo'd address costs nothing to recover from and the refusal is structurally
+  // ahead of every `docker run`.
+  const bind = resolveBindHost({ rest, env });
   // cinatra-cli#220: force a build even when this SHA's image is already here.
   const rebuild = readFlag(rest, "--rebuild", "--force-build");
 
@@ -2039,9 +2461,10 @@ export async function runPreviewCreate(rest, injected = {}) {
     hostPort =
       explicitPort !== undefined
         ? validatePreviewPort(explicitPort)
-        : await allocatePreviewHostPort({ registry: reg, probe: deps.probePort });
+        // cinatra-cli#248: a narrowed publish is probed on ITS OWN address too.
+        : await allocatePreviewHostPort({ registry: reg, probe: bindAwareProbePort({ probe: deps.probePort, bind }) });
     const next = cloneRegistry(reg);
-    next.previews[slug] = makePreviewSlot({ slug, ref, sha, hostPort, state: "provisioning", now: () => new Date().toISOString() });
+    next.previews[slug] = makePreviewSlot({ slug, ref, sha, hostPort, bind, state: "provisioning", now: () => new Date().toISOString() });
     writeRegistry(deps.registryPath, next);
   });
 
@@ -2110,14 +2533,15 @@ export async function runPreviewCreate(rest, injected = {}) {
       slug,
       tag,
       hostPort,
+      bind, // cinatra-cli#248
       encryptionKey: bootKey,
       provenance,
       sha,
       deps: { ...deps, env: runtimeEnv },
     });
-    deps.log(`  booted ${container}; health-gating http://localhost:${hostPort}/api/health ...`);
+    deps.log(`  booted ${container}; health-gating http://${previewReachHost(bind)}:${hostPort}/api/health ...`);
     const result = await pollHealthGate({
-      url: `http://localhost:${hostPort}/api/health`,
+      url: `http://${previewReachHost(bind)}:${hostPort}/api/health`,
       deps: { ...deps, isRunning: () => containerRunning(container, deps) },
     });
     if (result.state !== "healthy") {
@@ -2143,10 +2567,10 @@ export async function runPreviewCreate(rest, injected = {}) {
     const reg = requireUsableRegistry(deps.registryPath);
     const cur = getPreview(reg, slug);
     const next = cloneRegistry(reg);
-    next.previews[slug] = makePreviewSlot({ slug, ref, sha, hostPort, state: "ready", now: () => cur?.createdAt ?? new Date().toISOString() });
+    next.previews[slug] = makePreviewSlot({ slug, ref, sha, hostPort, bind, state: "ready", now: () => cur?.createdAt ?? new Date().toISOString() });
     writeRegistry(deps.registryPath, next);
   });
-  deps.log(`preview "${slug}" is healthy: ${tag} (sha ${sha}) on http://localhost:${hostPort}`);
+  deps.log(`preview "${slug}" is healthy: ${tag} (sha ${sha}) on http://${previewReachHost(bind)}:${hostPort}`);
   return { slug, sha, tag, hostPort, state: "healthy" };
 }
 
@@ -2168,6 +2592,7 @@ export async function runPreviewRefresh(rest, injected = {}) {
   // surface only after the old preview has been put into `provisioning`.
   resolveBuildTimeoutMs(deps.buildControlEnv ?? process.env);
   buildPreviewBuildArgs(deps.buildControlEnv ?? process.env); // same fail-fast for every build-arg lever
+  resolveBuildCacheMode(deps.buildControlEnv ?? process.env); // cinatra-cli#248
   resolveEndpointOwnershipMode(deps.ownershipControlEnv ?? deps.env ?? process.env); // cinatra-cli#219
 
   // AC9: refuse a genuine `--mode prod` checkout up front — checkout-derived and
@@ -2179,6 +2604,10 @@ export async function runPreviewRefresh(rest, injected = {}) {
   const slug = deriveSlug({ rest, checkoutDir });
   const ref = readOption(rest, "--ref") ?? "main";
   const rebuild = readFlag(rest, "--rebuild", "--force-build"); // cinatra-cli#220
+  // cinatra-cli#248: an explicit bind on THIS refresh (flag, else env), resolved
+  // and validated before the claim. `null` means the operator said nothing,
+  // which carries the row's recorded bind forward below rather than widening it.
+  const requestedBind = resolveBindHost({ rest, env });
   const newSha = deps.resolveSha(ref, checkoutDir);
   const newTag = previewImageTag(newSha);
   const provenance = previewProvenance(newSha);
@@ -2186,7 +2615,7 @@ export async function runPreviewRefresh(rest, injected = {}) {
   // CLAIM the slug under the lock: require an existing (non-in-flight) row,
   // capture the prior sha/tag + reuse the durable host port, and flip the row to
   // `provisioning` so a concurrent op can't race the container replacement.
-  let oldSha, oldTag, hostPort, volumeName;
+  let oldSha, oldTag, hostPort, bind, oldBind, volumeName;
   await withRegistryLock(deps.registryPath, async () => {
     const reg = requireUsableRegistry(deps.registryPath);
     const existing = getPreview(reg, slug);
@@ -2207,11 +2636,15 @@ export async function runPreviewRefresh(rest, injected = {}) {
       ? existing.hostPort
       : await allocatePreviewHostPort({ registry: reg, probe: deps.probePort });
     volumeName = existing.volumeName;
+    // cinatra-cli#248: reuse the preview's recorded bind exactly as the host port
+    // is reused — an explicit `--bind` / env on THIS refresh overrides it.
+    oldBind = existing.bind ?? null;
+    bind = requestedBind ?? oldBind;
     const next = cloneRegistry(reg);
     // Persist the (possibly freshly-allocated, for a legacy row) durable host
     // port in the SAME locked transaction as the claim — so a concurrent create
     // sees it claimed via usedPreviewHostPorts and never picks the same port.
-    next.previews[slug] = { ...existing, hostPort, state: "provisioning" };
+    next.previews[slug] = { ...existing, hostPort, bind, state: "provisioning" };
     writeRegistry(deps.registryPath, next);
   });
 
@@ -2246,6 +2679,13 @@ export async function runPreviewRefresh(rest, injected = {}) {
           sha: oldSha,
           imageTag: oldTag,
           provenance: previewProvenance(oldSha),
+          // cinatra-cli#248: the claim wrote THIS refresh's requested bind. Before
+          // replacement the OLD container is still serving on the OLD interface,
+          // so the row must say so — a registry that claims 127.0.0.1 while a
+          // wide-published container keeps running is the one lie this field
+          // exists to prevent. After replacement nothing is running, so the
+          // requested bind stands as the intent a later `start --recreate` boots.
+          bind: replaced ? (cur.bind ?? null) : oldBind,
           state: replaced ? "degraded" : "ready",
         };
         writeRegistry(deps.registryPath, next);
@@ -2282,14 +2722,15 @@ export async function runPreviewRefresh(rest, injected = {}) {
       slug,
       tag: newTag,
       hostPort,
+      bind, // cinatra-cli#248
       encryptionKey: bootKey,
       provenance,
       sha: newSha,
       deps: { ...deps, env: runtimeEnv },
     });
-    deps.log(`  booted ${container}; health-gating http://localhost:${hostPort}/api/health ...`);
+    deps.log(`  booted ${container}; health-gating http://${previewReachHost(bind)}:${hostPort}/api/health ...`);
     const result = await pollHealthGate({
-      url: `http://localhost:${hostPort}/api/health`,
+      url: `http://${previewReachHost(bind)}:${hostPort}/api/health`,
       deps: { ...deps, isRunning: () => containerRunning(container, deps) },
     });
     if (result.state !== "healthy") {
@@ -2318,14 +2759,14 @@ export async function runPreviewRefresh(rest, injected = {}) {
     // correct old->new history entry (the claim had flipped state, not sha).
     const base = { ...cur, sha: oldSha, imageTag: oldTag, provenance: previewProvenance(oldSha) };
     const next = cloneRegistry(reg);
-    next.previews[slug] = refreshPreviewSlot(base, { ref, sha: newSha, hostPort, state: "ready", now: () => new Date().toISOString() });
+    next.previews[slug] = refreshPreviewSlot(base, { ref, sha: newSha, hostPort, bind, state: "ready", now: () => new Date().toISOString() });
     writeRegistry(deps.registryPath, next);
   });
   if (oldTag !== newTag) {
     await removeImageIfUnreferenced(oldTag, { registryPath: deps.registryPath, keepSlug: slug, deps });
     deps.log(`  cleaned up superseded image ${oldTag} (${oldSha}) now that ${newTag} is healthy.`);
   }
-  deps.log(`preview "${slug}" refreshed and healthy: ${newTag} (sha ${newSha}) on http://localhost:${hostPort}`);
+  deps.log(`preview "${slug}" refreshed and healthy: ${newTag} (sha ${newSha}) on http://${previewReachHost(bind)}:${hostPort}`);
   return { slug, sha: newSha, tag: newTag, previousSha: oldSha, hostPort, state: "healthy" };
 }
 
@@ -2448,6 +2889,8 @@ export async function runPreviewStart(rest, injected = {}) {
   const env = deps.env ?? process.env;
   const slug = deriveSlug({ rest, checkoutDir });
   const recreate = readFlag(rest, "--recreate", "--re-materialize");
+  // cinatra-cli#248: validated before the claim, like every other lever here.
+  const requestedBind = resolveBindHost({ rest, env });
 
   // The same fail-fast gates the other mutating verbs apply, in the same order.
   assertMaterializeNotDisabled(env);
@@ -2469,6 +2912,10 @@ export async function runPreviewStart(rest, injected = {}) {
     }
     row = existing;
     const next = cloneRegistry(reg);
+    // cinatra-cli#248: the claim does NOT write the requested bind. A bind only
+    // becomes true when a container is re-materialized on it, and this claim runs
+    // before it is known whether that will happen — recording it here would leave
+    // the row claiming an interface a still-running container is not published on.
     next.previews[slug] = { ...existing, state: "provisioning" };
     writeRegistry(deps.registryPath, next);
   });
@@ -2494,14 +2941,32 @@ export async function runPreviewStart(rest, injected = {}) {
     );
   }
 
+  // cinatra-cli#248: docker cannot move a RUNNING container's publish, so a new
+  // `--bind` takes effect only on the path that re-materializes the container.
+  // On every other path it is neither applied nor recorded — and it is SAID, so
+  // an operator is never left believing they narrowed a publish they did not.
+  const willRematerialize = present === "absent" || recreate;
+  const bind = willRematerialize ? (requestedBind ?? row.bind ?? null) : (row.bind ?? null);
+  if (requestedBind !== null && !willRematerialize && requestedBind !== (row.bind ?? null)) {
+    deps.log(
+      `  note: --bind ${requestedBind} was NOT applied. This start does not re-materialize the ` +
+        `container, and docker cannot move a running publish. The preview stays published on ` +
+        `${row.bind ?? PREVIEW_BIND_HOST_DEFAULT} and its row is unchanged — re-run with --recreate ` +
+        `to apply it.`,
+    );
+  }
+
   // Restore the row on ANY failure — `start` never leaves a claim behind.
-  const release = async (state) => {
+  // `extra` carries the fields a SUCCESSFUL path commits with the release (the
+  // re-materialized bind); a failure path passes none, so the row keeps what it
+  // already truthfully recorded.
+  const release = async (state, extra = null) => {
     await withRegistryLock(deps.registryPath, () => {
       const reg = requireUsableRegistry(deps.registryPath);
       const cur = getPreview(reg, slug);
       if (cur && cur.state === "provisioning") {
         const next = cloneRegistry(reg);
-        next.previews[slug] = { ...cur, state };
+        next.previews[slug] = { ...cur, ...(extra ?? {}), state };
         writeRegistry(deps.registryPath, next);
       }
     });
@@ -2510,7 +2975,7 @@ export async function runPreviewStart(rest, injected = {}) {
   try {
     if (present === "running" && !recreate) {
       if (row.state !== "degraded") {
-        deps.log(`preview "${slug}" is already running: ${tag} on http://localhost:${hostPort}`);
+        deps.log(`preview "${slug}" is already running: ${tag} on http://${previewReachHost(row.bind ?? null)}:${hostPort}`);
         await release(row.state);
         return { slug, container: "running", changed: false, rematerialized: false, hostPort };
       }
@@ -2518,9 +2983,9 @@ export async function runPreviewStart(rest, injected = {}) {
       // says it is running" is not the same fact and must never clear it — the
       // container that failed the gate is typically still running. Re-probe, and
       // only a real healthy answer promotes the row.
-      deps.log(`preview "${slug}" is running but its row is degraded; re-probing http://localhost:${hostPort}/api/health ...`);
+      deps.log(`preview "${slug}" is running but its row is degraded; re-probing http://${previewReachHost(row.bind ?? null)}:${hostPort}/api/health ...`);
       const probe = await pollHealthGate({
-        url: `http://localhost:${hostPort}/api/health`,
+        url: `http://${previewReachHost(row.bind ?? null)}:${hostPort}/api/health`,
         deps: { ...deps, isRunning: () => containerRunning(name, deps) },
       });
       if (probe.state !== "healthy") {
@@ -2543,7 +3008,7 @@ export async function runPreviewStart(rest, injected = {}) {
         );
       }
       await release("ready");
-      deps.log(`preview "${slug}" is healthy again: ${tag} on http://localhost:${hostPort}`);
+      deps.log(`preview "${slug}" is healthy again: ${tag} on http://${previewReachHost(row.bind ?? null)}:${hostPort}`);
       return { slug, container: "running", changed: false, rematerialized: false, hostPort };
     }
 
@@ -2552,9 +3017,9 @@ export async function runPreviewStart(rest, injected = {}) {
       if (r.error || r.status !== 0) {
         throw new Error(`docker start of preview ${name} failed` + (r.stderr ? `: ${r.stderr.trim()}` : "."));
       }
-      deps.log(`  started ${name}; health-gating http://localhost:${hostPort}/api/health ...`);
+      deps.log(`  started ${name}; health-gating http://${previewReachHost(row.bind ?? null)}:${hostPort}/api/health ...`);
       const result = await pollHealthGate({
-        url: `http://localhost:${hostPort}/api/health`,
+        url: `http://${previewReachHost(row.bind ?? null)}:${hostPort}/api/health`,
         deps: { ...deps, isRunning: () => containerRunning(name, deps) },
       });
       if (result.state !== "healthy") {
@@ -2567,7 +3032,7 @@ export async function runPreviewStart(rest, injected = {}) {
         );
       }
       await release("ready");
-      deps.log(`preview "${slug}" is healthy: ${tag} (sha ${row.sha}) on http://localhost:${hostPort}`);
+      deps.log(`preview "${slug}" is healthy: ${tag} (sha ${row.sha}) on http://${previewReachHost(row.bind ?? null)}:${hostPort}`);
       return { slug, container: "running", changed: true, rematerialized: false, hostPort };
     }
 
@@ -2669,6 +3134,7 @@ export async function runPreviewStart(rest, injected = {}) {
         slug,
         tag,
         hostPort,
+        bind, // cinatra-cli#248
         encryptionKey: bootKey,
         provenance: row.provenance,
         sha: row.sha,
@@ -2681,10 +3147,10 @@ export async function runPreviewStart(rest, injected = {}) {
     }
     deps.log(
       `  re-materialized ${container} from the image already present (${tag}) — no build; ` +
-        `health-gating http://localhost:${hostPort}/api/health ...`,
+        `health-gating http://${previewReachHost(bind)}:${hostPort}/api/health ...`,
     );
     const result = await pollHealthGate({
-      url: `http://localhost:${hostPort}/api/health`,
+      url: `http://${previewReachHost(bind)}:${hostPort}/api/health`,
       deps: { ...deps, isRunning: () => containerRunning(container, deps) },
     });
     if (result.state !== "healthy") {
@@ -2700,9 +3166,10 @@ export async function runPreviewStart(rest, injected = {}) {
       );
     }
     if (parked) removeContainer(parked, deps);
-    await release("ready");
+    // The container IS published on `bind` now — that is when the row may say so.
+    await release("ready", { bind });
     deps.log(
-      `preview "${slug}" re-materialized and healthy: ${tag} (sha ${row.sha}) on http://localhost:${hostPort} ` +
+      `preview "${slug}" re-materialized and healthy: ${tag} (sha ${row.sha}) on http://${previewReachHost(bind)}:${hostPort} ` +
         `— container env recomposed, image untouched.`,
     );
     return { slug, container: "running", changed: true, rematerialized: true, hostPort };
@@ -2811,6 +3278,12 @@ export const __test = {
   PREVIEW_BUILD_BUNDLER_ARG,
   PREVIEW_STOP_TIMEOUT_MS,
   SUPERSEDED_CONTAINER_SUFFIX,
+  // cinatra-cli#248
+  PREVIEW_BIND_HOST_ENV,
+  PREVIEW_BIND_HOST_DEFAULT,
+  PREVIEW_BUILD_CACHE_ENV,
+  PREVIEW_BUILD_CACHE_DIR_ENV,
+  PREVIEW_BUILD_CACHE_MODES,
   // pure helpers
   resolveBuildTimeoutMs,
   formatBuildBudget,
@@ -2834,6 +3307,10 @@ export const __test = {
   usedPreviewHostPorts,
   allocatePreviewHostPort,
   validatePreviewPort,
+  validateBindHost, // cinatra-cli#248
+  resolveBindHost, // cinatra-cli#248
+  previewReachHost, // cinatra-cli#248
+  bindAwareProbePort, // cinatra-cli#248
   // registry
   defaultRegistryPath,
   readRegistry,
@@ -2851,6 +3328,14 @@ export const __test = {
   resolveBuildBundler,
   buildPreviewBuildArgs,
   dockerfileDeclaredBuildArgs,
+  resolveBuildCacheMode, // cinatra-cli#248
+  previewBuildCacheDir, // cinatra-cli#248
+  dockerBuildxAvailable, // cinatra-cli#248
+  dockerBuildxDriver, // cinatra-cli#248
+  dockerBuildxCacheCapable, // cinatra-cli#248
+  acquireBuildCacheLock, // cinatra-cli#248
+  releaseBuildCacheLock, // cinatra-cli#248
+  previewBuildDockerArgs, // cinatra-cli#248
   buildPreviewImage,
   bootPreviewContainer,
   dockerObjectExists,

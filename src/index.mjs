@@ -885,12 +885,13 @@ Usage:
   cinatra instance clone slug-for-worktree --worktree-path <path>
   cinatra instance clone prune [--worktree-path <path>] [--slug <slug>] --yes
   cinatra instance clone list
-  cinatra instance preview create [--ref <git-ref>] [--slug <slug>] [--port <port>] [--rebuild]
-  cinatra instance preview refresh [--ref <git-ref>] [--slug <slug>] [--rebuild]
+  cinatra instance preview create [--ref <git-ref>] [--slug <slug>] [--port <port>]
+                                 [--bind <address>] [--rebuild]
+  cinatra instance preview refresh [--ref <git-ref>] [--slug <slug>] [--bind <address>] [--rebuild]
                                # The build is SKIPPED when the image for the target SHA is
                                # already present locally; --rebuild (--force-build) forces it.
   cinatra instance preview stop [--slug <slug>]
-  cinatra instance preview start [--slug <slug>] [--recreate]
+  cinatra instance preview start [--slug <slug>] [--bind <address>] [--recreate]
                                # start re-materializes an ABSENT container from the recorded
                                # image with freshly composed env and NO build; --recreate does
                                # that for a running one (the stale-endpoint fix after a re-band).
@@ -908,7 +909,21 @@ Usage:
                                # CINATRA_PREVIEW_BUILD_BUNDLER=turbopack|webpack picks the
                                # bundler; webpack fails on the V8 heap the MEMORY_MB lever moves,
                                # the default fails on native memory it does not.
+                               # CINATRA_PREVIEW_BUILD_CACHE=auto|off picks the builder: auto
+                               # builds through \`docker buildx\` with a local layer cache when
+                               # buildx is installed (a warm rebuild then reports CACHED for the
+                               # unchanged layers), off pins the classic builder. The cache lives
+                               # in ~/.cinatra/preview-build-cache; CINATRA_PREVIEW_BUILD_CACHE_DIR
+                               # moves it, and pruning it is deleting that directory.
                                # Env-only so they apply to \`install --mode preview\` too.
+                               # --bind <address> publishes the container's port on ONE interface
+                               # (\`--bind 127.0.0.1\` for loopback-only) instead of every one.
+                               # Unset is unchanged (0.0.0.0). CINATRA_PREVIEW_BIND_HOST is the
+                               # env form; the flag wins. The bind is recorded on the preview's
+                               # row, so refresh and start --recreate re-publish identically
+                               # (on start, a CHANGED bind needs --recreate: docker
+                               # cannot move a running container's publish). The value
+                               # is an IP literal — docker refuses a hostname.
   cinatra instance preview status [--slug <slug>]
   cinatra instance preview list
   cinatra instance execution set-mode <remote|local-dev|disabled> [--sandbox-broker-url <url>]

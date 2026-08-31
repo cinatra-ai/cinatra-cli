@@ -36,6 +36,7 @@ const {
   runInstallPreviewRefresh,
   previewHandoffLines,
   previewSlugArgs,
+  previewBindArgs,
   decidePreviewAction,
   previewSkipReportLines,
   previewInFlightReportLines,
@@ -973,5 +974,104 @@ describe("preview front door — handoff (AC9)", () => {
     // AC9 + the invariant: the divergence is STATED, not discovered.
     expect(text).toMatch(/INSIDE the container/);
     expect(text).toMatch(/CINATRA_RUNTIME_MODE=development/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cinatra-cli#248 — the front door carries the bind flag and the new
+// deployment-registry passthrough keys
+// ---------------------------------------------------------------------------
+
+describe("preview front door — bind + deployment-registry passthrough (cinatra-cli#248)", () => {
+  const REGISTRY_KEYS = {
+    CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_URL: "https://deployments.example.test",
+    CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_READ_TOKEN: "read-only-token",
+    CINATRA_DEPLOYMENT_REGISTRY_ROUTING_MODE: "hosted",
+    CINATRA_DEPLOYMENT_REGISTRY_ALLOW_FIXTURE: "false",
+  };
+
+  it("AC2: the four keys are composed from the install with NO second change site", () => {
+    const { env, forwardedKeys } = derivePreviewEnvFromInstall({
+      envValues: { ...REGISTRY_KEYS },
+      previewHostPort: 3400,
+      onlyDefinedKeys: true,
+    });
+    for (const [k, v] of Object.entries(REGISTRY_KEYS)) {
+      expect(env[k]).toBe(v);
+      expect(forwardedKeys).toContain(k);
+      // Composed, never rewritten — they are not container-dialed loopback keys.
+      expect(CONTAINER_REWRITE_ENV_KEYS).not.toContain(k);
+      expect(PASSTHROUGH_ENV_KEYS).toContain(k);
+    }
+  });
+
+  it("AC2: they reach the container on the real `install --mode preview` argv", async () => {
+    writeFileSync(
+      path.join(checkoutDir, ".env.local"),
+      `${DEV_ENV_LOCAL}\n${Object.entries(REGISTRY_KEYS).map(([k, v]) => `${k}=${v}`).join("\n")}\n`,
+    );
+    const { deps, fake } = makeBootstrapDeps({ sha: SHA_A });
+    await runInstallPreviewBootstrap({ targetDir: checkoutDir, ref: "main", log: () => {}, deps });
+    const argv = runArgv(fake);
+    for (const [k, v] of Object.entries(REGISTRY_KEYS)) expect(argv).toContain(`${k}=${v}`);
+  });
+
+  it("AC1: `--bind` survives the front door's argv RECONSTRUCTION and reaches `docker run`", async () => {
+    const { deps, fake } = makeBootstrapDeps({ sha: SHA_A });
+    const out = await runInstallPreviewBootstrap({
+      targetDir: checkoutDir,
+      ref: "main",
+      rest: ["--bind", "127.0.0.1"],
+      log: () => {},
+      deps,
+    });
+    const argv = runArgv(fake);
+    expect(argv).toContain(`127.0.0.1:${out.hostPort}:3000`);
+    expect(argv).not.toContain(`-p ${out.hostPort}:3000`);
+  });
+
+  it("AC1: with no `--bind` the front door's publish is unchanged", async () => {
+    const { deps, fake } = makeBootstrapDeps({ sha: SHA_A });
+    const out = await runInstallPreviewBootstrap({ targetDir: checkoutDir, ref: "main", log: () => {}, deps });
+    expect(runArgv(fake)).toContain(`-p ${out.hostPort}:3000`);
+  });
+
+  it("previewBindArgs extracts BOTH spellings and forwards nothing else", () => {
+    expect(previewBindArgs({ rest: [] })).toEqual([]);
+    expect(previewBindArgs({ rest: ["--slug", "x", "--rebuild"] })).toEqual([]);
+    expect(previewBindArgs({ rest: ["--bind", "127.0.0.1"] })).toEqual(["--bind", "127.0.0.1"]);
+    expect(previewBindArgs({ rest: ["--bind=127.0.0.1"] })).toEqual(["--bind", "127.0.0.1"]);
+    // A bare trailing `--bind` is forwarded as an EMPTY value so create's own
+    // validator refuses it, rather than being silently dropped here.
+    expect(previewBindArgs({ rest: ["--bind"] })).toEqual(["--bind", ""]);
+  });
+
+  it("AC1: `install --mode preview --bind` is validated while ARGUMENTS are parsed, before any install work", () => {
+    expect(parseInstallArgs(["--mode", "preview", "--bind", "127.0.0.1"]).previewBind).toBe("127.0.0.1");
+    expect(parseInstallArgs(["--mode", "preview"]).previewBind).toBe(null);
+    expect(() => parseInstallArgs(["--mode", "preview", "--bind", "127.0.0.1:3400"])).toThrow(/--bind/);
+    // Preview-only: it names the interface the PREVIEW container publishes on.
+    expect(() => parseInstallArgs(["--mode", "dev", "--bind", "127.0.0.1"])).toThrow(/--mode preview/);
+  });
+
+  it("AC1: `install --mode preview` honours CINATRA_PREVIEW_BIND_HOST, and the flag still wins", () => {
+    const prior = process.env.CINATRA_PREVIEW_BIND_HOST;
+    try {
+      // The front door hands the lifecycle a RECONSTRUCTED argv and a COMPOSED
+      // env, so the env form only reaches `docker run` if the install itself
+      // resolves it — without that, this whole invocation publishes wide while
+      // the operator believes it is narrowed.
+      process.env.CINATRA_PREVIEW_BIND_HOST = "127.0.0.1";
+      expect(parseInstallArgs(["--mode", "preview"]).previewBind).toBe("127.0.0.1");
+      expect(parseInstallArgs(["--mode", "preview", "--bind", "10.0.0.5"]).previewBind).toBe("10.0.0.5");
+      process.env.CINATRA_PREVIEW_BIND_HOST = "127.0.0.1:3400";
+      expect(() => parseInstallArgs(["--mode", "preview"])).toThrow(/--bind/);
+      // A dev install neither reads nor refuses it — it publishes no preview.
+      process.env.CINATRA_PREVIEW_BIND_HOST = "127.0.0.1";
+      expect(parseInstallArgs(["--mode", "dev"]).previewBind).toBe(null);
+    } finally {
+      if (prior === undefined) delete process.env.CINATRA_PREVIEW_BIND_HOST;
+      else process.env.CINATRA_PREVIEW_BIND_HOST = prior;
+    }
   });
 });
