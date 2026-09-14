@@ -37,6 +37,7 @@ const {
   previewHandoffLines,
   previewSlugArgs,
   previewBindArgs,
+  previewFleetArgs, // engineering#666
   decidePreviewAction,
   previewSkipReportLines,
   previewInFlightReportLines,
@@ -1044,6 +1045,48 @@ describe("preview front door — bind + deployment-registry passthrough (cinatra
     // A bare trailing `--bind` is forwarded as an EMPTY value so create's own
     // validator refuses it, rather than being silently dropped here.
     expect(previewBindArgs({ rest: ["--bind"] })).toEqual(["--bind", ""]);
+  });
+
+  it("engineering#666: previewFleetArgs extracts BOTH spellings and forwards nothing else", () => {
+    expect(previewFleetArgs({ rest: [] })).toEqual([]);
+    expect(previewFleetArgs({ rest: ["--slug", "x", "--rebuild"] })).toEqual([]);
+    expect(previewFleetArgs({ rest: ["--fleet", "dev"] })).toEqual(["--fleet", "dev"]);
+    expect(previewFleetArgs({ rest: ["--fleet=dev"] })).toEqual(["--fleet", "dev"]);
+    // A bare trailing `--fleet` is forwarded as an EMPTY value so create's own
+    // validator refuses it, rather than being dropped here and silently
+    // building the REQUIRED set for someone who asked for a proof instance.
+    expect(previewFleetArgs({ rest: ["--fleet"] })).toEqual(["--fleet", ""]);
+  });
+
+  it("engineering#666: `--fleet dev` survives the front door's argv RECONSTRUCTION and reaches `docker build`", async () => {
+    const { deps, fake } = makeBootstrapDeps({ sha: SHA_A });
+    await runInstallPreviewBootstrap({
+      targetDir: checkoutDir,
+      ref: "main",
+      rest: ["--fleet", "dev"],
+      log: () => {},
+      deps,
+    });
+    const build = fake.calls.find((c) => c[0] === "build") ?? [];
+    expect(build.join(" ")).toContain(`${P.PREVIEW_FLEET_ARG}=dev`);
+    // Build-time only: never forwarded into the container.
+    expect(runArgv(fake)).not.toContain(P.PREVIEW_FLEET_ARG);
+
+    // And with nothing said, the front door forwards nothing.
+    const { deps: d2, fake: f2 } = makeBootstrapDeps({ sha: SHA_A });
+    await runInstallPreviewBootstrap({ targetDir: checkoutDir, ref: "main", log: () => {}, deps: d2 });
+    expect((f2.calls.find((c) => c[0] === "build") ?? []).join(" ")).not.toContain(P.PREVIEW_FLEET_ARG);
+  });
+
+  it("engineering#666: `install --mode preview --fleet` is parsed and validated with the ARGUMENTS, and is preview-only", () => {
+    expect(parseInstallArgs(["--mode", "preview", "--fleet", "dev"]).previewFleet).toBe("dev");
+    expect(parseInstallArgs(["--mode", "preview", "--fleet=dev"]).previewFleet).toBe("dev");
+    // Said nothing: nothing forwarded, so create's own default stands.
+    expect(parseInstallArgs(["--mode", "preview"]).previewFleet).toBe(null);
+    expect(() => parseInstallArgs(["--mode", "preview", "--fleet", "devel"])).toThrow(/--fleet/);
+    // The space form must not read `dev` as an unknown trailing positional.
+    expect(parseInstallArgs(["--mode", "preview", "--fleet", "dev"]).surfaceMode).toBe("preview");
+    expect(() => parseInstallArgs(["--mode", "dev", "--fleet", "dev"])).toThrow(/--mode preview/);
   });
 
   it("AC1: `install --mode preview --bind` is validated while ARGUMENTS are parsed, before any install work", () => {

@@ -277,6 +277,20 @@ export const PREVIEW_BUILD_CI_ARG = "CI";
 export const PREVIEW_BUILD_CPUS_ARG = "CINATRA_BUILD_CPUS";
 export const PREVIEW_BUILD_BUNDLER_ARG = "CINATRA_BUILD_BUNDLER";
 
+// engineering#666 — the extension FLEET the preview IMAGE acquires.
+//
+// Unlike the four levers above this one is a FLAG, not an env variable: it is
+// not a property of the host the build runs on (a ceiling, a worker count, a
+// bundler), it is what the resulting instance IS. A preview image acquires only
+// the REQUIRED extensions, while a dev boot syncs the dev fleet — so a proof run
+// dispatched on a preview has no agent to run. `--fleet dev` builds a PROOF
+// instance whose image carries the dev fleet; it is never a deployment.
+export const PREVIEW_FLEET_FLAG = "--fleet";
+export const PREVIEW_FLEETS = ["required", "dev"];
+export const PREVIEW_FLEET_DEFAULT = "required";
+// The build-arg NAME the Dockerfile must declare for the lever to bite.
+export const PREVIEW_FLEET_ARG = "CINATRA_EXTENSION_FLEET";
+
 export const PREVIEW_HEALTH_TIMEOUT_MS = 180_000; // 3m health-gate budget (mirrors prod-boot-e2e default)
 export const PREVIEW_HEALTH_POLL_INTERVAL_MS = 3_000; // 3s (mirrors prod-boot-e2e sleep 3)
 export const DOCKER_CLI_PROBE_TIMEOUT_MS = 15_000; // 15s fast docker-CLI metadata probes
@@ -494,12 +508,27 @@ export function isImmutableSha(s) {
   return typeof s === "string" && /^[0-9a-f]{40}$/.test(s);
 }
 
-/** The stable local image tag for a resolved SHA (AC3). */
-export function previewImageTag(sha) {
+/**
+ * The stable local image tag for a resolved SHA (AC3) and — engineering#666 —
+ * for the extension FLEET baked into it.
+ *
+ * The fleet is acquired INTO the image, so a `--fleet dev` proof instance and a
+ * required-fleet preview at the SAME SHA are two different ARTIFACTS. Sharing
+ * one tag would make them indistinguishable to `previewImagePresence`, whose
+ * reuse probe reads only the `cinatra.preview.sha` label: the dev create would
+ * skip the build and boot the required image (a proof instance with no agents to
+ * run — exactly the failure #666 exists to remove), and a `--rebuild` on either
+ * would overwrite the other's image under a running sibling.
+ *
+ * The DEFAULT fleet keeps the historical tag byte-for-byte, so every row and
+ * image written before this lever still matches.
+ */
+export function previewImageTag(sha, fleet = PREVIEW_FLEET_DEFAULT) {
   if (!isImmutableSha(sha)) {
     throw new Error(`previewImageTag requires a 40-hex SHA (got ${JSON.stringify(sha)}).`);
   }
-  return `${PREVIEW_IMAGE_TAG_PREFIX}${sha}`;
+  const f = PREVIEW_FLEETS.includes(fleet) ? fleet : PREVIEW_FLEET_DEFAULT;
+  return `${PREVIEW_IMAGE_TAG_PREFIX}${sha}${f === PREVIEW_FLEET_DEFAULT ? "" : `-${f}`}`;
 }
 
 /** The recorded provenance value for a resolved SHA (AC2). */
@@ -919,7 +948,21 @@ function isValidPreviewSlot(slug, slot) {
   if (slot.slug !== slug) return false;
   if (typeof slot.ref !== "string" || slot.ref.length === 0) return false;
   if (!isImmutableSha(slot.sha)) return false;
-  if (slot.imageTag !== previewImageTag(slot.sha)) return false;
+  // engineering#666: the tag carries a non-default fleet, so the row is checked
+  // against ITS fleet (an older row, with no field, reads as the required set).
+  //
+  // A fleet field that is PRESENT but names no fleet this CLI accepts is
+  // corruption, and it has to be caught HERE: `previewImageTag` normalises an
+  // unrecognised fleet back to the default, so the tag check below would pass
+  // and the row would read as usable — after which `preview status` prints a
+  // fleet no build could ever have produced, and a plain `refresh` carries that
+  // value out of the claim (already written, row already flipped to
+  // `provisioning`) into `buildPreviewBuildArgs`, which refuses it deep inside
+  // the build — the fail-LATE this lever's fail-fast exists to prevent. An
+  // absent field (a row written before the lever) still reads as the required
+  // set, which is what it was built with.
+  if (slot.fleet != null && !PREVIEW_FLEETS.includes(slot.fleet)) return false;
+  if (slot.imageTag !== previewImageTag(slot.sha, slot.fleet ?? PREVIEW_FLEET_DEFAULT)) return false;
   if (slot.provenance !== previewProvenance(slot.sha)) return false;
   if (slot.runtimeMode !== PREVIEW_RUNTIME_MODE) return false;
   if (slot.containerName !== previewContainerName(slug)) return false;
@@ -1118,11 +1161,13 @@ export function listPreviews(registry) {
  * the recorded value for "docker's default", which is also what a row written
  * before #248 reads as.
  */
-export function makePreviewSlot({ slug, ref, sha, hostPort, bind = null, state = "ready", now }) {
+export function makePreviewSlot({ slug, ref, sha, hostPort, bind = null, fleet = PREVIEW_FLEET_DEFAULT, state = "ready", now }) {
   if (!isValidSlug(slug)) throw new Error(`Invalid preview slug "${slug}".`);
   if (!isImmutableSha(sha)) throw new Error(`makePreviewSlot requires a 40-hex SHA (got ${JSON.stringify(sha)}).`);
   const at = (now ?? (() => new Date().toISOString()))();
-  const imageTag = previewImageTag(sha);
+  // engineering#666: normalise the fleet FIRST — the image tag is derived from it.
+  const fleetValue = PREVIEW_FLEETS.includes(fleet) ? fleet : PREVIEW_FLEET_DEFAULT;
+  const imageTag = previewImageTag(sha, fleetValue);
   return {
     slug,
     ref: String(ref),
@@ -1134,6 +1179,11 @@ export function makePreviewSlot({ slug, ref, sha, hostPort, bind = null, state =
     volumeName: previewVolumeName(slug),
     hostPort: hostPort ?? null,
     bind: bind ?? null, // cinatra-cli#248
+    // engineering#666: the fleet is baked INTO the image, so it is part of WHAT
+    // this preview is — recorded the way the bind and the port are, so a later
+    // start/refresh reuses it and a row written before the lever reads as the
+    // required set rather than as nothing.
+    fleet: fleetValue,
     state,
     createdAt: at,
     refreshedAt: at,
@@ -1147,10 +1197,15 @@ export function makePreviewSlot({ slug, ref, sha, hostPort, bind = null, state =
  * logs old→new. The volumeName/containerName are stable (the durable volume is
  * REUSED, AC4). Pure — returns a new slot.
  */
-export function refreshPreviewSlot(slot, { ref, sha, hostPort, bind, state = "ready", now }) {
+export function refreshPreviewSlot(slot, { ref, sha, hostPort, bind, fleet, state = "ready", now }) {
   if (!isImmutableSha(sha)) throw new Error(`refreshPreviewSlot requires a 40-hex SHA (got ${JSON.stringify(sha)}).`);
   const at = (now ?? (() => new Date().toISOString()))();
-  const imageTag = previewImageTag(sha);
+  // engineering#666, the same reading as `bind`: UNDEFINED carries the row's own
+  // fleet forward (a refresh that said nothing rebuilds the SAME instance).
+  // Resolved BEFORE the tag, which is derived from it.
+  const asked = fleet !== undefined ? (fleet ?? PREVIEW_FLEET_DEFAULT) : (slot.fleet ?? PREVIEW_FLEET_DEFAULT);
+  const fleetValue = PREVIEW_FLEETS.includes(asked) ? asked : PREVIEW_FLEET_DEFAULT;
+  const imageTag = previewImageTag(sha, fleetValue);
   return {
     ...slot,
     ref: ref !== undefined ? String(ref) : slot.ref,
@@ -1164,6 +1219,7 @@ export function refreshPreviewSlot(slot, { ref, sha, hostPort, bind, state = "re
     // caller resetting it to docker's default. `??` alone could not tell those
     // apart and would silently widen the publish on every refresh.
     bind: bind !== undefined ? (bind ?? null) : (slot.bind ?? null),
+    fleet: fleetValue,
     state,
     refreshedAt: at,
     history: [...(slot.history ?? []), { sha, imageTag, at }],
@@ -1479,6 +1535,49 @@ export function resolveBuildBundler(env = {}) {
 }
 
 /**
+ * The extension FLEET this invocation asks for (engineering#666): `--fleet dev`
+ * or `--fleet required`, defaulting to `required` — the fleet a real deployment
+ * carries.
+ *
+ * `fallback: null` answers "the operator said nothing", which is NOT the same
+ * answer as an explicit `--fleet required`: a refresh that says nothing carries
+ * the row's recorded fleet forward, while a refresh that NAMES a fleet is held
+ * against the row and refused on a mismatch. `??` alone could not tell those
+ * apart and a `--fleet dev` preview would silently rebuild without its fleet.
+ *
+ * A bare trailing `--fleet` (and a blank value) is a TYPO, not "unset": it is
+ * refused here rather than falling through to the default, because an operator
+ * who typed the flag asked for a proof instance and must not get a required-set
+ * one in silence. Case-insensitive and returned lowercase, like the bundler.
+ */
+export function resolveFleet(rest = [], { fallback = PREVIEW_FLEET_DEFAULT } = {}) {
+  const tokens = Array.isArray(rest) ? rest.map((t) => String(t)) : [];
+  const occurrences = tokens.filter((t) => t === PREVIEW_FLEET_FLAG || t.startsWith(`${PREVIEW_FLEET_FLAG}=`));
+  if (occurrences.length === 0) return fallback;
+  // A REPEATED flag is a typo too. `readOption` answers with the FIRST match, so
+  // `--fleet required --fleet dev` would silently build the required set for an
+  // operator who typed `dev` last, and `--fleet dev --fleet` would slip past the
+  // missing-value refusal. Neither may be guessed at: refuse and name the flag.
+  if (occurrences.length > 1) {
+    throw new Error(
+      `${PREVIEW_FLEET_FLAG} was given ${occurrences.length} times — pass it exactly once. ` +
+        `Accepted values: ${PREVIEW_FLEETS.join(", ")} (default ${PREVIEW_FLEET_DEFAULT}).`,
+    );
+  }
+  const raw = readOption(tokens, PREVIEW_FLEET_FLAG);
+  const value = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (!PREVIEW_FLEETS.includes(value)) {
+    throw new Error(
+      `${PREVIEW_FLEET_FLAG} ${JSON.stringify(raw ?? "")} is invalid: it is not a recognised extension fleet. ` +
+        `Accepted values: ${PREVIEW_FLEETS.join(", ")} (default ${PREVIEW_FLEET_DEFAULT}). ` +
+        `${PREVIEW_FLEET_FLAG} dev becomes --build-arg ${PREVIEW_FLEET_ARG}=dev for the image build and builds a ` +
+        `PROOF instance, never a deployment.`,
+    );
+  }
+  return value;
+}
+
+/**
  * Assemble the `--build-arg` pairs the preview image build passes to
  * `docker build`. This is the single env-assembly seam: every lever is resolved
  * here, from the OPERATOR's environment, and nowhere else.
@@ -1494,18 +1593,29 @@ export function resolveBuildBundler(env = {}) {
  * opposite by design: it is passed ONLY on an explicit override, so an untuned
  * preview never overrides the resolved SHA's own defaults.
  */
-export function buildPreviewBuildArgs(env = {}) {
+export function buildPreviewBuildArgs(env = {}, { fleet = PREVIEW_FLEET_DEFAULT } = {}) {
   const memoryMb = resolveBuildMemoryMb(env);
   const typecheck = resolveBuildTypecheck(env);
   const cpus = resolveBuildCpus(env);
   const bundler = resolveBuildBundler(env);
+  // engineering#666: the fleet arrives as an already-resolved VALUE (the flag is
+  // parsed once, by `resolveFleet`, at the front door) and is re-checked here so
+  // the seam can never assemble an argv for a fleet the CLI does not accept.
+  if (!PREVIEW_FLEETS.includes(fleet)) {
+    throw new Error(
+      `${PREVIEW_FLEET_FLAG} ${JSON.stringify(fleet)} is invalid: accepted values are ${PREVIEW_FLEETS.join(", ")}.`,
+    );
+  }
   const args = ["--build-arg", `${PREVIEW_BUILD_CI_ARG}=${typecheck ? "" : "true"}`];
   if (memoryMb !== null) {
     args.push("--build-arg", `${PREVIEW_BUILD_MEMORY_ARG}=--max-old-space-size=${memoryMb}`);
   }
   if (cpus !== null) args.push("--build-arg", `${PREVIEW_BUILD_CPUS_ARG}=${cpus}`);
   if (bundler !== null) args.push("--build-arg", `${PREVIEW_BUILD_BUNDLER_ARG}=${bundler}`);
-  return { memoryMb, typecheck, cpus, bundler, args };
+  // engineering#666: passed ONLY for the non-default fleet, exactly like every
+  // other lever — the default leaves the resolved SHA's own ARG default standing.
+  if (fleet !== PREVIEW_FLEET_DEFAULT) args.push("--build-arg", `${PREVIEW_FLEET_ARG}=${fleet}`);
+  return { memoryMb, typecheck, cpus, bundler, fleet, args };
 }
 
 /**
@@ -1741,12 +1851,12 @@ export function previewBuildDockerArgs({
  * operator's environment and is immune to any future env composition; the
  * injectable `buildControlEnv` seam keeps the unit suite hermetic.
  */
-export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
+export function buildPreviewImage({ tag, contextDir, deps, provenance, sha, fleet = PREVIEW_FLEET_DEFAULT }) {
   assertNotProductionImageTag(tag);
   const buildEnv = deps.buildControlEnv ?? process.env;
   const timeoutMs = resolveBuildTimeoutMs(buildEnv);
   const overridden = timeoutMs !== PREVIEW_BUILD_TIMEOUT_DEFAULT_MS;
-  const build = buildPreviewBuildArgs(buildEnv);
+  const build = buildPreviewBuildArgs(buildEnv, { fleet });
   deps.log?.(
     `  building ${tag} — budget ${formatBuildBudget(timeoutMs)}` +
       (overridden
@@ -1783,6 +1893,16 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
         ? `the checkout's own default (${PREVIEW_BUILD_BUNDLER_ENV}=${PREVIEW_BUILD_BUNDLERS.join("|")} switches it).`
         : `${build.bundler} (${PREVIEW_BUILD_BUNDLER_ENV} override).`),
   );
+  // engineering#666: the fleet is part of the build's identity in the strongest
+  // sense — it decides what the instance CAN run — so it is logged on every
+  // build, tuned or not, and the default names the flag so it is discoverable.
+  deps.log?.(
+    `  extension fleet: ${build.fleet}` +
+      (build.fleet === PREVIEW_FLEET_DEFAULT
+        ? ` — the required set only, as a deployment carries it (\`${PREVIEW_FLEET_FLAG} dev\` acquires the dev ` +
+          `fleet INTO the image, for a PROOF instance).`
+        : ` — a PROOF instance (--build-arg ${PREVIEW_FLEET_ARG}=${build.fleet}), never a deployment.`),
+  );
   // Warn — never block — when THIS SHA's Dockerfile does not declare an ARG a
   // lever is being passed for: docker drops an unconsumed --build-arg with only a
   // warning, so the lever would look set and do nothing. Only the args actually
@@ -1796,6 +1916,7 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha }) {
       ...(build.memoryMb === null ? [] : [PREVIEW_BUILD_MEMORY_ARG]),
       ...(build.cpus === null ? [] : [PREVIEW_BUILD_CPUS_ARG]),
       ...(build.bundler === null ? [] : [PREVIEW_BUILD_BUNDLER_ARG]),
+      ...(build.fleet === PREVIEW_FLEET_DEFAULT ? [] : [PREVIEW_FLEET_ARG]), // engineering#666
     ];
     const inert = passed.filter((n) => !declared.has(n));
     if (inert.length > 0) {
@@ -2025,7 +2146,7 @@ export function containerState(name, deps) {
  *
  * @returns {{ built: boolean, tag: string }}
  */
-export function ensurePreviewImage({ tag, sha, checkoutDir, rebuild = false, provenance, deps }) {
+export function ensurePreviewImage({ tag, sha, checkoutDir, rebuild = false, provenance, deps, fleet = PREVIEW_FLEET_DEFAULT }) {
   if (!rebuild) {
     const present = previewImagePresence({ tag, sha, deps });
     if (present.state === "present") {
@@ -2052,7 +2173,7 @@ export function ensurePreviewImage({ tag, sha, checkoutDir, rebuild = false, pro
   }
   const ctx = deps.prepareContext({ sha, checkoutDir });
   try {
-    buildPreviewImage({ tag, contextDir: ctx.contextDir, deps, provenance, sha });
+    buildPreviewImage({ tag, contextDir: ctx.contextDir, deps, provenance, sha, fleet });
   } finally {
     try {
       ctx.cleanup?.();
@@ -2432,7 +2553,10 @@ export async function runPreviewCreate(rest, injected = {}) {
   // for the same reason: a typo'd ceiling, CPU count or bundler must cost
   // nothing, not surface an hour into a build (or, worse, only after the
   // slug/port/volume state was claimed).
-  buildPreviewBuildArgs(deps.buildControlEnv ?? process.env);
+  // engineering#666: the fleet is resolved HERE too — before the slug claim —
+  // and handed to the same single assembly seam every other build lever uses.
+  const fleet = resolveFleet(rest);
+  buildPreviewBuildArgs(deps.buildControlEnv ?? process.env, { fleet });
   // cinatra-cli#248: the build-cache mode is one of those levers too.
   resolveBuildCacheMode(deps.buildControlEnv ?? process.env);
   // cinatra-cli#219: the endpoint-ownership mode lever gets the SAME fail-fast
@@ -2456,7 +2580,9 @@ export async function runPreviewCreate(rest, injected = {}) {
   const rebuild = readFlag(rest, "--rebuild", "--force-build");
 
   const sha = deps.resolveSha(ref, checkoutDir);
-  const tag = previewImageTag(sha);
+  // engineering#666: the fleet is part of the image's identity, so it is part of
+  // the tag — a dev proof instance never reuses (or overwrites) the required image.
+  const tag = previewImageTag(sha, fleet);
   const provenance = previewProvenance(sha);
   const volumeName = previewVolumeName(slug);
 
@@ -2487,7 +2613,7 @@ export async function runPreviewCreate(rest, injected = {}) {
         // cinatra-cli#248: a narrowed publish is probed on ITS OWN address too.
         : await allocatePreviewHostPort({ registry: reg, probe: bindAwareProbePort({ probe: deps.probePort, bind }) });
     const next = cloneRegistry(reg);
-    next.previews[slug] = makePreviewSlot({ slug, ref, sha, hostPort, bind, state: "provisioning", now: () => new Date().toISOString() });
+    next.previews[slug] = makePreviewSlot({ slug, ref, sha, hostPort, bind, fleet, state: "provisioning", now: () => new Date().toISOString() });
     writeRegistry(deps.registryPath, next);
   });
 
@@ -2550,7 +2676,7 @@ export async function runPreviewCreate(rest, injected = {}) {
     assertContainerDialedEndpointsOwned({ env: runtimeEnv, checkoutDir, deps });
 
     // cinatra-cli#220: an image already present for this SHA is reused.
-    imageBuiltHere = ensurePreviewImage({ tag, sha, checkoutDir, rebuild, provenance, deps }).built;
+    imageBuiltHere = ensurePreviewImage({ tag, sha, checkoutDir, rebuild, provenance, deps, fleet }).built;
 
     const container = bootPreviewContainer({
       slug,
@@ -2590,7 +2716,7 @@ export async function runPreviewCreate(rest, injected = {}) {
     const reg = requireUsableRegistry(deps.registryPath);
     const cur = getPreview(reg, slug);
     const next = cloneRegistry(reg);
-    next.previews[slug] = makePreviewSlot({ slug, ref, sha, hostPort, bind, state: "ready", now: () => cur?.createdAt ?? new Date().toISOString() });
+    next.previews[slug] = makePreviewSlot({ slug, ref, sha, hostPort, bind, fleet, state: "ready", now: () => cur?.createdAt ?? new Date().toISOString() });
     writeRegistry(deps.registryPath, next);
   });
   deps.log(`preview "${slug}" is healthy: ${tag} (sha ${sha}) on http://${previewReachHost(bind)}:${hostPort}`);
@@ -2614,7 +2740,10 @@ export async function runPreviewRefresh(rest, injected = {}) {
   // registry claim and the container replacement — a typo'd override must not
   // surface only after the old preview has been put into `provisioning`.
   resolveBuildTimeoutMs(deps.buildControlEnv ?? process.env);
-  buildPreviewBuildArgs(deps.buildControlEnv ?? process.env); // same fail-fast for every build-arg lever
+  // engineering#666: an explicit fleet on THIS refresh is validated before the
+  // registry claim and the container replacement, like every other build lever.
+  const requestedFleet = resolveFleet(rest, { fallback: null });
+  buildPreviewBuildArgs(deps.buildControlEnv ?? process.env, { fleet: requestedFleet ?? PREVIEW_FLEET_DEFAULT }); // same fail-fast for every build-arg lever
   resolveBuildCacheMode(deps.buildControlEnv ?? process.env); // cinatra-cli#248
   resolveEndpointOwnershipMode(deps.ownershipControlEnv ?? deps.env ?? process.env); // cinatra-cli#219
 
@@ -2632,13 +2761,15 @@ export async function runPreviewRefresh(rest, injected = {}) {
   // which carries the row's recorded bind forward below rather than widening it.
   const requestedBind = resolveBindHost({ rest, env });
   const newSha = deps.resolveSha(ref, checkoutDir);
-  const newTag = previewImageTag(newSha);
   const provenance = previewProvenance(newSha);
+  // engineering#666: the new tag is fleet-aware, and the fleet is the ROW's — so
+  // it is derived below, once the claim has read (and agreed with) the row.
+  let newTag;
 
   // CLAIM the slug under the lock: require an existing (non-in-flight) row,
   // capture the prior sha/tag + reuse the durable host port, and flip the row to
   // `provisioning` so a concurrent op can't race the container replacement.
-  let oldSha, oldTag, hostPort, bind, oldBind, volumeName;
+  let oldSha, oldTag, hostPort, bind, oldBind, volumeName, fleet;
   await withRegistryLock(deps.registryPath, async () => {
     const reg = requireUsableRegistry(deps.registryPath);
     const existing = getPreview(reg, slug);
@@ -2663,11 +2794,29 @@ export async function runPreviewRefresh(rest, injected = {}) {
     // is reused — an explicit `--bind` / env on THIS refresh overrides it.
     oldBind = existing.bind ?? null;
     bind = requestedBind ?? oldBind;
+    // engineering#666: the fleet is baked into the IMAGE, so a refresh cannot
+    // change it under a running preview's identity — it REBUILDS the same
+    // instance. Saying nothing reuses the row's fleet; naming a DIFFERENT one is
+    // refused here, before the claim is written and before anything is built or
+    // torn down, rather than silently rebuilding a proof instance without its
+    // agents (or a deployment-shaped one with them).
+    const rowFleet = existing.fleet ?? PREVIEW_FLEET_DEFAULT;
+    if (requestedFleet !== null && requestedFleet !== rowFleet) {
+      throw new Error(
+        `preview "${slug}" was built with the ${rowFleet} extension fleet and this refresh asks for ` +
+          `${PREVIEW_FLEET_FLAG} ${requestedFleet}. The fleet is acquired INTO the image, so it is a property of ` +
+          `this preview, not of one invocation: refresh without ${PREVIEW_FLEET_FLAG} to rebuild it on ${rowFleet}, ` +
+          `or create a SEPARATE preview under its own --slug with ${PREVIEW_FLEET_FLAG} ${requestedFleet} ` +
+          `(this CLI has no preview-prune verb; removing a preview is manual).`,
+      );
+    }
+    fleet = rowFleet;
+    newTag = previewImageTag(newSha, fleet);
     const next = cloneRegistry(reg);
     // Persist the (possibly freshly-allocated, for a legacy row) durable host
     // port in the SAME locked transaction as the claim — so a concurrent create
     // sees it claimed via usedPreviewHostPorts and never picks the same port.
-    next.previews[slug] = { ...existing, hostPort, bind, state: "provisioning" };
+    next.previews[slug] = { ...existing, hostPort, bind, fleet, state: "provisioning" };
     writeRegistry(deps.registryPath, next);
   });
 
@@ -2735,7 +2884,7 @@ export async function runPreviewRefresh(rest, injected = {}) {
     // cinatra-cli#220 AC1: when that image is ALREADY here, no build runs at all
     // — which is what makes re-pointing a preview at changed configuration cheap
     // enough to be possible on a host that cannot build (#210).
-    imageBuiltHere = ensurePreviewImage({ tag: newTag, sha: newSha, checkoutDir, rebuild, provenance, deps }).built;
+    imageBuiltHere = ensurePreviewImage({ tag: newTag, sha: newSha, checkoutDir, rebuild, provenance, deps, fleet }).built;
 
     // Replace the running container (AC4: the replaced container is removed —
     // no orphan accumulation), REUSING the durable volume (never dropped).
@@ -2782,7 +2931,7 @@ export async function runPreviewRefresh(rest, injected = {}) {
     // correct old->new history entry (the claim had flipped state, not sha).
     const base = { ...cur, sha: oldSha, imageTag: oldTag, provenance: previewProvenance(oldSha) };
     const next = cloneRegistry(reg);
-    next.previews[slug] = refreshPreviewSlot(base, { ref, sha: newSha, hostPort, bind, state: "ready", now: () => new Date().toISOString() });
+    next.previews[slug] = refreshPreviewSlot(base, { ref, sha: newSha, hostPort, bind, fleet, state: "ready", now: () => new Date().toISOString() });
     writeRegistry(deps.registryPath, next);
   });
   if (oldTag !== newTag) {
@@ -3238,7 +3387,10 @@ export function runPreviewStatus(rest, injected = {}) {
     out.push({ ...r, container });
     deps.log(
       `preview ${r.slug}: state=${r.state} container=${container} sha=${r.sha} tag=${r.imageTag} ` +
-        `provenance=${r.provenance} volume=${r.volumeName} port=${r.hostPort ?? "-"} ref=${r.ref}`,
+        `provenance=${r.provenance} volume=${r.volumeName} port=${r.hostPort ?? "-"} ref=${r.ref} ` +
+        // engineering#666: which fleet the image carries, so `start`/`refresh`
+        // reuse it knowingly and a proof instance is recognisable from a read.
+        `fleet=${r.fleet ?? PREVIEW_FLEET_DEFAULT}`,
     );
     if (r.state === "ready" && container === "unknown") {
       deps.log(`  the container's state could NOT be read (docker did not answer) — this is not a claim that it is gone.`);
@@ -3299,6 +3451,11 @@ export const __test = {
   PREVIEW_BUILD_CI_ARG,
   PREVIEW_BUILD_CPUS_ARG,
   PREVIEW_BUILD_BUNDLER_ARG,
+  // engineering#666
+  PREVIEW_FLEET_FLAG,
+  PREVIEW_FLEETS,
+  PREVIEW_FLEET_DEFAULT,
+  PREVIEW_FLEET_ARG,
   PREVIEW_STOP_TIMEOUT_MS,
   SUPERSEDED_CONTAINER_SUFFIX,
   // cinatra-cli#248
@@ -3349,6 +3506,7 @@ export const __test = {
   resolveBuildTypecheck,
   resolveBuildCpus,
   resolveBuildBundler,
+  resolveFleet, // engineering#666
   buildPreviewBuildArgs,
   dockerfileDeclaredBuildArgs,
   resolveBuildCacheMode, // cinatra-cli#248

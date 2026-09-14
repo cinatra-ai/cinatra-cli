@@ -7,7 +7,7 @@
 // runner RECORDS every argv so we can assert on the exact commands — this is how
 // the three hard-NEVERs (AC7) are asserted structurally.
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -99,6 +99,12 @@ const {
   PREVIEW_BUILD_BUNDLERS,
   PREVIEW_BUILD_CPUS_ARG,
   PREVIEW_BUILD_BUNDLER_ARG,
+  // engineering#666 — the extension-fleet lever
+  PREVIEW_FLEETS,
+  PREVIEW_FLEET_DEFAULT,
+  PREVIEW_FLEET_FLAG,
+  PREVIEW_FLEET_ARG,
+  resolveFleet,
   PREVIEW_IMAGE_TAG_PREFIX,
   PREVIEW_RUNTIME_MODE,
   PREVIEW_HOST_PORT_MIN,
@@ -206,7 +212,9 @@ function makeFakeDocker(state) {
         return { status: null, stdout: "", stderr: "", timedOut: true, error: new Error("ETIMEDOUT") };
       }
       if (!present) return { status: 1, stdout: "", stderr: `Error: No such image: ${ref}` };
-      const stamped = state.imageLabelSha ?? ref.split("local-")[1] ?? "";
+      // engineering#666: the tag may carry a non-default FLEET suffix, but the
+      // real build stamps the SHA on the label — the tag is never the stamp.
+      const stamped = state.imageLabelSha ?? (ref.split("local-")[1] ?? "").replace(/-(?:required|dev)$/, "");
       return { status: 0, stdout: `${stamped}\n`, stderr: "" };
     }
     // `docker stop|start|rename <name>` — cinatra-cli#220's lifecycle verbs.
@@ -3560,5 +3568,297 @@ describe("preview — the passthrough list covers the dev install's set (enginee
     // dev-install variable at all, it is the one flag a preview must never
     // sanction — excluded from the list AND stripped in `buildPreviewRunEnvArgs`.
     expect(PASSTHROUGH_ENV_KEYS).not.toContain(MATERIALIZE_DISABLE_ENV);
+  });
+});
+
+// --------------------------------------------------------------------------
+// engineering#666 — `--fleet required|dev`: which extension fleet the preview
+// IMAGE acquires. A preview image acquires only the required extensions, so a
+// proof run on a preview has no agent to run; `--fleet dev` is what puts the
+// dev fleet INTO the image.
+// --------------------------------------------------------------------------
+
+describe("preview extension fleet — --fleet required|dev (engineering#666)", () => {
+  const buildArgv = (fake) => fake.calls.find((c) => c[0] === "build");
+  const argFor = (argv, name) => {
+    const out = [];
+    for (let i = 0; i < argv.length - 1; i += 1) {
+      if (argv[i] === "--build-arg" && String(argv[i + 1]).startsWith(`${name}=`)) {
+        out.push(String(argv[i + 1]).slice(name.length + 1));
+      }
+    }
+    return out;
+  };
+  const healthy = { status: 200, body: '{"status":"ok"}' };
+
+  it("names the flag, the accepted values, the default and the build-arg the Dockerfile must declare", () => {
+    // The build-arg name is the contract with the product half's Dockerfile: a
+    // mismatch is SILENT (docker drops an unconsumed --build-arg with a warning).
+    expect(PREVIEW_FLEET_ARG).toBe("CINATRA_EXTENSION_FLEET");
+    expect(PREVIEW_FLEET_FLAG).toBe("--fleet");
+    expect(PREVIEW_FLEETS).toEqual(["required", "dev"]);
+    expect(PREVIEW_FLEET_DEFAULT).toBe("required");
+  });
+
+  it("defaults to the required fleet and accepts both values, in either spelling", () => {
+    expect(resolveFleet([])).toBe("required");
+    expect(resolveFleet(["--slug", "main"])).toBe("required");
+    expect(resolveFleet(["--fleet", "dev"])).toBe("dev");
+    expect(resolveFleet(["--fleet=dev"])).toBe("dev");
+    expect(resolveFleet(["--fleet", " DEV "])).toBe("dev");
+    expect(resolveFleet(["--fleet", "required"])).toBe("required");
+    // The "said nothing" answer is distinguishable from an explicit `required`,
+    // which is what lets refresh carry a row's fleet forward instead of resetting it.
+    expect(resolveFleet([], { fallback: null })).toBeNull();
+    expect(resolveFleet(["--fleet", "required"], { fallback: null })).toBe("required");
+  });
+
+  it("a typo is a HARD error naming the flag — never a silent fall back to required", () => {
+    for (const v of ["", "devel", "dev-fleet", "all", "REQUIRED-ISH", "1"]) {
+      let err;
+      try {
+        resolveFleet(["--fleet", v]);
+      } catch (e) {
+        err = e;
+      }
+      expect(err, `expected ${JSON.stringify(v)} to be rejected`).toBeTruthy();
+      expect(err.message).toContain(PREVIEW_FLEET_FLAG);
+      expect(err.message).toContain("required");
+      expect(err.message).toContain("dev");
+    }
+    // A bare trailing `--fleet` is a typo too, not "unset".
+    expect(() => resolveFleet(["--fleet"])).toThrow(/--fleet/);
+    // So is a REPEATED one. `readOption` answers with the FIRST match, so
+    // guessing would build the required set for an operator who typed `dev`
+    // last, and would let a trailing bare `--fleet` slip past the refusal above.
+    expect(() => resolveFleet(["--fleet", "required", "--fleet", "dev"])).toThrow(/--fleet/);
+    expect(() => resolveFleet(["--fleet", "dev", "--fleet"])).toThrow(/--fleet/);
+    expect(() => resolveFleet(["--fleet=dev", "--fleet=dev"])).toThrow(/--fleet/);
+  });
+
+  it("assembles the build-arg through the single seam, and ONLY for dev", () => {
+    expect(argFor(buildPreviewBuildArgs({}).args, PREVIEW_FLEET_ARG)).toEqual([]);
+    expect(buildPreviewBuildArgs({}).fleet).toBe("required");
+    expect(argFor(buildPreviewBuildArgs({}, { fleet: "required" }).args, PREVIEW_FLEET_ARG)).toEqual([]);
+    const dev = buildPreviewBuildArgs({}, { fleet: "dev" });
+    expect(dev.fleet).toBe("dev");
+    expect(argFor(dev.args, PREVIEW_FLEET_ARG)).toEqual(["dev"]);
+  });
+
+  it("the choice REACHES the real `docker build` argv from `preview create`", async () => {
+    const { deps, fake } = makeDeps({ sha: SHA_A, health: healthy });
+    await runPreviewCreate(["--slug", "main", "--fleet", "dev"], deps);
+    expect(argFor(buildArgv(fake), PREVIEW_FLEET_ARG)).toEqual(["dev"]);
+    // It is a BUILD-time choice: never forwarded into the container.
+    expect(fake.calls.find((c) => c[0] === "run").join(" ")).not.toContain(PREVIEW_FLEET_ARG);
+
+    const { deps: d2, fake: f2 } = makeDeps({ sha: SHA_A, health: healthy });
+    await runPreviewCreate(["--slug", "plain"], d2);
+    expect(argFor(buildArgv(f2), PREVIEW_FLEET_ARG)).toEqual([]);
+  });
+
+  it("records the fleet on the registry row and prints it in `preview status`", async () => {
+    const { deps } = makeDeps({ sha: SHA_A, health: healthy });
+    await runPreviewCreate(["--slug", "main", "--fleet", "dev"], deps);
+    const row = getPreview(readRegistry(registryPath).registry, "main");
+    expect(row.fleet).toBe("dev");
+    // A row written before this lever reads as the required fleet, never undefined.
+    expect(makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }).fleet).toBe(
+      "required",
+    );
+
+    const logs = [];
+    runPreviewStatus(["--slug", "main"], { registryPath, checkoutDir: tmp, log: (...m) => logs.push(m.join(" ")) });
+    expect(logs.join("\n")).toContain("fleet=dev");
+  });
+
+  it("a later refresh REUSES the recorded fleet when the operator says nothing", async () => {
+    const { deps } = makeDeps({ sha: SHA_A, health: healthy });
+    await runPreviewCreate(["--slug", "main", "--fleet", "dev"], deps);
+    const { deps: rdeps, fake: rfake } = makeDeps({ sha: SHA_B, health: healthy });
+    await runPreviewRefresh(["--slug", "main"], rdeps);
+    expect(argFor(buildArgv(rfake), PREVIEW_FLEET_ARG)).toEqual(["dev"]);
+    expect(getPreview(readRegistry(registryPath).registry, "main").fleet).toBe("dev");
+  });
+
+  it("a refresh whose --fleet DISAGREES with the row refuses, before any build or teardown", async () => {
+    const { deps } = makeDeps({ sha: SHA_A, health: healthy });
+    await runPreviewCreate(["--slug", "main", "--fleet", "dev"], deps);
+    const { deps: rdeps, fake: rfake } = makeDeps({ sha: SHA_B, health: healthy });
+    // "before any build or teardown" is only proved by measuring what the
+    // refusal TOUCHED, not by reading the final row: a run that removed the
+    // container and then threw, or wrote the `provisioning` claim and restored
+    // it, would leave the same final row. So: the registry FILE is not written
+    // at all (its mtime and its whole content are unchanged), and docker is
+    // asked to do nothing that mutates anything.
+    const registryBefore = readFileSync(registryPath, "utf8");
+    const mtimeBefore = statSync(registryPath).mtimeMs;
+    await expect(runPreviewRefresh(["--slug", "main", "--fleet", "required"], rdeps)).rejects.toThrow(
+      /fleet/i,
+    );
+    const MUTATING_DOCKER_VERBS = new Set(["build", "run", "create", "rm", "stop", "kill", "start", "rename"]);
+    expect(rfake.calls.filter((c) => MUTATING_DOCKER_VERBS.has(String(c[0])))).toEqual([]);
+    expect(readFileSync(registryPath, "utf8")).toBe(registryBefore);
+    expect(statSync(registryPath).mtimeMs).toBe(mtimeBefore);
+    const row = getPreview(readRegistry(registryPath).registry, "main");
+    expect(row.sha).toBe(SHA_A);
+    expect(row.state).toBe("ready");
+    expect(row.fleet).toBe("dev");
+    // The AGREEING value is not a mismatch.
+    const { deps: ok, fake: okFake } = makeDeps({ sha: SHA_B, health: healthy });
+    await runPreviewRefresh(["--slug", "main", "--fleet", "dev"], ok);
+    expect(argFor(buildArgv(okFake), PREVIEW_FLEET_ARG)).toEqual(["dev"]);
+  });
+
+  it("a row carrying a fleet this CLI does not accept is registry CORRUPTION, refused before anything is claimed", async () => {
+    // The tag is derived from the fleet and `previewImageTag` normalises an
+    // unknown one back to the default — so without an explicit check the row
+    // below (a hand-edited or forward-version registry) reads as perfectly
+    // valid, `status` prints a fleet no build produced, and a plain `refresh`
+    // carries it past the claim into the build assembly, which refuses it only
+    // after the row has been flipped to `provisioning`.
+    const corrupt = makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" });
+    corrupt.fleet = "devel"; // not one of PREVIEW_FLEETS; tag stays the required one
+    writeFileSync(registryPath, JSON.stringify({ version: 1, previews: { main: corrupt } }));
+    expect(readRegistry(registryPath).status).toBe("malformed");
+
+    const { deps: rdeps, fake: rfake } = makeDeps({ sha: SHA_B, health: healthy });
+    await expect(runPreviewRefresh(["--slug", "main"], rdeps)).rejects.toThrow();
+    expect(rfake.calls.find((c) => c[0] === "build")).toBeUndefined();
+
+    // An ABSENT field is not corruption: that is every row written before this
+    // lever, and it reads as the required set it was built with.
+    const legacy = makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" });
+    delete legacy.fleet;
+    writeFileSync(registryPath, JSON.stringify({ version: 1, previews: { main: legacy } }));
+    expect(readRegistry(registryPath).status).toBe("ok");
+  });
+
+  it("create and refresh FAIL FAST on a typo'd fleet, before a slug is claimed or a preview is touched", async () => {
+    const { deps: bad, fake: badFake } = makeDeps({ sha: SHA_A, health: healthy });
+    await expect(runPreviewCreate(["--slug", "other", "--fleet", "devel"], bad)).rejects.toThrow(/--fleet/);
+    expect(badFake.calls.find((c) => c[0] === "build")).toBeUndefined();
+    expect(getPreview(readRegistry(registryPath).registry ?? { previews: {} }, "other")).toBeFalsy();
+
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+    });
+    const { deps: badRefresh, fake: badRefreshFake } = makeDeps({ sha: SHA_B, health: healthy });
+    await expect(runPreviewRefresh(["--slug", "main", "--fleet", "devel"], badRefresh)).rejects.toThrow(/--fleet/);
+    expect(badRefreshFake.calls.find((c) => c[0] === "build")).toBeUndefined();
+    const row = getPreview(readRegistry(registryPath).registry, "main");
+    expect(row.sha).toBe(SHA_A);
+    expect(row.state).toBe("ready");
+  });
+
+  it("logs the fleet as part of the build's identity, and warns when the SHA's Dockerfile cannot honour it", () => {
+    const lines = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: "/ctx",
+      fleet: "dev",
+      deps: { runDocker: makeFakeDocker({}).runDocker, buildControlEnv: {}, log: (m) => lines.push(m) },
+    });
+    expect(lines.join("\n")).toMatch(/fleet: dev/);
+
+    // A SHA whose Dockerfile predates the ARG cannot honour the choice, and
+    // docker would drop it with only a warning — so the build says so.
+    const old = path.join(tmp, "ctx-no-fleet-arg");
+    mkdirSync(old, { recursive: true });
+    writeFileSync(path.join(old, "Dockerfile"), "FROM node:24-alpine\nARG CI=\nRUN echo hi\n");
+    const lines2 = [];
+    buildPreviewImage({
+      tag: previewImageTag(SHA_A),
+      contextDir: old,
+      fleet: "dev",
+      deps: { runDocker: makeFakeDocker({}).runDocker, buildControlEnv: {}, log: (m) => lines2.push(m) },
+    });
+    expect(lines2.join("\n")).toContain(`ARG ${PREVIEW_FLEET_ARG}`);
+  });
+
+  it("the fleet is part of the IMAGE TAG, so a dev image never reuses (or overwrites) the required one", async () => {
+    // The tag is the image's identity and the reuse probe reads only the
+    // `cinatra.preview.sha` label — so a SHA-only tag would let a `--fleet dev`
+    // create SKIP the build and boot the required image: a proof instance with
+    // no agent to run, which is the one failure engineering#666 exists to remove.
+    expect(previewImageTag(SHA_A)).toBe(`${PREVIEW_IMAGE_TAG_PREFIX}${SHA_A}`);
+    expect(previewImageTag(SHA_A, "required")).toBe(previewImageTag(SHA_A));
+    expect(previewImageTag(SHA_A, "dev")).toBe(`${PREVIEW_IMAGE_TAG_PREFIX}${SHA_A}-dev`);
+    expect(previewImageTag(SHA_A, "dev")).not.toBe(previewImageTag(SHA_A));
+
+    // The required image for this SHA is ALREADY here. A dev create must build
+    // anyway, and must not touch the required tag.
+    const { deps, fake } = makeDeps({ sha: SHA_A, health: healthy, images: new Set([previewImageTag(SHA_A)]) });
+    await runPreviewCreate(["--slug", "proof", "--fleet", "dev"], deps);
+    const build = buildArgv(fake);
+    expect(build, "a dev create must BUILD, never reuse the required image").toBeTruthy();
+    expect(argFor(build, PREVIEW_FLEET_ARG)).toEqual(["dev"]);
+    expect(build).toContain(previewImageTag(SHA_A, "dev"));
+    expect(build).not.toContain(previewImageTag(SHA_A));
+    const row = getPreview(readRegistry(registryPath).registry, "proof");
+    expect(row.imageTag).toBe(previewImageTag(SHA_A, "dev"));
+    expect(row.fleet).toBe("dev");
+
+    // And the mirror image of the same hazard: with the DEV image present, a
+    // plain create still builds the required one.
+    const { deps: d2, fake: f2 } = makeDeps({ sha: SHA_A, health: healthy, images: new Set([previewImageTag(SHA_A, "dev")]) });
+    await runPreviewCreate(["--slug", "plain"], d2);
+    expect(buildArgv(f2)).toBeTruthy();
+    expect(buildArgv(f2)).toContain(previewImageTag(SHA_A));
+    expect(getPreview(readRegistry(registryPath).registry, "plain").imageTag).toBe(previewImageTag(SHA_A));
+  });
+
+  it("`preview start` re-materializes a dev-fleet preview from ITS OWN image, with the row unchanged", async () => {
+    const { deps } = makeDeps({ sha: SHA_A, health: healthy });
+    await runPreviewCreate(["--slug", "main", "--fleet", "dev"], deps);
+
+    // The container is gone; start re-materializes it from the RECORDED tag —
+    // which is the dev one, so the proof instance comes back with its fleet.
+    const { deps: sdeps, fake: sfake } = makeDeps(
+      {
+        containerAbsent: true,
+        health: healthy,
+        images: new Set([previewImageTag(SHA_A, "dev")]),
+        compose: { containers: [{ id: "own-redis", name: "cinatra-redis-1", service: "redis", project: "cinatra", workingDir: tmp, ports: [["127.0.0.1", 6379, 6379]] }] },
+      },
+      { env: { [ENCRYPTION_KEY_ENV]: KEY_64, REDIS_URL: "redis://127.0.0.1:6379" } },
+    );
+    const out = await runPreviewStart(["--slug", "main"], sdeps);
+    expect(out.rematerialized).toBe(true);
+    // start NEVER builds — it honours the recorded fleet by re-using its image.
+    expect(sfake.calls.some((c) => c[0] === "build")).toBe(false);
+    expect(sfake.calls.find((c) => c[0] === "run").join(" ")).toContain(previewImageTag(SHA_A, "dev"));
+    const row = getPreview(readRegistry(registryPath).registry, "main");
+    expect(row.fleet).toBe("dev");
+    expect(row.imageTag).toBe(previewImageTag(SHA_A, "dev"));
+  });
+
+  it("a row written BEFORE this lever (no `fleet` field at all) stays valid and reads as the required fleet", async () => {
+    // Not `makePreviewSlot(...)` without the option — that writes the field.
+    // This is the shape a registry file on disk actually has today.
+    const legacy = makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" });
+    delete legacy.fleet;
+    expect(legacy.fleet).toBeUndefined();
+    writeRegistry(registryPath, { version: 1, previews: { main: legacy } });
+    // Still structurally valid: the tag it carries is the required-fleet tag.
+    const read = readRegistry(registryPath);
+    expect(read.state).not.toBe("malformed");
+    expect(getPreview(read.registry, "main")).toBeTruthy();
+
+    const logs = [];
+    runPreviewStatus(["--slug", "main"], { registryPath, checkoutDir: tmp, log: (...m) => logs.push(m.join(" ")) });
+    expect(logs.join("\n")).toContain("fleet=required");
+
+    // A refresh that says nothing rebuilds it on the required fleet, and a
+    // refresh that asks for `dev` is refused — it would be a different image.
+    const { deps: bad } = makeDeps({ sha: SHA_B, health: healthy });
+    await expect(runPreviewRefresh(["--slug", "main", "--fleet", "dev"], bad)).rejects.toThrow(/fleet/i);
+    const { deps: ok, fake: okFake } = makeDeps({ sha: SHA_B, health: healthy });
+    await runPreviewRefresh(["--slug", "main"], ok);
+    expect(argFor(buildArgv(okFake), PREVIEW_FLEET_ARG)).toEqual([]);
+    const row = getPreview(readRegistry(registryPath).registry, "main");
+    expect(row.fleet).toBe("required");
+    expect(row.imageTag).toBe(previewImageTag(SHA_B));
   });
 });

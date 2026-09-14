@@ -592,6 +592,33 @@ export function previewBindArgs({ rest = [] } = {}) {
   return [];
 }
 
+/**
+ * The `--fleet` argv the front door hands the preview lifecycle (engineering#666).
+ *
+ * Exactly the reason `previewBindArgs` exists: the bootstrap reconstructs the
+ * create argv, so a flag not extracted here is silently DROPPED — and
+ * `cinatra install --mode preview --fleet dev` would report a healthy preview
+ * that carries only the required extensions, i.e. a proof instance with no agent
+ * to run, which is the single failure engineering#666 exists to remove. The
+ * refresh continuation forwards `rest` verbatim, so the flag already reaches
+ * `runPreviewRefresh`; this closes the create half.
+ *
+ * The VALUE is deliberately left unvalidated: `resolveFleet` inside
+ * `runPreviewCreate` is the single validator and a second copy of its rules here
+ * is exactly how the two drift. A bare trailing `--fleet` is forwarded with an
+ * EMPTY value so that validator refuses it, rather than being dropped here and
+ * silently building the required set.
+ */
+export function previewFleetArgs({ rest = [] } = {}) {
+  if (!Array.isArray(rest)) return [];
+  for (let i = 0; i < rest.length; i++) {
+    const token = String(rest[i]);
+    if (token === "--fleet") return ["--fleet", rest[i + 1] === undefined ? "" : String(rest[i + 1])];
+    if (token.startsWith("--fleet=")) return ["--fleet", token.slice("--fleet=".length)];
+  }
+  return [];
+}
+
 // --- orchestration ---------------------------------------------------------
 
 /**
@@ -733,7 +760,8 @@ export async function runInstallPreviewBootstrap({
 
   // cinatra-cli#248: `--bind` is forwarded EXPLICITLY, because this argv is
   // reconstructed rather than passed through (see `previewBindArgs`).
-  const result = await runPreviewCreate(["--slug", slug, "--ref", ref, ...previewBindArgs({ rest })], {
+  // engineering#666: `--fleet` for the same reason (see `previewFleetArgs`).
+  const result = await runPreviewCreate(["--slug", slug, "--ref", ref, ...previewBindArgs({ rest }), ...previewFleetArgs({ rest })], {
     ...injected,
     checkoutDir: targetDir,
     // The pre-port env: enough for create's fail-fast encryption-key gate; the
@@ -1027,6 +1055,7 @@ export const __test = {
   previewHandoffLines,
   previewSlugArgs,
   previewBindArgs,
+  previewFleetArgs, // engineering#666
   decidePreviewAction,
   previewSkipReportLines,
   previewInFlightReportLines,
