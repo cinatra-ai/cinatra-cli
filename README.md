@@ -178,6 +178,35 @@ a loopback one, and the bound address itself when the publish names one
 interface, so a preview bound to a LAN address is health-gated where it actually
 listens.
 
+### Which extension fleet a preview image carries
+
+A preview image acquires only the **required** extensions, the set a real
+deployment carries. A dev boot, by contrast, syncs the **dev fleet** — so a proof
+run dispatched on a preview instance has no agent to run. `--fleet` decides which
+of the two goes into the image:
+
+    cinatra instance preview create --fleet dev
+    cinatra instance preview refresh --slug <slug> --fleet dev
+
+Accepted values are `required` and `dev`, and the default is `required`.
+`--fleet dev` becomes the build-arg `CINATRA_EXTENSION_FLEET=dev` for the image
+build; `required` passes nothing at all, so the resolved SHA's own default
+stands. The resolved fleet is **recorded on the preview's registry row** and
+printed by `instance preview status` as `fleet=<value>`, so a later `start` or
+`refresh` reuses the same fleet — and a `refresh` that names a *different* one is
+refused (the fleet is baked into the image, so changing it is creating a
+different instance: prune the preview and create it again).
+
+The front door forwards it too: `cinatra install --mode preview --fleet dev`
+bootstraps its first preview on the dev fleet. Because the fleet is baked into
+the image, it is part of the image's *tag* — a dev preview and a required one at
+the same SHA are two different images and never reuse or overwrite each other.
+
+**A dev-fleet preview is a proof instance — never a deployment.** It exists so a
+capture or verification host can dispatch a real run against a production-built
+image without an install step. The extra fleet is exactly what a deployment must
+not carry, which is why the default never changes on its own.
+
 ### The preview build cache and what it costs on disk
 
 A preview build is the checkout's whole multi-stage Dockerfile, and without a

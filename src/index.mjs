@@ -886,8 +886,9 @@ Usage:
   cinatra instance clone prune [--worktree-path <path>] [--slug <slug>] --yes
   cinatra instance clone list
   cinatra instance preview create [--ref <git-ref>] [--slug <slug>] [--port <port>]
-                                 [--bind <address>] [--rebuild]
-  cinatra instance preview refresh [--ref <git-ref>] [--slug <slug>] [--bind <address>] [--rebuild]
+                                 [--bind <address>] [--fleet required|dev] [--rebuild]
+  cinatra instance preview refresh [--ref <git-ref>] [--slug <slug>] [--bind <address>]
+                                 [--fleet required|dev] [--rebuild]
                                # The build is SKIPPED when the image for the target SHA is
                                # already present locally; --rebuild (--force-build) forces it.
   cinatra instance preview stop [--slug <slug>]
@@ -916,6 +917,13 @@ Usage:
                                # in ~/.cinatra/preview-build-cache; CINATRA_PREVIEW_BUILD_CACHE_DIR
                                # moves it, and pruning it is deleting that directory.
                                # Env-only so they apply to \`install --mode preview\` too.
+                               # --fleet required|dev picks the EXTENSION FLEET the image
+                               # acquires (default required). dev becomes the build-arg
+                               # CINATRA_EXTENSION_FLEET=dev, so the dev fleet is IN the image
+                               # and a proof run has agents to run. It is recorded on the
+                               # preview's row, printed by status, reused by refresh, and a
+                               # refresh that names a DIFFERENT fleet is refused. A dev-fleet
+                               # preview is a PROOF INSTANCE, never a deployment.
                                # --bind <address> publishes the container's port on ONE interface
                                # (\`--bind 127.0.0.1\` for loopback-only) instead of every one.
                                # Unset is unchanged (0.0.0.0). CINATRA_PREVIEW_BIND_HOST is the
@@ -1069,6 +1077,24 @@ Commands:
 
                       which becomes the build-arg CINATRA_BUILD_BUNDLER. UNSET
                       passes nothing and the resolved SHA keeps its own choice.
+
+                      EXTENSION FLEET: a preview image acquires only the
+                      REQUIRED extensions, while a dev boot syncs the dev fleet
+                      — so a proof run dispatched on a preview has no agent to
+                      run. Build the image with the dev fleet instead:
+
+                        cinatra instance preview create --fleet dev
+
+                      accepted values required|dev, default required. dev
+                      becomes the build-arg CINATRA_EXTENSION_FLEET=dev;
+                      required passes nothing, so the resolved SHA's own default
+                      stands. The choice is RECORDED on the preview's registry
+                      row (status prints fleet=<value>), so a later
+                      start/refresh reuses it and a refresh naming a different
+                      fleet is refused rather than silently rebuilding the
+                      instance as something else. A dev-fleet preview is a PROOF
+                      INSTANCE for capture/verification hosts — never a
+                      deployment.
 
                       Neither is a cure. The checkout documents a builder-memory
                       floor, and a builder far below it fails on both bundler

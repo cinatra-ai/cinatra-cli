@@ -168,7 +168,7 @@ import {
 // cinatra-cli#194: the preview image-build budget lever. `preview.mjs` is plain
 // ESM over node builtins (importable from the light CLI core), and only the pure
 // validator is used here — the lifecycle itself stays lazy-imported below.
-import { resolveBuildTimeoutMs, buildPreviewBuildArgs, resolveBuildCacheMode, resolveBindHost } from "./preview.mjs";
+import { resolveBuildTimeoutMs, buildPreviewBuildArgs, resolveBuildCacheMode, resolveBindHost, resolveFleet } from "./preview.mjs";
 // cinatra#2654: the WayFlow agent runtime starts with every install-owned local
 // stack. The decision, the operator-facing status text, and the two pre-`up`
 // steps (bridge-token env, image build) live in their own builtins-only module
@@ -438,6 +438,7 @@ const VALUE_TAKING_INSTALL_FLAGS = new Set([
   "--on-conflict",
   "--instance",
   "--bind", // cinatra-cli#248 (preview-only; its value is an address, not a mode)
+  "--fleet", // engineering#666 (preview-only; its value is a fleet name, not a mode)
   "--execution-mode",
   "--sandbox-broker-url",
   "--sandbox-broker-secret",
@@ -743,6 +744,21 @@ export function parseInstallArgs(argv = []) {
   // so the flag still wins over the env and a bad value is refused identically.
   const previewBind =
     surfaceMode === PREVIEW_SURFACE_MODE_VALUE ? resolveBindHost({ rest: argv, env: process.env }) : null;
+  // engineering#666: `--fleet` is preview-only for the same reason `--bind` is —
+  // it names what the preview IMAGE acquires, and a dev/prod/demo install builds
+  // no preview image. Resolved and validated HERE, before any side effect, by
+  // the SAME single validator the lifecycle uses; `fallback: null` means "the
+  // operator said nothing", which forwards nothing and leaves create's own
+  // default standing.
+  const previewFleetOpt = readOption(argv, "--fleet");
+  if (previewFleetOpt != null && surfaceMode !== PREVIEW_SURFACE_MODE_VALUE) {
+    throw new Error(
+      `--fleet applies only to \`install --mode preview\` — it names the extension fleet the preview ` +
+        `IMAGE acquires, and a ${surfaceMode} install builds no preview image.`,
+    );
+  }
+  const previewFleet =
+    surfaceMode === PREVIEW_SURFACE_MODE_VALUE ? resolveFleet(argv, { fallback: null }) : null;
 
   return {
     dir: dirOpt, // null → resolved later (prompt on TTY, else default).
@@ -758,6 +774,9 @@ export function parseInstallArgs(argv = []) {
     // cinatra-cli#248: the validated preview publish bind, or null for docker's
     // unchanged default. Handed to the preview lifecycle as its own `--bind`.
     previewBind,
+    // engineering#666: the validated preview extension fleet, or null when the
+    // operator said nothing. Handed to the lifecycle as its own `--fleet`.
+    previewFleet,
     yes: argv.includes("--yes"),
     force: argv.includes("--force"),
     resetEnv: argv.includes("--reset-env"),
@@ -9437,8 +9456,13 @@ async function bootstrapPreviewFrontDoor({
     // cinatra-cli#197 — this instance's effective local-infra endpoints, for the
     // container-dialed keys the install leaves implicit in `.env.local`.
     effectiveEndpoints,
-    // cinatra-cli#248 — the only lifecycle flag the front door forwards.
-    rest: opts.previewBind ? ["--bind", opts.previewBind] : [],
+    // cinatra-cli#248 / engineering#666 — the lifecycle flags the front door
+    // forwards. The argv handed to the lifecycle is RECONSTRUCTED, so a flag
+    // missing here is silently dropped (see `previewFleetArgs`).
+    rest: [
+      ...(opts.previewBind ? ["--bind", opts.previewBind] : []),
+      ...(opts.previewFleet ? ["--fleet", opts.previewFleet] : []),
+    ],
     log,
     deps: deps.previewDeps ?? {},
   });
