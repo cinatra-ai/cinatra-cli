@@ -374,7 +374,7 @@ export const PASSTHROUGH_ENV_KEYS = [
   "NANGO_SERVER_URL",
   "NANGO_SECRET_KEY",
   "OPENAI_API_KEY",
-  // cinatra-engineering#660: the RUNTIME BRIDGE. `CINATRA_BRIDGE_TOKEN` is only
+  // engineering#660: the RUNTIME BRIDGE. `CINATRA_BRIDGE_TOKEN` is only
   // the credential half of it — the address half is `WAYFLOW_BASE_URL`, which a
   // dev install re-points at this instance's own WayFlow host port
   // (`install.mjs`, cinatra-cli#97) and which a preview used to drop. Without it
@@ -475,7 +475,7 @@ export const CONTAINER_REWRITE_ENV_KEYS = [
   // dials. `NANGO_SECRET_KEY` is its credential, not an address, so it is
   // forwarded verbatim and never rewritten.
   "NANGO_SERVER_URL",
-  // cinatra-engineering#660: the agent runtime the SERVER-side bridge call
+  // engineering#660: the agent runtime the SERVER-side bridge call
   // dials. A dev install writes `http://127.0.0.1:<wayflow port>`, so forwarding
   // it verbatim would point the container at itself; `CINATRA_BRIDGE_TOKEN` is
   // its credential, not an address, so that one stays verbatim.

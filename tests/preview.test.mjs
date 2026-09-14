@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { answerComposeOwnership } from "./helpers/fake-compose-ownership.mjs";
 
-// cinatra-engineering#660: the two DELEGATED env writers own their key sets in
+// engineering#660: the two DELEGATED env writers own their key sets in
 // their own modules; the coverage guard below reads them from there rather than
 // transcribing them.
 import { buildCoUseEnv } from "../src/install-couse.mjs";
@@ -3186,7 +3186,7 @@ describe("preview — the build cache only runs on a builder that can hold one (
 });
 
 // --------------------------------------------------------------------------
-// cinatra-engineering#660 (item 1) — the passthrough list COVERS the dev
+// engineering#660 (item 1) — the passthrough list COVERS the dev
 // install's extension-install, connection-service and runtime-bridge variables
 //
 // The gap this closes is not a missing key alone (the registry keys arrived
@@ -3209,7 +3209,7 @@ describe("preview — the build cache only runs on a builder that can hold one (
 // it is; that decision is the point of the test.
 // --------------------------------------------------------------------------
 
-describe("preview — the passthrough list covers the dev install's set (cinatra-engineering#660)", () => {
+describe("preview — the passthrough list covers the dev install's set (engineering#660)", () => {
   const readSrc = (rel) => readFileSync(new URL(rel, import.meta.url), "utf8");
 
   /** The files the dev install road resolves its env-key CONSTANTS from. */
@@ -3469,9 +3469,9 @@ describe("preview — the passthrough list covers the dev install's set (cinatra
       CINATRA_AGENT_REGISTRY_URL: "http://registry.example.test:4873",
       CINATRA_AGENT_REGISTRY_UI_URL: "http://registry.example.test:4873",
       NANGO_SERVER_URL: "http://nango.example.test:3003",
-      NANGO_SECRET_KEY: "11111111-2222-4333-8444-555555555555",
+      NANGO_SECRET_KEY: "not-a-real-secret-fixture",
       NANGO_ENCRYPTION_KEY: "nango-encryption-key",
-      SUPABASE_DB_URL: "postgresql://u:p@db.example.test:5432/postgres",
+      SUPABASE_DB_URL: "postgresql://db.example.test:5432/postgres",
       SUPABASE_SCHEMA: "cinatra",
       REDIS_URL: "redis://cache.example.test:6379",
       BETTER_AUTH_SECRET: "better-auth-secret",
