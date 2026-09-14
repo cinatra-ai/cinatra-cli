@@ -85,6 +85,68 @@ Accepted range **1000 .. 21600000** ms (1 second .. 6 hours). Notes:
   step starts over from the beginning. So if a *single* step takes longer than
   the budget, retrying will never get past it; raise the budget instead.
 
+### What a preview instance receives
+
+A preview container is not handed your whole environment: it gets the runtime
+settings the composition decides, plus a fixed passthrough list — the variables
+an instance needs to serve requests, install extensions and hold connections.
+Anything else you have exported stays on the host.
+
+**Set by the composition, never inherited:** `CINATRA_RUNTIME_MODE=production`
+(a preview always runs production runtime semantics), `CINATRA_EXTENSION_DATA_ROOT`
+(the durable named volume's mount path) and `HOSTNAME`.
+
+**Required:** `CINATRA_ENCRYPTION_KEY` — 64 hex characters, checked *before* the
+boot rather than failing silently inside it.
+
+**Forwarded when set on the host:**
+
+| what it is for | variables |
+|---|---|
+| data + cache | `SUPABASE_DB_URL`, `SUPABASE_SCHEMA`, `REDIS_URL` |
+| auth + public URLs | `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, `NEXT_PUBLIC_BETTER_AUTH_URL`, `NEXT_PUBLIC_APP_URL`, `NEXT_PUBLIC_SITE_URL` |
+| extension installs (which registry a package is fetched from) | `CINATRA_AGENT_REGISTRY_URL`, `CINATRA_AGENT_REGISTRY_UI_URL` |
+| whether an installed package is trusted | `CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_URL`, `CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_READ_TOKEN`, `CINATRA_DEPLOYMENT_REGISTRY_ROUTING_MODE`, `CINATRA_DEPLOYMENT_REGISTRY_ALLOW_FIXTURE` |
+| connections (the connection service's address, its credential, the at-rest key) | `NANGO_SERVER_URL`, `NANGO_SECRET_KEY`, `NANGO_ENCRYPTION_KEY` |
+| model access | `OPENAI_API_KEY` |
+| the agent runtime bridge (its address, its shared secret, its attestation key) | `WAYFLOW_BASE_URL`, `CINATRA_BRIDGE_TOKEN`, `CINATRA_CONTEXT_ATTEST_KEY` |
+
+Without the registry pair a preview falls back to the hosted default registry it
+holds no credential for, so every marketplace install inside it fails with 401;
+without the Nango trio it can neither reach nor authenticate to the connection
+service, so saving a provider key reports only partial success; and without
+`WAYFLOW_BASE_URL` the app falls back to its default `http://localhost:3010` —
+the container itself — so every agent run refuses with "Cinatra WayFlow is not
+configured for agent …: WAYFLOW_BASE_URL is not set"; and without
+`CINATRA_CONTEXT_ATTEST_KEY` the bridge is reachable but the app rejects every
+context callback the runtime signs. A dev install writes all of them into its
+`.env.local`, which is why `install --mode preview` needs no extra setup for
+these — and a unit test holds this list against the set the dev install road
+writes, so a new variable that road starts writing fails the test until someone
+decides whether a preview needs it (it does not audit variables written outside
+that road).
+
+A forwarded address the CONTAINER dials (the database, Redis, the connection
+service, the runtime bridge) that points at the host's own loopback
+(`127.0.0.1` / `localhost`) is rewritten to `host.docker.internal` on the way in,
+because inside the container that address would mean the container itself.
+Credentials and browser-resolved URLs are forwarded verbatim. A rewritten
+loopback endpoint is also ownership-verified before the boot
+(`CINATRA_PREVIEW_ENDPOINT_OWNERSHIP`): when the endpoint is not this checkout's
+own compose service — an operator-managed runtime or database, a tunnel — name
+that key in `CINATRA_PREVIEW_ENDPOINT_OWNERSHIP_ALLOW` to proceed.
+
+**Deliberately never forwarded:**
+`CINATRA_DISABLE_REQUIRED_EXTENSION_MATERIALIZE`. It disables a required-extension
+safety invariant; its only sanctioned use is a CI screenshot context, never a boot
+workaround. A preview refuses to boot while it is set rather than quietly passing
+it on. Variables that belong to a service rather than to the app — the Nango
+service's own database URL (`NANGO_DATABASE_URL` / `NANGO_DB_URL`) — stay on the
+host too: they are dialed by those services, not by the app that talks to them.
+The memory and graph endpoints (`GRAPHITI_URL`, `NEO4J_URI`) stay on the host as
+well: they belong to subsystems outside extension installs, connections and the
+agent runtime bridge, so forwarding them is a separate decision.
+
 ### Where a preview publishes its port
 
 A preview container publishes its app port to a host port, and by default that

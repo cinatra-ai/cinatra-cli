@@ -345,6 +345,10 @@ describe("preview refresh — the continuation invents nothing (#197 AC6)", () =
           // cinatra-cli#219 joined the container-dialed class, and the isolated
           // path writes it down like the rest.
           NANGO_SERVER_URL: "http://127.0.0.1:3103",
+          // cinatra-engineering#660: the runtime bridge is container-dialed
+          // too, and the isolated path re-points it (`install.mjs`,
+          // cinatra-cli#97) exactly like the endpoints above.
+          WAYFLOW_BASE_URL: "http://127.0.0.1:3110",
         },
       }),
     ).toEqual([]);

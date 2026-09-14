@@ -374,7 +374,25 @@ export const PASSTHROUGH_ENV_KEYS = [
   "NANGO_SERVER_URL",
   "NANGO_SECRET_KEY",
   "OPENAI_API_KEY",
+  // cinatra-engineering#660: the RUNTIME BRIDGE. `CINATRA_BRIDGE_TOKEN` is only
+  // the credential half of it — the address half is `WAYFLOW_BASE_URL`, which a
+  // dev install re-points at this instance's own WayFlow host port
+  // (`install.mjs`, cinatra-cli#97) and which a preview used to drop. Without it
+  // the app falls back to its default `http://localhost:3010`, which inside the
+  // container is the CONTAINER, and every agent run refuses with "Cinatra
+  // WayFlow is not configured for agent …: WAYFLOW_BASE_URL is not set".
+  // Container-dialed (the server-side bridge call resolves it), so it is in
+  // CONTAINER_REWRITE_ENV_KEYS below and gets the host-loopback rewrite.
   "CINATRA_BRIDGE_TOKEN",
+  "WAYFLOW_BASE_URL",
+  // …and its THIRD half: the runtime signs its context callbacks with
+  // `CINATRA_CONTEXT_ATTEST_KEY`, which `ensureEnvLocal` mints for EVERY mode
+  // (`install.mjs`, cinatra-cli#143 + cinatra#2654) exactly like the bridge
+  // token. Without it the app fails CLOSED on the composed-child context path
+  // — "a runtime that starts and then rejects every context callback"
+  // (`wayflow-runtime.mjs`) — which is the same broken agent run one layer in.
+  // A credential, not an address: forwarded verbatim, never rewritten.
+  "CINATRA_CONTEXT_ATTEST_KEY",
   // cinatra-cli#190: the agent-registry (Verdaccio) client URLs. Without them
   // the container falls back to the HOSTED default
   // (`https://registry.cinatra.ai`, `packages/registries` `loadVerdaccioConfig`)
@@ -457,6 +475,11 @@ export const CONTAINER_REWRITE_ENV_KEYS = [
   // dials. `NANGO_SECRET_KEY` is its credential, not an address, so it is
   // forwarded verbatim and never rewritten.
   "NANGO_SERVER_URL",
+  // cinatra-engineering#660: the agent runtime the SERVER-side bridge call
+  // dials. A dev install writes `http://127.0.0.1:<wayflow port>`, so forwarding
+  // it verbatim would point the container at itself; `CINATRA_BRIDGE_TOKEN` is
+  // its credential, not an address, so that one stays verbatim.
+  "WAYFLOW_BASE_URL",
 ];
 
 // --- slug / name / tag -----------------------------------------------------

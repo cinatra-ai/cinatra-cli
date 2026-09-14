@@ -15,6 +15,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { answerComposeOwnership } from "./helpers/fake-compose-ownership.mjs";
 
+// cinatra-engineering#660: the two DELEGATED env writers own their key sets in
+// their own modules; the coverage guard below reads them from there rather than
+// transcribing them.
+import { buildCoUseEnv } from "../src/install-couse.mjs";
+import { CLI_MANAGED_EXECUTION_ENV_KEYS } from "../src/execution-mode.mjs";
+
 import { __test as P } from "../src/preview.mjs";
 
 const {
@@ -3176,5 +3182,345 @@ describe("preview — the build cache only runs on a builder that can hold one (
     const args = previewBuildDockerArgs({ tag: "t", contextDir: "/ctx", cacheDir: "/cache", cacheWrite: false });
     expect(args).toContain("--cache-from=type=local,src=/cache");
     expect(args.join(" ")).not.toContain("--cache-to");
+  });
+});
+
+// --------------------------------------------------------------------------
+// cinatra-engineering#660 (item 1) — the passthrough list COVERS the dev
+// install's extension-install, connection-service and runtime-bridge variables
+//
+// The gap this closes is not a missing key alone (the registry keys arrived
+// with #190, the Nango pair with #219, the deployment-registry four with #248)
+// but a missing GUARD: nothing tied PASSTHROUGH_ENV_KEYS to the dev install's
+// own set, so the next variable the dev road starts writing could be dropped
+// from a preview container silently — a preview that boots fine and then cannot
+// install an extension, save a connection, or run an agent.
+//
+// So the expected set is not transcribed here: it is READ OUT of the dev
+// install road — every key `src/install.mjs` re-points or upserts into an
+// instance's env file (INCLUDING the writes whose key argument is a constant
+// rather than a literal: an unresolved constant is a RED, not a hole), its
+// isolation-critical set, the connector credential `src/nango-secret-key.mjs`
+// reconciles, and the two delegated writers whose key sets live in their own
+// modules (`buildCoUseEnv`, `CLI_MANAGED_EXECUTION_ENV_KEYS`). Every key found
+// there must be CLASSIFIED below — forwarded into a preview, set by the preview
+// composition itself, or deliberately not forwarded, each with its reason. A
+// new dev-install variable is therefore a RED here until someone decides which
+// it is; that decision is the point of the test.
+// --------------------------------------------------------------------------
+
+describe("preview — the passthrough list covers the dev install's set (cinatra-engineering#660)", () => {
+  const readSrc = (rel) => readFileSync(new URL(rel, import.meta.url), "utf8");
+
+  /** The files the dev install road resolves its env-key CONSTANTS from. */
+  const KEY_CONSTANT_SOURCES = [
+    "../src/install.mjs",
+    "../src/prod-env-validate.mjs",
+    "../src/wayflow-runtime.mjs",
+    "../src/isolated-a2a.mjs",
+    "../src/install-couse.mjs",
+    "../src/nango-secret-key.mjs",
+  ];
+
+  /** `IDENT` / `IDENT.name` → the env key it names, read out of the road. */
+  function keyConstants() {
+    const map = new Map();
+    for (const rel of KEY_CONSTANT_SOURCES) {
+      const src = readSrc(rel);
+      for (const m of src.matchAll(/(?:export\s+)?const ([A-Za-z_$][\w$]*) = "([A-Z][A-Z0-9_]*)";/g)) {
+        map.set(m[1], m[2]);
+      }
+      // `export const ATTEST_KEY = { name: "CINATRA_CONTEXT_ATTEST_KEY", … }`
+      for (const m of src.matchAll(/(?:export\s+)?const ([A-Za-z_$][\w$]*) = \{\s*\n\s*name: "([A-Z][A-Z0-9_]*)"/g)) {
+        map.set(`${m[1]}.name`, m[2]);
+      }
+    }
+    // …and the ALIASES the road binds them to right before the write
+    // (`const ATTEST = ATTEST_KEY.name;`, `const ENC = PROD_ENCRYPTION_KEY;`).
+    // Resolved to a fixpoint so an alias of an alias is read too.
+    for (let pass = 0; pass < 4; pass += 1) {
+      let grew = false;
+      for (const rel of KEY_CONSTANT_SOURCES) {
+        for (const m of readSrc(rel).matchAll(/const ([A-Za-z_$][\w$]*) = ([A-Za-z_$][\w$.]*);/g)) {
+          const target = map.get(m[2]);
+          if (target && !map.has(m[1])) {
+            map.set(m[1], target);
+            grew = true;
+          }
+        }
+      }
+      if (!grew) break;
+    }
+    return map;
+  }
+
+  /**
+   * Every env key the dev install writes into an instance's env file, plus the
+   * write sites whose key is COMPUTED (those cannot be read statically; they
+   * are counted instead, so a new one is a red).
+   */
+  function devInstallEnvWrites() {
+    const installSrc = readSrc("../src/install.mjs");
+    const nangoSrc = readSrc("../src/nango-secret-key.mjs");
+    const constants = keyConstants();
+    const keys = new Set();
+    let computedSites = 0;
+
+    // `repointKey("<service>", "KEY", …)` — the infra/connection URLs an install
+    // re-points at this instance's own host ports.
+    for (const m of installSrc.matchAll(/repointKey\(\s*"[^"]*"\s*,\s*"([A-Z][A-Z0-9_]*)"/g)) keys.add(m[1]);
+
+    // `upsertEnvKey(<body>, <key>, …)` — the values an install writes outright.
+    // The key argument is a literal, a constant this road declares, or a loop
+    // variable; only the third is unreadable, and it is counted below.
+    for (const m of installSrc.matchAll(
+      /(?<!function )upsertEnvKey\(\s*[A-Za-z_$][\w$.]*\s*,\s*(?:"([A-Z][A-Z0-9_]*)"|([A-Za-z_$][\w$.]*))\s*,/g,
+    )) {
+      if (m[1]) {
+        keys.add(m[1]);
+        continue;
+      }
+      const resolved = constants.get(m[2]);
+      if (resolved) keys.add(resolved);
+      else computedSites += 1;
+    }
+    // The same for the execution-plane writer, which upserts through a helper.
+    for (const _ of installSrc.matchAll(/applyEnvUpsertsToBody\(/g)) computedSites += 1;
+
+    // `for (const key of ["A", "B"]) … upsertEnvKey(body, key, …)` — the loop
+    // sites whose key set IS written down, right there, as an array literal.
+    for (const m of installSrc.matchAll(/for \(const (?:key|k) of \[([^\]]*)\]\)/g)) {
+      for (const lit of m[1].matchAll(/"([A-Z][A-Z0-9_]*)"/g)) keys.add(lit[1]);
+    }
+
+    // The isolation-critical set (`ISOLATED_INFRA_ENV_KEYS`): the keys an
+    // isolated install refuses to let the ambient shell override.
+    const isolated = installSrc.match(/const ISOLATED_INFRA_ENV_KEYS = \[([\s\S]*?)\n\];/);
+    expect(isolated, "ISOLATED_INFRA_ENV_KEYS no longer parses out of src/install.mjs").toBeTruthy();
+    for (const m of isolated[1].matchAll(/"([A-Z][A-Z0-9_]*)"/g)) keys.add(m[1]);
+
+    // The connector credential the bring-up reconciles (cinatra-cli#211).
+    for (const m of nangoSrc.matchAll(/NANGO_SECRET_KEY_VAR = "([A-Z][A-Z0-9_]*)"/g)) keys.add(m[1]);
+
+    // The two DELEGATED writers. Their key sets are not literals in
+    // install.mjs, so they are taken from the modules that own them rather than
+    // guessed: the co-use env writer (`writeCoUseEnv` writes exactly what
+    // `buildCoUseEnv` returns) and the execution-plane writer
+    // (`persistExecutionEnv` writes exactly `CLI_MANAGED_EXECUTION_ENV_KEYS`).
+    for (const key of Object.keys(
+      buildCoUseEnv({
+        sourceEnv: Object.fromEntries(
+          ["REDIS_URL", "NANGO_SERVER_URL", "NANGO_DATABASE_URL", "NANGO_DB_URL", "GRAPHITI_URL", "BETTER_AUTH_SECRET", "CINATRA_ENCRYPTION_KEY"].map(
+            (k) => [k, "x"],
+          ),
+        ),
+        slug: "couse",
+        appPort: 3100,
+        dbUrl: "postgresql://u:p@127.0.0.1:5432/couse",
+      }),
+    )) {
+      keys.add(key);
+    }
+    for (const key of CLI_MANAGED_EXECUTION_ENV_KEYS) keys.add(key);
+
+    return { keys, computedSites };
+  }
+
+  const devInstallEnvKeys = () => devInstallEnvWrites().keys;
+
+  // The extension-install, connection-service and runtime-bridge half of that
+  // set: a preview container that lacks any of these installs no non-bundled
+  // extension (it falls back to the hosted registry it holds no credential
+  // for), holds no connection (it can neither reach nor authenticate to the
+  // connection service), or cannot run an agent. Every one MUST be in
+  // PASSTHROUGH_ENV_KEYS.
+  const FORWARDED_TO_A_PREVIEW = [
+    "CINATRA_AGENT_REGISTRY_URL", // where an extension package is fetched FROM
+    "CINATRA_AGENT_REGISTRY_UI_URL", // the registry's browser-facing twin
+    "NANGO_SERVER_URL", // the connection service's ADDRESS
+    "NANGO_SECRET_KEY", // …and its CREDENTIAL — an address alone still 401s
+    "NANGO_ENCRYPTION_KEY", // the at-rest key the stored connections need
+    // The RUNTIME BRIDGE, all three halves. The dev install re-points
+    // WAYFLOW_BASE_URL at this instance's own WayFlow host port
+    // (src/install.mjs, cinatra-cli#97); a preview that does not receive it
+    // falls back to the app's default `http://localhost:3010`, which inside the
+    // container is the container itself — the product then refuses every agent
+    // run with "Cinatra WayFlow is not configured for agent …: WAYFLOW_BASE_URL
+    // is not set". CINATRA_BRIDGE_TOKEN authenticates the runtime's callbacks
+    // into the app, and CINATRA_CONTEXT_ATTEST_KEY is the DISTINCT attestation
+    // contract the runtime signs its context callbacks with — ensureEnvLocal
+    // mints both for EVERY mode (src/install.mjs), and without the attestation
+    // key the app fails CLOSED on the composed-child context path
+    // (src/wayflow-runtime.mjs: "it starts and then rejects every context
+    // callback"), which is the same broken agent run one layer in.
+    "WAYFLOW_BASE_URL",
+    "CINATRA_BRIDGE_TOKEN",
+    "CINATRA_CONTEXT_ATTEST_KEY",
+    "SUPABASE_DB_URL", // the instance's own data, extension rows included
+    "SUPABASE_SCHEMA",
+    "REDIS_URL",
+    "BETTER_AUTH_SECRET",
+    "BETTER_AUTH_URL",
+    "NEXT_PUBLIC_BETTER_AUTH_URL",
+  ];
+
+  // Decided by the preview composition itself, so absence from
+  // PASSTHROUGH_ENV_KEYS is not a drop: these reach the container through a
+  // dedicated path (or are deliberately forced).
+  const SET_BY_THE_COMPOSITION = {
+    CINATRA_RUNTIME_MODE: "forced to production by the preview composition (AC2)",
+    CINATRA_ENCRYPTION_KEY: "required + validated + forwarded explicitly (AC6), never an optional passthrough",
+    PORT: "the container's port is the preview's own publish decision",
+  };
+
+  // The rest of the dev install's set, each with the reason a preview container
+  // must NOT receive it. This is the other half of the guard: a key here is a
+  // DECISION, not an omission.
+  const DELIBERATELY_NOT_FORWARDED = {
+    // Nango's OWN database. Consumed by the nango-server/nango-db services on
+    // the host, never by the app talking to Nango as a connection-service
+    // CLIENT — the app needs the server URL and the secret key, both above.
+    NANGO_DATABASE_URL: "the connection service's own database, read by the Nango services, not by the app",
+    NANGO_DB_URL: "the legacy spelling of the same Nango-owned database URL",
+    // Other subsystems entirely: neither is part of installing an extension,
+    // holding a connection or running an agent, so #660 does not forward them;
+    // a preview that needs the memory/graph subsystem is a separate decision.
+    GRAPHITI_URL: "a different subsystem (memory service), outside #660's three classes",
+    NEO4J_URI: "a different subsystem (graph store), outside #660's three classes",
+    // Host-side bookkeeping, meaningless inside the container.
+    CINATRA_INSTALL_PROFILE: "host-install bookkeeping (the dev/demo overlay), meaningless in the container",
+    CINATRA_WAYFLOW_RUNTIME:
+      "the CLI's record of what THIS install decided about the local runtime (doctor reads it); the container dials the runtime by address, not by that record",
+    CINATRA_A2A_DEV_PEER_URLS: "a DEV-boot peer list; a preview runs production runtime semantics",
+    // The co-use topology's namespacing. Written only on the co-use path, and
+    // forwarding a donor instance's namespaces into a preview is its own
+    // decision, outside #660's three classes.
+    BULLMQ_QUEUE_NAME: "the co-use path's queue namespace, not a dev install's extension/connection/runtime variable",
+    BETTER_AUTH_COOKIE_PREFIX: "the co-use path's cookie namespace (same class as the queue name)",
+    CINATRA_REDIS_PREFIX: "the co-use path's forward-compat Redis prefix, documented as not yet honoured",
+    // The execution plane is opt-in and writes NOTHING when disabled (the
+    // default). Carrying a broker address + its secrets into a preview is a
+    // separate decision with its own security surface; #660 does not make it.
+    CINATRA_EXECUTION_PLANE_ROLLOUT: "the execution plane is opt-in and out of #660's three classes",
+    EXECUTION_BROKER_URL: "execution-plane client config, out of #660's three classes",
+    EXECUTION_BROKER_SECRET: "execution-plane signing secret, out of #660's three classes",
+    EXECUTION_BROKER_SERVICE_TOKEN: "execution-plane service token, out of #660's three classes",
+    EXECUTION_ENVIRONMENT_PROVENANCE_KEY: "execution-plane provenance key, out of #660's three classes",
+    CINATRA_SANDBOX_L0_IMAGE: "execution-plane sandbox image override, out of #660's three classes",
+    EXECUTION_SANDBOX_NETWORK: "execution-plane sandbox network override, out of #660's three classes",
+  };
+
+  it("reads a real, non-vacuous key set out of the dev install road", () => {
+    const keys = devInstallEnvKeys();
+    // If a refactor breaks the extraction, this test must FAIL rather than pass
+    // on an empty set and wave a dropped variable through.
+    expect(keys.size).toBeGreaterThan(8);
+    for (const anchor of [
+      "CINATRA_AGENT_REGISTRY_URL",
+      "NANGO_SERVER_URL",
+      "NANGO_SECRET_KEY",
+      "SUPABASE_DB_URL",
+      "WAYFLOW_BASE_URL",
+      // the constant-keyed writes: the class a literal-only reader cannot see
+      "CINATRA_CONTEXT_ATTEST_KEY",
+      "CINATRA_BRIDGE_TOKEN",
+    ]) {
+      expect([...keys]).toContain(anchor);
+    }
+  });
+
+  it("sees every write site — a key written through a CONSTANT is read, not skipped", () => {
+    // The remaining sites write a key that is only known at runtime: the co-use
+    // writer (its keys come from `buildCoUseEnv`, enumerated above), the
+    // external-infra writer (operator-supplied infra keys), the two
+    // `BETTER_AUTH_URL` loop writes (their array literal is read above),
+    // `repointKey`'s own body (its call sites are read above) and
+    // `persistExecutionEnv` (its keys are `CLI_MANAGED_EXECUTION_ENV_KEYS`).
+    // A NEW computed-key write site is a red: enumerate its keys here the way
+    // the delegated writers are enumerated, or the guard stops being a guard.
+    expect(
+      devInstallEnvWrites().computedSites,
+      "src/install.mjs grew (or lost) an env write whose key is computed. Enumerate its key set here.",
+    ).toBe(6);
+  });
+
+  it("classifies EVERY variable the dev install writes — a new one is a red, never a silent drop", () => {
+    const unclassified = [...devInstallEnvKeys()].filter(
+      (k) =>
+        !FORWARDED_TO_A_PREVIEW.includes(k) && !(k in DELIBERATELY_NOT_FORWARDED) && !(k in SET_BY_THE_COMPOSITION),
+    );
+    expect(
+      unclassified,
+      `The dev install now writes ${unclassified.join(", ")}. Decide: forward it into a preview ` +
+        "(add it to PASSTHROUGH_ENV_KEYS and to FORWARDED_TO_A_PREVIEW) or record why it stays out " +
+        "(DELIBERATELY_NOT_FORWARDED / SET_BY_THE_COMPOSITION). Do not delete this assertion.",
+    ).toEqual([]);
+  });
+
+  it("forwards every extension-install, connection-service and runtime-bridge variable of that set", () => {
+    for (const key of FORWARDED_TO_A_PREVIEW) {
+      expect(PASSTHROUGH_ENV_KEYS, `${key} is written by the dev install but a preview would not receive it`).toContain(key);
+    }
+  });
+
+  it("a dev-install-shaped env really reaches the container", () => {
+    const env = {
+      [ENCRYPTION_KEY_ENV]: KEY_64,
+      CINATRA_AGENT_REGISTRY_URL: "http://registry.example.test:4873",
+      CINATRA_AGENT_REGISTRY_UI_URL: "http://registry.example.test:4873",
+      NANGO_SERVER_URL: "http://nango.example.test:3003",
+      NANGO_SECRET_KEY: "11111111-2222-4333-8444-555555555555",
+      NANGO_ENCRYPTION_KEY: "nango-encryption-key",
+      SUPABASE_DB_URL: "postgresql://u:p@db.example.test:5432/postgres",
+      SUPABASE_SCHEMA: "cinatra",
+      REDIS_URL: "redis://cache.example.test:6379",
+      BETTER_AUTH_SECRET: "better-auth-secret",
+      BETTER_AUTH_URL: "http://app.example.test:3000",
+      NEXT_PUBLIC_BETTER_AUTH_URL: "http://app.example.test:3000",
+      WAYFLOW_BASE_URL: "http://wayflow.example.test:3010",
+      CINATRA_BRIDGE_TOKEN: "bridge-token",
+      CINATRA_CONTEXT_ATTEST_KEY: "attest-key",
+    };
+    const joined = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env }).join(" ");
+    for (const key of FORWARDED_TO_A_PREVIEW) {
+      expect(joined).toContain(`${key}=${env[key]}`);
+    }
+  });
+
+  it("rewrites the runtime bridge's ADDRESS to the container gateway and leaves its SECRETS verbatim", () => {
+    // A dev install writes `http://127.0.0.1:<wayflow port>`; forwarded
+    // verbatim that address means the CONTAINER inside the container, so the
+    // runtime bridge's address is container-dialed and joins
+    // CONTAINER_REWRITE_ENV_KEYS with the DB/Redis/Nango endpoints rather than
+    // getting a second mechanism. Its two secrets are credentials, not
+    // addresses: they are never rewritten and never ownership-verified.
+    expect(CONTAINER_REWRITE_ENV_KEYS).toContain("WAYFLOW_BASE_URL");
+    expect(CONTAINER_REWRITE_ENV_KEYS).not.toContain("CINATRA_BRIDGE_TOKEN");
+    expect(CONTAINER_REWRITE_ENV_KEYS).not.toContain("CINATRA_CONTEXT_ATTEST_KEY");
+    const joined = buildPreviewRunEnvArgs({
+      encryptionKey: KEY_64,
+      env: {
+        [ENCRYPTION_KEY_ENV]: KEY_64,
+        WAYFLOW_BASE_URL: "http://127.0.0.1:3010",
+        CINATRA_CONTEXT_ATTEST_KEY: "attest-key",
+      },
+    }).join(" ");
+    expect(joined).toContain(`WAYFLOW_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:3010`);
+    expect(joined).toContain("CINATRA_CONTEXT_ATTEST_KEY=attest-key");
+    // …and the ownership gate sees the ADDRESS, exactly like every other
+    // container-dialed loopback endpoint (cinatra-cli#219), and only it.
+    expect(
+      containerDialedLoopbackEndpoints({ WAYFLOW_BASE_URL: "http://127.0.0.1:3010", CINATRA_CONTEXT_ATTEST_KEY: "attest-key" }),
+    ).toEqual([{ key: "WAYFLOW_BASE_URL", value: "http://127.0.0.1:3010" }]);
+  });
+
+  it("keeps the deliberately-absent keys absent", () => {
+    for (const key of Object.keys(DELIBERATELY_NOT_FORWARDED)) {
+      expect(PASSTHROUGH_ENV_KEYS).not.toContain(key);
+    }
+    // …and the safety-invariant bypass flag above all (AC7-iii): it is not a
+    // dev-install variable at all, it is the one flag a preview must never
+    // sanction — excluded from the list AND stripped in `buildPreviewRunEnvArgs`.
+    expect(PASSTHROUGH_ENV_KEYS).not.toContain(MATERIALIZE_DISABLE_ENV);
   });
 });
