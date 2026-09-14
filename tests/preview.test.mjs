@@ -7,7 +7,7 @@
 // runner RECORDS every argv so we can assert on the exact commands — this is how
 // the three hard-NEVERs (AC7) are asserted structurally.
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -3685,10 +3685,21 @@ describe("preview extension fleet — --fleet required|dev (engineering#666)", (
     const { deps } = makeDeps({ sha: SHA_A, health: healthy });
     await runPreviewCreate(["--slug", "main", "--fleet", "dev"], deps);
     const { deps: rdeps, fake: rfake } = makeDeps({ sha: SHA_B, health: healthy });
+    // "before any build or teardown" is only proved by measuring what the
+    // refusal TOUCHED, not by reading the final row: a run that removed the
+    // container and then threw, or wrote the `provisioning` claim and restored
+    // it, would leave the same final row. So: the registry FILE is not written
+    // at all (its mtime and its whole content are unchanged), and docker is
+    // asked to do nothing that mutates anything.
+    const registryBefore = readFileSync(registryPath, "utf8");
+    const mtimeBefore = statSync(registryPath).mtimeMs;
     await expect(runPreviewRefresh(["--slug", "main", "--fleet", "required"], rdeps)).rejects.toThrow(
       /fleet/i,
     );
-    expect(rfake.calls.find((c) => c[0] === "build")).toBeUndefined();
+    const MUTATING_DOCKER_VERBS = new Set(["build", "run", "create", "rm", "stop", "kill", "start", "rename"]);
+    expect(rfake.calls.filter((c) => MUTATING_DOCKER_VERBS.has(String(c[0])))).toEqual([]);
+    expect(readFileSync(registryPath, "utf8")).toBe(registryBefore);
+    expect(statSync(registryPath).mtimeMs).toBe(mtimeBefore);
     const row = getPreview(readRegistry(registryPath).registry, "main");
     expect(row.sha).toBe(SHA_A);
     expect(row.state).toBe("ready");
@@ -3697,6 +3708,30 @@ describe("preview extension fleet — --fleet required|dev (engineering#666)", (
     const { deps: ok, fake: okFake } = makeDeps({ sha: SHA_B, health: healthy });
     await runPreviewRefresh(["--slug", "main", "--fleet", "dev"], ok);
     expect(argFor(buildArgv(okFake), PREVIEW_FLEET_ARG)).toEqual(["dev"]);
+  });
+
+  it("a row carrying a fleet this CLI does not accept is registry CORRUPTION, refused before anything is claimed", async () => {
+    // The tag is derived from the fleet and `previewImageTag` normalises an
+    // unknown one back to the default — so without an explicit check the row
+    // below (a hand-edited or forward-version registry) reads as perfectly
+    // valid, `status` prints a fleet no build produced, and a plain `refresh`
+    // carries it past the claim into the build assembly, which refuses it only
+    // after the row has been flipped to `provisioning`.
+    const corrupt = makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" });
+    corrupt.fleet = "devel"; // not one of PREVIEW_FLEETS; tag stays the required one
+    writeFileSync(registryPath, JSON.stringify({ version: 1, previews: { main: corrupt } }));
+    expect(readRegistry(registryPath).status).toBe("malformed");
+
+    const { deps: rdeps, fake: rfake } = makeDeps({ sha: SHA_B, health: healthy });
+    await expect(runPreviewRefresh(["--slug", "main"], rdeps)).rejects.toThrow();
+    expect(rfake.calls.find((c) => c[0] === "build")).toBeUndefined();
+
+    // An ABSENT field is not corruption: that is every row written before this
+    // lever, and it reads as the required set it was built with.
+    const legacy = makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" });
+    delete legacy.fleet;
+    writeFileSync(registryPath, JSON.stringify({ version: 1, previews: { main: legacy } }));
+    expect(readRegistry(registryPath).status).toBe("ok");
   });
 
   it("create and refresh FAIL FAST on a typo'd fleet, before a slug is claimed or a preview is touched", async () => {

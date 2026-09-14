@@ -195,7 +195,8 @@ stands. The resolved fleet is **recorded on the preview's registry row** and
 printed by `instance preview status` as `fleet=<value>`, so a later `start` or
 `refresh` reuses the same fleet — and a `refresh` that names a *different* one is
 refused (the fleet is baked into the image, so changing it is creating a
-different instance: prune the preview and create it again).
+different instance: create a second preview under its own `--slug` instead —
+there is no `preview prune` verb, as the disk section below says).
 
 The front door forwards it too: `cinatra install --mode preview --fleet dev`
 bootstraps its first preview on the dev fleet. Because the fleet is baked into

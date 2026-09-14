@@ -950,6 +950,18 @@ function isValidPreviewSlot(slug, slot) {
   if (!isImmutableSha(slot.sha)) return false;
   // engineering#666: the tag carries a non-default fleet, so the row is checked
   // against ITS fleet (an older row, with no field, reads as the required set).
+  //
+  // A fleet field that is PRESENT but names no fleet this CLI accepts is
+  // corruption, and it has to be caught HERE: `previewImageTag` normalises an
+  // unrecognised fleet back to the default, so the tag check below would pass
+  // and the row would read as usable — after which `preview status` prints a
+  // fleet no build could ever have produced, and a plain `refresh` carries that
+  // value out of the claim (already written, row already flipped to
+  // `provisioning`) into `buildPreviewBuildArgs`, which refuses it deep inside
+  // the build — the fail-LATE this lever's fail-fast exists to prevent. An
+  // absent field (a row written before the lever) still reads as the required
+  // set, which is what it was built with.
+  if (slot.fleet != null && !PREVIEW_FLEETS.includes(slot.fleet)) return false;
   if (slot.imageTag !== previewImageTag(slot.sha, slot.fleet ?? PREVIEW_FLEET_DEFAULT)) return false;
   if (slot.provenance !== previewProvenance(slot.sha)) return false;
   if (slot.runtimeMode !== PREVIEW_RUNTIME_MODE) return false;
@@ -2794,7 +2806,8 @@ export async function runPreviewRefresh(rest, injected = {}) {
         `preview "${slug}" was built with the ${rowFleet} extension fleet and this refresh asks for ` +
           `${PREVIEW_FLEET_FLAG} ${requestedFleet}. The fleet is acquired INTO the image, so it is a property of ` +
           `this preview, not of one invocation: refresh without ${PREVIEW_FLEET_FLAG} to rebuild it on ${rowFleet}, ` +
-          `or prune this preview and create it again with ${PREVIEW_FLEET_FLAG} ${requestedFleet}.`,
+          `or create a SEPARATE preview under its own --slug with ${PREVIEW_FLEET_FLAG} ${requestedFleet} ` +
+          `(this CLI has no preview-prune verb; removing a preview is manual).`,
       );
     }
     fleet = rowFleet;
