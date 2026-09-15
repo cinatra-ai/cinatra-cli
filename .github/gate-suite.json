@@ -66,7 +66,14 @@
     "**/trust-gate/**",
     "**/signature-gate/**",
     "**/capability-registry/**",
-    "**/transport-registry/**"
+    "**/transport-registry/**",
+    "docs-site/astro.config.mjs",
+    "docs-site/src/content.config.ts",
+    "docs-site/integrations-registry.json",
+    "**/integrations-registry.json",
+    "scripts/sync-docs.mjs",
+    "scripts/docs-contract-gate.mjs",
+    "scripts/lib/docs-contract-rules.mjs"
   ],
   "lastAuditedAt": "2026-09-15",
   "auditEvidence": "2026-09-15, the birth of this suite on the pull request that adds it: every context it lists — actions-pinned-gate, gitignore-gate, source-leak-gate, secret-scan-gate and truthful-attribution-gate — was read green on that pull request's head, and each pin recorded here equals the sha this repository's own caller workflow pins for that gate at the same head."
