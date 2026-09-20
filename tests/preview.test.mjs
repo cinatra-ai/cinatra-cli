@@ -30,6 +30,8 @@ const {
   previewProvenance,
   previewContainerName,
   previewVolumeName,
+  previewArtifactVolumeName,
+  ARTIFACT_VOLUME_OWNER_LABEL,
   assertNotProductionImageTag,
   assertMaterializeNotDisabled,
   assertEncryptionKey,
@@ -152,6 +154,29 @@ function makeFakeDocker(state) {
     const ownership = answerComposeOwnership(args, state);
     if (ownership) return ownership;
     const [verb, sub] = args;
+    // Separate user-data volume and real container mount inspection. Existing
+    // unrelated fixtures start with an owned seeded volume; new lifecycle cases
+    // explicitly exercise absent/unknown/foreign data and creation outcomes.
+    if (verb === "volume" && args.at(-1).startsWith("cinatra-preview-artifacts-")) {
+      const name = args.at(-1); const slug = name.slice("cinatra-preview-artifacts-".length);
+      if (sub === "inspect") {
+        if (state.artifactProbeOverride) return state.artifactProbeOverride;
+        if (state.artifactProbeUnknown) return {status:null,timedOut:true,stdout:"",stderr:""};
+        if (state.artifactExists === false) return {status:1,stdout:"",stderr:"no such volume"};
+        return {status:0,stdout:JSON.stringify([{Name:name,Driver:"local",Options:state.artifactOptions ?? null,
+          Labels:{[ARTIFACT_VOLUME_OWNER_LABEL]:state.artifactOwner ?? slug}}]),stderr:""};
+      }
+      if (sub === "create") {
+        state.artifactExists=true;
+        return state.artifactCreateUnknown ? {status:null,timedOut:true,stdout:"",stderr:""} : {status:0,stdout:name,stderr:""};
+      }
+      if (sub === "rm") { state.artifactDeleted=true; return {status:0,stdout:"",stderr:""}; }
+    }
+    if (verb === "container" && sub === "inspect" && args.includes("{{json .}}")) {
+      const slug=args.at(-1).slice("cinatra-preview-".length);
+      return {status:0,stdout:JSON.stringify({Mounts:state.artifactMounts ?? [{Type:"volume",Name:previewArtifactVolumeName(slug),Destination:"/data/artifacts",RW:true}],
+        Config:{Env:state.artifactEnv ?? ["CINATRA_ARTIFACT_DATA_ROOT=/data/artifacts"]}}),stderr:""};
+    }
     // `docker build ...` — success unless state.buildFails / state.buildTimesOut.
     if (verb === "build") {
       if (state.buildTimesOut) {
@@ -188,7 +213,7 @@ function makeFakeDocker(state) {
       if (state.containerAbsent) return { status: 1, stdout: "", stderr: "No such object" };
       const running = Boolean(state.containerRunning);
       if (state.containerPresentStopped && !running) return { status: 0, stdout: "false\n", stderr: "" };
-      return { status: running ? 0 : 1, stdout: running ? "true\n" : "false\n", stderr: "" };
+      return { status: running ? 0 : 1, stdout: running ? "true\n" : "", stderr: running ? "" : "No such object" };
     }
     // `docker volume inspect <name>` — existence (default: does NOT exist).
     // The stderr matters: cinatra-cli#220 only lets a probe that SAID "no such
@@ -927,7 +952,7 @@ describe("preview — container liveness uses .State.Running, not mere existence
       runDocker: (args) =>
         args[0] === "container"
           ? { status: null, stdout: "", stderr: "", timedOut: true, error: new Error("ETIMEDOUT") }
-          : { status: 0, stdout: "", stderr: "" },
+          : { status: 0, stdout: JSON.stringify([{Name:previewArtifactVolumeName("main"),Driver:"local",Labels:{[ARTIFACT_VOLUME_OWNER_LABEL]:"main"}}]), stderr: "" },
       ...extra,
     });
     await expect(runPreviewStop(["--slug", "main"], unanswered())).rejects.toThrow(/Could not determine the state/);
@@ -3408,6 +3433,7 @@ describe("preview — the passthrough list covers the dev install's set (enginee
     "BETTER_AUTH_SECRET",
     "BETTER_AUTH_URL",
     "NEXT_PUBLIC_BETTER_AUTH_URL",
+    "BULLMQ_QUEUE_NAME",
   ];
 
   // Decided by the preview composition itself, so absence from
@@ -3439,9 +3465,8 @@ describe("preview — the passthrough list covers the dev install's set (enginee
       "the CLI's record of what THIS install decided about the local runtime (doctor reads it); the container dials the runtime by address, not by that record",
     CINATRA_A2A_DEV_PEER_URLS: "a DEV-boot peer list; a preview runs production runtime semantics",
     // The co-use topology's namespacing. Written only on the co-use path, and
-    // forwarding a donor instance's namespaces into a preview is its own
-    // decision, outside #660's three classes.
-    BULLMQ_QUEUE_NAME: "the co-use path's queue namespace, not a dev install's extension/connection/runtime variable",
+    // Queue names now forward explicitly for isolated captures; these other
+    // co-use values still have independent contracts.
     BETTER_AUTH_COOKIE_PREFIX: "the co-use path's cookie namespace (same class as the queue name)",
     CINATRA_REDIS_PREFIX: "the co-use path's forward-compat Redis prefix, documented as not yet honoured",
     // The execution plane is opt-in and writes NOTHING when disabled (the
@@ -3519,6 +3544,7 @@ describe("preview — the passthrough list covers the dev install's set (enginee
       NANGO_ENCRYPTION_KEY: "nango-encryption-key",
       SUPABASE_DB_URL: "postgresql://db.example.test:5432/postgres",
       SUPABASE_SCHEMA: "cinatra",
+      BULLMQ_QUEUE_NAME: "isolated-preview-queue",
       REDIS_URL: "redis://cache.example.test:6379",
       BETTER_AUTH_SECRET: "better-auth-secret",
       BETTER_AUTH_URL: "http://app.example.test:3000",
@@ -3860,5 +3886,101 @@ describe("preview extension fleet — --fleet required|dev (engineering#666)", (
     const row = getPreview(readRegistry(registryPath).registry, "main");
     expect(row.fleet).toBe("required");
     expect(row.imageTag).toBe(previewImageTag(SHA_B));
+  });
+});
+
+
+describe("preview — separately owned durable artifact storage", () => {
+  const artifactMutations = fake => fake.calls.filter(a => a[0] === "volume" && a[1] !== "inspect" && a.at(-1).startsWith("cinatra-preview-artifacts-"));
+  it("creates and verifies an owned artifact volume before first app, distinct from extensions", async () => {
+    const state={artifactExists:false,health:{status:200,body:'{"status":"ok"}'}};
+    const {deps,fake}=makeDeps(state,{env:{[ENCRYPTION_KEY_ENV]:KEY_64,BULLMQ_QUEUE_NAME:"isolated-queue"}});
+    await runPreviewCreate(["--slug","artifact","--ref","main"],deps);
+    const created=fake.calls.findIndex(a=>a[0]==="volume"&&a[1]==="create");
+    const boot=fake.calls.findIndex(a=>a[0]==="run");
+    expect(created).toBeGreaterThan(-1);expect(created).toBeLessThan(boot);
+    expect(fake.calls[created]).toContain(`${ARTIFACT_VOLUME_OWNER_LABEL}=artifact`);
+    expect(fake.calls.slice(created+1,boot).some(a=>a[0]==="volume"&&a[1]==="inspect"&&a.at(-1)===previewArtifactVolumeName("artifact"))).toBe(true);
+    const argv=fake.calls[boot];
+    expect(argv).toContain("cinatra-preview-artifacts-artifact:/data/artifacts");
+    expect(argv).toContain("cinatra-preview-data-artifact:/data/extensions");
+    expect(argv).toContain("CINATRA_ARTIFACT_DATA_ROOT=/data/artifacts");
+    expect(argv).toContain("BULLMQ_QUEUE_NAME=isolated-queue");
+    expect(readRegistry(registryPath).registry.previews.artifact.artifactVolumeName).toBe(previewArtifactVolumeName("artifact"));
+  });
+  it.each([true,false])("retains preseeded=%s artifact volume after failed app health",async preseeded=>{
+    const state={artifactExists:preseeded,health:{status:503,body:'{"status":"degraded"}'},artifactBytes:"real preserved fixture"};
+    const {deps,fake}=makeDeps(state);
+    await expect(runPreviewCreate(["--slug","artifact"],deps)).rejects.toThrow(/did not reach healthy/);
+    expect(state.artifactExists).toBe(true);expect(state.artifactDeleted).not.toBe(true);
+    expect(state.artifactBytes).toBe("real preserved fixture");
+    expect(artifactMutations(fake).map(a=>a[1])).toEqual(preseeded?[]:["create"]);
+  });
+  it.each([{artifactOwner:"foreign"},{artifactOwner:""},{artifactOptions:{device:"/unowned",o:"bind",type:"none"}},{artifactProbeUnknown:true}])("refuses unknown preexisting ownership before any write: %j",async extra=>{
+    const {deps,fake}=makeDeps(extra);
+    await expect(runPreviewCreate(["--slug","artifact"],deps)).rejects.toThrow(/artifact volume|Artifact volume/);
+    expect(existsSync(registryPath)).toBe(false);
+    expect(fake.calls.every(a=>a[0]==="volume"&&a[1]==="inspect")).toBe(true);
+  });
+  it("does not boot or delete on uncertain volume creation",async()=>{
+    const state={artifactExists:false,artifactCreateUnknown:true};const {deps,fake}=makeDeps(state);
+    await expect(runPreviewCreate(["--slug","artifact"],deps)).rejects.toThrow(/uncertain/);
+    expect(fake.calls.some(a=>a[0]==="run")).toBe(false);
+    expect(artifactMutations(fake).map(a=>a[1])).toEqual(["create"]);
+    expect(state.artifactExists).toBe(true);expect(state.artifactDeleted).not.toBe(true);
+  });
+  it.each(["start","refresh"])("legacy %s refuses without a storage declaration and leaves row/container unchanged",async verb=>{
+    const row=makePreviewSlot({slug:"artifact",ref:"main",sha:SHA_A,hostPort:3400});delete row.artifactVolumeName;
+    writeRegistry(registryPath,{version:1,previews:{artifact:row}});const original=readFileSync(registryPath,"utf8");
+    const {deps,fake}=makeDeps({containerRunning:true});
+    await expect((verb==="start"?runPreviewStart:runPreviewRefresh)(["--slug","artifact"],deps)).rejects.toThrow(/predates separate artifact storage/);
+    expect(readFileSync(registryPath,"utf8")).toBe(original);expect(fake.calls).toEqual([]);
+  });
+  it.each(["start","refresh"])("missing recorded artifact volume refuses %s before touching serving container",async verb=>{
+    const row=makePreviewSlot({slug:"artifact",ref:"main",sha:SHA_A,hostPort:3400});writeRegistry(registryPath,{version:1,previews:{artifact:row}});
+    const state={artifactExists:false,containerRunning:true};const {deps,fake}=makeDeps(state);
+    await expect((verb==="start"?runPreviewStart:runPreviewRefresh)(["--slug","artifact"],deps)).rejects.toThrow(/missing/);
+    expect(fake.calls.every(a=>a[0]==="volume"&&a[1]==="inspect")).toBe(true);expect(state.containerRunning).toBe(true);
+  });
+  it("refresh and start recreate reuse the same artifact bytes and exact volume",async()=>{
+    const state={health:{status:200,body:'{"status":"ok"}'},artifactBytes:"snapshot"};const {deps,fake}=makeDeps(state);
+    await runPreviewCreate(["--slug","artifact"],deps);
+    state.sha=SHA_B;await runPreviewRefresh(["--slug","artifact"],deps);
+    state.images=new Set([previewImageTag(SHA_B)]);
+    await runPreviewStart(["--slug","artifact","--recreate"],deps);
+    const boots=fake.calls.filter(a=>a[0]==="run");expect(boots.length).toBe(3);
+    for(const argv of boots)expect(argv).toContain("cinatra-preview-artifacts-artifact:/data/artifacts");
+    expect(artifactMutations(fake)).toEqual([]);expect(state.artifactBytes).toBe("snapshot");
+  });
+  it("refresh build failure leaves serving preview and artifact data untouched",async()=>{
+    const state={health:{status:200,body:'{"status":"ok"}'},artifactBytes:"snapshot"};const {deps,fake}=makeDeps(state);
+    await runPreviewCreate(["--slug","artifact"],deps);const n=fake.calls.length;state.sha=SHA_B;state.buildFails=true;
+    await expect(runPreviewRefresh(["--slug","artifact"],deps)).rejects.toThrow(/build/);
+    expect(fake.calls.slice(n).some(a=>["stop","rm","run"].includes(a[0]))).toBe(false);
+    expect(state.containerRunning).toBe(true);expect(state.artifactBytes).toBe("snapshot");expect(state.artifactDeleted).not.toBe(true);
+  });
+  it.each([{artifactMounts:[]},{artifactEnv:["CINATRA_ARTIFACT_DATA_ROOT=/wrong"]}])("start refuses existing container with incorrect artifact mount/root: %j",async extra=>{
+    writeRegistry(registryPath,{version:1,previews:{artifact:makePreviewSlot({slug:"artifact",ref:"main",sha:SHA_A,hostPort:3400})}});
+    const {deps,fake}=makeDeps({containerPresentStopped:true,...extra});
+    await expect(runPreviewStart(["--slug","artifact"],deps)).rejects.toThrow(/artifact mount\/root/);
+    expect(fake.calls.some(a=>["start","run","rm","rename"].includes(a[0]))).toBe(false);
+  });
+});
+
+
+describe("preview — refresh storage read races and absence evidence",()=>{
+  it.each([{artifactMounts:[]},{artifactEnv:["CINATRA_ARTIFACT_DATA_ROOT=/wrong"]},
+      {artifactMounts:[{Type:"volume",Name:"foreign",Destination:"/data/artifacts",RW:true}]}])("refuses refresh of incorrectly bound serving container: %j",async extra=>{
+    const row=makePreviewSlot({slug:"artifact",ref:"main",sha:SHA_A,hostPort:3400});
+    writeRegistry(registryPath,{version:1,previews:{artifact:row}});const original=readFileSync(registryPath,"utf8");
+    const state={containerRunning:true,artifactBytes:"preserved",...extra};const {deps,fake}=makeDeps(state);
+    await expect(runPreviewRefresh(["--slug","artifact"],deps)).rejects.toThrow(/artifact mount\/root/);
+    expect(readFileSync(registryPath,"utf8")).toBe(original);expect(state.containerRunning).toBe(true);expect(state.artifactBytes).toBe("preserved");
+    expect(fake.calls.every(a=>a[1]==="inspect")).toBe(true);
+  });
+  it.each([{status:null},{status:2},{status:1,signal:"SIGTERM"}])("never treats uncertain or non-Docker failure as absent: %j",async failure=>{
+    const {deps,fake}=makeDeps({artifactProbeOverride:{stdout:"",stderr:"no such volume",...failure}});
+    await expect(runPreviewCreate(["--slug","artifact"],deps)).rejects.toThrow(/Could not verify artifact volume/);
+    expect(existsSync(registryPath)).toBe(false);expect(fake.calls.every(a=>a[1]==="inspect")).toBe(true);
   });
 });

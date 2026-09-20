@@ -99,14 +99,26 @@ function makeFakeDocker(state) {
     const ownership = answerComposeOwnership(args, state); // cinatra-cli#219
     if (ownership) return ownership;
     const [verb, sub] = args;
+    if (verb === "volume" && args.at(-1).startsWith("cinatra-preview-artifacts-")) {
+      const name=args.at(-1), slug=name.slice("cinatra-preview-artifacts-".length);
+      if (sub === "create") { state.artifactVolumeCreated=true; return {status:0,stdout:name,stderr:""}; }
+      if (sub === "inspect") return state.artifactVolumeCreated !== false
+        ? {status:0,stdout:JSON.stringify([{Name:name,Driver:"local",Labels:{"cinatra.preview.artifact-owner":slug}}]),stderr:""}
+        : {status:1,stdout:"",stderr:"no such volume"};
+    }
     if (verb === "build") return { status: 0, stdout: "", stderr: "" };
     if (verb === "run" && sub === "-d") {
       state.containerRunning = true;
       return { status: 0, stdout: "deadbeef\n", stderr: "" };
     }
+    if (verb === "container" && sub === "inspect" && args.includes("{{json .}}")) {
+      const slug=args.at(-1).slice("cinatra-preview-".length);
+      return {status:0,stdout:JSON.stringify({Mounts:[{Type:"volume",Name:"cinatra-preview-artifacts-"+slug,Destination:"/data/artifacts",RW:true}],
+        Config:{Env:["CINATRA_ARTIFACT_DATA_ROOT=/data/artifacts"]}}),stderr:""};
+    }
     if (verb === "container" && sub === "inspect") {
       const running = Boolean(state.containerRunning);
-      return { status: running ? 0 : 1, stdout: running ? "true\n" : "false\n", stderr: "" };
+      return { status: running ? 0 : 1, stdout: running ? "true\n" : "", stderr: running ? "" : "No such object" };
     }
     if (verb === "volume" && sub === "inspect") return { status: 1, stdout: "", stderr: "" };
     if (verb === "image" && sub === "inspect") return { status: 1, stdout: "", stderr: "" };
