@@ -92,6 +92,10 @@ const REGISTRY_VERSION = 1;
 export const PREVIEW_IMAGE_TAG_PREFIX = "cinatra-preview:local-";
 export const PREVIEW_CONTAINER_PREFIX = "cinatra-preview-";
 export const PREVIEW_VOLUME_PREFIX = "cinatra-preview-data-";
+// Artifact bytes are durable user data, never part of the rebuildable extension cache.
+export const PREVIEW_ARTIFACT_VOLUME_PREFIX = "cinatra-preview-artifacts-";
+export const ARTIFACT_VOLUME_OWNER_LABEL = "cinatra.preview.artifact-owner";
+export const ARTIFACT_DATA_ROOT_IN_CONTAINER = "/data/artifacts";
 
 // The recorded provenance value (AC2). Stored in the registry row + as an OCI
 // label; NEVER a published image name.
@@ -371,6 +375,7 @@ export const PASSTHROUGH_ENV_KEYS = [
   "NEXT_PUBLIC_APP_URL",
   "NEXT_PUBLIC_SITE_URL",
   "REDIS_URL",
+  "BULLMQ_QUEUE_NAME",
   "NANGO_ENCRYPTION_KEY",
   // cinatra-cli#219: the connection service's ADDRESS and its CREDENTIAL. Only
   // `NANGO_ENCRYPTION_KEY` used to be forwarded, so a preview container could
@@ -828,6 +833,7 @@ export function buildPreviewRunEnvArgs({ encryptionKey, env = process.env }) {
   const pairs = [];
   pairs.push([ "CINATRA_RUNTIME_MODE", PREVIEW_RUNTIME_MODE ]);
   pairs.push([ EXTENSION_DATA_ROOT_ENV, EXTENSION_DATA_ROOT_IN_CONTAINER ]);
+  pairs.push([ "CINATRA_ARTIFACT_DATA_ROOT", ARTIFACT_DATA_ROOT_IN_CONTAINER ]);
   pairs.push([ ENCRYPTION_KEY_ENV, encryptionKey ]);
   pairs.push([ "HOSTNAME", "0.0.0.0" ]);
   for (const key of PASSTHROUGH_ENV_KEYS) {
@@ -967,6 +973,9 @@ function isValidPreviewSlot(slug, slot) {
   if (slot.runtimeMode !== PREVIEW_RUNTIME_MODE) return false;
   if (slot.containerName !== previewContainerName(slug)) return false;
   if (slot.volumeName !== previewVolumeName(slug)) return false;
+  // Legacy rows remain inspectable/stoppable, but cannot boot until their data
+  // ownership is explicitly recovered. A present, malformed declaration is corruption.
+  if (Object.hasOwn(slot, "artifactVolumeName") && slot.artifactVolumeName !== previewArtifactVolumeName(slug)) return false;
   if (!PREVIEW_STATES.has(slot.state)) return false;
   if (typeof slot.createdAt !== "string" || slot.createdAt.length === 0) return false;
   if (!Array.isArray(slot.history)) return false;
@@ -1177,6 +1186,7 @@ export function makePreviewSlot({ slug, ref, sha, hostPort, bind = null, fleet =
     runtimeMode: PREVIEW_RUNTIME_MODE,
     containerName: previewContainerName(slug),
     volumeName: previewVolumeName(slug),
+    artifactVolumeName: previewArtifactVolumeName(slug),
     hostPort: hostPort ?? null,
     bind: bind ?? null, // cinatra-cli#248
     // engineering#666: the fleet is baked INTO the image, so it is part of WHAT
@@ -2064,6 +2074,65 @@ export function volumeAbsence({ ref, deps }) {
   return "unknown";
 }
 
+/** Separate stable user-data volume; never nested in the extension volume. */
+export function previewArtifactVolumeName(slug) {
+  if (!isValidSlug(slug)) throw new Error("Invalid artifact volume slug.");
+  return PREVIEW_ARTIFACT_VOLUME_PREFIX + slug;
+}
+
+function artifactVolumePresence(slug, deps) {
+  const name = previewArtifactVolumeName(slug);
+  const r = deps.runDocker(["volume", "inspect", name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+  if (!r.error && !r.timedOut && r.status === 0) {
+    try {
+      const rows = JSON.parse(r.stdout);
+      const row = Array.isArray(rows) && rows.length === 1 ? rows[0] : null;
+      if (row?.Name === name && row?.Driver === "local" &&
+          row?.Labels?.[ARTIFACT_VOLUME_OWNER_LABEL] === slug &&
+          (row.Options == null || (typeof row.Options === "object" && !Array.isArray(row.Options) && Object.keys(row.Options).length === 0))) return "owned";
+    } catch { /* malformed successful reads are unknown ownership */ }
+    throw new Error(`Artifact volume ${name} has unknown ownership or storage options; nothing was adopted or removed.`);
+  }
+  if (r.status === 1 && !r.signal && !r.error && !r.timedOut && /no such volume/i.test(r.stderr ?? "")) return "absent";
+  throw new Error(`Could not verify artifact volume ${name}; nothing was adopted or removed.`);
+}
+
+function requireRecordedArtifactVolume(row, deps) {
+  if (row.artifactVolumeName !== previewArtifactVolumeName(row.slug)) {
+    throw new Error(`Preview "${row.slug}" predates separate artifact storage. Its original artifact bytes must be recovered and ownership explicitly recorded before start/refresh; no empty volume was substituted.`);
+  }
+  if (artifactVolumePresence(row.slug, deps) !== "owned") {
+    throw new Error(`Recorded artifact volume ${row.artifactVolumeName} is missing; refusing to replace user data with an empty volume.`);
+  }
+}
+
+function ensureArtifactVolume(slug, deps) {
+  if (artifactVolumePresence(slug, deps) === "owned") return;
+  const name = previewArtifactVolumeName(slug);
+  const r = deps.runDocker(["volume", "create", "--driver", "local", "--label", `${ARTIFACT_VOLUME_OWNER_LABEL}=${slug}`, name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+  if (r.error || r.timedOut || r.status !== 0) {
+    throw new Error(`Artifact volume creation for ${name} failed or is uncertain; any resulting volume was retained. Inspect it before retrying.`);
+  }
+  if (artifactVolumePresence(slug, deps) !== "owned") throw new Error(`New artifact volume ${name} could not be verified; it was retained.`);
+}
+
+// A stored row does not prove an existing container actually mounts its data.
+// Verify before docker start or an idempotent running result; never recreate it
+// silently to repair a missing/foreign mount.
+function requireArtifactContainerMount(slug, name, deps) {
+  const r = deps.runDocker(["container", "inspect", "--format", "{{json .}}", name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+  try {
+    if (r.error || r.timedOut || r.status !== 0) throw new Error();
+    const row = JSON.parse(r.stdout);
+    const mounts = row.Mounts?.filter(m => m.Destination === ARTIFACT_DATA_ROOT_IN_CONTAINER);
+    const roots = row.Config?.Env?.filter(e => e.startsWith("CINATRA_ARTIFACT_DATA_ROOT="));
+    if (mounts?.length !== 1 || mounts[0].Type !== "volume" || mounts[0].Name !== previewArtifactVolumeName(slug) || mounts[0].RW !== true ||
+        roots?.length !== 1 || roots[0] !== `CINATRA_ARTIFACT_DATA_ROOT=${ARTIFACT_DATA_ROOT_IN_CONTAINER}`) throw new Error();
+  } catch {
+    throw new Error(`Container ${name} does not prove its recorded artifact mount/root; it was not started or replaced.`);
+  }
+}
+
 /** True iff a docker object (container/image/volume) with `ref` exists for `kind`. */
 export function dockerObjectExists({ kind, ref, deps }) {
   const sub = { container: "container", image: "image", volume: "volume" }[kind];
@@ -2296,12 +2365,14 @@ export function bootPreviewContainer({ slug, tag, hostPort, bind = null, encrypt
   assertNotProductionImageTag(tag);
   const containerName = previewContainerName(slug);
   const volumeName = previewVolumeName(slug);
+  if (artifactVolumePresence(slug, deps) !== "owned") throw new Error("Artifact volume disappeared before boot; refusing empty replacement.");
   const envArgs = buildPreviewRunEnvArgs({ encryptionKey, env: deps.env ?? process.env });
   const args = [
     "run", "-d",
     "--name", containerName,
     "--add-host", `${CONTAINER_HOST_GATEWAY}:host-gateway`,
     "-v", `${volumeName}:${EXTENSION_DATA_ROOT_IN_CONTAINER}`,
+    "-v", `${previewArtifactVolumeName(slug)}:${ARTIFACT_DATA_ROOT_IN_CONTAINER}`,
     // cinatra-cli#248: an explicit bind narrows the publish to ONE interface;
     // unset is the byte-identical pre-#248 argument (docker's own 0.0.0.0).
     "-p", bind ? `${bind}:${hostPort}:3000` : `${hostPort}:3000`,
@@ -2585,6 +2656,7 @@ export async function runPreviewCreate(rest, injected = {}) {
   const tag = previewImageTag(sha, fleet);
   const provenance = previewProvenance(sha);
   const volumeName = previewVolumeName(slug);
+  artifactVolumePresence(slug, deps);
 
   // Atomically CLAIM the slug under the registry lock (lifecycle ownership) AND
   // allocate this preview's OWN host port against the same snapshot: a concurrent
@@ -2678,6 +2750,9 @@ export async function runPreviewCreate(rest, injected = {}) {
     // cinatra-cli#220: an image already present for this SHA is reused.
     imageBuiltHere = ensurePreviewImage({ tag, sha, checkoutDir, rebuild, provenance, deps, fleet }).built;
 
+    // Establish and verify the separate artifact volume BEFORE the first app
+    // process. Never remove it on failure: even a failed boot may have written data.
+    ensureArtifactVolume(slug, deps);
     const container = bootPreviewContainer({
       slug,
       tag,
@@ -2782,6 +2857,11 @@ export async function runPreviewRefresh(rest, injected = {}) {
     if (existing.state === "provisioning") {
       throw new Error(`An operation is already in-flight for preview "${slug}" (state=provisioning). Wait for it to finish.`);
     }
+    requireRecordedArtifactVolume(existing, deps);
+    const currentContainer = previewContainerName(slug);
+    const currentState = containerState(currentContainer, deps);
+    if (currentState === "unknown") throw new Error(`Could not verify existing preview ${currentContainer}; refresh left it untouched.`);
+    if (currentState !== "absent") requireArtifactContainerMount(slug, currentContainer, deps);
     oldSha = existing.sha;
     oldTag = existing.imageTag;
     // Reuse the preview's durable host port; allocate only if an older row never
@@ -3082,6 +3162,7 @@ export async function runPreviewStart(rest, injected = {}) {
     if (existing.state === "provisioning") {
       throw new Error(`An operation is already in-flight for preview "${slug}" (state=provisioning). Wait for it to finish.`);
     }
+    requireRecordedArtifactVolume(existing, deps);
     row = existing;
     const next = cloneRegistry(reg);
     // cinatra-cli#248: the claim does NOT write the requested bind. A bind only
@@ -3145,6 +3226,7 @@ export async function runPreviewStart(rest, injected = {}) {
   };
 
   try {
+    if (present !== "absent") requireArtifactContainerMount(slug, name, deps);
     if (present === "running" && !recreate) {
       if (row.state !== "degraded") {
         deps.log(`preview "${slug}" is already running: ${tag} on http://${previewReachHost(row.bind ?? null)}:${hostPort}`);
@@ -3420,6 +3502,10 @@ export const __test = {
   PREVIEW_IMAGE_TAG_PREFIX,
   PREVIEW_CONTAINER_PREFIX,
   PREVIEW_VOLUME_PREFIX,
+  PREVIEW_ARTIFACT_VOLUME_PREFIX,
+  ARTIFACT_VOLUME_OWNER_LABEL,
+  ARTIFACT_DATA_ROOT_IN_CONTAINER,
+  previewArtifactVolumeName,
   PROVENANCE_PREFIX,
   PREVIEW_RUNTIME_MODE,
   EXTENSION_DATA_ROOT_IN_CONTAINER,
