@@ -25,16 +25,22 @@ project adheres to [Semantic Versioning](https://semver.org/).
   install — in the install's own sync AND in the setup phase it runs, so the
   fleet cannot float back to a tip halfway through; it is refused for a `--mode
   prod` install, which acquires its extensions pinned and integrity-verified on
-  its own path. `--frozen-lockfile` runs every dependency install on the install
-  path as `pnpm install --frozen-lockfile`, on every package-manager tier, so a
-  lockfile that no longer matches the manifests is a clear refusal instead of a
-  modified tracked file. `--no-fetch` moves an existing checkout — a plain clone
-  or a detached worktree — to a branch, tag or full commit SHA using only what
-  that checkout already has, refusing and naming the ref when it does not
-  resolve locally, and refusing outright when there is no checkout to move,
-  because a fresh clone is a network operation and silently taking it would
-  hand the caller the access they asked us not to take. All three are off by
-  default and nothing about a hand-run install changes.
+  its own path; with `--mode preview` it pins the CHECKOUT's fleet, while what
+  the preview image acquires stays `--fleet`'s business. `--frozen-lockfile`
+  runs BOTH dependency installs of the run — the install's own, and the one the
+  setup phase performs when it re-links the workspace after its extension sync
+  or its prod acquisition — as `pnpm install --frozen-lockfile`, on every
+  package-manager tier, so a lockfile that no longer matches the manifests is a
+  clear refusal instead of a modified tracked file. `--no-fetch` moves an
+  existing checkout — a plain clone or a detached worktree — to a branch, tag or
+  full commit SHA using only what that checkout already has: it requires an
+  explicit `--ref`, resolves a local branch through its own `refs/heads` entry
+  rather than through a same-named tag, never consults a `FETCH_HEAD` this run
+  did not write, refuses and names the ref when it does not resolve locally, and
+  refuses when there is no checkout to move, because cloning one is the very
+  fetch it suppresses. That one fetch is all it suppresses — the run still
+  clones the declared companion extension repos and installs from a registry.
+  All three are off by default and nothing about a hand-run install changes.
 
 - **The preview image build can finally be tuned for a many-core builder.** The
   checkout's Dockerfile declares two build args as its documented remedy for a

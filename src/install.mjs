@@ -784,6 +784,20 @@ export function parseInstallArgs(argv = []) {
     );
   }
 
+  // `--no-fetch` needs an explicit `--ref`. Without one the install targets the
+  // DEFAULT ref ("main"), and a no-fetch move would resolve that from whatever
+  // the checkout happens to hold — quietly moving a checkout parked at a commit
+  // off it, which is the opposite of what a caller reaching for --no-fetch
+  // wants. The two only make sense together, so say so before any side effect.
+  const noFetch = argv.includes("--no-fetch");
+  if (noFetch && refOpt == null) {
+    throw new Error(
+      `--no-fetch needs an explicit --ref. Without one this install would move the checkout to the ` +
+        `default ref "${ref}", resolved from whatever that name already points at locally — moving a ` +
+        `checkout parked at a commit off it. Name the commit (or branch/tag) you want: --ref <sha>.`,
+    );
+  }
+
   return {
     dir: dirOpt, // null → resolved later (prompt on TTY, else default).
     ref,
@@ -820,7 +834,7 @@ export function parseInstallArgs(argv = []) {
     // dependencies and every mode moves an existing checkout to --ref.
     pinnedExtensions,
     frozenLockfile: argv.includes("--frozen-lockfile"),
-    noFetch: argv.includes("--no-fetch"),
+    noFetch,
 
     // cinatra-cli#17 surface.
     infra, // null | "new" | "external" | "share"(gated)
@@ -2296,17 +2310,28 @@ export function assertWorkspaceInstallPossible({ targetDir, exists = commandExis
   );
 }
 
-function pnpmInstall({ targetDir, usePnpmDirect, frozenLockfile = false, log = console.log }) {
-  // `usePnpmDirect` is the caller's already-probed corepack-absent/pnpm-present
-  // verdict; honored as-is so that selection is unchanged. Everything else goes
-  // through the shared tiering, which is what reaches the pinned-pnpm fallback.
-  // Both branches build their extra args from the SAME helper, so the
-  // already-probed shortcut cannot be the one tier that loses the opt-in.
+/** The command line the install's OWN dependency step runs.
+ *
+ *  `usePnpmDirect` is the caller's already-probed corepack-absent/pnpm-present
+ *  verdict; honored as-is so that selection is unchanged. Everything else goes
+ *  through the shared tiering, which is what reaches the pinned-pnpm fallback.
+ *  BOTH branches build their extra args from the same helper, so the
+ *  already-probed shortcut cannot be the one tier that loses the opt-in —
+ *  exported so each branch is asserted rather than assumed. */
+export function pnpmInstallInvocation({
+  targetDir,
+  usePnpmDirect,
+  frozenLockfile = false,
+  exists = commandExists,
+} = {}) {
   const frozen = frozenLockfileParts(frozenLockfile);
-  const invocation =
-    usePnpmDirect === true
-      ? { command: "pnpm", args: ["install", ...frozen.args], label: `pnpm install${frozen.suffix}` }
-      : resolvePnpmInvocation({ targetDir, frozenLockfile });
+  return usePnpmDirect === true
+    ? { command: "pnpm", args: ["install", ...frozen.args], label: `pnpm install${frozen.suffix}` }
+    : resolvePnpmInvocation({ targetDir, exists, frozenLockfile });
+}
+
+function pnpmInstall({ targetDir, usePnpmDirect, frozenLockfile = false, log = console.log }) {
+  const invocation = pnpmInstallInvocation({ targetDir, usePnpmDirect, frozenLockfile });
   // Name the binary actually invoked, like every other install site does — the
   // fixed "pnpm install" text told an operator on the Corepack tier something
   // that was not what ran.
@@ -2417,26 +2442,49 @@ export function classifySetupChildExit(status, { canReportRegistrySkew = false }
  *  `--pinned`: the setup phase re-syncs the dev extension fleet itself, so
  *  pinning only the install's sync would leave the child free to float the
  *  fleet back to a tip. Like `--skip-dev-apps` it is dev-path-only — a prod
- *  setup child has no dev fleet to pin. */
-export function setupChildArgs({ mode, skipDevApps = false, pinnedExtensions = false } = {}) {
+ *  setup child has no dev fleet to pin.
+ *
+ *  `frozenLockfile` forwards as the child's own `--frozen-lockfile`, for dev
+ *  AND prod: the child re-links the workspace after its extension sync (dev) or
+ *  its required-extension acquisition (prod), which is a SECOND `pnpm install`
+ *  inside the same run. A frozen install that stopped at the parent would still
+ *  let that one rewrite the tracked lockfile. */
+export function setupChildArgs({
+  mode,
+  skipDevApps = false,
+  pinnedExtensions = false,
+  frozenLockfile = false,
+} = {}) {
   const setupMode = mode === "demo" ? "dev" : mode;
   const args = ["instance", "setup", setupMode];
   if (setupMode === "dev" && skipDevApps) args.push("--skip-dev-apps");
   if (setupMode === "dev" && pinnedExtensions) args.push("--pinned");
+  if (frozenLockfile) args.push("--frozen-lockfile");
   return args;
 }
 
-function runSetupInTarget({ targetDir, mode, skipDevApps, pinnedExtensions = false, log = console.log }) {
+export function runSetupInTarget({
+  targetDir,
+  mode,
+  skipDevApps,
+  pinnedExtensions = false,
+  frozenLockfile = false,
+  log = console.log,
+  spawn = spawnSync,
+}) {
   const setupMode = mode === "demo" ? "dev" : mode;
   const profile = installProfileForMode(mode);
-  const setupArgs = [PUBLISHED_CLI_BIN, ...setupChildArgs({ mode, skipDevApps, pinnedExtensions })];
+  const setupArgs = [
+    PUBLISHED_CLI_BIN,
+    ...setupChildArgs({ mode, skipDevApps, pinnedExtensions, frozenLockfile }),
+  ];
   const label = profile ? `${setupMode} (${profile} profile)` : setupMode;
   log(`- Running \`cinatra instance setup ${setupMode}\` inside ${targetDir}${profile ? ` [${profile} profile]` : ""}…`);
   // cinatra-cli#200: NOT `runOrThrow` — the setup child has one non-zero status
   // that is a named, non-fatal verdict rather than a failure (see
   // classifySetupChildExit). Everything else still throws the same message.
   const message = `cinatra instance setup ${label} failed inside the target.`;
-  const result = spawnSync(process.execPath, setupArgs, {
+  const result = spawn(process.execPath, setupArgs, {
     stdio: "inherit",
     cwd: targetDir,
     env: buildSetupChildEnv({ mode, targetDir }),
@@ -3051,6 +3099,7 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
         mode: opts.mode,
         skipDevApps: opts.skipDevApps,
         pinnedExtensions: opts.pinnedExtensions,
+        frozenLockfile: opts.frozenLockfile === true,
         log,
       });
       // cinatra-cli#200 — co-use terminates on its OWN tail (below), so it must
@@ -9267,6 +9316,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
           mode: opts.mode,
           skipDevApps: opts.skipDevApps,
           pinnedExtensions: opts.pinnedExtensions,
+          frozenLockfile,
           log,
         });
         setupRegistrySkew = setupVerdict?.registrySkew === true;
@@ -9282,7 +9332,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     if (opts.noSetup) {
       log("- Skipping setup (--no-setup). Re-run `cinatra install --mode prod` (it reconciles in place — runs the setup phase) when ready.");
     } else {
-      runSetupChild({ targetDir, mode: "prod", skipDevApps: false, log });
+      runSetupChild({ targetDir, mode: "prod", skipDevApps: false, frozenLockfile, log });
       // cinatra-cli#143: with setup done, VALIDATE the prod required-env matrix in
       // .env.local so we never report success on an instance that would crash on
       // first prod boot ([required-env-preflight]). A missing/malformed HARD var
@@ -9607,15 +9657,17 @@ async function cloneOrUpdateHost({
     return moveExistingCheckoutToRef({ targetDir, ref, force, fetch: !noFetch, log });
   }
 
-  // `--no-fetch` says "reach no remote". A fresh clone IS a remote read, so
-  // there is nothing here the flag could honour — and silently cloning anyway
-  // would give the caller the network access they asked us not to take. Refuse
-  // and name what is missing instead.
+  // `--no-fetch` suppresses the HOST CHECKOUT's fetch — not every network read
+  // the run performs (it still clones the declared companion extension repos
+  // and installs dependencies from a registry). A fresh clone IS that same
+  // host-checkout read in a larger form, so there is nothing here the flag
+  // could suppress; refuse and name what is missing rather than cloning as if
+  // it had not been passed.
   if (noFetch) {
     throw new Error(
-      `--no-fetch: ${targetDir} holds no Cinatra checkout to move, and a fresh clone is a network ` +
-        `operation. Put a checkout there first (clone it, or add a git worktree at the commit you ` +
-        `want), or drop --no-fetch.`,
+      `--no-fetch: ${targetDir} holds no Cinatra checkout to move, and cloning one is the very fetch ` +
+        `this flag suppresses. Put a checkout there first (clone it, or add a git worktree at the ` +
+        `commit you want), or drop --no-fetch.`,
     );
   }
 
@@ -9873,17 +9925,26 @@ export function moveExistingCheckoutToRef({
   // just-fetched ref), then origin/<ref>, then the bare ref — so a stale local
   // ref of the same name never wins over the freshly-fetched remote commit.
   //
-  // WITHOUT a fetch, FETCH_HEAD is dropped from the list: nothing fetched it
-  // this run, so it is whatever some earlier, unrelated fetch left behind, and
-  // resolving through it would silently move the checkout to a commit the
-  // caller never named. What is left is the operator's own local state — the
-  // bare ref (a 40-hex commit, a tag, a branch) first, then the
-  // remote-tracking ref already on disk.
-  const candidates = isTag
-    ? [`refs/tags/${ref}`]
-    : fetch
-      ? ["FETCH_HEAD", `origin/${ref}`, ref]
-      : [ref, `origin/${ref}`];
+  // WITHOUT a fetch the list is rebuilt from the operator's own local state:
+  //   - FETCH_HEAD is DROPPED. Nothing fetched it this run, so it is whatever
+  //     some earlier, unrelated fetch left behind; resolving through it would
+  //     silently move the checkout to a commit the caller never named.
+  //   - A LOCAL BRANCH is resolved through its FULLY-QUALIFIED
+  //     `refs/heads/<ref>`. `rev-parse <name>^{commit}` prefers a TAG of the
+  //     same name, while the checkout below takes the BRANCH by name — so a
+  //     bare-name resolution would check out the operator's branch and then
+  //     fast-forward it onto the tag's commit.
+  //   - `origin/<ref>` stays LAST: with no fetch it may be stale, and a stale
+  //     remote-tracking ref must never beat the operator's own branch.
+  let candidates;
+  if (isTag) {
+    candidates = [`refs/tags/${ref}`];
+  } else if (fetch) {
+    candidates = ["FETCH_HEAD", `origin/${ref}`, ref];
+  } else {
+    const hasLocalBranch = runGit(["show-ref", "--verify", "--quiet", `refs/heads/${ref}`]).status === 0;
+    candidates = [...(hasLocalBranch ? [`refs/heads/${ref}`] : []), ref, `origin/${ref}`];
+  }
   let targetCommit = null;
   for (const candidate of candidates) {
     const r = runGit(["rev-parse", "--verify", "--quiet", `${candidate}^{commit}`]);

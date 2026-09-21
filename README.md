@@ -342,8 +342,8 @@ opt-in flags make `cinatra install` fit:
                                           # OWN committed lock shas, not the repos' tips
     cinatra install --frozen-lockfile     # `pnpm install --frozen-lockfile`: a lockfile
                                           # drift is a refusal, not a rewritten file
-    cinatra install --no-fetch            # move an existing checkout to --ref with no
-                                          # fetch (it is already at the commit)
+    cinatra install --no-fetch --ref <sha> # move an existing checkout to that commit
+                                          # without fetching (it already has it)
 
 `--pinned-extensions` applies to the install's own extension sync **and** to the
 setup phase it runs, so the fleet cannot float back to a tip halfway through. It
@@ -351,17 +351,23 @@ is fail-closed: an extension the committed lock cannot pin stops the install
 rather than silently tracking a branch. It belongs to a dev-like install
 (`dev`/`demo`/`preview`) — a `--mode prod` install already acquires its required
 extensions pinned and integrity-verified, and refuses the flag rather than
-pretending to honour it.
+pretending to honour it. With `--mode preview` it pins the fleet of the
+**checkout** (the dev half of that composition); what the preview *image*
+acquires is chosen by `--fleet` and is not affected.
 
-`--frozen-lockfile` reaches every dependency install the run performs, on every
-package-manager tier.
+`--frozen-lockfile` reaches both dependency installs the run performs — the
+install's own, and the one the setup phase runs when it re-links the workspace
+after its extension sync — on every package-manager tier.
 
 `--no-fetch` moves an existing checkout — a plain clone or a detached git
 worktree — to `--ref` (a branch, a tag, or a full commit SHA) using only what
-that checkout already has. If the ref does not resolve locally it refuses and
-names it, rather than moving somewhere else; and because a fresh clone is a
-network operation there is nothing it could honour, it refuses when the target
-directory holds no checkout at all.
+that checkout already has. It requires an explicit `--ref`: without one the
+install would target the default `main` and resolve it from whatever the
+checkout happens to hold. If the ref does not resolve locally it refuses and
+names it, rather than moving somewhere else, and it refuses when the target
+directory holds no checkout at all, because cloning one is the very fetch the
+flag suppresses. It suppresses *that* fetch only — the run still clones the
+declared companion extension repos and installs dependencies from a registry.
 
 All three are off by default: an install that does not ask for them behaves
 exactly as it did before.

@@ -23,12 +23,18 @@ import { fileURLToPath } from "node:url";
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { devExtensionSyncArgv } from "../src/index.mjs";
+import {
+  installAfterExtensionSync,
+  resolvePnpmInstallInvocation,
+  setupPhaseOptions,
+} from "../src/index.mjs";
 import {
   moveExistingCheckoutToRef,
   parseInstallArgs,
+  pnpmInstallInvocation,
   resolvePnpmInvocation,
   runInstall,
+  runSetupInTarget,
   setupChildArgs,
 } from "../src/install.mjs";
 
@@ -54,9 +60,28 @@ describe("parseInstallArgs — the unattended opt-ins", () => {
   it("parses each one ON", () => {
     expect(parseInstallArgs(["--pinned-extensions"]).pinnedExtensions).toBe(true);
     expect(parseInstallArgs(["--frozen-lockfile"]).frozenLockfile).toBe(true);
-    expect(parseInstallArgs(["--no-fetch"]).noFetch).toBe(true);
-    const all = parseInstallArgs(["--pinned-extensions", "--frozen-lockfile", "--no-fetch"]);
+    expect(parseInstallArgs(["--no-fetch", "--ref", "main"]).noFetch).toBe(true);
+    const all = parseInstallArgs([
+      "--pinned-extensions",
+      "--frozen-lockfile",
+      "--no-fetch",
+      "--ref",
+      "main",
+    ]);
     expect([all.pinnedExtensions, all.frozenLockfile, all.noFetch]).toEqual([true, true, true]);
+  });
+
+  it("--no-fetch REFUSES without an explicit --ref, naming both flags", () => {
+    // Without --ref the install targets the default "main", and --no-fetch
+    // would resolve that from whatever the checkout happens to hold — quietly
+    // moving a checkout parked at a commit off it. The two flags only make
+    // sense together, so say so instead of moving the operator's HEAD.
+    expect(() => parseInstallArgs(["--no-fetch"])).toThrow(/--no-fetch/);
+    expect(() => parseInstallArgs(["--no-fetch"])).toThrow(/--ref/);
+    expect(() => parseInstallArgs(["--no-fetch", "dev"])).toThrow(/--ref/);
+    // With one it parses.
+    expect(parseInstallArgs(["--no-fetch", "--ref", "a".repeat(40)]).noFetch).toBe(true);
+    expect(parseInstallArgs(["--no-fetch", "--ref=main"]).noFetch).toBe(true);
   });
 
   it("they are VALUE-LESS: the token after one is still read as the mode positional", () => {
@@ -64,10 +89,12 @@ describe("parseInstallArgs — the unattended opt-ins", () => {
     // make `install --no-fetch dev` swallow `dev` as a value and silently run a
     // DEFAULT-mode install, while `install --no-fetch bogus` would stop
     // rejecting the unknown trailing argument.
-    expect(parseInstallArgs(["--no-fetch", "dev"]).mode).toBe("dev");
+    expect(parseInstallArgs(["--no-fetch", "--ref", "main", "dev"]).mode).toBe("dev");
     expect(parseInstallArgs(["--frozen-lockfile", "demo"]).mode).toBe("demo");
     expect(parseInstallArgs(["--pinned-extensions", "demo"]).mode).toBe("demo");
-    expect(() => parseInstallArgs(["--no-fetch", "bogus"])).toThrow(/Unknown argument "bogus"/);
+    expect(() => parseInstallArgs(["--no-fetch", "--ref", "main", "bogus"])).toThrow(
+      /Unknown argument "bogus"/,
+    );
     expect(() => parseInstallArgs(["--frozen-lockfile", "dev", "extra"])).toThrow(
       /Unexpected extra argument/,
     );
@@ -91,7 +118,7 @@ describe("parseInstallArgs — the unattended opt-ins", () => {
   it("--frozen-lockfile and --no-fetch carry no mode restriction (every install installs / moves)", () => {
     for (const mode of ["dev", "prod", "demo", "preview"]) {
       expect(parseInstallArgs(["--frozen-lockfile", "--mode", mode]).frozenLockfile).toBe(true);
-      expect(parseInstallArgs(["--no-fetch", "--mode", mode]).noFetch).toBe(true);
+      expect(parseInstallArgs(["--no-fetch", "--ref", "main", "--mode", mode]).noFetch).toBe(true);
     }
   });
 });
@@ -156,7 +183,41 @@ describe("resolvePnpmInvocation — --frozen-lockfile on every package-manager t
   });
 });
 
-describe("setupChildArgs — --pinned-extensions forwarded to the setup child", () => {
+describe("pnpmInstallInvocation — BOTH tiers of the install's own dependency step", () => {
+  // `pnpmInstall` takes a shortcut when the caller already probed that Corepack
+  // is absent and pnpm is present. That shortcut is a second construction site
+  // for the command line, so it is asserted here alongside the tiered one — a
+  // revert of either branch has to fail.
+  it("the already-probed direct-pnpm tier, OFF then ON", () => {
+    expect(pnpmInstallInvocation({ usePnpmDirect: true })).toEqual({
+      command: "pnpm",
+      args: ["install"],
+      label: "pnpm install",
+    });
+    expect(pnpmInstallInvocation({ usePnpmDirect: true, frozenLockfile: true })).toEqual({
+      command: "pnpm",
+      args: ["install", "--frozen-lockfile"],
+      label: "pnpm install --frozen-lockfile",
+    });
+  });
+
+  it("the tiered resolve, OFF then ON", () => {
+    expect(pnpmInstallInvocation({ usePnpmDirect: false, exists: present("corepack") })).toEqual({
+      command: "corepack",
+      args: ["pnpm", "install"],
+      label: "corepack pnpm install",
+    });
+    expect(
+      pnpmInstallInvocation({ usePnpmDirect: false, exists: present("corepack"), frozenLockfile: true }),
+    ).toEqual({
+      command: "corepack",
+      args: ["pnpm", "install", "--frozen-lockfile"],
+      label: "corepack pnpm install --frozen-lockfile",
+    });
+  });
+});
+
+describe("setupChildArgs — the opt-ins forwarded to the setup child", () => {
   it("OFF is byte-for-byte today's child argv", () => {
     expect(setupChildArgs({ mode: "dev" })).toEqual(["instance", "setup", "dev"]);
     expect(setupChildArgs({ mode: "demo" })).toEqual(["instance", "setup", "dev"]);
@@ -169,7 +230,7 @@ describe("setupChildArgs — --pinned-extensions forwarded to the setup child", 
     ]);
   });
 
-  it("ON appends --pinned, and composes with --skip-dev-apps", () => {
+  it("--pinned-extensions appends --pinned, and composes with --skip-dev-apps", () => {
     expect(setupChildArgs({ mode: "dev", pinnedExtensions: true })).toEqual([
       "instance",
       "setup",
@@ -191,37 +252,178 @@ describe("setupChildArgs — --pinned-extensions forwarded to the setup child", 
     ]);
   });
 
-  it("never reaches a prod setup child (the pinned fleet is a dev-path concept)", () => {
+  it("--pinned never reaches a prod setup child (the pinned fleet is a dev-path concept)", () => {
     expect(setupChildArgs({ mode: "prod", pinnedExtensions: true })).toEqual([
       "instance",
       "setup",
       "prod",
     ]);
   });
+
+  it("--frozen-lockfile IS forwarded, for dev AND prod (both run their own install)", () => {
+    // The child re-links the workspace after its own extension sync / prod
+    // acquisition. That is a second `pnpm install` inside the same run, so a
+    // frozen install that stopped at the parent could still rewrite the
+    // tracked lockfile — the exact thing the flag exists to prevent.
+    expect(setupChildArgs({ mode: "dev", frozenLockfile: true })).toEqual([
+      "instance",
+      "setup",
+      "dev",
+      "--frozen-lockfile",
+    ]);
+    expect(setupChildArgs({ mode: "prod", frozenLockfile: true })).toEqual([
+      "instance",
+      "setup",
+      "prod",
+      "--frozen-lockfile",
+    ]);
+    expect(
+      setupChildArgs({ mode: "demo", skipDevApps: true, pinnedExtensions: true, frozenLockfile: true }),
+    ).toEqual(["instance", "setup", "dev", "--skip-dev-apps", "--pinned", "--frozen-lockfile"]);
+  });
 });
 
-describe("devExtensionSyncArgv — the setup child's OWN sync keeps --pinned", () => {
-  it("passes the ambient argv through unchanged when nothing narrows the run", () => {
-    const ambient = ["instance", "setup", "dev", "--pinned"];
-    expect(devExtensionSyncArgv(false, ambient)).toBe(ambient);
+describe("runSetupInTarget — the REAL command line it spawns", () => {
+  function spawnRecorder() {
+    const calls = [];
+    return {
+      calls,
+      spawn: (command, args, options) => {
+        calls.push({ command, args, options });
+        return { status: 0 };
+      },
+    };
+  }
+
+  it("OFF spawns the published bin with today's argv", () => {
+    const { calls, spawn } = spawnRecorder();
+    runSetupInTarget({ targetDir: "/target", mode: "dev", skipDevApps: false, log: () => {}, spawn });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].command).toBe(process.execPath);
+    expect(calls[0].args.slice(1)).toEqual(["instance", "setup", "dev"]);
+    expect(calls[0].options.cwd).toBe("/target");
   });
 
-  it("keeps --pinned when --skip-dev-apps narrows the run (both flags, not one)", () => {
-    // The drop this pins: a narrowed run used to substitute a single-flag array
-    // for the ambient argv, so `install --pinned-extensions --skip-dev-apps`
-    // pinned the install's own sync and left the setup child's sync
-    // tip-tracking — the exact thing --pinned-extensions exists to prevent.
-    expect(devExtensionSyncArgv(true, ["instance", "setup", "dev", "--skip-dev-apps", "--pinned"])).toEqual([
+  it("ON spawns the published bin with every forwarded opt-in, in order", () => {
+    const { calls, spawn } = spawnRecorder();
+    runSetupInTarget({
+      targetDir: "/target",
+      mode: "dev",
+      skipDevApps: true,
+      pinnedExtensions: true,
+      frozenLockfile: true,
+      log: () => {},
+      spawn,
+    });
+    expect(calls[0].args.slice(1)).toEqual([
+      "instance",
+      "setup",
+      "dev",
       "--skip-dev-apps",
       "--pinned",
+      "--frozen-lockfile",
     ]);
   });
+});
 
-  it("is unchanged for a narrowed run that never asked to pin", () => {
-    expect(devExtensionSyncArgv(true, ["instance", "setup", "dev", "--skip-dev-apps"])).toEqual([
-      "--skip-dev-apps",
+// ---------------------------------------------------------------------------
+// 2b. The setup child's OWN dependency install — the second `pnpm install` a
+//     `--frozen-lockfile` run performs. The install spawns `instance setup
+//     <mode>`, and that child re-links the workspace after its own extension
+//     sync; without the flag reaching THERE, a run that asked for a frozen
+//     install could still rewrite the tracked lockfile.
+// ---------------------------------------------------------------------------
+describe("resolvePnpmInstallInvocation — the setup child's own install", () => {
+  it("OFF is byte-for-byte the previous invocation on all three tiers", () => {
+    expect(resolvePnpmInstallInvocation({ exists: present("corepack", "pnpm") })).toEqual({
+      command: "corepack",
+      args: ["pnpm", "install"],
+      label: "corepack pnpm install",
+    });
+    expect(resolvePnpmInstallInvocation({ exists: present("pnpm") })).toEqual({
+      command: "pnpm",
+      args: ["install"],
+      label: "pnpm install",
+    });
+    expect(resolvePnpmInstallInvocation({ exists: () => false })).toEqual({
+      command: "corepack",
+      args: ["pnpm", "install"],
+      label: "corepack pnpm install",
+    });
+    expect(
+      resolvePnpmInstallInvocation({
+        exists: present("npm"),
+        repoRoot: "/repo",
+        readPin: () => "pnpm@10.0.0",
+      }).args,
+    ).toEqual(["exec", "-y", "--", "pnpm@10.0.0", "install"]);
+  });
+
+  it("ON appends --frozen-lockfile to EVERY tier", () => {
+    expect(resolvePnpmInstallInvocation({ exists: present("corepack"), frozenLockfile: true })).toEqual({
+      command: "corepack",
+      args: ["pnpm", "install", "--frozen-lockfile"],
+      label: "corepack pnpm install --frozen-lockfile",
+    });
+    expect(resolvePnpmInstallInvocation({ exists: present("pnpm"), frozenLockfile: true })).toEqual({
+      command: "pnpm",
+      args: ["install", "--frozen-lockfile"],
+      label: "pnpm install --frozen-lockfile",
+    });
+    expect(resolvePnpmInstallInvocation({ exists: () => false, frozenLockfile: true }).args).toEqual([
+      "pnpm",
+      "install",
+      "--frozen-lockfile",
     ]);
-    expect(devExtensionSyncArgv(true, [])).toEqual(["--skip-dev-apps"]);
+    expect(
+      resolvePnpmInstallInvocation({
+        exists: present("npm"),
+        repoRoot: "/repo",
+        readPin: () => "pnpm@10.0.0",
+        frozenLockfile: true,
+      }).args,
+    ).toEqual(["exec", "-y", "--", "pnpm@10.0.0", "install", "--frozen-lockfile"]);
+  });
+});
+
+describe("installAfterExtensionSync — carries the frozen opt-in to the re-link", () => {
+  const syncResult = { results: [{ action: "cloned" }] };
+
+  function recorder() {
+    const calls = [];
+    return {
+      calls,
+      spawn: (command, args, options) => {
+        calls.push({ command, args, options });
+        return { status: 0 };
+      },
+    };
+  }
+
+  it("OFF issues the plain re-link (unchanged)", () => {
+    const { calls, spawn } = recorder();
+    const res = installAfterExtensionSync("/repo", syncResult, { spawn, exists: present("pnpm") });
+    expect(calls[0].args).toEqual(["install"]);
+    expect(res).toEqual({ ok: true, label: "pnpm install" });
+  });
+
+  it("ON issues the frozen re-link", () => {
+    const { calls, spawn } = recorder();
+    const res = installAfterExtensionSync("/repo", syncResult, {
+      spawn,
+      exists: present("pnpm"),
+      frozenLockfile: true,
+    });
+    expect(calls[0].args).toEqual(["install", "--frozen-lockfile"]);
+    expect(res).toEqual({ ok: true, label: "pnpm install --frozen-lockfile" });
+  });
+});
+
+describe("setupPhaseOptions — only `instance setup dev|prod` reads the flag", () => {
+  it("reads --frozen-lockfile from the setup command's OWN trailing args", () => {
+    expect(setupPhaseOptions([])).toEqual({ frozenLockfile: false });
+    expect(setupPhaseOptions(["--skip-dev-apps"])).toEqual({ frozenLockfile: false });
+    expect(setupPhaseOptions(["--pinned", "--frozen-lockfile"])).toEqual({ frozenLockfile: true });
   });
 });
 
@@ -356,6 +558,52 @@ describe("moveExistingCheckoutToRef — --no-fetch (fetch: false)", () => {
     expect(calls.some((a) => a[0] === "checkout")).toBe(true);
   });
 
+  it("resolves a LOCAL BRANCH through refs/heads, not through a same-named TAG", () => {
+    // `git rev-parse <name>^{commit}` prefers refs/tags/<name> over
+    // refs/heads/<name> (verified: with both present it answers the TAG's
+    // commit), while the checkout step takes the BRANCH by name. So a
+    // bare-name resolution checks out the operator's branch and then
+    // fast-forwards it onto the TAG's commit — silently moving their branch to
+    // a commit they never named. Pinned with the tag AHEAD of the branch,
+    // which is the direction where the fast-forward actually succeeds.
+    const { checkout, headSha } = buildOrphanedCheckout(sandbox, "collide");
+    const parent = gitIn(["rev-parse", `${headSha}^`], checkout);
+    // Branch `release` parked at the OLDER commit; a TAG of the same name at
+    // the newer one.
+    execFileSync("git", ["-C", checkout, "checkout", "-B", "release", parent], { stdio: "ignore" });
+    execFileSync("git", ["-C", checkout, "tag", "release", headSha], { stdio: "ignore" });
+
+    const sha = moveExistingCheckoutToRef({
+      targetDir: checkout,
+      ref: "release",
+      fetch: false,
+      log: () => {},
+    });
+    // The BRANCH's commit is what `--ref release` means here.
+    expect(sha).toBe(parent);
+    // Still on the branch, and the branch was NOT dragged onto the tag.
+    expect(gitIn(["symbolic-ref", "HEAD"], checkout)).toBe("refs/heads/release");
+    expect(gitIn(["rev-parse", "refs/heads/release"], checkout)).toBe(parent);
+    expect(gitIn(["rev-parse", "refs/tags/release^{commit}"], checkout)).toBe(headSha);
+  });
+
+  it("does not let a stale origin/<ref> beat the operator's own branch", () => {
+    const { checkout, headSha } = buildOrphanedCheckout(sandbox, "stale-remote");
+    const parent = gitIn(["rev-parse", `${headSha}^`], checkout);
+    execFileSync("git", ["-C", checkout, "checkout", "-B", "topic", headSha], { stdio: "ignore" });
+    // A remote-tracking ref left behind at the OLDER commit by some earlier fetch.
+    execFileSync("git", ["-C", checkout, "update-ref", "refs/remotes/origin/topic", parent], {
+      stdio: "ignore",
+    });
+    const sha = moveExistingCheckoutToRef({
+      targetDir: checkout,
+      ref: "topic",
+      fetch: false,
+      log: () => {},
+    });
+    expect(sha).toBe(headSha);
+  });
+
   it("refuses an unresolvable ref by NAME, and runs nothing after the refusal", () => {
     const { checkout } = buildOrphanedCheckout(sandbox, "unresolvable");
     const missing = "b".repeat(40);
@@ -472,37 +720,38 @@ describe("runInstall — the unattended opt-ins reach the children", () => {
       { log: () => {}, deps },
     );
 
-  it("OFF: the sync is tip-tracking, pnpm is bare, the setup child carries no --pinned", async () => {
+  it("OFF: the sync is tip-tracking, pnpm is bare, the setup child carries no opt-in", async () => {
     const { seen, deps } = recordingDeps();
     await install(path.join(sandbox, "off"), [], deps);
     expect(seen.sync).toHaveLength(1);
     expect(seen.sync[0].argv).toEqual([]);
     expect(seen.pnpm).toHaveLength(1);
-    expect(seen.pnpm[0].frozenLockfile ?? false).toBe(false);
+    expect(seen.pnpm[0].frozenLockfile).toBe(false);
     expect(seen.setup).toHaveLength(1);
-    expect(setupChildArgs(seen.setup[0])).toEqual(["instance", "setup", "dev"]);
+    expect(seen.setup[0].pinnedExtensions).toBeFalsy();
+    expect(seen.setup[0].frozenLockfile).toBeFalsy();
   });
 
   it("--pinned-extensions: the install's OWN sync and the setup child both run pinned", async () => {
     const { seen, deps } = recordingDeps();
     await install(path.join(sandbox, "pinned"), ["--pinned-extensions"], deps);
-    expect(seen.sync[0].argv).toContain("--pinned");
-    expect(setupChildArgs(seen.setup[0])).toEqual(["instance", "setup", "dev", "--pinned"]);
+    expect(seen.sync[0].argv).toEqual(["--pinned"]);
+    expect(seen.setup[0].pinnedExtensions).toBe(true);
     // It did NOT turn on anything else.
-    expect(seen.pnpm[0].frozenLockfile ?? false).toBe(false);
+    expect(seen.pnpm[0].frozenLockfile).toBe(false);
+    expect(seen.setup[0].frozenLockfile).toBeFalsy();
   });
 
-  it("--frozen-lockfile: the dependency install carries it; nothing else changes", async () => {
+  it("--frozen-lockfile: BOTH dependency installs carry it — the install's and the child's", async () => {
     const { seen, deps } = recordingDeps();
     await install(path.join(sandbox, "frozen"), ["--frozen-lockfile"], deps);
     expect(seen.pnpm[0].frozenLockfile).toBe(true);
-    expect(resolvePnpmInvocation({ exists: present("pnpm"), frozenLockfile: seen.pnpm[0].frozenLockfile }).args)
-      .toEqual(["install", "--frozen-lockfile"]);
+    expect(seen.setup[0].frozenLockfile).toBe(true);
     expect(seen.sync[0].argv).toEqual([]);
-    expect(setupChildArgs(seen.setup[0])).toEqual(["instance", "setup", "dev"]);
+    expect(seen.setup[0].pinnedExtensions).toBeFalsy();
   });
 
-  it("the three compose: pinned sync + pinned setup child + a frozen dependency install", async () => {
+  it("the three compose: pinned sync + a pinned, frozen setup child + a frozen dependency install", async () => {
     // `--no-fetch` only means anything on an EXISTING checkout, so seed one
     // first — the unattended shape: the checkout is already there, at the commit.
     const dir = path.join(sandbox, "all-three");
@@ -523,15 +772,14 @@ describe("runInstall — the unattended opt-ins reach the children", () => {
       ],
       { log: () => {}, deps },
     );
-    expect(seen.sync[0].argv).toContain("--pinned");
+    expect(seen.sync[0].argv).toEqual(["--pinned"]);
     expect(seen.pnpm[0].frozenLockfile).toBe(true);
-    expect(setupChildArgs(seen.setup[0])).toEqual([
-      "instance",
-      "setup",
-      "dev",
-      "--skip-dev-apps",
-      "--pinned",
-    ]);
+    expect(seen.setup[0]).toMatchObject({
+      mode: "dev",
+      skipDevApps: true,
+      pinnedExtensions: true,
+      frozenLockfile: true,
+    });
     expect(gitIn(["rev-parse", "HEAD"], dir)).toBe(sha);
   });
 
@@ -565,6 +813,61 @@ describe("runInstall — the unattended opt-ins reach the children", () => {
     await expect(
       install(path.join(sandbox, "no-fetch-fresh"), ["--no-fetch", "--no-install"], deps),
     ).rejects.toThrow(/--no-fetch/);
+  });
+
+  // The co-use executor owns its WHOLE install tail — its own extension sync,
+  // its own dependency install and its own setup call. An opt-in that stopped
+  // at the default path would silently give a co-use instance a tip-tracking
+  // fleet and a lockfile-rewriting install.
+  it("co-use carries the same opt-ins through its own tail", async () => {
+    const seen = { sync: [], pnpm: [], setup: [] };
+    const installDir = path.join(sandbox, "couse");
+    await runInstall(
+      [
+        "--dir", installDir,
+        "--repo-url", `file://${originRepo}`,
+        "--ref", "main",
+        "--on-conflict=co-use",
+        "--pinned-extensions",
+        "--frozen-lockfile",
+        "--yes",
+      ],
+      {
+        log: () => {},
+        deps: {
+          ...recordingDeps().deps,
+          // Past the fail-closed capability gate, with a donor that supplies the
+          // shared endpoints; no stack is ever brought up on this road.
+          probeCookiePrefixSupport: () => true,
+          readDonorEnv: () => ({
+            SUPABASE_DB_URL: "postgresql://u:p@127.0.0.1:5434/postgres",
+            REDIS_URL: "redis://127.0.0.1:6379",
+            NANGO_SERVER_URL: "http://127.0.0.1:3003",
+            BETTER_AUTH_SECRET: "donor-secret",
+            CINATRA_ENCRYPTION_KEY: "donor-enc",
+          }),
+          coUseDbOps: {
+            createCoUseDb: async () => ({ created: true }),
+            dropDbCreatedByThisRun: async () => {},
+          },
+          bringUpInfra: () => {
+            throw new Error("co-use must NOT bring up an infra stack");
+          },
+          syncDevExtensions: async (args) => {
+            seen.sync.push(args);
+            return { skipped: true, reason: "no declared dev extensions", results: [] };
+          },
+          pnpmInstall: (args) => seen.pnpm.push(args),
+          runSetup: (args) => {
+            seen.setup.push(args);
+            return { tolerated: true, registrySkew: false, lines: [] };
+          },
+        },
+      },
+    );
+    expect(seen.sync[0].argv).toEqual(["--pinned"]);
+    expect(seen.pnpm[0].frozenLockfile).toBe(true);
+    expect(seen.setup[0]).toMatchObject({ pinnedExtensions: true, frozenLockfile: true });
   });
 });
 
