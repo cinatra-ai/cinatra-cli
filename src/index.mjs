@@ -529,6 +529,7 @@ Usage:
   cinatra install [dev|prod|demo] [--dir <path>] [--ref <main|tag|sha>]
                   [--mode dev|prod|demo] [--repo-url <url>] [--yes] [--force] [--reset-env]
                   [--skip-dev-apps] [--no-infra] [--no-install] [--no-setup] [--no-wayflow]
+                  [--pinned-extensions] [--frozen-lockfile] [--no-fetch]
                   [--on-conflict fail|prompt|isolated|stop-existing|attach|external|co-use]
                   [--infra new|external|share] [--instance <slug>] [--app-port <n>]
                   [--port-offset auto|<n>] [--db-url <url>] [--redis-url <url>]
@@ -621,6 +622,26 @@ Commands:
                                       owns a local stack starts it by default, so agents work
                                       out of the box; pass this for a deliberately lean install
                                       (agent runs then fail until you start it by hand).
+                    For an UNATTENDED install — a CI job or an automated verification runner
+                    that creates many instances in a checkout already parked at an exact
+                    commit and has to hand it back byte-for-byte clean. All three are off by
+                    default; without them the install is unchanged.
+                    --pinned-extensions  Sync the dev extension fleet at the checkout's OWN
+                                      committed lock shas instead of the repos' tips, in this
+                                      install AND in the setup phase it runs. Fail-closed: an
+                                      entry that cannot be pinned stops the install. Dev-like
+                                      modes only (a prod install acquires its extensions
+                                      pinned + integrity-verified already).
+                    --frozen-lockfile Run every dependency install as \`pnpm install
+                                      --frozen-lockfile\`, so a lockfile that does not match
+                                      the manifests is a clear refusal instead of a rewritten
+                                      tracked file.
+                    --no-fetch        Move an EXISTING checkout to --ref without fetching
+                                      from origin. Refuses, naming the ref, when that ref is
+                                      not already resolvable in the checkout — and refuses
+                                      outright when there is no checkout to move (a fresh
+                                      clone is a network operation). For a worktree already
+                                      parked at the commit you want.
                     When an EXISTING instance already holds the ports, install
                     offers + executes an isolation option (prompts on a TTY):
                     --on-conflict=isolated  Second FULL stack on remapped ports + own app port.
@@ -6629,6 +6650,21 @@ function regenerateExtensionManifest(repoRoot) {
 // imported at the call site below to avoid pulling in the server-only
 // barrel from this plain-Node CLI.
 
+/** The argv the dev-extension sync inside `instance setup dev` parses.
+ *
+ *  A caller that NARROWS the run (`install --skip-dev-apps`, `instance
+ *  refresh`) passes an explicit signal rather than letting the ambient argv
+ *  speak, and the narrowed list used to be a single-flag array — which silently
+ *  dropped every OTHER flag the sync reads from the same argv. `--pinned` is
+ *  one of them, so `install --pinned-extensions --skip-dev-apps` would have
+ *  pinned the install's own sync and left the setup child's sync tip-tracking.
+ *  Rebuild the list from the signals this run actually carries instead of
+ *  substituting for it. */
+export function devExtensionSyncArgv(skipDevApps, ambientArgv = process.argv.slice(2)) {
+  if (!skipDevApps) return ambientArgv;
+  return ["--skip-dev-apps", ...(ambientArgv.includes("--pinned") ? ["--pinned"] : [])];
+}
+
 async function runSetup(mode, { skipDevApps = false } = {}) {
   const repoRoot = getRepoRoot();
   const env = collectEnvironment(repoRoot);
@@ -6787,7 +6823,7 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
         extensionSync = await syncCinatraDevExtensions({
           repoRoot,
           targetRoot: repoRoot,
-          argv: skipDevApps ? ["--skip-dev-apps"] : process.argv.slice(2),
+          argv: devExtensionSyncArgv(skipDevApps),
         });
       } catch (err) {
         extensionSyncFailed = true;

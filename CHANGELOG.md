@@ -8,6 +8,34 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`cinatra install` can now be run unattended, by a caller that has to hand
+  its checkout back clean.** `install --mode dev` is the one command that makes
+  an instance exist or makes it healthy, but three small things kept it out of
+  reach of an operator creating many isolated instances with nobody watching —
+  a CI job or an automated verification runner, working in a checkout already
+  parked at an exact commit and required to hand it back byte-for-byte clean.
+  The dev extension fleet was synced
+  tip-tracking, so two installs of the same commit could differ; the dependency
+  install was a bare `pnpm install`, which rewrites the lockfile rather than
+  reporting the drift; and an existing checkout was always moved to `--ref`
+  behind a `git fetch`, which is wasted work when the checkout is already at
+  that commit and a network dependency where there may be none. Three opt-in
+  flags close them. `--pinned-extensions` syncs the fleet at the checkout's OWN
+  committed lock shas — fail-closed, so an entry that cannot be pinned stops the
+  install — in the install's own sync AND in the setup phase it runs, so the
+  fleet cannot float back to a tip halfway through; it is refused for a `--mode
+  prod` install, which acquires its extensions pinned and integrity-verified on
+  its own path. `--frozen-lockfile` runs every dependency install on the install
+  path as `pnpm install --frozen-lockfile`, on every package-manager tier, so a
+  lockfile that no longer matches the manifests is a clear refusal instead of a
+  modified tracked file. `--no-fetch` moves an existing checkout — a plain clone
+  or a detached worktree — to a branch, tag or full commit SHA using only what
+  that checkout already has, refusing and naming the ref when it does not
+  resolve locally, and refusing outright when there is no checkout to move,
+  because a fresh clone is a network operation and silently taking it would
+  hand the caller the access they asked us not to take. All three are off by
+  default and nothing about a hand-run install changes.
+
 - **The preview image build can finally be tuned for a many-core builder.** The
   checkout's Dockerfile declares two build args as its documented remedy for a
   constrained or many-core host, and no CLI surface could send either one: the
