@@ -27,11 +27,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
   prod` install, which acquires its extensions pinned and integrity-verified on
   its own path; with `--mode preview` it pins the CHECKOUT's fleet, while what
   the preview image acquires stays `--fleet`'s business. `--frozen-lockfile`
-  runs BOTH dependency installs of the run — the install's own, and the one the
+  runs EVERY dependency install of the run — the install's own, and the one the
   setup phase performs when it re-links the workspace after its extension sync
-  or its prod acquisition — as `pnpm install --frozen-lockfile`, on every
-  package-manager tier, so a lockfile that no longer matches the manifests is a
-  clear refusal instead of a modified tracked file. `--no-fetch` moves an
+  or its prod acquisition (a `--mode prod` install has three, one either side of
+  the acquisition plus the child's) — as `pnpm install --frozen-lockfile`, on
+  every package-manager tier, so a lockfile that no longer matches the manifests
+  is a clear refusal instead of a modified tracked file. `--no-fetch` moves an
   existing checkout — a plain clone or a detached worktree — to a branch, tag or
   full commit SHA using only what that checkout already has: it requires an
   explicit `--ref`, resolves a local branch through its own `refs/heads` entry

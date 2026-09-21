@@ -634,11 +634,12 @@ Commands:
                                       pinned + integrity-verified already). Under --mode
                                       preview it pins the CHECKOUT's fleet; what the preview
                                       IMAGE acquires is --fleet's business.
-                    --frozen-lockfile Run BOTH of the run's dependency installs — this one
-                                      and the setup phase's workspace re-link — as \`pnpm
-                                      install --frozen-lockfile\`, so a lockfile that does not
-                                      match the manifests is a clear refusal instead of a
-                                      rewritten tracked file.
+                    --frozen-lockfile Run EVERY dependency install of the run — this one (a
+                                      prod install does two, around the extension
+                                      acquisition) and the setup phase's workspace re-link —
+                                      as \`pnpm install --frozen-lockfile\`, so a lockfile that
+                                      does not match the manifests is a clear refusal instead
+                                      of a rewritten tracked file.
                     --no-fetch        Move an EXISTING checkout to --ref without fetching it
                                       from origin; needs an explicit --ref. Refuses, naming
                                       the ref, when that ref is not already resolvable in the
@@ -6848,6 +6849,17 @@ async function runSetup(mode, { skipDevApps = false, frozenLockfile = false } = 
       // (post-cutover); a no-op when `cinatra.devExtensions` is empty.
       // Loud-but-non-fatal, like the dev-app sync in the tail.
       try {
+        // DO NOT narrow this branch by adding `skipDevApps` to the options
+        // `setupPhaseOptions(rest)` returns. `install --pinned-extensions`
+        // forwards `--pinned` on the setup child's command line, and the ONLY
+        // reason the child's sync honours it is that `skipDevApps` is false for
+        // every CLI-invoked setup — the dispatcher passes no such option — so
+        // the ambient-argv branch below carries the flag through. Deriving
+        // `skipDevApps` from the child's own args would flip this to the
+        // single-flag array and silently unpin the fleet the parent pinned,
+        // with nothing failing. (`instance refresh` reaches the narrowed branch
+        // by passing the option directly, which is why it is the one caller
+        // whose extra flags do not reach the sync.)
         extensionSync = await syncCinatraDevExtensions({
           repoRoot,
           targetRoot: repoRoot,
@@ -16450,7 +16462,7 @@ function readCliVersion() {
  *
  * @returns {Record<string, (rest: string[], routedTokens: string[]) => unknown>}
  */
-function buildHandlers() {
+export function buildHandlers({ runSetupPhase = runSetup } = {}) {
   return {
     install: async (rest) => {
       // Command-routing dispatcher contract: `rest = argv.slice(path.length)` already
@@ -16547,12 +16559,17 @@ function buildHandlers() {
     // `setup` with NO mode: env-driven dev|prod dispatch.
     setup: async () => {
       const env = collectEnvironment(getRepoRoot());
-      await runSetup(readConfiguredRuntimeMode(env) === "production" ? "prod" : "dev");
+      await runSetupPhase(readConfiguredRuntimeMode(env) === "production" ? "prod" : "dev");
     },
     "setup.dev|prod": async (rest, routedTokens) => {
       // The `dev|prod` mode token is the LAST routed token (canonical path
       // `["instance","setup","dev|prod"]`, alias path `["setup","dev|prod"]`).
-      await runSetup(routedTokens[routedTokens.length - 1], setupPhaseOptions(rest));
+      // `setupPhaseOptions(rest)` is what turns the child's own
+      // `--frozen-lockfile` token into behaviour: without it the token still
+      // arrives and is silently ignored, and the child's workspace re-link runs
+      // unfrozen. It is the only place that reads it, which is what keeps a
+      // flag typed at `instance refresh` from reaching the setup phase.
+      await runSetupPhase(routedTokens[routedTokens.length - 1], setupPhaseOptions(rest));
     },
     "setup.nango": async () => {
       await runSetupNango();

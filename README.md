@@ -355,9 +355,10 @@ pretending to honour it. With `--mode preview` it pins the fleet of the
 **checkout** (the dev half of that composition); what the preview *image*
 acquires is chosen by `--fleet` and is not affected.
 
-`--frozen-lockfile` reaches both dependency installs the run performs — the
-install's own, and the one the setup phase runs when it re-links the workspace
-after its extension sync — on every package-manager tier.
+`--frozen-lockfile` reaches every dependency install of the run — the install's
+own, and the one the setup phase runs when it re-links the workspace after its
+extension sync — on every package-manager tier. A `--mode prod` install performs
+three: one either side of the extension acquisition, and the setup child's.
 
 `--no-fetch` moves an existing checkout — a plain clone or a detached git
 worktree — to `--ref` (a branch, a tag, or a full commit SHA) using only what

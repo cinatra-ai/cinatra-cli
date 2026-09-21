@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  buildHandlers,
   installAfterExtensionSync,
   resolvePnpmInstallInvocation,
   setupPhaseOptions,
@@ -427,6 +428,46 @@ describe("setupPhaseOptions — only `instance setup dev|prod` reads the flag", 
   });
 });
 
+describe("the `instance setup dev|prod` HANDLER turns the token into behaviour", () => {
+  // The joint between the child's command line and the child's behaviour. The
+  // parent forwards `--frozen-lockfile` on the child's argv, and the routing
+  // contract delivers it in `rest` — but a handler that drops
+  // `setupPhaseOptions(rest)` still accepts the token, ignores it, and runs its
+  // workspace re-link unfrozen. Nothing else observes that, so it is asserted
+  // on the real handler map here.
+  function handlerCalls() {
+    const calls = [];
+    const handlers = buildHandlers({
+      runSetupPhase: async (...args) => {
+        calls.push(args);
+      },
+    });
+    return { calls, handler: handlers["setup.dev|prod"] };
+  }
+
+  it("OFF: the setup phase is asked for a plain install", async () => {
+    const { calls, handler } = handlerCalls();
+    await handler([], ["instance", "setup", "dev"]);
+    expect(calls).toEqual([["dev", { frozenLockfile: false }]]);
+  });
+
+  it("ON: the child's own --frozen-lockfile reaches the setup phase, dev and prod", async () => {
+    const dev = handlerCalls();
+    await dev.handler(["--frozen-lockfile"], ["instance", "setup", "dev"]);
+    expect(dev.calls).toEqual([["dev", { frozenLockfile: true }]]);
+
+    const prod = handlerCalls();
+    await prod.handler(["--frozen-lockfile"], ["instance", "setup", "prod"]);
+    expect(prod.calls).toEqual([["prod", { frozenLockfile: true }]]);
+  });
+
+  it("the other forwarded tokens do not turn it on", async () => {
+    const { calls, handler } = handlerCalls();
+    await handler(["--skip-dev-apps", "--pinned"], ["instance", "setup", "dev"]);
+    expect(calls).toEqual([["dev", { frozenLockfile: false }]]);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 3. The ref move with no fetch, against a REAL checkout whose origin is gone.
 //
@@ -742,13 +783,77 @@ describe("runInstall — the unattended opt-ins reach the children", () => {
     expect(seen.setup[0].frozenLockfile).toBeFalsy();
   });
 
-  it("--frozen-lockfile: BOTH dependency installs carry it — the install's and the child's", async () => {
+  it("--frozen-lockfile: EVERY dependency install carries it — the install's and the child's", async () => {
     const { seen, deps } = recordingDeps();
     await install(path.join(sandbox, "frozen"), ["--frozen-lockfile"], deps);
     expect(seen.pnpm[0].frozenLockfile).toBe(true);
     expect(seen.setup[0].frozenLockfile).toBe(true);
     expect(seen.sync[0].argv).toEqual([]);
     expect(seen.setup[0].pinnedExtensions).toBeFalsy();
+  });
+
+  it("--frozen-lockfile on a PROD install: both of its installs and its setup child", async () => {
+    // The prod branch is a separate construction site: it installs, acquires the
+    // required extensions, installs AGAIN, then runs a `setup prod` child that
+    // re-links the workspace once more. Every one of those has to be frozen, or
+    // the tracked lockfile can still be rewritten under a caller that asked for
+    // it not to be.
+    const savedMode = process.env.CINATRA_RUNTIME_MODE;
+    delete process.env.CINATRA_RUNTIME_MODE;
+    try {
+      const { seen, deps } = recordingDeps({ acquireProdExtensions: () => {} });
+      await runInstall(
+        [
+          "--dir", path.join(sandbox, "prod-frozen"),
+          "--repo-url", `file://${originRepo}`,
+          "--ref", "main",
+          "--mode", "prod",
+          "--yes",
+          "--frozen-lockfile",
+          "--infra", "external",
+          "--db-url", "postgresql://u:p@127.0.0.1:5434/inst",
+          "--external-db-disposable",
+        ],
+        { log: () => {}, deps },
+      );
+      // install → acquire-prod → install, all frozen.
+      expect(seen.pnpm).toHaveLength(2);
+      expect(seen.pnpm.map((c) => c.frozenLockfile)).toEqual([true, true]);
+      // …and the `setup prod` child it spawns.
+      expect(seen.setup).toHaveLength(1);
+      expect(seen.setup[0]).toMatchObject({ mode: "prod", frozenLockfile: true });
+      // A prod install never syncs the dev fleet.
+      expect(seen.sync).toHaveLength(0);
+    } finally {
+      if (savedMode === undefined) delete process.env.CINATRA_RUNTIME_MODE;
+      else process.env.CINATRA_RUNTIME_MODE = savedMode;
+    }
+  });
+
+  it("a PROD install with no opt-in keeps both installs and its setup child plain", async () => {
+    const savedMode = process.env.CINATRA_RUNTIME_MODE;
+    delete process.env.CINATRA_RUNTIME_MODE;
+    try {
+      const { seen, deps } = recordingDeps({ acquireProdExtensions: () => {} });
+      await runInstall(
+        [
+          "--dir", path.join(sandbox, "prod-plain"),
+          "--repo-url", `file://${originRepo}`,
+          "--ref", "main",
+          "--mode", "prod",
+          "--yes",
+          "--infra", "external",
+          "--db-url", "postgresql://u:p@127.0.0.1:5434/inst",
+          "--external-db-disposable",
+        ],
+        { log: () => {}, deps },
+      );
+      expect(seen.pnpm.map((c) => c.frozenLockfile)).toEqual([false, false]);
+      expect(seen.setup[0].frozenLockfile).toBeFalsy();
+    } finally {
+      if (savedMode === undefined) delete process.env.CINATRA_RUNTIME_MODE;
+      else process.env.CINATRA_RUNTIME_MODE = savedMode;
+    }
   });
 
   it("the three compose: pinned sync + a pinned, frozen setup child + a frozen dependency install", async () => {

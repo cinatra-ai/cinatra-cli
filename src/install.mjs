@@ -9277,6 +9277,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   const syncDevExtensions = deps.syncDevExtensions ?? syncCinatraDevExtensions;
   const installDeps = deps.pnpmInstall ?? pnpmInstall;
   const runSetupChild = deps.runSetupInTarget ?? runSetupInTarget;
+  const acquireProd = deps.acquireProdExtensions ?? acquireProdExtensions;
   // `--frozen-lockfile` is the same opt-in on every dependency install this run
   // performs (prod does two), so it is resolved once here.
   const frozenLockfile = opts.frozenLockfile === true;
@@ -9327,7 +9328,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   } else {
     // prod: install → acquire-prod → install → setup prod (mirrors setup.sh).
     installDeps({ targetDir, usePnpmDirect, frozenLockfile, log });
-    acquireProdExtensions({ targetDir, log });
+    acquireProd({ targetDir, log });
     installDeps({ targetDir, usePnpmDirect, frozenLockfile, log });
     if (opts.noSetup) {
       log("- Skipping setup (--no-setup). Re-run `cinatra install --mode prod` (it reconciles in place — runs the setup phase) when ready.");
