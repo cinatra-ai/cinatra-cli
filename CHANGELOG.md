@@ -8,6 +8,50 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **An instance on a shared PostgreSQL server can be given its own database
+  name and its own template database.** Running several isolated instances on
+  one machine against ONE PostgreSQL server is the cheap way to do it, and the
+  database is the one thing each instance must not share. `cinatra install`
+  could already create that separate database on the shared server, but it
+  decided both halves itself: the name was derived from the instance, and the
+  template it was copied from was always the seed the CLI maintains. An
+  operator who had prepared a template database of their own — migrated and
+  seeded once, so that every later instance costs a copy instead of a full
+  migration run — had no way to say so, and no way to fit the CLI's databases
+  into a naming scheme they already used. `--db-name <name>` now decides what
+  the database is called and `--db-template <name>` what it is created from;
+  with neither flag nothing changes for anyone. Both names are checked against
+  one pattern — a lowercase letter, then lowercase letters, digits or
+  underscores, at most 63 bytes — while the arguments are parsed, so a bad name
+  costs nothing: it is refused before a checkout is touched and long before a
+  connection is opened. Every name still reaches SQL quoted as an identifier.
+  A legal name is not yet a safe one, so a `--db-name` is refused as well when
+  it is one of the databases no cinatra command may touch, when it sits in a
+  namespace the CLI creates and drops on its own (`instance clone prune` and
+  `clone refresh-seed` delete those without asking), when it is the database the
+  donor instance itself uses — which would put two instances in one database,
+  the single thing this road exists to prevent — and when it is the template it
+  would be copied from, which would run the instance inside its own template.
+  The donor's own database is read from its connection string, from the path or
+  from a libpq `dbname` parameter, and asked of the server when the string names
+  none, so that check is made rather than skipped; in the one case where even
+  that cannot answer, the run says so instead of passing over it in silence.
+  A template that is marked one but still open to connections is a warning, not
+  a refusal, and PostgreSQL's own `template0`/`template1` are accepted with a
+  line saying the new database will be empty.
+  A template named by an operator is checked for existence and for being usable
+  as a template BEFORE anything is created, instead of surfacing as whatever
+  the server says once the create has already been attempted. A database of the
+  chosen name that already exists is used as it stands — it is never dropped
+  and never created over, and a failed install rolls back only a database that
+  same run created.
+
+- **`--bullmq-queue` now names the instance's job queue.** It was accepted and
+  then never read: an operator could pass it, see the install succeed, and
+  believe they had separated something that was in fact still derived.
+  `--bullmq-queue <name>` now really sets the instance's queue name on the
+  shared Redis, which is where that isolation actually lives.
+
 - **The preview image build can finally be tuned for a many-core builder.** The
   checkout's Dockerfile declares two build args as its documented remedy for a
   constrained or many-core host, and no CLI surface could send either one: the
@@ -58,6 +102,25 @@ project adheres to [Semantic Versioning](https://semver.org/).
   its health gate. `status` now reports the container's actual state (running,
   stopped or absent) alongside the registry row's, and says which verb closes
   the gap.
+
+### Changed
+
+- **Three install flags that did nothing now say so, or say which road they
+  take.** `--redis-db` was accepted and never read. No install road applies a
+  Redis database index to an instance — the shared-services road reuses the
+  Redis URL it is given, unchanged — so the flag is now refused, with that
+  explanation and with the one separation that does work (`--bullmq-queue`),
+  instead of being accepted and quietly ignored. `--db-name`, `--db-template`,
+  `--bullmq-queue` and `--reuse-from` SELECT the shared-services road: passing
+  one beside an `--on-conflict` or `--infra` that names a different road used to
+  take the shared-services road anyway and ignore the explicit choice, and is
+  now refused while the arguments are parsed, naming both halves of the
+  contradiction. A re-run that converges on an instance already recorded ready
+  creates nothing, so a `--db-name` that disagrees with the database that
+  instance is recorded on is refused rather than reported as done, and a
+  `--db-template` or `--bullmq-queue` passed to such a re-run says plainly that
+  it had no effect. The install summary now prints the database the instance is
+  recorded on, never the one that was merely asked for.
 
 ### Fixed
 

@@ -326,6 +326,9 @@ Useful extras:
     cinatra install --instance <name>        # name the instance (default: the folder name)
     cinatra install --app-port <n>           # pick the app port for an isolated instance
     cinatra install --port-offset auto|<n>   # how far to shift an isolated instance's ports
+    cinatra install --db-name <name>         # name the co-use instance's own database
+    cinatra install --db-template <name>     # create it from your own template database
+    cinatra install --bullmq-queue <name>    # name its job queue on the shared Redis
     cinatra install --dry-run                # show what would happen, change nothing
     cinatra install --list-instances         # list the instances you have set up
     cinatra install --status [--dir <path>]  # show one checkout's instance state
@@ -346,6 +349,49 @@ it, because setup can write to that database).
 > needed and points you at `--on-conflict=isolated`). When the donor sets a
 > Graphiti URL, add `--allow-shared-graphiti` to accept sharing it (it is
 > org-scoped, not per-instance).
+>
+> **Your own database name and template.** By default the instance's database is
+> named after the instance and created from the seed template the CLI maintains.
+> If you run many instances against one PostgreSQL server, you can say what that
+> database is called and what it is copied from: `--db-name <name>` and
+> `--db-template <name>`. A template database you prepared yourself — migrated
+> and seeded once, then marked a template — makes each new instance's database a
+> copy made in an instant rather than a full migration run. Either flag selects
+> this shared-services road, so `cinatra install` refuses them beside an
+> `--on-conflict`/`--infra` that asks for a different one.
+>
+> Both names must be plain PostgreSQL identifiers: a lowercase letter, then
+> lowercase letters, digits or underscores, at most 63 bytes. A `--db-name` may
+> not be one of the databases no cinatra command may touch (`postgres`,
+> `cinatra`, the seed, `template0`, `template1`), may not sit in a namespace the
+> CLI creates and drops on its own (`cinatra_clone_…`, `cinatra_inst_…`,
+> `cinatra_seed…` — `instance clone prune` and `clone refresh-seed` delete those
+> without asking), may not be the database the donor instance itself uses, and
+> may not be the template you are copying from. Every one of those is refused
+> before `cinatra install` opens a connection.
+>
+> The template must already exist and be marked one:
+> `ALTER DATABASE "<name>" WITH IS_TEMPLATE true ALLOW_CONNECTIONS false`. Both
+> halves matter — PostgreSQL will not copy a database while another session is
+> connected to it, which is exactly what the second half prevents; the CLI marks
+> its own seed the same way. This is checked before anything is created, and a
+> template that is still open to connections is called out as a warning rather
+> than refused. PostgreSQL's own `template0` and `template1` are accepted too;
+> the run then says plainly that the new database will be empty.
+>
+> A database of the chosen name that ALREADY exists is used as it stands: it is
+> never dropped, never created over — the template is then not used at all, and
+> the run says so — and never removed if the install fails afterwards. Only a
+> database this run created itself is rolled back. `--bullmq-queue <name>`
+> likewise names the instance's job queue on the shared Redis instead of
+> deriving it.
+>
+> One requirement the CLI cannot check for you: a co-use instance INHERITS the
+> donor's `BETTER_AUTH_SECRET` and `CINATRA_ENCRYPTION_KEY`, because a database
+> copied from the donor's seed must be readable with the donor's keys. If your
+> own template was seeded under different keys, its encrypted rows will not
+> decrypt in the new instance. Prepare the template on the same keys, or expect
+> to re-enter whatever was encrypted.
 
 ## Author an extension
 

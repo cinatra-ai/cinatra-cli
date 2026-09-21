@@ -112,6 +112,23 @@ export function cloneDbName(slug) {
 const CLONE_DB_NAME_RE = /^cinatra_clone_[a-z0-9][a-z0-9_]{0,29}$/;
 
 /**
+ * The database names no CLI road may ever claim or destroy: the server's own
+ * maintenance database, the app database, the seed template and the two pg
+ * system templates. ONE list — the destructive `clone prune` guard below and
+ * the install surface's operator-name guard (`install-couse.mjs`) both read it,
+ * so the set a `--db-name` may not take is exactly the set a prune refuses to
+ * drop. Two copies could drift apart, and then one side would hand out a name
+ * the other treats as sacred.
+ */
+export const RESERVED_DB_NAMES = Object.freeze([
+  "postgres",
+  "cinatra",
+  SEED_DB_NAME,
+  "template0",
+  "template1",
+]);
+
+/**
  * Hard guard for the destructive `clone prune` path. Returns true for any
  * database name that must NEVER be dropped: the maintenance/app DBs, the
  * seed template, the pg system templates, and — critically — ANY name that
@@ -120,14 +137,7 @@ const CLONE_DB_NAME_RE = /^cinatra_clone_[a-z0-9][a-z0-9_]{0,29}$/;
  */
 export function isProtectedDbName(name) {
   if (typeof name !== "string" || name.length === 0) return true;
-  const reserved = new Set([
-    "postgres",
-    "cinatra",
-    SEED_DB_NAME,
-    "template0",
-    "template1",
-  ]);
-  if (reserved.has(name)) return true;
+  if (RESERVED_DB_NAMES.includes(name)) return true;
   // Anything not shaped EXACTLY like a clone DB is protected (fail closed).
   return !CLONE_DB_NAME_RE.test(name);
 }

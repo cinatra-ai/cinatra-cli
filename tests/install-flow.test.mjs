@@ -46,8 +46,10 @@ describe("parseInstallArgs — cinatra-cli#17 surface", () => {
     expect(parseInstallArgs(["--infra", "share"]).couseRequested).toBe(true);
     expect(parseInstallArgs(["--on-conflict", "co-use"]).onConflict).toBe("co-use");
     expect(parseInstallArgs(["--on-conflict", "co-use"]).couseRequested).toBe(true);
-    // co-use sidecar flags also trip the gate.
-    expect(parseInstallArgs(["--db-name", "cinatra_clone_x"]).couseRequested).toBe(true);
+    // co-use sidecar flags also trip the gate. (The name is an operator's own:
+    // `--db-name` refuses the namespaces the CLI creates and drops itself, so a
+    // `cinatra_clone_*` name never reaches this gate.)
+    expect(parseInstallArgs(["--db-name", "team_instance_a"]).couseRequested).toBe(true);
     expect(parseInstallArgs(["--reuse-from", "/x"]).couseRequested).toBe(true);
   });
 
