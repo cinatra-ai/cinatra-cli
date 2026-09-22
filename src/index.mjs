@@ -187,6 +187,7 @@ import {
   cloneTailscaleStateDir,
   ensureCloneRuntimeDir,
   findPositionalSlug,
+  isInstanceProcessRunning,
   isPidAlive,
   isRuntimeLockHeld,
   processCommandLineMatches,
@@ -280,6 +281,19 @@ import {
   devTunnelRuntimeSlug,
   claimDevTunnelRuntimeDir,
 } from "./dev-tunnel-identity.mjs";
+// cinatra-cli#261 — the per-instance start/stop/restart derivation: the
+// selector, one instance's runtime paths, names and ports, the record of what a
+// running instance holds, and the refusal when another one already holds it.
+// Pure leaf (node builtins + the slug/path helpers), safe to import statically.
+import {
+  DEFAULT_INSTANCE_SLUG,
+  assertInstanceStartFree,
+  clearInstanceRecord,
+  listInstanceRecords,
+  parseInstanceStartFlags,
+  resolveInstanceStartPlan,
+  writeInstanceRecord,
+} from "./instance-start.mjs";
 // cinatra-cli#246 — the verification exposure mode. Pure leaf (builtins only):
 // the path-scoped mapping builder, this mode's own runtime paths, the loopback
 // access-logging proxy, and the built-in check's assertion logic. Safe to
@@ -572,7 +586,7 @@ Usage:
   cinatra upgrade [--ref <ref>] [--force] [--docker=auto|always|--no-docker]
   cinatra login --app-url <https://instance> [--profile <name>] [--default]
   cinatra status [--app-url <url>|--profile <name>]
-  cinatra logs [--app | --service <name>] [--follow|-f]
+  cinatra logs [--app | --service <name>] [--instance <name>] [--follow|-f]
   cinatra skills reset-repo --yes [--app-url <url>]
   cinatra extensions purge <packageName> --confirm <packageName> --digest <d>
                           [--reason <r>] [--app-url <url>] --yes
@@ -853,9 +867,12 @@ Commands:
                     files by hand. Read-only — starts/stops nothing. With NO flag,
                     prints the app log then ALL container logs. Resolves the
                     checkout via the same root as \`instance start\`.
-                    --app             Only the dev-main app log
+                    --app             Only the app log
                                       (~/.cinatra/clones/dev-main/nextjs.log,
                                       written by \`cinatra instance start\`).
+                    --instance <name> Read THAT instance's app log instead of the
+                                      single instance's (the same name
+                                      \`instance start --instance\` was given).
                     --service <name>  Only that compose service's container log.
                     --follow, -f      Stream live instead of a snapshot. With --app
                                       it \`tail -f\`s the app log; with --service it
@@ -1048,9 +1065,18 @@ Usage:
                                # WHOLE dev app published for general dev use.
   cinatra instance tunnel stop
   cinatra instance tunnel status
-  cinatra instance start
-  cinatra instance stop
-  cinatra instance restart
+  cinatra instance start [--instance <name>] [--port <n>] [--runtime-port <n>]
+                         [--bind <address>] [--clean|--no-clean]
+                               # --instance <name> starts a SECOND instance beside the
+                               # first: its own runtime directory, pid file, log, lock,
+                               # container and queue name. --port / --runtime-port name
+                               # its app and agent-runtime ports (else its own
+                               # .env.local), and --bind 127.0.0.1 makes it
+                               # loopback-only. A name or a port another running
+                               # instance already holds is refused by name.
+  cinatra instance stop [--instance <name>]
+  cinatra instance restart [--instance <name>] [--port <n>] [--runtime-port <n>]
+                           [--bind <address>] [--clean|--no-clean]
   cinatra instance wordpress start|stop
   cinatra instance drupal start|stop
   cinatra instance wayflow start|stop
@@ -1237,8 +1263,13 @@ Commands:
   instance tunnel start|stop|status
                       Manage the dev-main Tailscale Funnel.
   instance start|stop|restart
-                      Start / stop / restart the local dev MAIN instance
-                      (host-native \`pnpm dev\` on port 3000).
+                      Start / stop / restart a local dev instance (host-native
+                      \`pnpm dev\` on port 3000). With \`--instance <name>\` this is
+                      one of SEVERAL instances on the machine: it owns its runtime
+                      directory, pid file, log, lock, container and queue name, and
+                      takes \`--port\` / \`--runtime-port\` (else its own .env.local)
+                      plus \`--bind <address>\` (\`--bind 127.0.0.1\` = loopback only).
+                      Without it: the single instance, unchanged.
   instance wordpress start|stop / instance drupal start|stop
                       Start or stop ONLY the named CMS dev container (single
                       compose service; preserves its named volumes).
@@ -11793,14 +11824,20 @@ async function runCloneStart(argv) {
 // only moving parts are the `pnpm dev` process group, its pid/log files, and
 // the `/api/health` probe.
 
-// Resolve the main checkout + its dev port. `getRepoRoot()` is the same
-// resolver `instance tunnel` uses: module-relative in-repo, or the operator's
-// checkout when run standalone. PORT mirrors `runDevTunnel`'s `nextjsPort`.
-function resolveDevMainTarget() {
+// Resolve the SELECTED instance: the checkout it runs from plus the plan that
+// names everything it owns — its runtime directory, pid/log/lock paths, its app
+// and runtime ports, its container and queue names, the argument list to spawn
+// and the environment overlay to spawn it under (cinatra-cli#261).
+//
+// `getRepoRoot()` is the same resolver `instance tunnel` uses: module-relative
+// in-repo, or the operator's checkout when run standalone. Without `--instance`
+// the plan is the single-instance one this verb has always produced: the
+// reserved slug, the same paths, `PORT` (default 3000) and a bare `pnpm dev`.
+function resolveInstanceTarget(argv = []) {
   const repoRoot = getRepoRoot();
   const env = collectEnvironment(repoRoot);
-  const port = Number(env.PORT) || 3000;
-  return { repoRoot, port };
+  const plan = resolveInstanceStartPlan({ argv, env });
+  return { repoRoot, plan: { ...plan, repoRoot } };
 }
 
 async function runDevStart(argv) {
@@ -11809,18 +11846,20 @@ async function runDevStart(argv) {
   // drive the `.next` auto-clean (cinatra-cli#105).
   rejectTailscaleAuthkeyFlag(argv);
   const cleanDirective = parseNextCleanDirective(argv);
-  const { repoRoot, port } = resolveDevMainTarget();
+  const { repoRoot, plan } = resolveInstanceTarget(argv);
+  const { port } = plan;
   // cinatra-cli#146: fail-closed — a production-mode checkout must never host-boot
   // `pnpm dev`. Refuse BEFORE taking the runtime lock or spawning.
   assertHostDevStartAllowed(repoRoot);
-  const pidPath = clonePidPath(DEV_MAIN_SLUG);
-  const logPath = cloneLogPath(DEV_MAIN_SLUG);
-  const healthUrl = `http://localhost:${port}/api/health`;
-  ensureCloneRuntimeDir(DEV_MAIN_SLUG);
+  const { pidPath, logPath, healthUrl } = plan;
+  const restartVerb = plan.isDefault
+    ? "cinatra instance restart"
+    : `cinatra instance restart --instance ${plan.slug}`;
+  ensureCloneRuntimeDir(plan.slug);
 
-  // Take the per-main runtime lock so start cannot race a concurrent
-  // start/stop on the same reserved slug.
-  acquireRuntimeLock(DEV_MAIN_SLUG);
+  // Take THIS instance's runtime lock so start cannot race a concurrent
+  // start/stop of the same instance. Another instance's start takes its own.
+  acquireRuntimeLock(plan.slug);
   let success = false;
   let spawnedChildPid = null;
   try {
@@ -11840,20 +11879,20 @@ async function runDevStart(argv) {
           // stop-first verb `restart --clean` (cinatra-cli#105).
           if (cleanDirective === "force") {
             throw new Error(
-              `Dev main is already running (pid ${recordedPid}); refusing to purge .next under a running ` +
-                "dev server. Run `cinatra instance restart --clean` to stop, clean, and restart.",
+              `${plan.label} is already running (pid ${recordedPid}); refusing to purge .next under a running ` +
+                `dev server. Run \`${restartVerb} --clean\` to stop, clean, and restart.`,
             );
           }
           const probe = await probeHttp(healthUrl, { timeoutMs: 1_500, intervalMs: 500 });
           if (probe.ok) {
-            console.log(`Dev main already running (pid ${recordedPid}) at http://localhost:${port}.`);
+            console.log(`${plan.label} already running (pid ${recordedPid}) at ${plan.appUrl}.`);
             // The HEAD may have moved since `.next` was built (e.g. a manual
             // `git pull` while the server kept running). We cannot purge under a
             // live server, so surface it and point at `restart` — unless
             // `--no-clean` opted out of the staleness signal (cinatra-cli#105).
             if (cleanDirective !== "off" && evaluateNextStaleness(repoRoot).stale) {
               console.warn(
-                "  Note: the checkout HEAD has moved since .next was built — run `cinatra instance restart` " +
+                `  Note: the checkout HEAD has moved since .next was built — run \`${restartVerb}\` ` +
                   "to rebuild against the new HEAD (a live .next purge is unsafe, so start left it in place).",
               );
             }
@@ -11862,7 +11901,7 @@ async function runDevStart(argv) {
           }
           // Alive + cwd-matched but unhealthy — kill the group before respawn
           // (mirrors runCloneStart's unhealthy-restart path).
-          console.log(`Dev main pid ${recordedPid} alive but unhealthy — restarting.`);
+          console.log(`${plan.label} pid ${recordedPid} alive but unhealthy — restarting.`);
           try { process.kill(-recordedPid, "SIGTERM"); } catch { /* best-effort */ }
           await new Promise((r) => setTimeout(r, 3_000));
           if (isPidAlive(recordedPid)) {
@@ -11871,7 +11910,9 @@ async function runDevStart(argv) {
           try { rmSync(pidPath, { force: true }); } catch { /* best-effort */ }
         } else if (match.alive && !match.ours) {
           throw new Error(
-            `Dev main: pid ${recordedPid} is alive but does not match the main checkout (${match.why}). Refusing to spawn a second instance.`,
+            `${plan.label}: pid ${recordedPid} is alive but does not match this checkout (${match.why}). ` +
+              `Refusing to spawn a second instance under the same name — start it under another one ` +
+              `(\`--instance <name>\`).`,
           );
         } else {
           // Dead — stale pid file. Auto-clean.
@@ -11879,6 +11920,19 @@ async function runDevStart(argv) {
         }
       }
     }
+
+    // cinatra-cli#261 — refuse a start this machine cannot honour: another
+    // RUNNING instance already holds this name, this app port or this runtime
+    // port. Read from the instances' own records — a record PLUS a process that
+    // is still that instance's dev server — so a record left behind by a
+    // process that is gone, or one whose pid a reboot handed to something else,
+    // is repaired rather than refused. `kill -0` alone is not enough for that
+    // second case, which is why the liveness probe is the command-line one. The
+    // refusal names the instance and the port, nothing else about the holder.
+    assertInstanceStartFree(plan, {
+      records: listInstanceRecords({ isAlive: isInstanceProcessRunning }),
+      repoRoot,
+    });
 
     // Port-not-already-bound precheck. Skip when our own (just-validated) pid
     // owns the port from the idempotent/repair path above.
@@ -11888,7 +11942,8 @@ async function runDevStart(argv) {
     })();
     if (!ourPidOwnsPort && await isHostPortBound(port)) {
       throw new Error(
-        `Dev main: port ${port} is already bound by another process. Free it (or set PORT) before starting.`,
+        `${plan.label}: port ${port} is already bound by another process. ` +
+          `Free it (or set PORT, or pass \`--port <n>\`) before starting.`,
       );
     }
 
@@ -11902,11 +11957,20 @@ async function runDevStart(argv) {
     // Spawn host-native `pnpm dev`. Truncate log + write pid file. Process
     // group LEADER (detached=true) so `instance stop` SIGTERMs the whole tree
     // (turbopack, tsc-watch, etc.) — identical to runCloneStart.
-    truncateCloneLog(DEV_MAIN_SLUG);
+    truncateCloneLog(plan.slug);
     const logFd = openSync(logPath, "a", 0o600);
-    const child = spawn("pnpm", ["dev"], {
+    // The plan carries BOTH moving parts of the spawn: the argument list (a
+    // chosen `--bind` travels as the dev server's own `--hostname` argument) and
+    // the environment overlay (this instance's port, runtime endpoint and
+    // queue, through the product's own keys). With no flags both are what they
+    // always were — `["dev"]` and nothing overlaid (cinatra-cli#261).
+    const child = spawn("pnpm", plan.spawnArgs, {
       cwd: repoRoot,
-      env: { ...process.env, ...readEnvFileSnapshot(path.join(repoRoot, ".env.local")) },
+      env: {
+        ...process.env,
+        ...readEnvFileSnapshot(path.join(repoRoot, ".env.local")),
+        ...plan.envOverrides,
+      },
       detached: true,
       stdio: ["ignore", logFd, logFd],
     });
@@ -11922,15 +11986,18 @@ async function runDevStart(argv) {
     let spawnError = null;
     child.on("error", (err) => { spawnError = err; });
     if (!child.pid) {
-      throw new Error("Failed to spawn `pnpm dev` for the dev main.");
+      throw new Error(`Failed to spawn \`pnpm dev\` for ${plan.target}.`);
     }
     writeFileSync(pidPath, `${child.pid}\n${new Date().toISOString()}\n`, { mode: 0o600 });
+    // Record what this instance now holds, so every OTHER start on this machine
+    // can refuse a colliding name or port by name (cinatra-cli#261).
+    writeInstanceRecord(plan, { pid: child.pid });
     spawnedChildPid = child.pid;
     child.unref();
     await new Promise((r) => setImmediate(r));
     if (spawnError) {
       throw new Error(
-        `Failed to spawn \`pnpm dev\` for the dev main: ${spawnError.message ?? spawnError}. ` +
+        `Failed to spawn \`pnpm dev\` for ${plan.target}: ${spawnError.message ?? spawnError}. ` +
           `Is pnpm on PATH? Inspect ${logPath}.`,
       );
     }
@@ -11961,12 +12028,19 @@ async function runDevStart(argv) {
     console.log("");
     console.log(
       health.ok
-        ? "Dev main started."
-        : "Dev main spawned (health not yet confirmed — check the log).",
+        ? `${plan.label} started.`
+        : `${plan.label} spawned (health not yet confirmed — check the log).`,
     );
-    console.log(`  Next.js:  http://localhost:${port}`);
+    console.log(`  Next.js:  ${plan.appUrl}`);
     console.log(`  pid:      ${pidPath}`);
     console.log(`  log:      ${logPath}`);
+    // What a NAMED instance owns beside its pid and log — printed only for one,
+    // so the single-instance tail stays exactly the line set it always was.
+    if (!plan.isDefault) {
+      if (plan.bind) console.log(`  bind:     ${plan.bind}`);
+      console.log(`  runtime:  http://localhost:${plan.runtimePort} (container ${plan.runtimeContainer})`);
+      if (plan.queueName) console.log(`  queue:    ${plan.queueName}`);
+    }
   } finally {
     if (!success && spawnedChildPid != null) {
       // We spawned `pnpm dev` THIS run but start ultimately failed — don't
@@ -11986,44 +12060,51 @@ async function runDevStart(argv) {
         try { process.kill(spawnedChildPid, "SIGKILL"); } catch { /* gone */ }
       }
       try { rmSync(pidPath, { force: true }); } catch { /* best-effort */ }
+      // The instance holds nothing after a failed start — drop its record so no
+      // other start is refused on its behalf (cinatra-cli#261).
+      clearInstanceRecord(plan.slug);
     }
-    releaseRuntimeLock(DEV_MAIN_SLUG);
+    releaseRuntimeLock(plan.slug);
   }
 }
 
-// SIGTERM the dev-main process group; SIGKILL after 10s. cwd-verify before
-// signalling so a stale/reused pid is NEVER killed. Returns
+// SIGTERM the selected instance's process group; SIGKILL after 10s. cwd-verify
+// before signalling so a stale/reused pid is NEVER killed. Returns
 // { stopped, reason? } mirroring `stopCloneRuntime`. The pid file is preserved
 // on `stopped:false` so the operator / a re-run can still find it.
-async function stopDevMainRuntime(repoRoot) {
-  const pidPath = clonePidPath(DEV_MAIN_SLUG);
+async function stopInstanceRuntime(repoRoot, plan) {
+  const pidPath = plan.pidPath;
   if (!existsSync(pidPath)) {
+    clearInstanceRecord(plan.slug);
     return { stopped: true };
   }
   const recordedPid = readPidFromFile(pidPath);
   if (recordedPid == null || !isPidAlive(recordedPid)) {
     try { rmSync(pidPath, { force: true }); } catch { /* best-effort */ }
+    clearInstanceRecord(plan.slug);
     return { stopped: true };
   }
   const match = processCommandLineMatches(recordedPid, { cwdMustEqual: repoRoot });
   if (!match.alive) {
     try { rmSync(pidPath, { force: true }); } catch { /* best-effort */ }
+    clearInstanceRecord(plan.slug);
     return { stopped: true };
   }
   if (match.indeterminate) {
     console.warn(
-      `Dev main stop: pid ${recordedPid} alive but unverifiable (${match.why}). NOT signalling.`,
+      `${plan.label} stop: pid ${recordedPid} alive but unverifiable (${match.why}). NOT signalling.`,
     );
     return { stopped: false, reason: `pid ${recordedPid} alive but unverifiable (${match.why})` };
   }
   if (!match.ours) {
     console.warn(
-      `Dev main stop: pid ${recordedPid} is a different process (${match.why}); treating dev main as not running.`,
+      `${plan.label} stop: pid ${recordedPid} is a different process (${match.why}); treating ${plan.target} as not running.`,
     );
     try { rmSync(pidPath, { force: true }); } catch { /* best-effort */ }
+    clearInstanceRecord(plan.slug);
     return { stopped: true };
   }
-  // It's our dev main — SIGTERM the group, grace, then SIGKILL.
+  // It's this instance's own process group — SIGTERM, grace, then SIGKILL.
   try {
     process.kill(-recordedPid, "SIGTERM");
   } catch {
@@ -12042,32 +12123,35 @@ async function stopDevMainRuntime(repoRoot) {
     }
   }
   try { rmSync(pidPath, { force: true }); } catch { /* best-effort */ }
+  clearInstanceRecord(plan.slug);
   return { stopped: true };
 }
 
-// Returns the structured `{ stopped, reason? }` from stopDevMainRuntime so
+// Returns the structured `{ stopped, reason? }` from stopInstanceRuntime so
 // callers (runDevRestart) can branch on the real outcome rather than a global
 // side-channel. Still owns the CLI-surface concerns: lock acquire/release,
 // the success/warn log line, and the `process.exitCode = 1` on a
 // could-not-confirm stop.
 async function runDevStop(argv) {
   rejectTailscaleAuthkeyFlag(argv);
-  const { repoRoot } = resolveDevMainTarget();
+  // `--instance <slug>` selects WHICH instance to stop; without it, the single
+  // instance this verb has always stopped (cinatra-cli#261).
+  const { repoRoot, plan } = resolveInstanceTarget(argv);
 
-  // Per-main runtime lock so stop cannot race a concurrent start.
-  acquireRuntimeLock(DEV_MAIN_SLUG);
+  // This instance's runtime lock so stop cannot race a concurrent start.
+  acquireRuntimeLock(plan.slug);
   let stopResult;
   try {
-    stopResult = await stopDevMainRuntime(repoRoot);
+    stopResult = await stopInstanceRuntime(repoRoot, plan);
   } finally {
-    releaseRuntimeLock(DEV_MAIN_SLUG);
+    releaseRuntimeLock(plan.slug);
   }
 
   if (stopResult.stopped) {
-    console.log("Dev main stopped.");
+    console.log(`${plan.label} stopped.`);
   } else {
     // Best-effort + non-destructive — loud warning, not a throw.
-    console.warn(`Dev main: could not confirm it stopped (${stopResult.reason}). Investigate manually.`);
+    console.warn(`${plan.label}: could not confirm it stopped (${stopResult.reason}). Investigate manually.`);
     process.exitCode = 1;
   }
   return stopResult;
@@ -12082,7 +12166,8 @@ async function runDevRestart(argv) {
   // cinatra-cli#146: refuse a production-mode checkout BEFORE stopping the server —
   // restart calls stop→start, so guard here too so a prod checkout is not torn down
   // only to then refuse to start. (runDevStart re-checks; the guard is idempotent.)
-  assertHostDevStartAllowed(resolveDevMainTarget().repoRoot);
+  const { repoRoot: restartRoot, plan: restartPlan } = resolveInstanceTarget(argv);
+  assertHostDevStartAllowed(restartRoot);
   // Branch on the structured stop RESULT, not the global `process.exitCode`
   // side-channel: a restart must NOT start a second instance on top of a
   // possibly-live one (the start would refuse on the not-ours guard anyway,
@@ -12090,7 +12175,7 @@ async function runDevRestart(argv) {
   const stopResult = await runDevStop(argv);
   if (!stopResult.stopped) {
     throw new Error(
-      `Dev main restart aborted: stop could not be confirmed (${stopResult.reason}).`,
+      `${restartPlan.label} restart aborted: stop could not be confirmed (${stopResult.reason}).`,
     );
   }
   await runDevStart(argv);
@@ -13307,8 +13392,9 @@ async function runDevWayflow(argv = [], deps = {}) {
 // `cinatra logs [--app] [--service <name>] [--follow|-f]` (cinatra#12).
 //
 // Surfaces the two log sources an operator otherwise has to hunt for by hand:
-//   * the dev MAIN app log written by `cinatra instance start` (the host-native
-//     `pnpm dev` stdout/stderr at ~/.cinatra/clones/dev-main/nextjs.log), and
+//   * the app log written by `cinatra instance start` (the host-native
+//     `pnpm dev` stdout/stderr at ~/.cinatra/clones/<instance>/nextjs.log —
+//     `--instance <name>` selects which one, else the single instance), and
 //   * the bundled docker-compose container logs (Postgres/Redis/Nango/…).
 //
 // Selection (mutually exclusive — `--app` + `--service` is rejected):
@@ -13338,7 +13424,12 @@ function parseLogsFlags(argv) {
         "Omit both to see the app log and all container logs together.",
     );
   }
-  return { app, service, follow };
+  // cinatra-cli#261 — `instance start --instance <name>` writes its log under
+  // that instance's own runtime directory, so `logs` has to be told which
+  // instance to read. The SAME selector the start verb uses (one parser, one
+  // slug shape); without it, the single instance, exactly as before.
+  const { slug } = parseInstanceStartFlags(argv);
+  return { app, service, follow, slug };
 }
 
 // Print the last `maxLines` lines of a UTF-8 log file. Returns false when the
@@ -13440,9 +13531,18 @@ function applyComposeStatus({ available, status }) {
 
 async function runLogs(argv = []) {
   rejectTailscaleAuthkeyFlag(argv);
-  const { app, service, follow } = parseLogsFlags(argv);
+  const { app, service, follow, slug } = parseLogsFlags(argv);
   const repoRoot = getRepoRoot();
-  const appLogPath = cloneLogPath(DEV_MAIN_SLUG);
+  const appLogPath = cloneLogPath(slug);
+  // How the app log is named, and how an operator is told to produce one: the
+  // single instance keeps the wording it has always printed.
+  const isDefaultInstance = slug === DEFAULT_INSTANCE_SLUG;
+  const appLogLabel = isDefaultInstance ? "Dev main app log" : `Instance "${slug}" app log`;
+  const appLogFollowLabel = isDefaultInstance ? "dev main app log" : `instance "${slug}" app log`;
+  const startHint = isDefaultInstance
+    ? "`cinatra instance start`"
+    : `\`cinatra instance start --instance ${slug}\``;
+  const noLogYet = `  No app log yet — start it with ${startHint}.`;
 
   // --service: container logs only (the app log is irrelevant to a single
   // service). Pass the service + follow straight through to docker compose.
@@ -13456,13 +13556,13 @@ async function runLogs(argv = []) {
   // --app: app log only.
   if (app) {
     if (follow) {
-      console.log(`Following dev main app log (${appLogPath}) — Ctrl-C to stop.`);
+      console.log(`Following ${appLogFollowLabel} (${appLogPath}) — Ctrl-C to stop.`);
       followFileTail(appLogPath, LOGS_DEFAULT_TAIL_LINES);
       return;
     }
-    console.log(`Dev main app log (${appLogPath}):`);
+    console.log(`${appLogLabel} (${appLogPath}):`);
     if (!printFileTail(appLogPath, LOGS_DEFAULT_TAIL_LINES)) {
-      console.log("  No app log yet — start the dev main with `cinatra instance start`.");
+      console.log(noLogYet);
     }
     return;
   }
@@ -13473,9 +13573,9 @@ async function runLogs(argv = []) {
   // `--follow` we print a one-shot app-log snapshot FIRST and then hand the
   // foreground to `docker compose logs --follow` (which multiplexes every
   // container). Without `--follow` both are one-shot snapshots.
-  console.log(`Dev main app log (${appLogPath}):`);
+  console.log(`${appLogLabel} (${appLogPath}):`);
   if (!printFileTail(appLogPath, LOGS_DEFAULT_TAIL_LINES)) {
-    console.log("  No app log yet — start the dev main with `cinatra instance start`.");
+    console.log(noLogYet);
   }
   console.log("");
   console.log(
