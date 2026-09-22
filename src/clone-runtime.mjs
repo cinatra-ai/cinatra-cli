@@ -17,7 +17,8 @@
 //   - naming: cloneComposeProjectName, cloneTailscaleHostname
 //   - process: isPidAlive, processCommandLineMatches
 //   - lock: acquireRuntimeLock, releaseRuntimeLock, isRuntimeLockHeld
-//   - guard: assertPortBandOk, CLONE_NEXTJS_PORT_LIMIT, CLONE_WAYFLOW_PORT_LIMIT
+//   - guard: assertPortBandOk, assertCloneSlotPorts, CLONE_NEXTJS_PORT_LIMIT,
+//     CLONE_WAYFLOW_PORT_LIMIT
 //   - secret: validateTailscaleAuthkey, redactTailscaleAuthkey,
 //     scrubTailscaleAuthkey
 // ---------------------------------------------------------------------------
@@ -418,14 +419,33 @@ function readLockOwnerPid(lockPath) {
 
 // --- port-band guard -------------------------------------------------------
 
+/** Where the port came from. A REGISTRY row is checked against the bands; a
+ *  port an OPERATOR named on a flag is taken as given (cinatra-cli#260). */
+export const PORT_BAND_SOURCE_REGISTRY = "registry";
+export const PORT_BAND_SOURCE_OPERATOR = "operator";
+
 /**
- * Refuse to start a clone whose registered port falls outside the
- * clone-on-demand port bands. Catches corrupt/legacy registry rows.
+ * Refuse a port that falls outside the clone-on-demand port bands.
+ *
+ * The bands belong to the clone registry: its slots are index-derived, so a row
+ * naming a port outside them is a corrupt or legacy row and starting on it would
+ * collide with whatever really holds that port. That is what this guard catches,
+ * and it is why the check is scoped to its REGISTRY caller (the default).
+ *
+ * A port an operator names on a flag carries no such promise and needs none —
+ * an instance's own agent runtime is started on the port its operator chose
+ * (cinatra-cli#260), so `source: "operator"` checks the SHAPE and stops there.
+ * The shape check is never skipped: a value that is not a number, or a kind this
+ * guard does not know, is refused whoever asked.
  */
-export function assertPortBandOk(port, kind) {
+export function assertPortBandOk(port, kind, { source = PORT_BAND_SOURCE_REGISTRY } = {}) {
   if (typeof port !== "number" || !Number.isFinite(port)) {
     throw new Error(`Clone runtime: port for ${kind} is not a number: ${port}`);
   }
+  if (kind !== "nextjs" && kind !== "wayflow") {
+    throw new Error(`Clone runtime: unknown port kind "${kind}".`);
+  }
+  if (source !== PORT_BAND_SOURCE_REGISTRY) return;
   if (kind === "nextjs") {
     if (port < CLONE_NEXTJS_PORT_BASE || port > CLONE_NEXTJS_PORT_LIMIT) {
       throw new Error(
@@ -435,16 +455,24 @@ export function assertPortBandOk(port, kind) {
     }
     return;
   }
-  if (kind === "wayflow") {
-    if (port < CLONE_WAYFLOW_PORT_BASE || port > CLONE_WAYFLOW_PORT_LIMIT) {
-      throw new Error(
-        `Clone runtime: WayFlow port ${port} outside band ` +
-          `${CLONE_WAYFLOW_PORT_BASE}-${CLONE_WAYFLOW_PORT_LIMIT}. Registry corrupt?`,
-      );
-    }
-    return;
+  if (port < CLONE_WAYFLOW_PORT_BASE || port > CLONE_WAYFLOW_PORT_LIMIT) {
+    throw new Error(
+      `Clone runtime: WayFlow port ${port} outside band ` +
+        `${CLONE_WAYFLOW_PORT_BASE}-${CLONE_WAYFLOW_PORT_LIMIT}. Registry corrupt?`,
+    );
   }
-  throw new Error(`Clone runtime: unknown port kind "${kind}".`);
+}
+
+/**
+ * The REGISTRY caller's own assertion: both ports of a clone slot, checked
+ * against the bands they were allocated from. One named call site, so "which
+ * callers check the band" is answerable by reading the code rather than by
+ * chasing an options object through the CLI.
+ */
+export function assertCloneSlotPorts(slot) {
+  assertPortBandOk(slot?.nextjsPort, "nextjs", { source: PORT_BAND_SOURCE_REGISTRY });
+  assertPortBandOk(slot?.wayflowPort, "wayflow", { source: PORT_BAND_SOURCE_REGISTRY });
+  return slot;
 }
 
 // --- log management --------------------------------------------------------

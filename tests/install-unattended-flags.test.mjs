@@ -38,6 +38,7 @@ import {
   runSetupInTarget,
   setupChildArgs,
 } from "../src/install.mjs";
+import { SETUP_EXIT_GENERATED_MAPS_DRIFT } from "../src/install-byproducts.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.join(HERE, "..");
@@ -325,6 +326,91 @@ describe("runSetupInTarget — the REAL command line it spawns", () => {
       "--frozen-lockfile",
     ]);
   });
+
+  // cinatra-cli#270 — the drift status is TYPED, and the caller it exists for
+  // reads exit codes. A bare 1 out of the install would make "your committed
+  // maps are stale" indistinguishable from a Docker that would not start, so
+  // the child's own code is re-raised the way the install tail re-raises 20
+  // and 21 (`bin/cinatra.mjs` honours `error.exitCode`).
+  const exiting = (status) => () => ({ status });
+
+  it("re-raises the generated-maps drift code out of the DEV child, as a failure", () => {
+    let thrown = null;
+    try {
+      runSetupInTarget({
+        targetDir: "/target",
+        mode: "dev",
+        pinnedExtensions: true,
+        log: () => {},
+        spawn: exiting(SETUP_EXIT_GENERATED_MAPS_DRIFT),
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    // It is a FAILURE — never tolerated, never a completed install…
+    expect(thrown).toBeInstanceOf(Error);
+    // …and it carries the child's own typed code out to the process.
+    expect(thrown.exitCode).toBe(SETUP_EXIT_GENERATED_MAPS_DRIFT);
+    // The message names the condition, not just "setup failed".
+    expect(thrown.message).toContain("src/lib/generated/");
+    expect(thrown.message).toContain("refused to rewrite");
+    expect(thrown.message).toContain("as it was handed over");
+  });
+
+  it("`demo` reaches the same dev child, so it re-raises the code too", () => {
+    let thrown = null;
+    try {
+      runSetupInTarget({
+        targetDir: "/target",
+        mode: "demo",
+        pinnedExtensions: true,
+        log: () => {},
+        spawn: exiting(SETUP_EXIT_GENERATED_MAPS_DRIFT),
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown.exitCode).toBe(SETUP_EXIT_GENERATED_MAPS_DRIFT);
+  });
+
+  it("a PROD child cannot mint it, so the same status stays an unexplained failure", () => {
+    // Only the dev child is given `--pinned` (setupChildArgs), so only it can
+    // reach the maps check. The same status out of a prod child must not
+    // borrow the meaning — the same fail-closed rule the skew code follows.
+    let thrown = null;
+    try {
+      runSetupInTarget({
+        targetDir: "/target",
+        mode: "prod",
+        log: () => {},
+        spawn: exiting(SETUP_EXIT_GENERATED_MAPS_DRIFT),
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown.exitCode).toBeUndefined();
+    expect(thrown.message).not.toContain("src/lib/generated/");
+  });
+
+  it("every other non-zero is untouched — no typed code is invented for it", () => {
+    for (const status of [1, 2, 21, 127]) {
+      let thrown = null;
+      try {
+        runSetupInTarget({
+          targetDir: "/target",
+          mode: "dev",
+          pinnedExtensions: true,
+          log: () => {},
+          spawn: exiting(status),
+        });
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(Error);
+      expect(thrown.exitCode).toBeUndefined();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -420,11 +506,30 @@ describe("installAfterExtensionSync — carries the frozen opt-in to the re-link
   });
 });
 
-describe("setupPhaseOptions — only `instance setup dev|prod` reads the flag", () => {
+describe("setupPhaseOptions — only `instance setup dev|prod` reads the flags", () => {
   it("reads --frozen-lockfile from the setup command's OWN trailing args", () => {
-    expect(setupPhaseOptions([])).toEqual({ frozenLockfile: false });
-    expect(setupPhaseOptions(["--skip-dev-apps"])).toEqual({ frozenLockfile: false });
-    expect(setupPhaseOptions(["--pinned", "--frozen-lockfile"])).toEqual({ frozenLockfile: true });
+    expect(setupPhaseOptions([])).toEqual({ frozenLockfile: false, pinnedExtensions: false });
+    expect(setupPhaseOptions(["--skip-dev-apps"])).toEqual({
+      frozenLockfile: false,
+      pinnedExtensions: false,
+    });
+    expect(setupPhaseOptions(["--pinned", "--frozen-lockfile"])).toEqual({
+      frozenLockfile: true,
+      pinnedExtensions: true,
+    });
+  });
+
+  // cinatra-cli#270 — the child's own `--pinned` is what decides whether the
+  // generated maps are checked or rewritten, so the setup phase has to READ it.
+  it("reads --pinned too: the pinned fleet is what makes the maps checkable", () => {
+    expect(setupPhaseOptions(["--pinned"])).toEqual({
+      frozenLockfile: false,
+      pinnedExtensions: true,
+    });
+    expect(setupPhaseOptions(["--pinned-extensions"])).toEqual({
+      frozenLockfile: false,
+      pinnedExtensions: false,
+    });
   });
 });
 
@@ -448,23 +553,29 @@ describe("the `instance setup dev|prod` HANDLER turns the token into behaviour",
   it("OFF: the setup phase is asked for a plain install", async () => {
     const { calls, handler } = handlerCalls();
     await handler([], ["instance", "setup", "dev"]);
-    expect(calls).toEqual([["dev", { frozenLockfile: false }]]);
+    expect(calls).toEqual([["dev", { frozenLockfile: false, pinnedExtensions: false }]]);
   });
 
   it("ON: the child's own --frozen-lockfile reaches the setup phase, dev and prod", async () => {
     const dev = handlerCalls();
     await dev.handler(["--frozen-lockfile"], ["instance", "setup", "dev"]);
-    expect(dev.calls).toEqual([["dev", { frozenLockfile: true }]]);
+    expect(dev.calls).toEqual([["dev", { frozenLockfile: true, pinnedExtensions: false }]]);
 
     const prod = handlerCalls();
     await prod.handler(["--frozen-lockfile"], ["instance", "setup", "prod"]);
-    expect(prod.calls).toEqual([["prod", { frozenLockfile: true }]]);
+    expect(prod.calls).toEqual([["prod", { frozenLockfile: true, pinnedExtensions: false }]]);
   });
 
-  it("the other forwarded tokens do not turn it on", async () => {
+  it("ON: the child's own --pinned reaches it too (cinatra-cli#270)", async () => {
     const { calls, handler } = handlerCalls();
     await handler(["--skip-dev-apps", "--pinned"], ["instance", "setup", "dev"]);
-    expect(calls).toEqual([["dev", { frozenLockfile: false }]]);
+    expect(calls).toEqual([["dev", { frozenLockfile: false, pinnedExtensions: true }]]);
+  });
+
+  it("the other forwarded tokens do not turn them on", async () => {
+    const { calls, handler } = handlerCalls();
+    await handler(["--skip-dev-apps"], ["instance", "setup", "dev"]);
+    expect(calls).toEqual([["dev", { frozenLockfile: false, pinnedExtensions: false }]]);
   });
 });
 
@@ -783,6 +894,39 @@ describe("runInstall — the unattended opt-ins reach the children", () => {
     expect(seen.setup[0].frozenLockfile).toBeFalsy();
   });
 
+  // cinatra-cli#270 — the whole chain in one run: the install-level flag, the
+  // `--pinned` token it puts on the child's command line (the token
+  // `setupPhaseOptions` reads to CHECK the maps instead of rewriting them),
+  // and the typed code coming back out as the install's own exit status. The
+  // child here is the REAL `runSetupInTarget` over a fake process, so none of
+  // the forwarding is mocked away.
+  it("--pinned-extensions: the child is spawned with --pinned, and its drift code fails the INSTALL", async () => {
+    const spawned = [];
+    const { deps } = recordingDeps({
+      runSetupInTarget: (args) =>
+        runSetupInTarget({
+          ...args,
+          spawn: (command, argv) => {
+            spawned.push(argv);
+            return { status: SETUP_EXIT_GENERATED_MAPS_DRIFT };
+          },
+        }),
+    });
+    let thrown = null;
+    try {
+      await install(path.join(sandbox, "pinned-drift"), ["--pinned-extensions"], deps);
+    } catch (err) {
+      thrown = err;
+    }
+    // The token the maps check is keyed on actually reached the child.
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0].slice(1)).toEqual(["instance", "setup", "dev", "--pinned"]);
+    // And the install failed with the child's own typed code, not a bare 1.
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown.exitCode).toBe(SETUP_EXIT_GENERATED_MAPS_DRIFT);
+    expect(thrown.message).toContain("src/lib/generated/");
+  });
+
   it("--frozen-lockfile: EVERY dependency install carries it — the install's and the child's", async () => {
     const { seen, deps } = recordingDeps();
     await install(path.join(sandbox, "frozen"), ["--frozen-lockfile"], deps);
@@ -1002,5 +1146,24 @@ describe("the three flags are documented", () => {
       changelog.indexOf("## [", changelog.indexOf("## [Unreleased]") + 1),
     );
     for (const flag of FLAGS) expect(unreleased).toContain(flag);
+  });
+
+  // cinatra-cli#270 — the second byproduct and its exit code are as much part
+  // of the unattended contract as the flags themselves.
+  it("all three surfaces say the generated maps are checked, and name the exit code", () => {
+    const help = execFileSync(process.execPath, [path.join(REPO_ROOT, "bin", "cinatra.mjs"), "--help"], {
+      encoding: "utf8",
+      env: { ...process.env, CI: "1" },
+    });
+    const readme = readFileSync(path.join(REPO_ROOT, "README.md"), "utf8");
+    const changelog = readFileSync(path.join(REPO_ROOT, "CHANGELOG.md"), "utf8");
+    const unreleased = changelog.slice(
+      changelog.indexOf("## [Unreleased]"),
+      changelog.indexOf("## [", changelog.indexOf("## [Unreleased]") + 1),
+    );
+    for (const text of [help, readme, unreleased]) {
+      expect(text).toContain("generated extension maps");
+      expect(text).toContain("22");
+    }
   });
 });

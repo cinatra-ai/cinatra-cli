@@ -21,14 +21,18 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   INSTALL_BYPRODUCT_RULES,
   INSTALL_BYPRODUCT_STATUS_CODES,
+  SETUP_EXIT_GENERATED_MAPS_DRIFT,
   byproductBoundaryLines,
   byproductExemptionLines,
   classifyWorkingTreeDirt,
+  claimGeneratedMapsDriftExitCode,
   installByproductDriftLines,
   isInstallByproductPath,
   parseGitPorcelainZ,
 } from "../src/install-byproducts.mjs";
 import { moveExistingCheckoutToRef } from "../src/install.mjs";
+import { SETUP_EXIT_REGISTRY_SKEW } from "../src/seed-local-registry.mjs";
+import { INSTALL_EXIT_AGENTS_UNAVAILABLE } from "../src/wayflow-agent-mount.mjs";
 
 // `git status --porcelain -z` emits NUL-terminated records.
 const z = (...records) => records.map((r) => `${r}\0`).join("");
@@ -104,6 +108,33 @@ describe("install byproducts — the declared boundary (#198 AC2, AC3)", () => {
       expect(lines).toContain(rule.path);
       expect(lines).toContain(rule.why);
     }
+  });
+
+  // cinatra-cli#270 — a byproduct is only unavoidable until a flag avoids it.
+  // `--frozen-lockfile` keeps the lockfile out of the caller's checkout; the
+  // generated maps needed the same declaration, so the boundary now names the
+  // opt-in that avoids each one and an unattended caller can read both off it.
+  it("names the opt-in that AVOIDS each byproduct, in the declaration and in the lines", () => {
+    expect(INSTALL_BYPRODUCT_RULES.map((rule) => [rule.path, rule.avoidedBy])).toEqual([
+      ["pnpm-lock.yaml", "--frozen-lockfile"],
+      ["src/lib/generated/", "--pinned-extensions"],
+    ]);
+    const lines = byproductBoundaryLines().join("\n");
+    expect(lines).toContain("avoided by --frozen-lockfile");
+    expect(lines).toContain("avoided by --pinned-extensions");
+  });
+
+  it("carries a typed setup exit code of its own, distinct from the other two", () => {
+    expect(SETUP_EXIT_GENERATED_MAPS_DRIFT).toBe(22);
+    expect(SETUP_EXIT_GENERATED_MAPS_DRIFT).not.toBe(SETUP_EXIT_REGISTRY_SKEW);
+    expect(SETUP_EXIT_GENERATED_MAPS_DRIFT).not.toBe(INSTALL_EXIT_AGENTS_UNAVAILABLE);
+  });
+
+  it("claims that code ONLY over a provably clean exit — a real failure keeps its own", () => {
+    expect(claimGeneratedMapsDriftExitCode(undefined)).toBe(SETUP_EXIT_GENERATED_MAPS_DRIFT);
+    expect(claimGeneratedMapsDriftExitCode(0)).toBe(SETUP_EXIT_GENERATED_MAPS_DRIFT);
+    expect(claimGeneratedMapsDriftExitCode(1)).toBe(1);
+    expect(claimGeneratedMapsDriftExitCode(SETUP_EXIT_REGISTRY_SKEW)).toBe(SETUP_EXIT_REGISTRY_SKEW);
   });
 });
 

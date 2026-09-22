@@ -44,9 +44,23 @@
 // ---------------------------------------------------------------------------
 
 /**
- * The install-owned paths, each with the phase that writes it. `kind`:
+ * The install-owned paths, each with the phase that writes it and the opt-in
+ * that AVOIDS it. `kind`:
  *   - "exact"  — this repo-relative path exactly.
  *   - "prefix" — this directory prefix and everything beneath it.
+ *
+ * `avoidedBy` names the unattended flag that keeps the path out of the
+ * caller's checkout altogether (cinatra-cli#270). The exemption above is what
+ * an install needs to be RE-RUNNABLE; `avoidedBy` is what a caller working in
+ * a checkout parked at an exact commit — and required to hand it back
+ * byte-for-byte clean — needs instead. Both byproducts now have one, and each
+ * flag turns the phase that writes the path into a phase that CHECKS it:
+ * `--frozen-lockfile` makes the workspace install refuse a lockfile drift
+ * rather than rewrite the tracked file, and `--pinned-extensions` puts the dev
+ * fleet at the checkout's own committed lock — so the maps cannot legitimately
+ * move — and has the generator compare them instead of rewriting them. Neither
+ * flag narrows the exemption: without them both phases still write, which is
+ * what the classification below exists for.
  *
  * Repo-relative, POSIX separators (git reports paths that way on every platform).
  */
@@ -55,13 +69,38 @@ export const INSTALL_BYPRODUCT_RULES = Object.freeze([
     kind: "exact",
     path: "pnpm-lock.yaml",
     why: "workspace re-link — the cloned dev extensions join the pnpm workspace, so the workspace install rewrites the lockfile",
+    avoidedBy: "--frozen-lockfile",
   }),
   Object.freeze({
     kind: "prefix",
     path: "src/lib/generated/",
     why: "tracked generated barrels — rewritten by the extension-manifest regeneration for the acquired set",
+    avoidedBy: "--pinned-extensions",
   }),
 ]);
+
+/**
+ * Typed setup exit code: "the generated extension maps do not match this
+ * checkout's pinned extension set, and setup refused to rewrite them".
+ *
+ * Documented BESIDE the other two typed setup/install codes, and chosen the
+ * same way (see `SETUP_EXIT_REGISTRY_SKEW`): node reserves 1–12 for its own
+ * fatal conditions and 128+N for signal deaths, while 64–78 are the BSD
+ * `sysexits` conventions other tooling may assume — so a typed code sits above
+ * node's block and below those. 20 is the registry skew, 21 is an install that
+ * completed onto a runtime which cannot serve its agents, and 22 is this: the
+ * next free one. Unlike 20 it is a real FAILURE — the run stopped, and the
+ * checkout is exactly as it was handed over.
+ */
+export const SETUP_EXIT_GENERATED_MAPS_DRIFT = 22;
+
+/** Claim the typed code ONLY over a provably clean exit — never downgrade or
+ *  mask a non-zero that a real failure already set (the same rule the other
+ *  two typed codes follow). */
+export function claimGeneratedMapsDriftExitCode(currentExitCode) {
+  const clean = currentExitCode === undefined || currentExitCode === null || currentExitCode === 0;
+  return clean ? SETUP_EXIT_GENERATED_MAPS_DRIFT : currentExitCode;
+}
 
 /**
  * True iff `p` is a path the install's own phases regenerate.
@@ -172,7 +211,11 @@ export function classifyWorkingTreeDirt(porcelainZ, rules = INSTALL_BYPRODUCT_RU
 /** The declared boundary, as operator-readable lines (AC3 — the guard states
  *  what it does and does not protect, rather than exempting silently). */
 export function byproductBoundaryLines(rules = INSTALL_BYPRODUCT_RULES) {
-  return rules.map((rule) => `      ${rule.path}${rule.kind === "prefix" ? "**" : ""} — ${rule.why}`);
+  return rules.map(
+    (rule) =>
+      `      ${rule.path}${rule.kind === "prefix" ? "**" : ""} — ${rule.why}` +
+      (rule.avoidedBy ? ` (avoided by ${rule.avoidedBy})` : ""),
+  );
 }
 
 /** The lines the updater prints when it exempts (and restores) its own dirt. */
