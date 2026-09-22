@@ -261,6 +261,33 @@ export function processCommandLineMatches(pid, { cwdMustEqual } = {}) {
   return { alive: true, ours: true };
 }
 
+/**
+ * Is the pid a record names STILL that instance's dev server? (cinatra-cli#261)
+ *
+ * A running-instance record outlives the machine — a crash or a reboot leaves
+ * one behind — and pids are recycled, so `kill -0` alone eventually answers
+ * "alive" for a process that has nothing to do with the instance, and a start
+ * whose ports are in fact free is refused in its name. The command line settles
+ * it, with the same narrow shape gate every other liveness decision here uses:
+ *
+ *   - dead                      → not running (the record is stale; repair it).
+ *   - a POSITIVE mismatch       → not running (the pid was recycled).
+ *   - alive and dev-server-shaped, or UNVERIFIABLE (`ps` refused) → running.
+ *
+ * Unverifiable stays "running" deliberately: losing the refusal is worse than a
+ * conservative one, and the caller's port precheck still catches a real
+ * collision either way. No cwd is compared — the holder is by definition
+ * another checkout, which is the very thing being refused.
+ *
+ * @param {number} pid
+ * @returns {boolean}
+ */
+export function isInstanceProcessRunning(pid) {
+  const match = processCommandLineMatches(pid);
+  if (!match.alive) return false;
+  return match.ours === true || match.indeterminate === true;
+}
+
 // --- runtime lock ----------------------------------------------------------
 
 /**

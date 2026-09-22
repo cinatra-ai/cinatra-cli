@@ -8,6 +8,37 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`cinatra instance start` can now run several dev instances on one machine.**
+  The command booted the app for the checkout you were in, and it was written
+  for exactly one such checkout: the process-id file, the log and the lock all
+  lived under one fixed name, so a second checkout's start refused ("does not
+  match the main checkout") rather than starting anything. It also spawned the
+  dev server without saying which address to bind, so an instance an operator
+  wanted reachable over loopback only took the dev server's own default
+  instead. `--instance <name>` is now that second instance: a plain lower-case
+  name from which the runtime directory, the process-id file, the log, the
+  lock, the container name and the job-queue name are all derived, so two named
+  instances never share one of them. `--port <n>` and `--runtime-port <n>` name
+  the instance's app port and its agent runtime's port when you give them, and
+  otherwise the ports the instance's own `.env.local` already records; a named
+  instance whose environment records no queue gets its own, through the
+  product's own key, so two instances on one cache never drain each other's
+  jobs. `--bind <address>` reaches the spawned dev server, so `--bind 127.0.0.1`
+  is a loopback-only instance. A start whose name, app port or runtime port
+  another RUNNING instance already holds is refused before anything is spawned
+  — every running instance records what it holds next to its process-id file,
+  and the refusal names that instance and the port, nothing else about it. A
+  record whose process is gone is repaired rather than refused — and so is one
+  whose process id a reboot has since handed to something else, because what the
+  refusal asks is not merely whether that process id is alive but whether it is
+  still a dev server. Starting an instance that is already healthy still reports
+  it and spawns nothing. `stop` and `restart` take the same `--instance <name>`,
+  so they act on the instance you mean, and `cinatra logs --instance <name>`
+  reads that instance's own app log. Without `--instance` all four commands are what they
+  always were, to the argument list and the environment the dev server is
+  spawned with: the one instance of this checkout, on `PORT` (default 3000),
+  with the dev server's own bind address.
+
 - **An `install --infra=external` can now create the instance's database from
   your own template.** An operator who points `cinatra install` at a PostgreSQL
   server they run themselves, and names the instance database plus the template

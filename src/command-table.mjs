@@ -106,7 +106,7 @@ export const COMMAND_DESCRIPTORS = [
     id: "logs",
     path: ["logs"],
     match: "command",
-    summary: "Tail the dev-main app log and/or docker compose container logs.",
+    summary: "Tail an instance's app log and/or docker compose container logs — `--instance <name>` selects which instance, else the single one.",
   },
   {
     id: "skills.reset-repo",
@@ -499,20 +499,20 @@ export const COMMAND_DESCRIPTORS = [
     path: ["instance", "start"],
     match: "command+mode",
     summary:
-      "Start the local dev main instance (host-native `pnpm dev` on port 3000; auto-purges a stale `.next` when the checkout HEAD moved — `--clean` to force, `--no-clean` to suppress).",
+      "Start a local dev instance (host-native `pnpm dev` on port 3000; auto-purges a stale `.next` when the checkout HEAD moved — `--clean` to force, `--no-clean` to suppress). `--instance <name>` starts one of SEVERAL instances on this machine: it owns its runtime directory, pid file, log, lock, container name and queue name, takes `--port` / `--runtime-port` when given (else its own `.env.local`), and `--bind <address>` reaches the dev server (`--bind 127.0.0.1` for a loopback-only instance). A name, an app port or a runtime port another RUNNING instance already holds is refused, naming that instance and the port. Without `--instance` the single instance is started exactly as before.",
   },
   {
     id: "dev.stop",
     path: ["instance", "stop"],
     match: "command+mode",
-    summary: "Stop the local dev main instance started by `instance start`.",
+    summary: "Stop a local dev instance started by `instance start` — `--instance <name>` selects which one, else the single instance.",
   },
   {
     id: "dev.restart",
     path: ["instance", "restart"],
     match: "command+mode",
     summary:
-      "Restart the local dev main instance (`instance stop` then `instance start`; `--clean` purges `.next` first, `--no-clean` suppresses the HEAD-moved auto-purge).",
+      "Restart a local dev instance (`instance stop` then `instance start`; `--clean` purges `.next` first, `--no-clean` suppresses the HEAD-moved auto-purge). Takes the same `--instance <name>`, `--port`, `--runtime-port` and `--bind` as `start`.",
   },
   {
     id: "dev.wordpress",
