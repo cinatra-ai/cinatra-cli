@@ -351,6 +351,38 @@ Useful extras:
     cinatra install --status [--dir <path>]  # show one checkout's instance state
     cinatra install --resume                 # finish an install that was interrupted
 
+### Starting several dev instances on one machine
+
+`cinatra instance start` boots the app for the checkout you are in. Give it a
+name and it becomes one of several instances that can run side by side, each
+owning what it needs to stay out of the others' way:
+
+    cinatra instance start --instance web-a --port 3301 --runtime-port 3311 \
+        --bind 127.0.0.1
+
+* `--instance <name>` is the instance's own name (a plain lower-case name). Its
+  runtime directory, process-id file, log, lock, container name and job-queue
+  name are all derived from it, so two instances never share one.
+* `--port <n>` is the app port and `--runtime-port <n>` the agent runtime's.
+  Without them the instance keeps the ports its own `.env.local` records.
+* `--bind <address>` is the address the app listens on — `--bind 127.0.0.1` for
+  an instance reachable over loopback only.
+* A name, an app port or a runtime port that another **running** instance
+  already holds is refused before anything is started, and the refusal says
+  which instance holds it and which port it is.
+
+`stop` and `restart` take the same `--instance <name>`, so they act on the
+instance you mean, and `logs` reads that instance's own app log:
+
+    cinatra instance start --instance web-b --port 3302 --runtime-port 3312
+    cinatra instance restart --instance web-b
+    cinatra logs --app --instance web-b
+    cinatra instance stop --instance web-b
+
+Without `--instance` all of them are exactly what they always were: the one
+instance of this checkout, on `PORT` (default 3000), with the dev server's own
+bind address.
+
 ### Installing unattended
 
 If nobody is watching the install — a CI job or an automated verification runner
