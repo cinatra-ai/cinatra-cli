@@ -34,6 +34,14 @@ import {
   registrySkewVerdictLines,
   seedLocalRegistryExtensions,
 } from "./seed-local-registry.mjs";
+// cinatra-cli#270: the generated extension maps are a DECLARED install
+// byproduct, and `--pinned-extensions` is the opt-in that avoids it — so the
+// typed exit code for "they drifted and setup refused to rewrite them" lives
+// with the declaration.
+import {
+  SETUP_EXIT_GENERATED_MAPS_DRIFT,
+  claimGeneratedMapsDriftExitCode,
+} from "./install-byproducts.mjs";
 import { parseDevRefreshFlags, describeDockerDecision } from "./dev-refresh.mjs";
 import {
   createComposeNangoDbTransport,
@@ -634,7 +642,13 @@ Commands:
                                       modes only (a prod install acquires its extensions
                                       pinned + integrity-verified already). Under --mode
                                       preview it pins the CHECKOUT's fleet; what the preview
-                                      IMAGE acquires is --fleet's business.
+                                      IMAGE acquires is --fleet's business. With the fleet at
+                                      that lock the generated extension maps
+                                      (src/lib/generated/) cannot legitimately move, so setup
+                                      CHECKS them instead of rewriting them: it names the
+                                      files that differ and exits 22 — the code the install
+                                      exits with too — leaving every tracked file as it
+                                      found it.
                     --frozen-lockfile Run EVERY dependency install of the run — this one (a
                                       prod install does two, around the extension
                                       acquisition) and the setup phase's workspace re-link —
@@ -6609,7 +6623,7 @@ function decideManifestRegenGate({
 function regenerateExtensionManifestAfterSync(
   repoRoot,
   syncResult,
-  { failed = false, blockedBy = null, recovery = [] } = {},
+  { failed = false, blockedBy = null, recovery = [], checkOnly = false } = {},
 ) {
   const reconciled =
     !failed &&
@@ -6643,15 +6657,16 @@ function regenerateExtensionManifestAfterSync(
     );
     return;
   }
-  regenerateExtensionManifest(repoRoot);
+  regenerateExtensionManifest(repoRoot, { checkOnly });
 }
 
 // NOTE: the generator roots itself via import.meta.url (relative .mjs imports
 // only, no workspace install needed), so spawning the WORKTREE's copy of the
 // script — relative path + cwd — regenerates that worktree's maps.
-function regenerateExtensionManifest(repoRoot) {
-  console.log("- Regenerating the extension manifest against the on-disk extension set…");
+function regenerateExtensionManifest(repoRoot, { checkOnly = false } = {}) {
   const generator = path.join("scripts", "extensions", "generate-extension-manifest.mjs");
+  if (checkOnly) return checkExtensionManifest(repoRoot, generator);
+  console.log("- Regenerating the extension manifest against the on-disk extension set…");
   const regen = spawnSync(process.execPath, [generator], {
     cwd: repoRoot,
     stdio: "inherit",
@@ -6691,6 +6706,100 @@ function regenerateExtensionManifest(repoRoot) {
 }
 
 // ---------------------------------------------------------------------------
+// The generated maps as a CHECK rather than a rewrite (cinatra-cli#270)
+// ---------------------------------------------------------------------------
+//
+// `src/lib/generated/` is one of the install's two declared working-tree
+// byproducts (src/install-byproducts.mjs). `--frozen-lockfile` already keeps
+// the other one out of an unattended caller's checkout; this is the same idea
+// for this one. `--pinned-extensions` stands the dev fleet at the checkout's
+// OWN committed lock, so the emission for that fleet is the emission the
+// committed maps were generated from — the maps cannot legitimately move, and
+// a difference is drift in the checkout rather than news this run should write
+// into it.
+//
+// The generator already HAS the mode: its CANONICAL `--check` (no `--self`)
+// compares the on-disk generated files byte-exactly against a fresh emission,
+// writes nothing, and names every file that differs. That is exactly the
+// question here — the pinned fleet makes this tree's presence universe the
+// canonical one — so the check is the product's own, not a copy of its
+// comparison. `--self` stays where it was: it is the mode for a tree whose
+// presence universe legitimately differs, which is the write path's case.
+function checkExtensionManifest(repoRoot, generator) {
+  console.log(
+    "- Checking the committed extension maps against the pinned extension set (they are not rewritten)…",
+  );
+  const check = spawnSync(process.execPath, [generator, "--check"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: process.env,
+  });
+  // Piped rather than inherited so the verdict below can name the files the
+  // generator named — then echoed, unchanged, where it would have printed
+  // them: its own lines are the operator's evidence.
+  if (check.stdout) process.stdout.write(check.stdout);
+  if (check.stderr) process.stderr.write(check.stderr);
+  if (check.status === 0) {
+    console.log(
+      "- The committed extension maps already describe this extension set — not rewritten, the checkout stays clean.",
+    );
+    return;
+  }
+  const drifted = parseGeneratedMapDrift(`${check.stdout ?? ""}\n${check.stderr ?? ""}`);
+  if (drifted.length === 0) {
+    // The check never reached a per-file verdict: the script is missing, it
+    // threw, or it failed on something that names no file. That is a plain
+    // failure — the typed code below must keep meaning exactly one thing.
+    const detail = check.error ? check.error.message : `exit ${check.status}`;
+    console.error(
+      `\n⚠ Extension-manifest CHECK failed (${detail}) — the committed generated maps could not be verified ` +
+        `against this checkout's pinned extension set. Nothing was rewritten. Run \`node ${generator} --check\` ` +
+        `in ${repoRoot} to see why.\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  for (const line of generatedMapsDriftLines(repoRoot, drifted)) console.error(line);
+  process.exitCode = claimGeneratedMapsDriftExitCode(process.exitCode);
+}
+
+/** The generated files the manifest generator named as drifted or missing,
+ *  read from its own `--check` output: `[extension-manifest] DRIFT <path> — …`,
+ *  the `MISSING` form, and the `SELF-CHECK` variants of both. Every other line
+ *  it prints (catalog parity, the closing verdict) names no generated file and
+ *  is left alone. Sorted and de-duplicated, so the message reads the same way
+ *  twice. Pure. */
+function parseGeneratedMapDrift(output) {
+  const named = new Set();
+  for (const line of String(output ?? "").split("\n")) {
+    const match = /^\[extension-manifest\] (?:SELF-CHECK )?(?:DRIFT|MISSING) (\S+)/.exec(line.trim());
+    if (match) named.add(match[1]);
+  }
+  return [...named].sort();
+}
+
+/** What an operator is told when the committed maps differ from the emission
+ *  for their pinned fleet: which files, where, what to run, and that this run
+ *  changed nothing. Pure. */
+function generatedMapsDriftLines(repoRoot, drifted = []) {
+  const generator = path.join("scripts", "extensions", "generate-extension-manifest.mjs");
+  return [
+    "",
+    "⚠ The generated extension maps do NOT match this checkout's extension set — nothing was rewritten.",
+    "  --pinned-extensions stands the dev extension fleet at this checkout's OWN committed lock, so these",
+    "  maps cannot legitimately move. They differ from what the generator emits for that fleet:",
+    ...drifted.map((file) => `      ${file}`),
+    `  Regenerate them and COMMIT them on the commit this checkout is parked at, in ${repoRoot}:`,
+    `    1. node ${generator}`,
+    "    2. git add src/lib/generated && git commit",
+    `  Setup exits ${SETUP_EXIT_GENERATED_MAPS_DRIFT} for this — and so does the \`cinatra install\` it runs`,
+    "  under — and every tracked file is as you handed it over.",
+    "  Without --pinned-extensions setup regenerates these maps itself and the checkout comes back dirty.",
+    "",
+  ];
+}
+
+// ---------------------------------------------------------------------------
 // Agent skill auto-registration at setup time
 // ---------------------------------------------------------------------------
 //
@@ -6703,12 +6812,24 @@ function regenerateExtensionManifest(repoRoot) {
  *  args. Only that command reads them: `instance refresh` calls `runSetup`
  *  directly with its own explicit options and deliberately keeps a plain
  *  install (see the note at its dependency step), so a flag typed at `refresh`
- *  can never reach this. */
+ *  can never reach this.
+ *
+ *  `pinnedExtensions` reads the child's own `--pinned` — the token
+ *  `install --pinned-extensions` forwards — for ONE decision: whether the
+ *  generated extension maps are checked or rewritten (cinatra-cli#270). It is
+ *  deliberately NOT how the extension sync learns about the flag; that one
+ *  reads the ambient argv, for the reason spelled out at the sync call. */
 export function setupPhaseOptions(rest = []) {
-  return { frozenLockfile: rest.includes("--frozen-lockfile") };
+  return {
+    frozenLockfile: rest.includes("--frozen-lockfile"),
+    pinnedExtensions: rest.includes("--pinned"),
+  };
 }
 
-async function runSetup(mode, { skipDevApps = false, frozenLockfile = false } = {}) {
+async function runSetup(
+  mode,
+  { skipDevApps = false, frozenLockfile = false, pinnedExtensions = false } = {},
+) {
   const repoRoot = getRepoRoot();
   const env = collectEnvironment(repoRoot);
   const runtimeMode = readConfiguredRuntimeMode(env);
@@ -6905,10 +7026,16 @@ async function runSetup(mode, { skipDevApps = false, frozenLockfile = false } = 
         // No install ran (warm no-op) → still name a command THIS host can run.
         resolveInstallLabel: () => resolvePnpmInstallInvocation({ repoRoot }).label,
       });
+      // cinatra-cli#270 — with a PINNED fleet the maps cannot legitimately
+      // move, so they are checked, not rewritten: a caller that has to hand
+      // this checkout back byte-for-byte clean gets a refusal naming the
+      // drifted files instead of a dirty tree. Unpinned, the rewrite is
+      // unchanged — the fleet may genuinely have moved.
       regenerateExtensionManifestAfterSync(repoRoot, extensionSync, {
         failed: devGate.blocked,
         blockedBy: devGate.blockedBy,
         recovery: devGate.recovery,
+        checkOnly: pinnedExtensions,
       });
     }
     // A canonical single-instance main install declares its own database
@@ -16420,6 +16547,8 @@ export {
   // cinatra#2637 — the manifest-regeneration gate: one decision that names the
   // blocker and the exact, host-resolved recovery commands a blocked run needs.
   decideManifestRegenGate,
+  generatedMapsDriftLines,
+  parseGeneratedMapDrift,
   regenerateExtensionManifestAfterSync,
   // cinatra-cli#41 — clone link-invariant seams (pure; injectable fs).
   linkedSetMatchesEmittedSet,

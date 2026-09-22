@@ -16,14 +16,18 @@
 //   3. an unresolvable dev-CLI key says WHICH tree was scanned and what to run.
 
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
   decideManifestRegenGate,
+  generatedMapsDriftLines,
+  parseGeneratedMapDrift,
   regenerateExtensionManifestAfterSync,
   installAfterExtensionSync,
 } from "../src/index.mjs";
+import { SETUP_EXIT_GENERATED_MAPS_DRIFT } from "../src/install-byproducts.mjs";
 import {
   describeDevCliDeclarerMissing,
   scanDevCliExtensionTree,
@@ -295,5 +299,154 @@ describe("unresolvable dev-CLI key (cinatra#2637)", () => {
     await expect(loadDevCliModule("tailscale-hostname", root)).rejects.toThrow(
       /Recover:[\s\S]*cinatra instance setup dev/,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4. `--pinned-extensions`: the maps are CHECKED, never rewritten (cinatra-cli#270).
+// ---------------------------------------------------------------------------
+//
+// The generated extension maps are one of the install's two declared working-
+// tree byproducts (src/install-byproducts.mjs). `--frozen-lockfile` already
+// keeps the other one — the lockfile — out of an unattended caller's checkout;
+// nothing kept these, so a caller working in a checkout parked at an exact
+// commit and required to hand it back byte-for-byte clean got a dirty tree from
+// every run. With `--pinned-extensions` the fleet stands at the checkout's OWN
+// committed lock, so the maps cannot legitimately move: the setup phase runs
+// the generator in its CHECK mode and stops on a difference instead of
+// rewriting tracked files.
+//
+// The generator below is the CHECKOUT's own script, spawned by relative path —
+// so the fixture reproduces its CONTRACT rather than mocking our call: write
+// mode rewrites the maps; `--check` writes nothing, prints
+// `[extension-manifest] DRIFT <path>` for every differing file and exits 1.
+const MAP_REL = "src/lib/generated/extensions.server.ts";
+const MAP_CURRENT = 'export const EXTENSIONS = ["pinned"];\n';
+const MAP_STALE = 'export const EXTENSIONS = ["stale"];\n';
+
+const GENERATOR_STUB = [
+  "import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';",
+  "import path from 'node:path';",
+  "const root = process.cwd();",
+  "const files = JSON.parse(readFileSync(path.join(root, 'emission.json'), 'utf8'));",
+  "const args = process.argv.slice(2);",
+  "const tag = args.includes('--self') ? 'SELF-CHECK ' : '';",
+  "if (args.includes('--check')) {",
+  "  let drift = false;",
+  "  for (const [rel, content] of Object.entries(files)) {",
+  "    const file = path.join(root, rel);",
+  "    if (!existsSync(file)) {",
+  "      console.error('[extension-manifest] ' + tag + 'MISSING ' + rel + ' — regenerate: node scripts/extensions/generate-extension-manifest.mjs');",
+  "      drift = true;",
+  "      continue;",
+  "    }",
+  "    if (readFileSync(file, 'utf8') !== content) {",
+  "      console.error('[extension-manifest] ' + tag + 'DRIFT ' + rel + ' — file differs from generator output (hand-edit or stale; regenerate, never hand-edit)');",
+  "      drift = true;",
+  "    }",
+  "  }",
+  "  if (drift) {",
+  "    console.error('[extension-manifest] FAIL (canonical mode) — generated-tree drift and/or catalog parity break (see lines above).');",
+  "    process.exit(1);",
+  "  }",
+  "  console.log('[extension-manifest] OK — generated files current + parity holds.');",
+  "  process.exit(0);",
+  "}",
+  "for (const [rel, content] of Object.entries(files)) {",
+  "  mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });",
+  "  writeFileSync(path.join(root, rel), content);",
+  "}",
+  "console.log('[extension-manifest] wrote ' + Object.keys(files).length + ' files');",
+].join("\n");
+
+/** A checkout whose generator emits MAP_CURRENT, with `onDisk` committed. */
+function makeCheckout(onDisk) {
+  const root = makeTree();
+  mkdirSync(path.join(root, "scripts", "extensions"), { recursive: true });
+  writeFileSync(
+    path.join(root, "scripts", "extensions", "generate-extension-manifest.mjs"),
+    GENERATOR_STUB,
+  );
+  writeFileSync(path.join(root, "emission.json"), JSON.stringify({ [MAP_REL]: MAP_CURRENT }));
+  mkdirSync(path.join(root, "src", "lib", "generated"), { recursive: true });
+  writeFileSync(path.join(root, MAP_REL), onDisk);
+  return root;
+}
+const mapDigest = (root) =>
+  createHash("sha256").update(readFileSync(path.join(root, MAP_REL))).digest("hex");
+const mapText = (root) => readFileSync(path.join(root, MAP_REL), "utf8");
+
+describe("the generated maps under --pinned-extensions (cinatra-cli#270)", () => {
+  const reconciled = { results: [{ action: "cloned", dest: "/repo/extensions/cinatra-ai/x" }] };
+
+  it("maps already current: the run succeeds and the tracked bytes never move", () => {
+    const logs = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const root = makeCheckout(MAP_CURRENT);
+    const before = mapDigest(root);
+
+    regenerateExtensionManifestAfterSync(root, reconciled, { checkOnly: true });
+
+    expect(mapDigest(root)).toBe(before);
+    expect(process.exitCode).toBeUndefined();
+    expect(errors).not.toHaveBeenCalled();
+    expect(logs.mock.calls.flat().join("\n")).toContain("not rewritten");
+  });
+
+  it("a stale map STOPS the run with the typed code, names the file, and rewrites nothing", () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const root = makeCheckout(MAP_STALE);
+    const before = mapDigest(root);
+
+    regenerateExtensionManifestAfterSync(root, reconciled, { checkOnly: true });
+
+    // The whole point: the tracked file is exactly as the caller handed it over.
+    expect(mapText(root)).toBe(MAP_STALE);
+    expect(mapDigest(root)).toBe(before);
+    expect(process.exitCode).toBe(SETUP_EXIT_GENERATED_MAPS_DRIFT);
+    const blob = errors.mock.calls.flat().join("\n");
+    expect(blob).toContain(MAP_REL);
+    expect(blob).toContain("node scripts/extensions/generate-extension-manifest.mjs");
+    expect(blob).toContain("commit");
+    expect(blob).toContain(String(SETUP_EXIT_GENERATED_MAPS_DRIFT));
+  });
+
+  it("WITHOUT the opt-in a stale map is rewritten, exactly as today", () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const root = makeCheckout(MAP_STALE);
+
+    regenerateExtensionManifestAfterSync(root, reconciled, {});
+
+    expect(mapText(root)).toBe(MAP_CURRENT);
+    expect(process.exitCode).toBeUndefined();
+    expect(errors).not.toHaveBeenCalled();
+  });
+
+  it("reads the generator's own DRIFT/MISSING lines, in the shape it prints them", () => {
+    const output = [
+      "[extension-manifest] DRIFT src/lib/generated/extensions.server.ts — file differs from generator output (hand-edit or stale; regenerate, never hand-edit)",
+      "[extension-manifest] MISSING src/lib/generated/chat-views.ts — regenerate: node scripts/extensions/generate-extension-manifest.mjs",
+      "[extension-manifest] SELF-CHECK DRIFT src/lib/generated/streams.server.ts — on-disk file differs from a fresh emission for THIS tree",
+      "[extension-manifest] FAIL (canonical mode) — generated-tree drift and/or catalog parity break (see lines above).",
+    ].join("\n");
+    expect(parseGeneratedMapDrift(output)).toEqual([
+      "src/lib/generated/chat-views.ts",
+      "src/lib/generated/extensions.server.ts",
+      "src/lib/generated/streams.server.ts",
+    ]);
+    expect(parseGeneratedMapDrift("")).toEqual([]);
+    expect(parseGeneratedMapDrift(null)).toEqual([]);
+  });
+
+  it("says which files drifted, where, and what to run — never that it fixed them", () => {
+    const lines = generatedMapsDriftLines("/checkout", [MAP_REL]).join("\n");
+    expect(lines).toContain(MAP_REL);
+    expect(lines).toContain("/checkout");
+    expect(lines).toContain("--pinned-extensions");
+    expect(lines).toContain("node scripts/extensions/generate-extension-manifest.mjs");
+    expect(lines).toContain("commit");
+    expect(lines).toContain(String(SETUP_EXIT_GENERATED_MAPS_DRIFT));
   });
 });
