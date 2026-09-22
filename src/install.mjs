@@ -834,6 +834,44 @@ export function parseInstallArgs(argv = []) {
   const previewFleet =
     surfaceMode === PREVIEW_SURFACE_MODE_VALUE ? resolveFleet(argv, { fallback: null }) : null;
 
+  // ── The unattended opt-ins ────────────────────────────────────────────────
+  // Three value-less booleans for the operator who creates MANY instances with
+  // nobody watching — a CI job or an automated verification runner, working in a
+  // checkout already parked at an exact commit and required to hand it back
+  // byte-for-byte clean. Each one is OFF by default and
+  // changes NOTHING for anyone who does not ask for it; the hand-run install is
+  // unchanged to the character.
+  //
+  // `--pinned-extensions` pins the DEV extension fleet to the checkout's own
+  // committed lock shas (fail-closed: an entry that cannot be pinned stops the
+  // install rather than floating to a tip). A prod install never syncs that
+  // fleet — it acquires its required extensions pinned and integrity-verified
+  // on its own path — so accepting the flag there would let an operator believe
+  // they had pinned something. Refused HERE, before any side effect, in the
+  // same position as the mode-scoped refusals above.
+  const pinnedExtensions = argv.includes("--pinned-extensions");
+  if (pinnedExtensions && !isDevLikeMode(mode)) {
+    throw new Error(
+      `--pinned-extensions applies only to a dev-like install (dev|demo|preview) — it pins the DEV ` +
+        `extension fleet to the checkout's committed lock, and a ${surfaceMode} install acquires its ` +
+        `extensions pinned + integrity-verified on its own path.`,
+    );
+  }
+
+  // `--no-fetch` needs an explicit `--ref`. Without one the install targets the
+  // DEFAULT ref ("main"), and a no-fetch move would resolve that from whatever
+  // the checkout happens to hold — quietly moving a checkout parked at a commit
+  // off it, which is the opposite of what a caller reaching for --no-fetch
+  // wants. The two only make sense together, so say so before any side effect.
+  const noFetch = argv.includes("--no-fetch");
+  if (noFetch && refOpt == null) {
+    throw new Error(
+      `--no-fetch needs an explicit --ref. Without one this install would move the checkout to the ` +
+        `default ref "${ref}", resolved from whatever that name already points at locally — moving a ` +
+        `checkout parked at a commit off it. Name the commit (or branch/tag) you want: --ref <sha>.`,
+    );
+  }
+
   return {
     dir: dirOpt, // null → resolved later (prompt on TTY, else default).
     ref,
@@ -865,6 +903,12 @@ export function parseInstallArgs(argv = []) {
     // --no-install ⇒ clone + env only; pnpm install + setup both skipped
     // (setup needs the installed deps, so skipping install implies skipping setup).
     noInstall: argv.includes("--no-install"),
+    // The unattended opt-ins (validated above). Dev-like only for the first;
+    // the other two apply to every mode, because every mode installs
+    // dependencies and every mode moves an existing checkout to --ref.
+    pinnedExtensions,
+    frozenLockfile: argv.includes("--frozen-lockfile"),
+    noFetch,
 
     // cinatra-cli#17 surface.
     infra, // null | "new" | "external" | "share"(gated)
@@ -1756,16 +1800,15 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
     // it ensures the key is present; downgrading demo → dev/prod clears it.
     const original = readFileSync(envPath, "utf8");
     const { body: reconciled, changed: profileChanged } = reconcileInstallProfile(original, profile);
-    // cinatra-cli#143 + cinatra#2654: self-heal the instance secrets in an
-    // existing file — mint CINATRA_CONTEXT_ATTEST_KEY / CINATRA_BRIDGE_TOKEN
-    // (every mode, both feed the WayFlow runtime this install now starts) and
-    // CINATRA_ENCRYPTION_KEY (prod only) when MISSING, carry a valid existing
-    // value forward untouched, and THROW on a malformed encryption key
-    // (rotating it would orphan encrypted data). The source values come from
-    // the existing file itself, so a valid key never changes.
+    // cinatra-cli#143 + cinatra#2654 + cinatra-cli#265: self-heal the instance
+    // secrets in an existing file — mint CINATRA_ENCRYPTION_KEY /
+    // CINATRA_CONTEXT_ATTEST_KEY / CINATRA_BRIDGE_TOKEN (every mode) when
+    // MISSING, carry a valid existing value forward untouched, and THROW on a
+    // malformed encryption key (rotating it would orphan encrypted data). The
+    // source values come from the existing file itself, so a valid key never
+    // changes — a re-run on a healthy checkout rewrites nothing.
     const { body: withSecrets, changed: secretsChanged, minted } = ensureInstanceSecrets({
       body: reconciled,
-      mode,
       envPath,
       sourceValues: parseEnvBody(original),
     });
@@ -1788,15 +1831,15 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
   if (!existsSync(examplePath)) {
     throw new Error(`Cannot create .env.local — ${examplePath} is missing from the cloned checkout.`);
   }
-  // cinatra-cli#143: capture any prod secrets from an EXISTING file BEFORE the
-  // copyFileSync overwrite so a --reset-env regen preserves a valid existing
+  // cinatra-cli#143: capture any instance secrets from an EXISTING file BEFORE
+  // the copyFileSync overwrite so a --reset-env regen preserves a valid existing
   // CINATRA_ENCRYPTION_KEY / CINATRA_CONTEXT_ATTEST_KEY (rotating the encryption
   // key would orphan already-encrypted data). Empty on a fresh install.
   const priorSecrets = existsSync(envPath) ? parseEnvBody(readFileSync(envPath, "utf8")) : {};
   // Validate the prior encryption key BEFORE overwriting — a malformed key must
   // abort with the file still intact (never destroy it, then let a retry mint a
-  // replacement that orphans encrypted data). No-op for dev/demo or fresh.
-  assertPriorEncryptionKeyDecodable({ mode, sourceValues: priorSecrets, envPath });
+  // replacement that orphans encrypted data). No-op when no key is present yet.
+  assertPriorEncryptionKeyDecodable({ sourceValues: priorSecrets, envPath });
   copyFileSync(examplePath, envPath);
   const secret = randomBytes(32).toString("hex");
   // Mint the other required secrets too, otherwise a fresh install is broken
@@ -1813,14 +1856,14 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
   // cinatra-cli#122: stamp the demo install profile so `pnpm dev` seeds the demo
   // fixtures. dev/prod carry no profile line (default fixtures-off, cinatra#1237).
   if (profile) body = upsertEnvKey(body, "CINATRA_INSTALL_PROFILE", profile);
-  // cinatra-cli#143 + cinatra#2654: add CINATRA_CONTEXT_ATTEST_KEY and
-  // CINATRA_BRIDGE_TOKEN (every mode — the WayFlow runtime this install starts
-  // needs both) plus CINATRA_ENCRYPTION_KEY for prod (app prod-boot hard
-  // requirement) — preserving valid prior values across a --reset-env regen
-  // (throws on a malformed prior encryption key).
+  // cinatra-cli#143 + cinatra#2654 + cinatra-cli#265: add CINATRA_ENCRYPTION_KEY,
+  // CINATRA_CONTEXT_ATTEST_KEY and CINATRA_BRIDGE_TOKEN — every mode needs all
+  // three (the WayFlow runtime this install starts needs the latter two, and the
+  // checkout's provisioning command seals its instance secrets with the first
+  // BEFORE the first boot) — preserving valid prior values across a --reset-env
+  // regen (throws on a malformed prior encryption key).
   const { body: withProdSecrets, minted: prodMinted, preserved: prodPreserved } = ensureInstanceSecrets({
     body,
-    mode,
     envPath,
     sourceValues: priorSecrets,
   });
@@ -1843,76 +1886,89 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
 }
 
 /**
- * cinatra-cli#143 — for `--mode prod` ONLY, ensure `.env.local` carries the two
- * prod-only secrets the dev flow never provisions:
- *   - `CINATRA_ENCRYPTION_KEY` — HARD-required by the app's prod-boot preflight
- *     (a valid 32-byte key). The app's dev auto-generator explicitly skips
- *     production, so a prod install must mint it here.
+ * cinatra-cli#143 + cinatra-cli#265 — ensure `.env.local` carries the instance
+ * secrets the copied `.env.example` leaves empty, in EVERY mode:
+ *   - `CINATRA_ENCRYPTION_KEY` — the at-rest key for instance/connector secrets.
+ *     HARD-required by the app's prod-boot preflight, and equally required
+ *     BEFORE the first boot of a dev or demo instance: the checkout's own
+ *     provisioning command seals an instance's secrets with it and refuses
+ *     without it. The app mints one on its first DEVELOPMENT boot, which is
+ *     exactly the boot a one-command setup exists to make unnecessary, so the
+ *     install writes it itself (cinatra-cli#265).
  *   - `CINATRA_CONTEXT_ATTEST_KEY` — the DISTINCT WayFlow attestation contract
  *     (soft: its absence degrades the WayFlow runtime; it is NOT in the app's
  *     hard/soft required-env set).
+ *   - `CINATRA_BRIDGE_TOKEN` — the shared secret for the runtime's bridge
+ *     callbacks (soft, same runtime).
  *
  * Lifecycle: mint a fresh `randomBytes(32).toString("hex")` value ONLY when the
  * key is MISSING; carry a VALID existing value forward UNTOUCHED (never rotate —
  * rotating the encryption key would orphan already-encrypted instance/connector
  * secrets, and rotating the attestation key can invalidate in-flight WayFlow
  * callbacks). A MALFORMED existing `CINATRA_ENCRYPTION_KEY` THROWS (naming the
- * var + file) rather than silently rotating or proceeding.
+ * var + file) rather than silently rotating or proceeding. Only the key NAMES
+ * are ever logged — never a minted value.
  *
  * `sourceValues` is the parsed prior env — the existing file on the preserve
  * path, or the OLD file captured BEFORE a `--reset-env` overwrite — so a valid
- * key survives a reset. No-op for dev/demo. Returns `{ body, changed, minted,
- * preserved }`.
+ * key survives a reset. Returns `{ body, changed, minted, preserved }`.
  */
-const PROD_ENCRYPTION_KEY = "CINATRA_ENCRYPTION_KEY";
+const INSTANCE_ENCRYPTION_KEY = "CINATRA_ENCRYPTION_KEY";
 
 /**
- * cinatra-cli#143 — THROW (prod only) if a prior `CINATRA_ENCRYPTION_KEY` is
- * present but does not decode to 32 bytes (hex-64 OR base64). Extracted so the
- * fresh/`--reset-env` path can call it BEFORE `copyFileSync` overwrites
- * `.env.local` — otherwise a malformed key would abort only AFTER the file (and
- * its key line) was destroyed, and a retry would then mint a replacement,
- * SILENTLY ROTATING the key and orphaning already-encrypted data (the exact
- * hazard the throw exists to prevent). No-op for dev/demo or an absent key.
+ * cinatra-cli#143 — THROW if a prior `CINATRA_ENCRYPTION_KEY` is present but does
+ * not decode to 32 bytes (hex-64 OR base64). Extracted so the fresh/`--reset-env`
+ * path can call it BEFORE `copyFileSync` overwrites `.env.local` — otherwise a
+ * malformed key would abort only AFTER the file (and its key line) was destroyed,
+ * and a retry would then mint a replacement, SILENTLY ROTATING the key and
+ * orphaning already-encrypted data (the exact hazard the throw exists to
+ * prevent). No-op when no key is present.
+ *
+ * cinatra-cli#265: MODE-INDEPENDENT. The guard used to run for production only,
+ * because only a production install wrote the key. Now every mode does, and a
+ * dev or demo instance has sealed rows as soon as its provisioning command has
+ * run — so rotating a dev key orphans exactly as much data as rotating a prod
+ * one. The fix is the same in every mode: refuse, name the var and the file, and
+ * let the operator decide.
  */
-function assertPriorEncryptionKeyDecodable({ mode, sourceValues = {}, envPath }) {
-  if (RUNTIME_MODE[mode] !== "production") return;
-  const existing = String(sourceValues[PROD_ENCRYPTION_KEY] ?? "").trim();
+function assertPriorEncryptionKeyDecodable({ sourceValues = {}, envPath }) {
+  const existing = String(sourceValues[INSTANCE_ENCRYPTION_KEY] ?? "").trim();
   if (!existing) return;
   const err = validateEncryptionKey(existing);
   if (err) {
     throw new Error(
-      `.env.local has a malformed ${PROD_ENCRYPTION_KEY} (${err}) at ${envPath}. Refusing to rotate it — ` +
+      `.env.local has a malformed ${INSTANCE_ENCRYPTION_KEY} (${err}) at ${envPath}. Refusing to rotate it — ` +
         `a fresh key would orphan already-encrypted instance/connector secrets. Fix or remove the ` +
-        `${PROD_ENCRYPTION_KEY} line (or delete ${envPath} to provision a new instance), then retry.`,
+        `${INSTANCE_ENCRYPTION_KEY} line (or delete ${envPath} to provision a new instance), then retry.`,
     );
   }
 }
 
-function ensureInstanceSecrets({ body, mode, envPath, sourceValues = {} }) {
-  const isProd = RUNTIME_MODE[mode] === "production";
+function ensureInstanceSecrets({ body, envPath, sourceValues = {} }) {
   // A malformed prior encryption key aborts (never rotate). On the preserve path
   // this throws before any write; the fresh/reset path calls the same guard
-  // BEFORE copyFileSync so the existing file is never destroyed first. No-op
-  // for dev/demo (the key is prod-only).
-  assertPriorEncryptionKeyDecodable({ mode, sourceValues, envPath });
+  // BEFORE copyFileSync so the existing file is never destroyed first.
+  assertPriorEncryptionKeyDecodable({ sourceValues, envPath });
   let next = body;
   const minted = [];
   const preserved = [];
 
-  // HARD, PROD ONLY: CINATRA_ENCRYPTION_KEY — a present value is already
-  // validated (hex-64 OR base64 32-byte, matching the app); carry it forward,
-  // else mint. Dev/demo boot without it (the app auto-generates in development).
-  if (isProd) {
-    const ENC = PROD_ENCRYPTION_KEY;
-    const encExisting = String(sourceValues[ENC] ?? "").trim();
-    if (encExisting) {
-      next = upsertEnvKey(next, ENC, encExisting);
-      preserved.push(ENC);
-    } else {
-      next = upsertEnvKey(next, ENC, randomBytes(32).toString("hex"));
-      minted.push(ENC);
-    }
+  // EVERY MODE: CINATRA_ENCRYPTION_KEY — a present value is already validated
+  // (hex-64 OR base64 32-byte, matching the app); carry it forward byte for
+  // byte, else mint 32 bytes as hex — the SAME shape the app's own first
+  // development boot writes, so a later boot finds it and generates nothing.
+  // cinatra-cli#265: minting this for prod alone broke the unattended order
+  // install → provision → first boot, because the checkout's provisioning
+  // command runs BEFORE any boot and refuses without the key; dev and demo were
+  // left waiting on a boot that was supposed to come after them.
+  const ENC = INSTANCE_ENCRYPTION_KEY;
+  const encExisting = String(sourceValues[ENC] ?? "").trim();
+  if (encExisting) {
+    next = upsertEnvKey(next, ENC, encExisting);
+    preserved.push(ENC);
+  } else {
+    next = upsertEnvKey(next, ENC, randomBytes(32).toString("hex"));
+    minted.push(ENC);
   }
 
   // EVERY MODE: CINATRA_CONTEXT_ATTEST_KEY — the WayFlow runtime signs its
@@ -2274,28 +2330,50 @@ function pinnedPnpmSpec(targetDir) {
   }
 }
 
+/** What `--frozen-lockfile` adds to a dependency install, resolved in ONE place
+ *  so no package-manager tier can silently drop the operator's opt-in. */
+function frozenLockfileParts(frozenLockfile) {
+  return frozenLockfile
+    ? { args: ["--frozen-lockfile"], suffix: " --frozen-lockfile" }
+    : { args: [], suffix: "" };
+}
+
 /** Same three-tier selection as `resolvePnpmInstallInvocation` in src/index.mjs:
  *  Corepack (pin honored by Corepack itself) → bare `pnpm` → the checkout's
  *  pinned pnpm through `npm exec` (the Node 25 line, where Corepack is no longer
  *  bundled — cinatra-cli#207). Only an unreadable pin degrades to attempting the
- *  canonical corepack command, so the failure still names what to enable. */
-function resolvePnpmInvocation({ targetDir, exists = commandExists } = {}) {
+ *  canonical corepack command, so the failure still names what to enable.
+ *
+ *  `frozenLockfile` appends `--frozen-lockfile` on EVERY tier, so an unattended
+ *  install refuses a lockfile drift instead of rewriting a tracked file under a
+ *  caller that has to hand its checkout back clean. Default false — the
+ *  invocation is then byte-for-byte what it has always been. */
+export function resolvePnpmInvocation({ targetDir, exists = commandExists, frozenLockfile = false } = {}) {
+  const frozen = frozenLockfileParts(frozenLockfile);
   if (exists("corepack", ["--version"])) {
-    return { command: "corepack", args: ["pnpm", "install"], label: "corepack pnpm install" };
+    return {
+      command: "corepack",
+      args: ["pnpm", "install", ...frozen.args],
+      label: `corepack pnpm install${frozen.suffix}`,
+    };
   }
   if (exists("pnpm", ["--version"])) {
-    return { command: "pnpm", args: ["install"], label: "pnpm install" };
+    return { command: "pnpm", args: ["install", ...frozen.args], label: `pnpm install${frozen.suffix}` };
   }
   const spec = pinnedPnpmSpec(targetDir);
   if (spec && exists("npm", ["--version"])) {
     return {
       command: "npm",
-      args: ["exec", "-y", "--", spec, "install"],
-      label: `npm exec -y -- ${spec} install`,
+      args: ["exec", "-y", "--", spec, "install", ...frozen.args],
+      label: `npm exec -y -- ${spec} install${frozen.suffix}`,
       pinned: spec,
     };
   }
-  return { command: "corepack", args: ["pnpm", "install"], label: "corepack pnpm install" };
+  return {
+    command: "corepack",
+    args: ["pnpm", "install", ...frozen.args],
+    label: `corepack pnpm install${frozen.suffix}`,
+  };
 }
 
 /** Fail-fast gate: the checkout is on disk, nothing has been mutated around it
@@ -2318,14 +2396,28 @@ export function assertWorkspaceInstallPossible({ targetDir, exists = commandExis
   );
 }
 
-function pnpmInstall({ targetDir, usePnpmDirect, log = console.log }) {
-  // `usePnpmDirect` is the caller's already-probed corepack-absent/pnpm-present
-  // verdict; honored as-is so that selection is unchanged. Everything else goes
-  // through the shared tiering, which is what reaches the pinned-pnpm fallback.
-  const invocation =
-    usePnpmDirect === true
-      ? { command: "pnpm", args: ["install"], label: "pnpm install" }
-      : resolvePnpmInvocation({ targetDir });
+/** The command line the install's OWN dependency step runs.
+ *
+ *  `usePnpmDirect` is the caller's already-probed corepack-absent/pnpm-present
+ *  verdict; honored as-is so that selection is unchanged. Everything else goes
+ *  through the shared tiering, which is what reaches the pinned-pnpm fallback.
+ *  BOTH branches build their extra args from the same helper, so the
+ *  already-probed shortcut cannot be the one tier that loses the opt-in —
+ *  exported so each branch is asserted rather than assumed. */
+export function pnpmInstallInvocation({
+  targetDir,
+  usePnpmDirect,
+  frozenLockfile = false,
+  exists = commandExists,
+} = {}) {
+  const frozen = frozenLockfileParts(frozenLockfile);
+  return usePnpmDirect === true
+    ? { command: "pnpm", args: ["install", ...frozen.args], label: `pnpm install${frozen.suffix}` }
+    : resolvePnpmInvocation({ targetDir, exists, frozenLockfile });
+}
+
+function pnpmInstall({ targetDir, usePnpmDirect, frozenLockfile = false, log = console.log }) {
+  const invocation = pnpmInstallInvocation({ targetDir, usePnpmDirect, frozenLockfile });
   // Name the binary actually invoked, like every other install site does — the
   // fixed "pnpm install" text told an operator on the Corepack tier something
   // that was not what ran.
@@ -2419,27 +2511,66 @@ export function classifySetupChildExit(status, { canReportRegistrySkew = false }
   return { tolerated: status === 0, registrySkew: false, lines: [] };
 }
 
-function runSetupInTarget({ targetDir, mode, skipDevApps, log = console.log }) {
-  // The command-routing contract (renamed cinatra-cli#61): invoke the CANONICAL namespaced form
-  // (`cinatra instance setup <mode>`) — the only form that resolves (the bare
-  // `setup <mode>` was removed in cinatra-cli#81).
-  //
-  // cinatra-cli#122: `demo` drives the DEV setup path (it is a dev superset, and
-  // there is no `instance setup demo` subcommand — the demo behaviour rides the
-  // orthogonal `CINATRA_INSTALL_PROFILE=demo` env, cinatra#1237). So the child
-  // command is `instance setup dev`; the demo-ness is carried by the profile env
-  // + the target's own demo overlay, not by the setup subcommand name.
+/** The argv of the `instance setup` child, built in ONE place so no forwarded
+ *  opt-in can be dropped by one caller and kept by another.
+ *
+ *  The command-routing contract (renamed cinatra-cli#61): the CANONICAL
+ *  namespaced form (`cinatra instance setup <mode>`) — the only form that
+ *  resolves (the bare `setup <mode>` was removed in cinatra-cli#81).
+ *
+ *  cinatra-cli#122: `demo` drives the DEV setup path (it is a dev superset, and
+ *  there is no `instance setup demo` subcommand — the demo behaviour rides the
+ *  orthogonal `CINATRA_INSTALL_PROFILE=demo` env, cinatra#1237). So the child
+ *  command is `instance setup dev`; the demo-ness is carried by the profile env
+ *  + the target's own demo overlay, not by the setup subcommand name.
+ *
+ *  `pinnedExtensions` forwards the install's opt-in as the child's own
+ *  `--pinned`: the setup phase re-syncs the dev extension fleet itself, so
+ *  pinning only the install's sync would leave the child free to float the
+ *  fleet back to a tip. Like `--skip-dev-apps` it is dev-path-only — a prod
+ *  setup child has no dev fleet to pin.
+ *
+ *  `frozenLockfile` forwards as the child's own `--frozen-lockfile`, for dev
+ *  AND prod: the child re-links the workspace after its extension sync (dev) or
+ *  its required-extension acquisition (prod), which is a SECOND `pnpm install`
+ *  inside the same run. A frozen install that stopped at the parent would still
+ *  let that one rewrite the tracked lockfile. */
+export function setupChildArgs({
+  mode,
+  skipDevApps = false,
+  pinnedExtensions = false,
+  frozenLockfile = false,
+} = {}) {
+  const setupMode = mode === "demo" ? "dev" : mode;
+  const args = ["instance", "setup", setupMode];
+  if (setupMode === "dev" && skipDevApps) args.push("--skip-dev-apps");
+  if (setupMode === "dev" && pinnedExtensions) args.push("--pinned");
+  if (frozenLockfile) args.push("--frozen-lockfile");
+  return args;
+}
+
+export function runSetupInTarget({
+  targetDir,
+  mode,
+  skipDevApps,
+  pinnedExtensions = false,
+  frozenLockfile = false,
+  log = console.log,
+  spawn = spawnSync,
+}) {
   const setupMode = mode === "demo" ? "dev" : mode;
   const profile = installProfileForMode(mode);
-  const setupArgs = [PUBLISHED_CLI_BIN, "instance", "setup", setupMode];
-  if (setupMode === "dev" && skipDevApps) setupArgs.push("--skip-dev-apps");
+  const setupArgs = [
+    PUBLISHED_CLI_BIN,
+    ...setupChildArgs({ mode, skipDevApps, pinnedExtensions, frozenLockfile }),
+  ];
   const label = profile ? `${setupMode} (${profile} profile)` : setupMode;
   log(`- Running \`cinatra instance setup ${setupMode}\` inside ${targetDir}${profile ? ` [${profile} profile]` : ""}…`);
   // cinatra-cli#200: NOT `runOrThrow` — the setup child has one non-zero status
   // that is a named, non-fatal verdict rather than a failure (see
   // classifySetupChildExit). Everything else still throws the same message.
   const message = `cinatra instance setup ${label} failed inside the target.`;
-  const result = spawnSync(process.execPath, setupArgs, {
+  const result = spawn(process.execPath, setupArgs, {
     stdio: "inherit",
     cwd: targetDir,
     env: buildSetupChildEnv({ mode, targetDir }),
@@ -3249,10 +3380,13 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
   try {
     if (isDevLikeMode(opts.mode) && deps.skipCoUseInstall !== true) {
       log("- Cloning declared companion extension repos (cinatra.devExtensions)…");
-      const extResult = await syncCinatraDevExtensions({
+      const extResult = await (deps.syncDevExtensions ?? syncCinatraDevExtensions)({
         repoRoot: targetDir,
         targetRoot: targetDir,
-        argv: [],
+        // Same opt-in as the default path — co-use owns its whole tail, so it
+        // has to carry the flag itself or a co-use instance would silently get
+        // a tip-tracking fleet where the default path pinned one.
+        argv: opts.pinnedExtensions ? ["--pinned"] : [],
         env: process.env,
         log,
       });
@@ -3260,7 +3394,12 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
     }
     if (!opts.noInstall && deps.skipCoUseInstall !== true) {
       const usePnpm = !commandExists("corepack", ["--version"]) && commandExists("pnpm", ["--version"]);
-      pnpmInstall({ targetDir, usePnpmDirect: usePnpm, log });
+      (deps.pnpmInstall ?? pnpmInstall)({
+        targetDir,
+        usePnpmDirect: usePnpm,
+        frozenLockfile: opts.frozenLockfile === true,
+        log,
+      });
     }
 
     // The donor's database was not in its connection string. Ask the SERVER
@@ -3316,7 +3455,14 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
     // Run setup with NO infra bring-up (the donor's stack is the backing infra).
     if (!opts.noSetup && deps.runSetup !== false) {
       const runSetup = deps.runSetup ?? ((d) => runSetupInTarget({ ...d }));
-      const setupVerdict = runSetup({ targetDir, mode: opts.mode, skipDevApps: opts.skipDevApps, log });
+      const setupVerdict = runSetup({
+        targetDir,
+        mode: opts.mode,
+        skipDevApps: opts.skipDevApps,
+        pinnedExtensions: opts.pinnedExtensions,
+        frozenLockfile: opts.frozenLockfile === true,
+        log,
+      });
       // cinatra-cli#200 — co-use terminates on its OWN tail (below), so it must
       // carry the typed skew outcome itself: the same completed-with-skew setup
       // that exits non-zero on the default install path cannot silently exit 0
@@ -6140,7 +6286,7 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
 
 /** Minimal `.env` body → { KEY: value } map (last wins; quotes stripped). Used
  *  to PRESERVE existing credentials when re-pointing an isolated URL, to read the
- *  prior prod secrets ensureEnvLocal carries forward, and by the post-install
+ *  prior instance secrets ensureEnvLocal carries forward, and by the post-install
  *  prod-env gate (cinatra-cli#143) — a single dotenv parser for all three. */
 export function parseEnvBody(body) {
   const out = {};
@@ -9104,6 +9250,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     alreadyCheckout,
     force: opts.force,
     yes: opts.yes,
+    noFetch: opts.noFetch,
     log,
   });
 
@@ -9490,13 +9637,29 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   // sees it after the wall of install output, not only where it happened.
   let setupRegistrySkew = false;
 
+  // Injectable seams for the three children this phase spawns, so a test can
+  // pin the exact command lines the install issues without running a sync, a
+  // package manager or a setup child.
+  const syncDevExtensions = deps.syncDevExtensions ?? syncCinatraDevExtensions;
+  const installDeps = deps.pnpmInstall ?? pnpmInstall;
+  const runSetupChild = deps.runSetupInTarget ?? runSetupInTarget;
+  const acquireProd = deps.acquireProdExtensions ?? acquireProdExtensions;
+  // `--frozen-lockfile` is the same opt-in on every dependency install this run
+  // performs (prod does two), so it is resolved once here.
+  const frozenLockfile = opts.frozenLockfile === true;
+
   if (isDevLikeMode(opts.mode)) {
     // (demo overlay support was verified right after checkout, above.)
     log("- Cloning declared companion extension repos (cinatra.devExtensions)…");
-    const extResult = await syncCinatraDevExtensions({
+    const extResult = await syncDevExtensions({
       repoRoot: targetDir,
       targetRoot: targetDir,
-      argv: [],
+      // `--pinned-extensions` is the ONLY thing that puts a flag here: without
+      // it the sync stays tip-tracking, exactly as it has always been. The
+      // pinned path is fail-closed (an entry that cannot be pinned stops the
+      // install), which is the point for a caller that cannot inspect the
+      // fleet afterwards.
+      argv: opts.pinnedExtensions ? ["--pinned"] : [],
       env: process.env,
       log,
     });
@@ -9507,7 +9670,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     if (opts.noInstall) {
       log(`- Skipping dependency install + setup (--no-install). Checkout + env are ready; re-run \`cinatra install --mode ${opts.mode}\` (it reconciles in place — skips the clone, runs deps + setup) when ready.`);
     } else {
-      pnpmInstall({ targetDir, usePnpmDirect, log });
+      installDeps({ targetDir, usePnpmDirect, frozenLockfile, log });
       if (opts.noSetup) {
         log(`- Skipping setup (--no-setup). Checkout + deps are ready; re-run \`cinatra install --mode ${opts.mode}\` (it reconciles in place — runs the setup phase) when ready.`);
       } else {
@@ -9515,10 +9678,12 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
         // through honors the operator's choice. (We do NOT sync devApps here to
         // avoid double-cloning.) `demo` drives the same dev setup path + the
         // orthogonal CINATRA_INSTALL_PROFILE=demo signal (see runSetupInTarget).
-        const setupVerdict = runSetupInTarget({
+        const setupVerdict = runSetupChild({
           targetDir,
           mode: opts.mode,
           skipDevApps: opts.skipDevApps,
+          pinnedExtensions: opts.pinnedExtensions,
+          frozenLockfile,
           log,
         });
         setupRegistrySkew = setupVerdict?.registrySkew === true;
@@ -9528,13 +9693,13 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     log("- Skipping dependency install + setup (--no-install). Re-run `cinatra install --mode prod` (it reconciles in place — runs deps + acquire-prod + setup) when ready.");
   } else {
     // prod: install → acquire-prod → install → setup prod (mirrors setup.sh).
-    pnpmInstall({ targetDir, usePnpmDirect, log });
-    acquireProdExtensions({ targetDir, log });
-    pnpmInstall({ targetDir, usePnpmDirect, log });
+    installDeps({ targetDir, usePnpmDirect, frozenLockfile, log });
+    acquireProd({ targetDir, log });
+    installDeps({ targetDir, usePnpmDirect, frozenLockfile, log });
     if (opts.noSetup) {
       log("- Skipping setup (--no-setup). Re-run `cinatra install --mode prod` (it reconciles in place — runs the setup phase) when ready.");
     } else {
-      runSetupInTarget({ targetDir, mode: "prod", skipDevApps: false, log });
+      runSetupChild({ targetDir, mode: "prod", skipDevApps: false, frozenLockfile, log });
       // cinatra-cli#143: with setup done, VALIDATE the prod required-env matrix in
       // .env.local so we never report success on an instance that would crash on
       // first prod boot ([required-env-preflight]). A missing/malformed HARD var
@@ -9825,7 +9990,16 @@ async function bootstrapPreviewFrontDoor({
 /** Clone a fresh host repo or update an existing checkout to `ref`; return the
  *  resolved commit SHA. Refuses a dirty checkout unless --force (stash-then-
  *  reset), and refuses to update a checkout whose origin is a different repo. */
-async function cloneOrUpdateHost({ targetDir, repoUrl, ref, alreadyCheckout, force, yes, log }) {
+async function cloneOrUpdateHost({
+  targetDir,
+  repoUrl,
+  ref,
+  alreadyCheckout,
+  force,
+  yes,
+  noFetch = false,
+  log,
+}) {
   if (alreadyCheckout) {
     log(`- Existing cinatra checkout at ${targetDir} — updating to ref "${ref}"…`);
     const currentRef = capture("git", ["-C", targetDir, "rev-parse", "--short", "HEAD"], { env: gitEnv() });
@@ -9845,7 +10019,23 @@ async function cloneOrUpdateHost({ targetDir, repoUrl, ref, alreadyCheckout, for
     // Reuse the single shared git-move primitive (fetch ref + tags → resolve to
     // a concrete commit → fast-forward / --force hard-reset). The same helper
     // backs `cinatra update`, so install and update can never drift apart.
-    return moveExistingCheckoutToRef({ targetDir, ref, force, log });
+    // `--no-fetch` turns off only its fetch step: the checkout is already at
+    // the commit the caller put there, so the move is a local resolve.
+    return moveExistingCheckoutToRef({ targetDir, ref, force, fetch: !noFetch, log });
+  }
+
+  // `--no-fetch` suppresses the HOST CHECKOUT's fetch — not every network read
+  // the run performs (it still clones the declared companion extension repos
+  // and installs dependencies from a registry). A fresh clone IS that same
+  // host-checkout read in a larger form, so there is nothing here the flag
+  // could suppress; refuse and name what is missing rather than cloning as if
+  // it had not been passed.
+  if (noFetch) {
+    throw new Error(
+      `--no-fetch: ${targetDir} holds no Cinatra checkout to move, and cloning one is the very fetch ` +
+        `this flag suppresses. Put a checkout there first (clone it, or add a git worktree at the ` +
+        `commit you want), or drop --no-fetch.`,
+    );
   }
 
   if (existsSync(targetDir) && !isEmptyDir(targetDir)) {
@@ -10101,7 +10291,27 @@ export function moveExistingCheckoutToRef({
   // Tag: resolve the tag-qualified ref unambiguously. Ref: try FETCH_HEAD (the
   // just-fetched ref), then origin/<ref>, then the bare ref — so a stale local
   // ref of the same name never wins over the freshly-fetched remote commit.
-  const candidates = isTag ? [`refs/tags/${ref}`] : ["FETCH_HEAD", `origin/${ref}`, ref];
+  //
+  // WITHOUT a fetch the list is rebuilt from the operator's own local state:
+  //   - FETCH_HEAD is DROPPED. Nothing fetched it this run, so it is whatever
+  //     some earlier, unrelated fetch left behind; resolving through it would
+  //     silently move the checkout to a commit the caller never named.
+  //   - A LOCAL BRANCH is resolved through its FULLY-QUALIFIED
+  //     `refs/heads/<ref>`. `rev-parse <name>^{commit}` prefers a TAG of the
+  //     same name, while the checkout below takes the BRANCH by name — so a
+  //     bare-name resolution would check out the operator's branch and then
+  //     fast-forward it onto the tag's commit.
+  //   - `origin/<ref>` stays LAST: with no fetch it may be stale, and a stale
+  //     remote-tracking ref must never beat the operator's own branch.
+  let candidates;
+  if (isTag) {
+    candidates = [`refs/tags/${ref}`];
+  } else if (fetch) {
+    candidates = ["FETCH_HEAD", `origin/${ref}`, ref];
+  } else {
+    const hasLocalBranch = runGit(["show-ref", "--verify", "--quiet", `refs/heads/${ref}`]).status === 0;
+    candidates = [...(hasLocalBranch ? [`refs/heads/${ref}`] : []), ref, `origin/${ref}`];
+  }
   let targetCommit = null;
   for (const candidate of candidates) {
     const r = runGit(["rev-parse", "--verify", "--quiet", `${candidate}^{commit}`]);
@@ -10112,8 +10322,15 @@ export function moveExistingCheckoutToRef({
   }
   if (!targetCommit) {
     throw new Error(
-      `Could not resolve ${isTag ? "tag" : "ref"} "${ref}" to a commit after fetching. ` +
-        `Verify the ${isTag ? "tag" : "branch/tag/sha"} exists in origin.`,
+      fetch
+        ? `Could not resolve ${isTag ? "tag" : "ref"} "${ref}" to a commit after fetching. ` +
+            `Verify the ${isTag ? "tag" : "branch/tag/sha"} exists in origin.`
+        : // Fail closed, naming the ref: a move asked to reach no remote can only
+          // land on a commit the checkout already has, and quietly staying where
+          // it is would report a commit the caller did not ask for.
+          `Could not resolve ${isTag ? "tag" : "ref"} "${ref}" to a commit WITHOUT fetching. ` +
+            `--no-fetch moves ${targetDir} only to a commit it already has — fetch "${ref}" into it ` +
+            `first, or drop --no-fetch.`,
     );
   }
 

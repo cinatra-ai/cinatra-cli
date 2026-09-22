@@ -8,6 +8,41 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`cinatra install` can now be run unattended, by a caller that has to hand
+  its checkout back clean.** `install --mode dev` is the one command that makes
+  an instance exist or makes it healthy, but three small things kept it out of
+  reach of an operator creating many isolated instances with nobody watching —
+  a CI job or an automated verification runner, working in a checkout already
+  parked at an exact commit and required to hand it back byte-for-byte clean.
+  The dev extension fleet was synced
+  tip-tracking, so two installs of the same commit could differ; the dependency
+  install was a bare `pnpm install`, which rewrites the lockfile rather than
+  reporting the drift; and an existing checkout was always moved to `--ref`
+  behind a `git fetch`, which is wasted work when the checkout is already at
+  that commit and a network dependency where there may be none. Three opt-in
+  flags close them. `--pinned-extensions` syncs the fleet at the checkout's OWN
+  committed lock shas — fail-closed, so an entry that cannot be pinned stops the
+  install — in the install's own sync AND in the setup phase it runs, so the
+  fleet cannot float back to a tip halfway through; it is refused for a `--mode
+  prod` install, which acquires its extensions pinned and integrity-verified on
+  its own path; with `--mode preview` it pins the CHECKOUT's fleet, while what
+  the preview image acquires stays `--fleet`'s business. `--frozen-lockfile`
+  runs EVERY dependency install of the run — the install's own, and the one the
+  setup phase performs when it re-links the workspace after its extension sync
+  or its prod acquisition (a `--mode prod` install has three, one either side of
+  the acquisition plus the child's) — as `pnpm install --frozen-lockfile`, on
+  every package-manager tier, so a lockfile that no longer matches the manifests
+  is a clear refusal instead of a modified tracked file. `--no-fetch` moves an
+  existing checkout — a plain clone or a detached worktree — to a branch, tag or
+  full commit SHA using only what that checkout already has: it requires an
+  explicit `--ref`, resolves a local branch through its own `refs/heads` entry
+  rather than through a same-named tag, never consults a `FETCH_HEAD` this run
+  did not write, refuses and names the ref when it does not resolve locally, and
+  refuses when there is no checkout to move, because cloning one is the very
+  fetch it suppresses. That one fetch is all it suppresses — the run still
+  clones the declared companion extension repos and installs from a registry.
+  All three are off by default and nothing about a hand-run install changes.
+
 - **An instance on a shared PostgreSQL server can be given its own database
   name and its own template database.** Running several isolated instances on
   one machine against ONE PostgreSQL server is the cheap way to do it, and the
@@ -123,6 +158,31 @@ project adheres to [Semantic Versioning](https://semver.org/).
   recorded on, never the one that was merely asked for.
 
 ### Fixed
+
+- **`cinatra install` now mints the instance encryption key in every mode, so an
+  instance can be provisioned before its first boot.** The intended unattended
+  order is install, then the checkout's provisioning step, then the first boot.
+  That provisioning step seals the instance's secrets with
+  `CINATRA_ENCRYPTION_KEY`, and the install used to mint that key for `--mode
+  prod` only — in development the app generates one on its FIRST server boot and
+  writes it into `.env.local`. So a development or demo install produced a
+  checkout whose provisioning step refused (`CINATRA_ENCRYPTION_KEY env var is
+  required for instance-secrets encryption`) until the app had been started once,
+  which is exactly the boot a single-command setup exists to make unnecessary.
+  The install now authors the key itself whenever it is absent, in every mode: 32
+  bytes as 64 lowercase hex characters, the same shape the app's own first boot
+  writes, so a later boot finds it and generates nothing. Everything the
+  production path already guaranteed for this key now holds for every mode. A
+  value that is already present is carried forward byte for byte on every path —
+  a fresh checkout, a `--reset-env` regeneration, and the self-heal of an
+  existing file — because rotating it would orphan every secret the instance has
+  already sealed, and a second install on the same checkout therefore rewrites
+  nothing. A present but MALFORMED value (one that decodes to neither a 64-char
+  hex nor a base64 32-byte key) now aborts the install in every mode, naming the
+  variable and the file, before anything is written: a development instance has
+  sealed rows as soon as it has been provisioned, so silently replacing its key
+  would lose exactly as much as it would in production. No value is ever printed:
+  the install names the variables it minted and nothing else.
 
 - **`cinatra install --on-conflict=stop-existing` no longer leaks the stopped
   instance's ports, and no longer stops a stack the operator was never shown.**

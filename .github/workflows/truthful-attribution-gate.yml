@@ -1,16 +1,29 @@
 name: truthful-attribution-gate
 # Thin caller for the org-reusable truthful-attribution-gate (cinatra-ai/ci),
 # per the Truthful Attribution protocol; supersedes the earlier paused
-# no-AI-attribution rollout): findings are annotated, the check is ALWAYS green —
-# it never fails a PR. No .github/gate-suite.json committed (WARN scope exercises
-# presence + the human arm; the gate-suite arm is not exercised without a suite).
-# Pinned to the immutable engine SHA proven green in cinatra ENFORCE today; the
-# `uses:` line below is double-pinned (SHA + the moving ci version marker
-# re-pointed to this SHA), exactly like the other cinatra-ai/ci gate callers
-# in this repo and the live cinatra ENFORCE caller.
+# no-AI-attribution gate. WARN mode (`mode: warn` below): findings are
+# annotated, the check is ALWAYS green — it never fails a PR.
+# .github/gate-suite.json IS committed in this repository: its requiredContexts
+# entry for this context carries the same engine SHA the `uses:` line below
+# pins, and the gate reads that suite at the merged SHA whenever a merge record
+# carries a Gate-suite arm.
+# Pinned to the immutable engine SHA the cinatra application repository's
+# ENFORCE caller pins today; the `uses:` line below is double-pinned (SHA + the
+# moving ci version marker re-pointed to this SHA), exactly like the other
+# cinatra-ai/ci gate callers in this repo and the live cinatra ENFORCE caller.
 
 on:
   pull_request:
+  # merge_group: the engine at this pin carries a merge-group ARM — a step that
+  # runs only on a merge_group event and judges the QUEUE CANDIDATE (it resolves
+  # the group's pull request from the candidate's parents and the queue's
+  # pull-request list, then validates the approved head at enqueue, the
+  # approval's standing, the verification-boundary record for that head and the
+  # candidate's tree; ambiguous membership fails CLOSED). Without this trigger
+  # the context would never post on a queue candidate. Inert until a merge queue
+  # is enabled — no merge_group event fires without one — and gate-suite.json
+  # already lists merge_group among this context's allowedEvents.
+  merge_group:
   push:
     branches: [main]
 
@@ -18,17 +31,25 @@ permissions:
   contents: read
   pull-requests: read
   checks: read
-  # actions:read is MANDATORY: the engine at 8eede102 resolves a reusable-workflow
-  # check-run to its Actions run (GET /actions/runs/{id}) to verify referenced_workflows[]
-  # at the pinned SHA. With an explicit permissions block, any omitted scope defaults
-  # to `none`, and a called reusable workflow cannot exceed the caller's grant — so
-  # omitting this causes startup_failure (red/missing check), which WARN mode CANNOT
-  # rescue (it fails before any step runs). Do not drop this line.
+  # actions:read is MANDATORY: the engine at the pinned SHA resolves a reusable-
+  # workflow check-run to its Actions run (GET /actions/runs/{id}) to verify
+  # referenced_workflows[] at the pinned SHA. With an explicit permissions block,
+  # any omitted scope defaults to `none`, and a called reusable workflow cannot
+  # exceed the caller's grant — so omitting this causes startup_failure
+  # (red/missing check), which WARN mode CANNOT rescue (it fails before any step
+  # runs). Do not drop this line.
   actions: read
 
 jobs:
   truthful-attribution-gate:                 # caller job id MUST stay this exact string
-    uses: cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@8eede1022e835997d94974e4bd6205daf72131a2 # v0.1.0
+    # Double-pin per the workflow-pinning convention: the workflow ref (@<sha>)
+    # and the `ref` engine-checkout input below are the SAME cinatra-ai/ci
+    # commit, so the gate code is never pulled from mutable main.
+    # gate-suite.json requiredContexts[].pinned tracks this uses:@ SHA (the gate
+    # compares the resolved run's referenced_workflows[] entry against it
+    # EXACTLY), so a LAGGING pin fails CLOSED, not open — the caller `uses:@`,
+    # the `ref:` below and the suite entry must move in one commit.
+    uses: cinatra-ai/ci/.github/workflows/truthful-attribution-gate.yml@1e40675e1642dcc32d195f27b3deb285b4d3d6fc # v0.1.4-next.1e40675
     with:
       mode: warn
-      ref: 8eede1022e835997d94974e4bd6205daf72131a2
+      ref: 1e40675e1642dcc32d195f27b3deb285b4d3d6fc # same SHA as the workflow @ref

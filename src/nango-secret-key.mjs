@@ -3,7 +3,7 @@
 //
 // THE GAP: a local install never provisioned `NANGO_SECRET_KEY`. `ensureEnvLocal`
 // mints `NANGO_ENCRYPTION_KEY` and `CINATRA_BRIDGE_TOKEN` (cinatra-cli#18) and the
-// prod-only secrets (cinatra-cli#143), but not this one — so the app fell back to
+// other instance secrets (cinatra-cli#143), but not this one — so the app fell back to
 // whatever the operator typed at `/setup/connections`, which is stored as
 // `connector_config:nango` and is almost never a UUID. nango-server then refuses
 // it with `invalid_secret_key_format` (HTTP 401) and EVERY Nango-backed connector
