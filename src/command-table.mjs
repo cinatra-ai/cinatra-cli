@@ -531,7 +531,7 @@ export const COMMAND_DESCRIPTORS = [
     path: ["instance", "wayflow"],
     match: "command+mode",
     summary:
-      "Manage the shared WayFlow agent runtime dev container (start|stop) via the compose `wayflow` profile; start regenerates the bridge-token env first.",
+      "Manage the shared WayFlow agent runtime dev container (start|stop) via the compose `wayflow` profile; start regenerates the bridge-token env first. With `--instance <name> --runtime-port <n> [--app-url <url>]` it starts or stops ONE instance's own runtime container instead, on the port you name and under its own name, health-gated on the runtime answering AND the container reaching that instance's app.",
   },
   {
     id: "dev.a2a",
