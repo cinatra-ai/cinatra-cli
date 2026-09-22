@@ -377,7 +377,7 @@ const mapDigest = (root) =>
 const mapText = (root) => readFileSync(path.join(root, MAP_REL), "utf8");
 
 describe("the generated maps under --pinned-extensions (cinatra-cli#270)", () => {
-  const reconciled = { results: [{ action: "cloned", dest: "/repo/extensions/cinatra-ai/x" }] };
+  const reconciled = { results: [{ action: "cloned", dest: "/repo/extensions/vendor/x" }] };
 
   it("maps already current: the run succeeds and the tracked bytes never move", () => {
     const logs = vi.spyOn(console, "log").mockImplementation(() => {});
