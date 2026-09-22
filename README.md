@@ -331,6 +331,48 @@ Useful extras:
     cinatra install --status [--dir <path>]  # show one checkout's instance state
     cinatra install --resume                 # finish an install that was interrupted
 
+### Installing unattended
+
+If nobody is watching the install — a CI job or an automated verification runner
+that creates many isolated instances, each in a checkout already parked at an
+exact commit, and has to hand that checkout back byte-for-byte clean — three
+opt-in flags make `cinatra install` fit:
+
+    cinatra install --pinned-extensions   # the dev extension fleet at the checkout's
+                                          # OWN committed lock shas, not the repos' tips
+    cinatra install --frozen-lockfile     # `pnpm install --frozen-lockfile`: a lockfile
+                                          # drift is a refusal, not a rewritten file
+    cinatra install --no-fetch --ref <sha> # move an existing checkout to that commit
+                                          # without fetching (it already has it)
+
+`--pinned-extensions` applies to the install's own extension sync **and** to the
+setup phase it runs, so the fleet cannot float back to a tip halfway through. It
+is fail-closed: an extension the committed lock cannot pin stops the install
+rather than silently tracking a branch. It belongs to a dev-like install
+(`dev`/`demo`/`preview`) — a `--mode prod` install already acquires its required
+extensions pinned and integrity-verified, and refuses the flag rather than
+pretending to honour it. With `--mode preview` it pins the fleet of the
+**checkout** (the dev half of that composition); what the preview *image*
+acquires is chosen by `--fleet` and is not affected.
+
+`--frozen-lockfile` reaches every dependency install of the run — the install's
+own, and the one the setup phase runs when it re-links the workspace after its
+extension sync — on every package-manager tier. A `--mode prod` install performs
+three: one either side of the extension acquisition, and the setup child's.
+
+`--no-fetch` moves an existing checkout — a plain clone or a detached git
+worktree — to `--ref` (a branch, a tag, or a full commit SHA) using only what
+that checkout already has. It requires an explicit `--ref`: without one the
+install would target the default `main` and resolve it from whatever the
+checkout happens to hold. If the ref does not resolve locally it refuses and
+names it, rather than moving somewhere else, and it refuses when the target
+directory holds no checkout at all, because cloning one is the very fetch the
+flag suppresses. It suppresses *that* fetch only — the run still clones the
+declared companion extension repos and installs dependencies from a registry.
+
+All three are off by default: an install that does not ask for them behaves
+exactly as it did before.
+
 `--list-instances` / `--status` are read-only. Stopping or wiping an existing
 instance always asks for confirmation first; `--yes` alone never deletes data
 (and pointing setup at your own external database with `--db-url` likewise needs

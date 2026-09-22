@@ -529,6 +529,7 @@ Usage:
   cinatra install [dev|prod|demo] [--dir <path>] [--ref <main|tag|sha>]
                   [--mode dev|prod|demo] [--repo-url <url>] [--yes] [--force] [--reset-env]
                   [--skip-dev-apps] [--no-infra] [--no-install] [--no-setup] [--no-wayflow]
+                  [--pinned-extensions] [--frozen-lockfile] [--no-fetch]
                   [--on-conflict fail|prompt|isolated|stop-existing|attach|external|co-use]
                   [--infra new|external|share] [--instance <slug>] [--app-port <n>]
                   [--port-offset auto|<n>] [--db-url <url>] [--redis-url <url>]
@@ -621,6 +622,32 @@ Commands:
                                       owns a local stack starts it by default, so agents work
                                       out of the box; pass this for a deliberately lean install
                                       (agent runs then fail until you start it by hand).
+                    For an UNATTENDED install — a CI job or an automated verification runner
+                    that creates many instances in a checkout already parked at an exact
+                    commit and has to hand it back byte-for-byte clean. All three are off by
+                    default; without them the install is unchanged.
+                    --pinned-extensions  Sync the dev extension fleet at the checkout's OWN
+                                      committed lock shas instead of the repos' tips, in this
+                                      install AND in the setup phase it runs. Fail-closed: an
+                                      entry that cannot be pinned stops the install. Dev-like
+                                      modes only (a prod install acquires its extensions
+                                      pinned + integrity-verified already). Under --mode
+                                      preview it pins the CHECKOUT's fleet; what the preview
+                                      IMAGE acquires is --fleet's business.
+                    --frozen-lockfile Run EVERY dependency install of the run — this one (a
+                                      prod install does two, around the extension
+                                      acquisition) and the setup phase's workspace re-link —
+                                      as \`pnpm install --frozen-lockfile\`, so a lockfile that
+                                      does not match the manifests is a clear refusal instead
+                                      of a rewritten tracked file.
+                    --no-fetch        Move an EXISTING checkout to --ref without fetching it
+                                      from origin; needs an explicit --ref. Refuses, naming
+                                      the ref, when that ref is not already resolvable in the
+                                      checkout, and refuses when there is no checkout to move
+                                      (cloning one IS that fetch). For a checkout already
+                                      parked at the commit you want. It suppresses that one
+                                      fetch only — companion extension repos and dependencies
+                                      are still fetched.
                     When an EXISTING instance already holds the ports, install
                     offers + executes an isolation option (prompts on a TTY):
                     --on-conflict=isolated  Second FULL stack on remapped ports + own app port.
@@ -1895,23 +1922,46 @@ function readPinnedPnpmSpec(repoRoot) {
 //
 // `repoRoot` is what carries the pin; a caller that has no checkout in hand can
 // omit it and keeps exactly the tier-1/tier-2 behavior it had before.
-function resolvePnpmInstallInvocation({ exists = commandExists, repoRoot = null, readPin = readPinnedPnpmSpec } = {}) {
+// `frozenLockfile` appends `--frozen-lockfile` on EVERY tier. It is how
+// `cinatra install --frozen-lockfile` reaches the SECOND dependency install of
+// its own run: the install spawns `instance setup <mode>`, and that child
+// re-links the workspace after its extension sync / prod acquisition. Without
+// it here, a run that asked for a frozen install could still rewrite the
+// tracked lockfile from inside the child. Default false — every other caller
+// (`update`, `instance refresh`, the standalone re-link) keeps its plain
+// install byte for byte.
+function resolvePnpmInstallInvocation({
+  exists = commandExists,
+  repoRoot = null,
+  readPin = readPinnedPnpmSpec,
+  frozenLockfile = false,
+} = {}) {
+  const extra = frozenLockfile ? ["--frozen-lockfile"] : [];
+  const suffix = frozenLockfile ? " --frozen-lockfile" : "";
   if (exists("corepack", ["--version"])) {
-    return { command: "corepack", args: ["pnpm", "install"], label: "corepack pnpm install" };
+    return {
+      command: "corepack",
+      args: ["pnpm", "install", ...extra],
+      label: `corepack pnpm install${suffix}`,
+    };
   }
   if (exists("pnpm", ["--version"])) {
-    return { command: "pnpm", args: ["install"], label: "pnpm install" };
+    return { command: "pnpm", args: ["install", ...extra], label: `pnpm install${suffix}` };
   }
   const spec = repoRoot ? readPin(repoRoot) : null;
   if (spec && exists("npm", ["--version"])) {
     return {
       command: "npm",
-      args: ["exec", "-y", "--", spec, "install"],
-      label: `npm exec -y -- ${spec} install`,
+      args: ["exec", "-y", "--", spec, "install", ...extra],
+      label: `npm exec -y -- ${spec} install${suffix}`,
       pinned: spec,
     };
   }
-  return { command: "corepack", args: ["pnpm", "install"], label: "corepack pnpm install" };
+  return {
+    command: "corepack",
+    args: ["pnpm", "install", ...extra],
+    label: `corepack pnpm install${suffix}`,
+  };
 }
 
 function createTempDirectory(prefix) {
@@ -6188,7 +6238,13 @@ function extensionDeclaresInstallableDeps(pkgDir) {
 function installAfterExtensionSync(
   repoRoot,
   syncResult,
-  { failHard = false, spawn = spawnSync, exists = commandExists, readPin = readPinnedPnpmSpec } = {},
+  {
+    failHard = false,
+    spawn = spawnSync,
+    exists = commandExists,
+    readPin = readPinnedPnpmSpec,
+    frozenLockfile = false,
+  } = {},
 ) {
   const results = syncResult && Array.isArray(syncResult.results) ? syncResult.results : [];
   if (results.length === 0) return; // no-config / nothing matched / nothing synced
@@ -6209,7 +6265,7 @@ function installAfterExtensionSync(
       !existsSync(path.join(r.dest, "node_modules")),
   );
   if (!materiallyChanged && !hydrationMissing) return;
-  const invocation = resolvePnpmInstallInvocation({ exists, repoRoot, readPin });
+  const invocation = resolvePnpmInstallInvocation({ exists, repoRoot, readPin, frozenLockfile });
   console.log(`- Linking cloned extensions into the workspace (${invocation.label})…`);
   const install = spawn(invocation.command, invocation.args, {
     cwd: repoRoot,
@@ -6629,7 +6685,16 @@ function regenerateExtensionManifest(repoRoot) {
 // imported at the call site below to avoid pulling in the server-only
 // barrel from this plain-Node CLI.
 
-async function runSetup(mode, { skipDevApps = false } = {}) {
+/** The options `cinatra instance setup dev|prod` derives from its OWN trailing
+ *  args. Only that command reads them: `instance refresh` calls `runSetup`
+ *  directly with its own explicit options and deliberately keeps a plain
+ *  install (see the note at its dependency step), so a flag typed at `refresh`
+ *  can never reach this. */
+export function setupPhaseOptions(rest = []) {
+  return { frozenLockfile: rest.includes("--frozen-lockfile") };
+}
+
+async function runSetup(mode, { skipDevApps = false, frozenLockfile = false } = {}) {
   const repoRoot = getRepoRoot();
   const env = collectEnvironment(repoRoot);
   const runtimeMode = readConfiguredRuntimeMode(env);
@@ -6671,7 +6736,7 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
     // can never be followed by DB setup.
     const { acquireProdRequiredExtensions } = await import("./prod-extension-acquisition.mjs");
     const acquisition = await acquireProdRequiredExtensions({ repoRoot });
-    installAfterExtensionSync(repoRoot, acquisition, { failHard: true });
+    installAfterExtensionSync(repoRoot, acquisition, { failHard: true, frozenLockfile });
   }
 
   const client = await createClient(connectionString);
@@ -6784,6 +6849,17 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
       // (post-cutover); a no-op when `cinatra.devExtensions` is empty.
       // Loud-but-non-fatal, like the dev-app sync in the tail.
       try {
+        // DO NOT narrow this branch by adding `skipDevApps` to the options
+        // `setupPhaseOptions(rest)` returns. `install --pinned-extensions`
+        // forwards `--pinned` on the setup child's command line, and the ONLY
+        // reason the child's sync honours it is that `skipDevApps` is false for
+        // every CLI-invoked setup — the dispatcher passes no such option — so
+        // the ambient-argv branch below carries the flag through. Deriving
+        // `skipDevApps` from the child's own args would flip this to the
+        // single-flag array and silently unpin the fleet the parent pinned,
+        // with nothing failing. (`instance refresh` reaches the narrowed branch
+        // by passing the option directly, which is why it is the one caller
+        // whose extra flags do not reach the sync.)
         extensionSync = await syncCinatraDevExtensions({
           repoRoot,
           targetRoot: repoRoot,
@@ -6796,7 +6872,7 @@ async function runSetup(mode, { skipDevApps = false } = {}) {
       }
       // Re-link the freshly-cloned extensions into the workspace so their host
       // value-imports resolve at `pnpm dev` (guarded no-op on warm checkouts).
-      const devInstallResult = installAfterExtensionSync(repoRoot, extensionSync);
+      const devInstallResult = installAfterExtensionSync(repoRoot, extensionSync, { frozenLockfile });
       // cinatra-cli#41: guarantee every emitted on-disk extension is linked into
       // node_modules (verify + non-destructive symlink repair) before regen, and
       // gate the regen on it — see ensureClonedExtensionsLinked.
@@ -16386,7 +16462,7 @@ function readCliVersion() {
  *
  * @returns {Record<string, (rest: string[], routedTokens: string[]) => unknown>}
  */
-function buildHandlers() {
+export function buildHandlers({ runSetupPhase = runSetup } = {}) {
   return {
     install: async (rest) => {
       // Command-routing dispatcher contract: `rest = argv.slice(path.length)` already
@@ -16483,12 +16559,17 @@ function buildHandlers() {
     // `setup` with NO mode: env-driven dev|prod dispatch.
     setup: async () => {
       const env = collectEnvironment(getRepoRoot());
-      await runSetup(readConfiguredRuntimeMode(env) === "production" ? "prod" : "dev");
+      await runSetupPhase(readConfiguredRuntimeMode(env) === "production" ? "prod" : "dev");
     },
     "setup.dev|prod": async (rest, routedTokens) => {
       // The `dev|prod` mode token is the LAST routed token (canonical path
       // `["instance","setup","dev|prod"]`, alias path `["setup","dev|prod"]`).
-      await runSetup(routedTokens[routedTokens.length - 1]);
+      // `setupPhaseOptions(rest)` is what turns the child's own
+      // `--frozen-lockfile` token into behaviour: without it the token still
+      // arrives and is silently ignored, and the child's workspace re-link runs
+      // unfrozen. It is the only place that reads it, which is what keeps a
+      // flag typed at `instance refresh` from reaching the setup phase.
+      await runSetupPhase(routedTokens[routedTokens.length - 1], setupPhaseOptions(rest));
     },
     "setup.nango": async () => {
       await runSetupNango();
