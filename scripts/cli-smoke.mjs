@@ -94,7 +94,7 @@ function record(name, pass, detail) {
 // ---------------------------------------------------------------------------
 {
   const r = runCli(["--version"]);
-  const want = new RegExp(`^cinatra ${PKG_VERSION.replace(/\./g, "\\.")}( \\(commit [0-9a-f]{12}\\))?$`);
+  const want = new RegExp(`^cinatra ${PKG_VERSION.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}( \\(commit [0-9a-f]{12}\\))?$`);
   const pass = r.status === 0 && want.test(r.stdout.trim());
   record(
     "--version",

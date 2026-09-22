@@ -281,7 +281,7 @@ describe("cinatra --version end to end", () => {
     const res = runCli(["--version"]);
     expect(res.status).toBe(0);
     expect(res.stdout.trim()).toMatch(
-      new RegExp(`^cinatra ${PKG.version.replace(/\./g, "\\.")}( \\(commit [0-9a-f]{12}\\))?$`),
+      new RegExp(`^cinatra ${PKG.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}( \\(commit [0-9a-f]{12}\\))?$`),
     );
   });
 
