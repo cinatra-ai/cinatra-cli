@@ -504,6 +504,52 @@ command is safe to re-run.
 different one would create a database nothing then uses while setup migrated
 another, so `cinatra install` refuses that, naming both databases.
 
+### Giving an instance its own agent runtime
+
+An instance needs an agent runtime: the container that runs your installed
+agents and calls the app back for every model request. An install that owns a
+local stack starts one for you. An install pointed at a database, a cache and a
+connection service you run yourself (`--infra=external`) does not — it says so —
+and an instance without one fails at its first agent run.
+
+Start one for a named instance, on the port you choose:
+
+    cinatra instance wayflow start --instance team-a --runtime-port 3910
+    cinatra instance wayflow start --instance team-b --runtime-port 3911 \
+        --app-url http://127.0.0.1:3301
+
+Each instance gets its own container (`cinatra-instance-<name>-wayflow-1`) in
+its own compose project, so a second instance starts its runtime beside the
+first and neither can address the other's. The port is taken as given: it is
+yours to pick, not drawn from a pool.
+
+`--app-url` is the address on **this machine** that the runtime calls the app
+back on. Leave it out and it comes from the instance's own `.env.local`. Inside
+a container your machine's loopback means the container itself, so the runtime
+is given the address through the container's gateway to the host — which is also
+what makes this work on an engine that runs containers without root.
+
+The command returns only once both halves are true: the runtime answers on the
+port it published, **and** the container can reach the app. It asks that second
+question inside the container, because that is the only place the answer is
+true, and if the answer is no it refuses and names the address the runtime was
+trying to reach — rather than leaving you a runtime that looks up and fails at
+its first agent run. Re-run it against a healthy container and it writes nothing
+and exits 0; "healthy" means it answers **and** it is the container this command
+would start now, so one that was started on a different port or for a different
+app address is replaced rather than reported as fine.
+
+The runtime's shared secret with the app is read from that instance's own
+`.env.local` and handed to the container at launch. It is never printed, never
+passed on a command line, and never written into any file this command creates.
+
+To take one down — and nothing else on the machine with it:
+
+    cinatra instance wayflow stop --instance team-a
+
+Without `--instance`, `cinatra instance wayflow start|stop` still manages the one
+shared runtime of the checkout you run it in, exactly as before.
+
 ## Author an extension
 
 Scaffold a ready-to-author, ready-to-publish extension package — one of four
