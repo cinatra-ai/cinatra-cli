@@ -22,7 +22,9 @@
 //       off a real install). Proven by exit 0 + a Usage banner + NO mutation.
 //   (2) every visible command id in the table has a help row reachable from the
 //       top-level or `instance` group banner (no orphaned/undocumented command).
-//   (3) `--version` reports the package version.
+//   (3) `--version` reports the package version and, when this build can prove
+//       one, the commit it came from (cinatra-cli#271) — in the human line and
+//       in the `--json` machine form.
 //   (4) an unknown command exits non-zero with a helpful message (no silent pass).
 //
 // The HEAVY, instance-dependent E2E (a real `install` → `status`/`doctor`/`db
@@ -85,12 +87,39 @@ function record(name, pass, detail) {
 }
 
 // ---------------------------------------------------------------------------
-// (3) --version
+// (3) --version — the version, plus the commit when this build can prove one.
+//     The commit half is OPTIONAL by design: a published build proves nothing
+//     and prints the version alone, a build installed from a git ref (or run
+//     from a checkout, as here) names its commit.
 // ---------------------------------------------------------------------------
 {
   const r = runCli(["--version"]);
-  const pass = r.status === 0 && r.stdout.trim() === PKG_VERSION;
-  record("--version", pass, `exit=${r.status} out="${r.stdout.trim()}" want="${PKG_VERSION}"`);
+  const want = new RegExp(`^cinatra ${PKG_VERSION.replace(/\./g, "\\.")}( \\(commit [0-9a-f]{12}\\))?$`);
+  const pass = r.status === 0 && want.test(r.stdout.trim());
+  record(
+    "--version",
+    pass,
+    `exit=${r.status} out="${r.stdout.trim()}" want="cinatra ${PKG_VERSION} [(commit <12 hex>)]"`,
+  );
+}
+
+{
+  const r = runCli(["--version", "--json"]);
+  let report = null;
+  try {
+    report = JSON.parse(r.stdout);
+  } catch {
+    report = null;
+  }
+  const pass =
+    r.status === 0 &&
+    report?.version === PKG_VERSION &&
+    (report.commit === null || /^[0-9a-f]{40}$/.test(report.commit));
+  record(
+    "--version --json",
+    pass,
+    `exit=${r.status} out="${r.stdout.trim().replace(/\s+/g, " ")}" want=version ${PKG_VERSION} + a full commit or null`,
+  );
 }
 
 // ---------------------------------------------------------------------------

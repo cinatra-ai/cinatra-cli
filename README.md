@@ -454,6 +454,45 @@ it, because setup can write to that database).
 > decrypt in the new instance. Prepare the template on the same keys, or expect
 > to re-enter whatever was encrypted.
 
+### Which build am I running?
+
+`cinatra --version` names the version and, when the installed build can prove
+it, the commit that build came from:
+
+    $ cinatra --version
+    cinatra 0.1.8 (commit e82ddd36e178)
+
+`package.json` carries the same version at the published build and at every
+commit of main, so the version on its own never distinguished them. A caller
+that pinned the CLI to an exact commit can now verify the pin from the command
+itself instead of asking its package manager which ref it resolved.
+
+The commit is printed when the build can prove one. An install from a git ref
+into a directory — `npm install github:cinatra-ai/cinatra-cli#<commit>`, or the
+same spec run through `npx` — is named by the resolved ref npm records beside
+the installed package, and a CLI run from a clone is named by that checkout's
+own HEAD. A published build can prove none of that and prints the version
+alone, which is itself the answer to "is this the published build?". One
+install does the same for a different reason: `npm install -g <git-ref>` writes
+no lockfile and no resolved ref anywhere, so a global install from a commit
+cannot name it either — pin into a directory, or use `npx`, where the pin has
+to stay verifiable.
+
+For a machine caller, `--json` is the form to read. It carries the full commit
+and which source proved it, and it never fails when nothing is known — `commit`
+and `commitSource` are then both `null`:
+
+    $ cinatra --version --json
+    {
+      "name": "@cinatra-ai/cinatra",
+      "version": "0.1.8",
+      "commit": "e82ddd36e178a0b1c2d3e4f5061728394a5b6c7d",
+      "commitSource": "package-lock"
+    }
+
+Reading the version costs one or two file reads: it never starts a subprocess
+and never reaches the network.
+
 ### Your own PostgreSQL server: letting the install create the database
 
 `--infra=external` points an instance at a PostgreSQL server, a Redis and a

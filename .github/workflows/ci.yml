@@ -76,12 +76,31 @@ jobs:
       - name: Smoke — cinatra --help loads and exits 0
         run: node bin/cinatra.mjs --help
 
-      - name: Smoke — cinatra --version prints the package version
+      - name: Smoke — cinatra --version prints the package version and its build
+        # cinatra-cli#271: the line is `cinatra <version>`, followed by
+        # `(commit <12 hex>)` when the build can prove which commit it came
+        # from — it can here, because CI runs from a checkout. `--json` is the
+        # machine form and carries the full commit.
         run: |
-          want="$(node -e 'console.log(require("./package.json").version)')"
-          got="$(node bin/cinatra.mjs --version)"
-          test "$want" = "$got" || { echo "--version mismatch: want $want got $got"; exit 1; }
-          echo "OK: cinatra --version = $got"
+          node -e '
+            const { execFileSync } = require("node:child_process");
+            const want = require("./package.json").version;
+            const run = (args) =>
+              execFileSync(process.execPath, ["bin/cinatra.mjs", ...args], { encoding: "utf8" }).trim();
+            const line = run(["--version"]);
+            const report = JSON.parse(run(["--version", "--json"]));
+            if (report.version !== want) {
+              console.error("--version mismatch: want " + want + " got " + report.version);
+              process.exit(1);
+            }
+            const head = `cinatra ${want}`;
+            const rest = line.startsWith(head) ? line.slice(head.length) : null;
+            if (rest === null || (rest !== "" && !/^ \(commit [0-9a-f]{12}\)$/.test(rest))) {
+              console.error("--version line unexpected: " + line);
+              process.exit(1);
+            }
+            console.log("OK: " + line);
+          '
 
       - name: Pack (dry run) — validate publish payload shape
         run: npm pack --dry-run
