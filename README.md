@@ -334,7 +334,7 @@ option up front with a flag:
     cinatra install --infra=external \       # point at your own database/cache
         --db-url <url> --redis-url <url> --nango-url <url> --graphiti-url <url> \
         --external-db-disposable             # confirm the external DB is disposable
-                                             # (setup may write to it; required for --db-url)
+                                             # (setup may write to it; required unattended)
     cinatra install --infra=external \       # …and let the CLI create that database
         --db-name <name> --db-template <name>  # from your own template first
 
@@ -350,6 +350,38 @@ Useful extras:
     cinatra install --list-instances         # list the instances you have set up
     cinatra install --status [--dir <path>]  # show one checkout's instance state
     cinatra install --resume                 # finish an install that was interrupted
+
+### Starting several dev instances on one machine
+
+`cinatra instance start` boots the app for the checkout you are in. Give it a
+name and it becomes one of several instances that can run side by side, each
+owning what it needs to stay out of the others' way:
+
+    cinatra instance start --instance web-a --port 3301 --runtime-port 3311 \
+        --bind 127.0.0.1
+
+* `--instance <name>` is the instance's own name (a plain lower-case name). Its
+  runtime directory, process-id file, log, lock, container name and job-queue
+  name are all derived from it, so two instances never share one.
+* `--port <n>` is the app port and `--runtime-port <n>` the agent runtime's.
+  Without them the instance keeps the ports its own `.env.local` records.
+* `--bind <address>` is the address the app listens on — `--bind 127.0.0.1` for
+  an instance reachable over loopback only.
+* A name, an app port or a runtime port that another **running** instance
+  already holds is refused before anything is started, and the refusal says
+  which instance holds it and which port it is.
+
+`stop` and `restart` take the same `--instance <name>`, so they act on the
+instance you mean, and `logs` reads that instance's own app log:
+
+    cinatra instance start --instance web-b --port 3302 --runtime-port 3312
+    cinatra instance restart --instance web-b
+    cinatra logs --app --instance web-b
+    cinatra instance stop --instance web-b
+
+Without `--instance` all of them are exactly what they always were: the one
+instance of this checkout, on `PORT` (default 3000), with the dev server's own
+bind address.
 
 ### Installing unattended
 
@@ -408,9 +440,14 @@ exactly as it did before.
 
 `--list-instances` / `--status` are read-only. Stopping or wiping an existing
 instance always asks for confirmation first; `--yes` alone never deletes data
-(and pointing setup at your own external database with `--db-url` likewise needs
-the explicit `--external-db-disposable` acknowledgement — a bare `--yes` won't do
-it, because setup can write to that database).
+(and pointing setup at your own external database likewise needs the explicit
+`--external-db-disposable` acknowledgement — a bare `--yes` won't do it, because
+setup can write to that database). That acknowledgement follows the database,
+not the flag that named it: it is required whether the database comes from
+`--db-url`, from the `SUPABASE_DB_URL` in your own `.env.local`, or from a
+`SUPABASE_DB_URL` exported in your shell — setup overlays the shell over the
+file, so the exported one is the database it would write to and the one you are
+asked about. `--external-db-disposable` may therefore be given on its own.
 
 > **Co-use (sharing one set of services).** `--on-conflict=co-use` /
 > `--infra=share` runs a second instance against the first one's running services
@@ -529,7 +566,19 @@ You do not have to put the credential on the command line. With no `--db-url`,
 the install reads the `SUPABASE_DB_URL` your checkout's `.env.local` already
 carries and creates the database on that server. The value is read by key and
 used in the process — it is never passed to another command and never printed;
-every line the run writes names the database and the template only.
+every line the run writes names the database and the template only:
+
+    cinatra install --infra=external \
+        --db-name team_instance_a --db-template team_seed_template \
+        --external-db-disposable
+
+That database takes the same acknowledgement a `--db-url` one takes, because it
+is the database setup and migrations are pointed at: on a terminal `cinatra
+install` names it and asks you to type the confirmation, and with nobody
+watching it needs `--external-db-disposable` — which stands on its own, so
+acknowledging the target never means putting a password on a command line. A
+`.env.local` that names no database has nothing to acknowledge, and the run then
+says for itself what it is missing.
 
 The database is created on the server's maintenance database, from the template
 exactly as on the shared road: the template must exist and be marked one

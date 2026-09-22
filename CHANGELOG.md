@@ -8,6 +8,36 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`cinatra instance start` can now run several dev instances on one machine.**
+  The command booted the app for the checkout you were in, and it was written
+  for exactly one such checkout: the process-id file, the log and the lock all
+  lived under one fixed name, so a second checkout's start refused ("does not
+  match the main checkout") rather than starting anything. It also spawned the
+  dev server without saying which address to bind, so an instance an operator
+  wanted reachable over loopback only took the dev server's own default
+  instead. `--instance <name>` is now that second instance: a plain lower-case
+  name from which the runtime directory, the process-id file, the log, the
+  lock, the container name and the job-queue name are all derived, so two named
+  instances never share one of them. `--port <n>` and `--runtime-port <n>` name
+  the instance's app port and its agent runtime's port when you give them, and
+  otherwise the ports the instance's own `.env.local` already records; a named
+  instance whose environment records no queue gets its own, through the
+  product's own key, so two instances on one cache never drain each other's
+  jobs. `--bind <address>` reaches the spawned dev server, so `--bind 127.0.0.1`
+  is a loopback-only instance. A start whose name, app port or runtime port
+  another RUNNING instance already holds is refused before anything is spawned
+  — every running instance records what it holds next to its process-id file,
+  and the refusal names that instance and the port, nothing else about it. A
+  record whose process is gone is repaired rather than refused — and so is one
+  whose process id a reboot has since handed to something else, because what the
+  refusal asks is not merely whether that process id is alive but whether it is
+  still a dev server. Starting an instance that is already healthy still reports
+  it and spawns nothing. `stop` and `restart` take the same `--instance <name>`,
+  so they act on the instance you mean, and `cinatra logs --instance <name>`
+  reads that instance's own app log. Without `--instance` all four commands are what they
+  always were, to the argument list and the environment the dev server is
+  spawned with: the one instance of this checkout, on `PORT` (default 3000),
+  with the dev server's own bind address.
 - **Every instance on a machine can now have its own agent runtime.** An
   instance needs an agent runtime — the container that runs your installed
   agents and calls the app back for every model request — and an install told
@@ -77,9 +107,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
   and `--bullmq-queue` are read by the shared road alone and are refused beside
   `--infra=external` rather than silently ignored, an `--on-conflict`/`--infra`
   naming a different road is still two roads, and `--db-name` must be the
-  database the install itself points at. `--external-db-disposable` is
-  unchanged: creating a database that is not there adds one and touches nothing
-  existing.
+  database the install itself points at. Creating a database that is not there
+  adds one and touches nothing existing, so the creation itself needs no
+  acknowledgement of its own — the database setup and migrations are then
+  pointed at does, whichever source named it (see Changed, below).
 
 - **`cinatra install` can now be run unattended, by a caller that has to hand
   its checkout back clean.** `install --mode dev` is the one command that makes
@@ -233,6 +264,33 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The acknowledgement an external database takes now follows the database,
+  not the flag that named it.** Pointing `cinatra install --infra=external` at a
+  database you run yourself has always taken an eyes-open acknowledgement —
+  `--external-db-disposable` when nobody is watching, a typed confirmation on a
+  terminal — because setup and migrations write to a database this install does
+  not own and will never roll back, and it may be non-empty or production. That
+  gate could only be reached through `--db-url`, so the one way to ARM it was to
+  put a credential-bearing URL on the command line, where any process listing
+  can read it — while the install that leaves the URL in its own `.env.local`,
+  the road this CLI itself documents as the one where you own your own file, ran
+  setup and migrations against whatever that file names with no acknowledgement
+  at all. The gate now follows the database: with no `--db-url` the install
+  reads the `SUPABASE_DB_URL` its checkout is really pointed at — by key, used
+  in the process, never printed — and takes the same acknowledgement for it,
+  before setup runs. That is the value setup itself would resolve: the
+  checkout's `.env.local`, or a `SUPABASE_DB_URL` exported in your shell, which
+  setup overlays over the file, so the database you acknowledge is always the
+  database it writes to. `--external-db-disposable` stands on its own, so a
+  target can be acknowledged without a password ever reaching a command line. Both
+  roads now speak of the database by its bare NAME — the refusal, the prompt and
+  the line that records the acknowledgement — instead of printing the connection
+  string it was read from, and a `.env.local` that names no database has nothing
+  to acknowledge: the run proceeds as before and still says for itself what it
+  is missing. **This changes the behaviour of an unattended external install
+  that passes no URLs:** a run whose `.env.local` names a database used to
+  proceed on a bare `--yes` and is now refused, naming the flag and the
+  database. Add `--external-db-disposable` to such a call.
 - **`cinatra --version` now names the build it came from, so a pinned install
   can be verified from the command itself.** `package.json` carries the same
   version at the published build and at every commit of main, so a caller that

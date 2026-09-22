@@ -78,6 +78,14 @@ function writeAppLog(contents) {
   writeFileSync(p, contents);
 }
 
+// cinatra-cli#261: a NAMED instance writes its log under its own slug.
+function writeInstanceLog(slug, contents) {
+  const p = path.join(home, ".cinatra", "clones", slug, "nextjs.log");
+  mkdirSync(path.dirname(p), { recursive: true });
+  writeFileSync(p, contents);
+  return p;
+}
+
 function runLogs(args) {
   return spawnSync(process.execPath, [BIN, "logs", ...args], {
     encoding: "utf8",
@@ -140,6 +148,43 @@ describe("cinatra logs (default) — both sources", () => {
     const res = runLogs([]);
     expect(res.status).toBe(0);
     expect(res.stderr).toMatch(/docker compose is not available/i);
+  });
+});
+
+// cinatra-cli#261 — `instance start --instance <name>` writes its log under that
+// instance's own runtime directory, so `logs` has to be able to name it.
+describe("cinatra logs --instance <name> — the selected instance's app log", () => {
+  it("reads THAT instance's log, not the single instance's", () => {
+    writeAppLog("default-instance-line\n");
+    writeInstanceLog("web-a", "web-a-line\n");
+    const res = runLogs(["--app", "--instance", "web-a"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain("web-a-line");
+    expect(res.stdout).not.toContain("default-instance-line");
+    expect(res.stdout).toMatch(/Instance "web-a" app log/);
+  });
+
+  it("hints at the instance's OWN start command when it has no log yet", () => {
+    const res = runLogs(["--app", "--instance", "web-b"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/No app log yet/i);
+    expect(res.stdout).toMatch(/cinatra instance start --instance web-b/);
+  });
+
+  it("refuses a name that is not a plain lower-case slug, before any path is built", () => {
+    const res = runLogs(["--app", "--instance", "../etc"]);
+    expect(res.status).toBe(1);
+    expect(res.stderr).toMatch(/Invalid --instance/);
+  });
+
+  it("without --instance the single instance's log is read, wording unchanged", () => {
+    writeAppLog("default-instance-line\n");
+    writeInstanceLog("web-a", "web-a-line\n");
+    const res = runLogs(["--app"]);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/Dev main app log/);
+    expect(res.stdout).toContain("default-instance-line");
+    expect(res.stdout).not.toContain("web-a-line");
   });
 });
 

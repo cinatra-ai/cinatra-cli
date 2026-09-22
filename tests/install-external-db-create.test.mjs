@@ -374,6 +374,10 @@ describe("runInstall --infra=external — the instance database is created from 
       "--infra", "external",
       "--db-name", "team_instance_a",
       "--db-template", "team_seed_template",
+      // cinatra-cli#269: the database this file names takes the same
+      // acknowledgement a --db-url one takes. The flag arms it; the credential
+      // still never reaches the command line.
+      "--external-db-disposable",
     ], h);
 
     expect(h.pg.record.connections).toEqual([MAINTENANCE_URL]);
@@ -587,6 +591,9 @@ describe("runInstall --infra=external — the instance database is created from 
       "--infra", "external",
       "--db-name", "team_instance_a",
       "--db-template", "team_seed_template",
+      // cinatra-cli#269: the acknowledgement is still required — a value that
+      // names no database still points setup somewhere.
+      "--external-db-disposable",
     ], h);
 
     expect(h.lines.some((l) => l.includes("⚠") && l.includes("names no database"))).toBe(true);
