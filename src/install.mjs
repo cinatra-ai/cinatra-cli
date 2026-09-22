@@ -51,7 +51,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
-import { isValidSlug } from "./clone-registry.mjs";
+import { SEED_DB_NAME, isValidSlug } from "./clone-registry.mjs";
 import {
   createComposeNangoDbTransport,
   ensureNangoSecretKey,
@@ -203,6 +203,11 @@ import {
   deriveCoUseSlug,
   coUseDbName,
   isCoUseDbNameShape,
+  isOperatorDbName,
+  isOperatorTemplateName,
+  assertOperatorDbName,
+  assertOperatorTemplateName,
+  assertOperatorQueueName,
   coUseQueueName,
   coUseCookiePrefix,
   parseAuthCookiePrefixSupport,
@@ -432,6 +437,7 @@ const VALUE_TAKING_INSTALL_FLAGS = new Set([
   "--graphiti-url",
   "--reuse-from",
   "--db-name",
+  "--db-template",
   "--redis-db",
   "--bullmq-queue",
   "--infra",
@@ -636,6 +642,10 @@ export function parseInstallArgs(argv = []) {
   // still errors cleanly); the GATED values (`share` / `co-use`) are valid here
   // and routed to a loud-fail at dispatch (T5b), not rejected as invalid.
   let infra = readEnumOption(argv, "--infra", VALID_INFRA, "--infra");
+  // The spelling the operator actually typed, captured before the `--no-infra`
+  // alias rewrites it below: a message that names a value nobody wrote sends
+  // the reader looking for a flag they did not use.
+  const infraTyped = infra;
   const onConflict = readEnumOption(argv, "--on-conflict", VALID_ON_CONFLICT, "--on-conflict");
 
   // `--no-infra` is an ALIAS for `--infra=external` (don't silently drop it).
@@ -670,24 +680,88 @@ export function parseInstallArgs(argv = []) {
   const nangoUrl = readOption(argv, "--nango-url");
   const graphitiUrl = readOption(argv, "--graphiti-url");
 
-  // GATED co-use sidecar flags — accepted, but their presence forces the T5b
-  // loud-fail (they advertise a surface that does nothing until co-use lands).
+  // Co-use sidecar flags. Their presence routes the install to the shared-infra
+  // road (the T5b predicate below), which is the only road that creates an
+  // instance database of its own.
   const reuseFrom = readOption(argv, "--reuse-from");
+  // `--db-name` names the database this install creates on the shared server and
+  // `--db-template` the template database it is created FROM (default: the
+  // built-in seed). Both are validated HERE, while arguments are parsed, so a
+  // malformed name costs nothing — it is refused before a checkout is touched
+  // and long before a connection is opened. They reach a `CREATE DATABASE`,
+  // where a name can only be quoted as an identifier, never bound as a
+  // parameter, so both go through the same identifier pattern — and then
+  // through the guard that fits their ROLE.
+  // `--db-name` is a database the CLI will CREATE and may DROP again on a
+  // rollback, so it takes the TARGET guard (pattern + the reserved set + the
+  // namespaces the CLI drops on its own). `--db-template` is only ever READ, so
+  // it takes the pattern alone — the CLI's own seed is the default template and
+  // a target-side ban would refuse it.
   const dbName = readOption(argv, "--db-name");
+  if (dbName != null) assertOperatorDbName("--db-name", dbName);
+  const dbTemplate = readOption(argv, "--db-template");
+  if (dbTemplate != null) assertOperatorTemplateName("--db-template", dbTemplate);
+  // `--redis-db` was parsed and never read. The CLI has no road that applies a
+  // numeric Redis database index to an instance: the shared-infra road reuses
+  // the Redis URL it is given, unchanged, and the one Redis-namespacing value
+  // it writes (CINATRA_REDIS_PREFIX) is forward-compat and isolates nothing
+  // today. So the flag is REFUSED rather than silently ignored — a flag that is
+  // accepted and does nothing reads as isolation an operator does not have.
+  // The refusal offers only what is true: queue-name isolation, which works.
   const redisDb = readOption(argv, "--redis-db");
+  if (redisDb != null) {
+    throw new Error(
+      `--redis-db is not implemented. No install road applies a Redis database index to an instance: the ` +
+        `shared-infra road reuses the Redis URL it is given, unchanged, so this value would silently change ` +
+        `nothing about where the instance's keys land. Use --bullmq-queue <name> to give the instance its own ` +
+        `job queue on the shared Redis — that is the separation this road does provide.`,
+    );
+  }
+  // `--bullmq-queue` was parsed and never read either. BullMQ isolates job sets
+  // by queue name on a shared Redis, so this one is real isolation: it replaces
+  // the derived `cinatra-inst-<slug>` queue in the instance's env.
   const bullmqQueue = readOption(argv, "--bullmq-queue");
+  if (bullmqQueue != null) assertOperatorQueueName("--bullmq-queue", bullmqQueue);
 
   // cinatra-cli#40: the presence of ANY gated co-use signal routes to the T5b
   // loud-fail / the co-use executor. Computed BEFORE the return so the preview
   // refusal below is keyed on the EXACT same predicate the terminal co-use branch
   // reads — a narrower hand-written signal list would let a sidecar flag through.
+  // (`--redis-db` is not in this list: it threw above, so it can never be read
+  // here as a signal for a road it does not reach.)
+  const sidecarFlags = [
+    ["--reuse-from", reuseFrom],
+    ["--db-name", dbName],
+    ["--db-template", dbTemplate],
+    ["--bullmq-queue", bullmqQueue],
+  ].filter(([, v]) => v != null);
   const couseRequested =
-    infra === GATED_INFRA ||
-    onConflict === GATED_ON_CONFLICT ||
-    reuseFrom != null ||
-    dbName != null ||
-    redisDb != null ||
-    bullmqQueue != null;
+    infra === GATED_INFRA || onConflict === GATED_ON_CONFLICT || sidecarFlags.length > 0;
+
+  // cinatra-cli#17: the sidecar flags SELECT the shared-infra road — they are
+  // read nowhere else. Combined with an explicit `--on-conflict`/`--infra` that
+  // names a DIFFERENT road, the install took the shared-infra road anyway and
+  // the explicit choice was silently ignored. Refuse the contradiction here,
+  // before any side effect, in the same position as the `--mode preview`
+  // refusal below: the operator asked for two roads and must say which.
+  if (sidecarFlags.length > 0) {
+    const contradiction =
+      onConflict != null && onConflict !== GATED_ON_CONFLICT
+        ? `--on-conflict=${onConflict}`
+        : infra != null && infra !== GATED_INFRA
+          ? infraTyped != null
+            ? `--infra=${infraTyped}`
+            : "--no-infra"
+          : null;
+    if (contradiction) {
+      throw new Error(
+        `${contradiction} cannot be combined with ${sidecarFlags.map(([f]) => f).join(" / ")}: those flags ` +
+          `configure the shared-infra install (one Postgres server, a separate database per instance, no ` +
+          `second stack) and select it, so ${contradiction} would be ignored. Drop the flags to take the ` +
+          `${contradiction} road, or ask for the shared-infra road with --on-conflict=co-use / --infra=share.`,
+      );
+    }
+  }
 
   // cinatra-cli#188: co-use is TERMINAL — `executeCoUse` owns the whole install
   // tail and returns before the preview composition could run. Rather than let
@@ -697,7 +771,7 @@ export function parseInstallArgs(argv = []) {
   if (surfaceMode === PREVIEW_SURFACE_MODE_VALUE && couseRequested) {
     throw new Error(
       "--mode preview cannot be combined with co-use (--infra=share / --on-conflict=co-use / --reuse-from / " +
-        "--db-name / --redis-db / --bullmq-queue): co-use owns the whole install tail and returns before a " +
+        "--db-name / --db-template / --bullmq-queue): co-use owns the whole install tail and returns before a " +
         "preview could be composed, so the preview would silently never be created. Install the co-use " +
         "instance first, then run `cinatra instance preview create` in that checkout — or use --mode preview " +
         "with --on-conflict=isolated for a preview over its own stack.",
@@ -866,7 +940,7 @@ export function parseInstallArgs(argv = []) {
     // The presence of ANY gated co-use signal (the gated enum values or the
     // co-use sidecar flags) routes to the T5b loud-fail. Computed above.
     couseRequested,
-    couseSidecar: { reuseFrom, dbName, redisDb, bullmqQueue },
+    couseSidecar: { reuseFrom, dbName, dbTemplate, bullmqQueue },
     // cinatra-cli#160 (exec-plane S4): the execution-mode choice + remote/egress
     // config (parse-time validated; null-filled when absent).
     execution: parseExecutionModeFlags(argv),
@@ -2851,6 +2925,53 @@ function connStringForDatabase(connectionString, name) {
   return u.toString();
 }
 
+/** The refusal when an instance's database would BE the donor's own — one
+ *  message for both roads, raised from wherever the donor's database name
+ *  finally becomes known. Carries the bare name and the flag; a connection
+ *  string never reaches it. */
+function donorCollisionError(dbName, operatorNamed) {
+  return new Error(
+    operatorNamed
+      ? `--db-name "${dbName}" is the donor instance's own database. A shared-infra install shares the ` +
+        `donor's Postgres SERVER but must have a database of its OWN — pointing it at the donor's would ` +
+        `put two instances in one database, which is the one thing this road guarantees against. ` +
+        `Choose another name.`
+      : `This instance would derive the database name "${dbName}", which is the donor instance's own ` +
+        `database — two instances would share one database. Pass --instance <slug> for a different ` +
+        `derived name, or --db-name <name> to choose one.`,
+  );
+}
+
+/** The database an instance registry row records as install-owned, or null.
+ *  The row carries it as a `db:<name>` entry in `createdResources` — there is
+ *  no `dbName` field — and it is the ONLY record of which database an instance
+ *  actually uses, so a converge reads the name from here rather than deriving
+ *  it or believing a flag. */
+function recordedInstanceDbName(slot) {
+  const entry = (slot?.createdResources ?? []).find((r) => typeof r === "string" && r.startsWith("db:"));
+  return entry ? entry.slice("db:".length) : null;
+}
+
+/** The database a connection string names, or null when it names none FROM THE
+ *  STRING ALONE. Used to keep a co-use instance off the donor's OWN database —
+ *  the name only, never the URL it came from. A URL may carry the database in
+ *  the path (what the CLI itself always writes) or, libpq-style, as a `dbname`
+ *  parameter — a hand-written or provider-issued URL often does the latter, and
+ *  reading only the path made the collision guard skip itself in silence. When
+ *  neither is present the caller asks the SERVER (`resolveDatabaseName`) rather
+ *  than guessing or giving up quietly. */
+function donorDatabaseName(connectionString) {
+  try {
+    const u = new URL(connectionString);
+    const fromPath = u.pathname.replace(/^\//, "");
+    if (fromPath) return decodeURIComponent(fromPath);
+    const fromQuery = u.searchParams.get("dbname");
+    return fromQuery && fromQuery.length > 0 ? fromQuery : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Quote a Postgres identifier for a CREATE/DROP DATABASE statement (double the
  *  inner double-quotes). The db NAME is also shape-validated (isCoUseDbNameShape)
  *  before it ever reaches here, so this is defence-in-depth. */
@@ -2858,24 +2979,126 @@ function quoteIdent(name) {
   return `"${String(name).replace(/"/g, '""')}"`;
 }
 
+/** The name a database is created FROM when the operator names no other: the
+ *  seed template `cinatra instance clone refresh-seed` builds and maintains. */
+const DEFAULT_DB_TEMPLATE = SEED_DB_NAME;
+
+/** PostgreSQL's own templates. Copying one is legal and produces an EMPTY
+ *  database — accepted, and said out loud, never refused. */
+const PG_SYSTEM_TEMPLATES = Object.freeze(["template0", "template1"]);
+
+/** The guard a database name must pass before it reaches a CREATE/DROP here.
+ *  Each road is checked against its OWN rule, and the two are disjoint: a name
+ *  the OPERATOR chose (`--db-name`) must pass `isOperatorDbName`, which refuses
+ *  every reserved name and every namespace the CLI creates and drops itself
+ *  (`cinatra_inst_*` included); a DERIVED name must be exactly
+ *  `cinatra_inst_<slug>`. Neither road can reach the other's names, which is
+ *  what keeps a mis-derived or mistyped name away from a DROP. */
+function dbNameUsableInStatement(dbName, operatorNamed) {
+  return operatorNamed ? isOperatorDbName(dbName) : isCoUseDbNameShape(dbName);
+}
+
 /** Default real DB operations for co-use (injectable via deps for tests). All run
  *  against the DONOR's Postgres SERVER (admin/maintenance DB) so CREATE/DROP never
- *  run while connected to the DB being mutated. */
-function defaultCoUseDbOps() {
+ *  run while connected to the DB being mutated. `createClient` is injectable so
+ *  the exact statements these issue are testable without a live server. */
+export function defaultCoUseDbOps({ createClient = loadPgClient } = {}) {
   return {
-    // Idempotent create: SELECT 1 then CREATE … TEMPLATE cinatra_seed. Returns
+    // Idempotent create: SELECT 1 then CREATE … TEMPLATE <template>. Returns
     // { created: boolean } so rollback only drops a DB THIS run created.
-    async createCoUseDb({ adminUrl, dbName }) {
-      if (!isCoUseDbNameShape(dbName)) {
-        throw new Error(`Refusing to create a non-co-use-shaped database ${JSON.stringify(dbName)}.`);
+    //
+    // An EXISTING database of that name is REUSED, never dropped and never
+    // created over: the SELECT returns early with `created: false`, which is
+    // also what keeps it out of the rollback plan. `verifyTemplate` is set when
+    // the operator named the template: the built-in seed has its own build verb
+    // and its own failure message, while an operator-prepared template is the
+    // new input, so it is checked for existence and template-usability BEFORE
+    // the CREATE rather than through whatever error the server returns.
+    async createCoUseDb({
+      adminUrl,
+      dbName,
+      template = DEFAULT_DB_TEMPLATE,
+      operatorNamed = false,
+      verifyTemplate = false,
+    }) {
+      if (!dbNameUsableInStatement(dbName, operatorNamed)) {
+        throw new Error(
+          operatorNamed
+            ? `Refusing to create a database under an invalid --db-name ${JSON.stringify(dbName)}.`
+            : `Refusing to create a non-co-use-shaped database ${JSON.stringify(dbName)}.`,
+        );
       }
-      const client = await loadPgClient(connStringForDatabase(adminUrl, "postgres"));
+      if (!isOperatorTemplateName(template)) {
+        throw new Error(`Refusing to create from a template with an invalid name ${JSON.stringify(template)}.`);
+      }
+      // The executor refuses this too, before anything is opened. It is mirrored
+      // here because this layer is the last thing before SQL, and every other
+      // guard on it is: a database cannot be a copy of itself.
+      if (dbName === template) {
+        throw new Error(
+          `Refusing to create ${JSON.stringify(dbName)} from its own template: a database cannot be ` +
+            `created from itself.`,
+        );
+      }
+      const warnings = [];
+      const client = await createClient(connStringForDatabase(adminUrl, "postgres"));
       await client.connect();
       try {
         const exists = await client.query("SELECT 1 FROM pg_database WHERE datname = $1", [dbName]);
-        if (exists.rowCount > 0) return { created: false };
-        await client.query(`CREATE DATABASE ${quoteIdent(dbName)} TEMPLATE ${quoteIdent("cinatra_seed")}`);
-        return { created: true };
+        if (exists.rowCount > 0) return { created: false, warnings };
+        if (verifyTemplate) {
+          const row = await client.query(
+            "SELECT datistemplate, datallowconn FROM pg_database WHERE datname = $1",
+            [template],
+          );
+          if (row.rows.length === 0) {
+            throw new Error(
+              `Template database "${template}" does not exist on this Postgres server. Create it first ` +
+                `(migrate and seed it once), then mark it: ALTER DATABASE "${template}" WITH IS_TEMPLATE true ` +
+                `ALLOW_CONNECTIONS false — PostgreSQL refuses to copy a database that has another session ` +
+                `connected, which is why the CLI's own seed is marked both ways. Or drop --db-template to use ` +
+                `the built-in seed.`,
+            );
+          }
+          if (row.rows[0].datistemplate !== true) {
+            throw new Error(
+              `Database "${template}" exists but is not marked as a template, so copying it is not reliably ` +
+                `permitted. Run: ALTER DATABASE "${template}" WITH IS_TEMPLATE true ALLOW_CONNECTIONS false ` +
+                `(the second half keeps sessions off it, which is what lets it be copied at all).`,
+            );
+          }
+          // Marked a template but still open to connections: the copy below
+          // succeeds only while nobody is connected to it, so this is a warning
+          // — the run may well be the lucky one — never a refusal.
+          if (row.rows[0].datallowconn === true) {
+            warnings.push(
+              `Template ${template} still allows connections. PostgreSQL cannot copy a database while ` +
+                `another session is connected to it, so this install fails if anyone connects to ` +
+                `${template} at the wrong moment. Close it: ALTER DATABASE "${template}" WITH ` +
+                `ALLOW_CONNECTIONS false`,
+            );
+          }
+        }
+        await client.query(`CREATE DATABASE ${quoteIdent(dbName)} TEMPLATE ${quoteIdent(template)}`);
+        return { created: true, warnings };
+      } finally {
+        await client.end().catch(() => {});
+      }
+    },
+    /** Ask the SERVER which database a connection string names. Used only when
+     *  the string itself names none — neither in its path nor in a `dbname`
+     *  parameter — so the donor-collision guard can still be made instead of
+     *  skipping in silence. It asks over the string AS GIVEN: the admin
+     *  connection the rest of this module opens is deliberately re-pointed at
+     *  the maintenance database, so asking there would answer "postgres" every
+     *  time and the guard would look present while never firing. */
+    async resolveDatabaseName({ connectionString }) {
+      const client = await createClient(connectionString);
+      await client.connect();
+      try {
+        const row = await client.query("SELECT current_database()");
+        const name = row.rows?.[0]?.current_database ?? null;
+        return typeof name === "string" && name.length > 0 ? name : null;
       } finally {
         await client.end().catch(() => {});
       }
@@ -2885,14 +3108,22 @@ function defaultCoUseDbOps() {
     // (c) carries no foreign owner (we only ever drop a DB our own run just made).
     // This is the controlled bypass of isProtectedDbName's `cinatra_inst_*`
     // protection (cinatra-cli#40 §3.2, codex Q3) — never a generic override.
-    async dropDbCreatedByThisRun({ adminUrl, dbName, createdThisRun }) {
+    // (a) has one further case since an operator can name the database: a name
+    // the operator passed as `--db-name`, guarded by `isOperatorDbName` — the
+    // reserved set plus the namespaces the CLI drops on its own — rather than by
+    // the derived shape. Nothing else moves: `createdThisRun` still decides.
+    async dropDbCreatedByThisRun({ adminUrl, dbName, createdThisRun, operatorNamed = false }) {
       if (createdThisRun !== true) {
         throw new Error("dropDbCreatedByThisRun refuses to drop a DB not created by this run.");
       }
-      if (!isCoUseDbNameShape(dbName)) {
-        throw new Error(`dropDbCreatedByThisRun refuses a non-co-use-shaped name ${JSON.stringify(dbName)}.`);
+      if (!dbNameUsableInStatement(dbName, operatorNamed)) {
+        throw new Error(
+          operatorNamed
+            ? `dropDbCreatedByThisRun refuses an invalid --db-name ${JSON.stringify(dbName)}.`
+            : `dropDbCreatedByThisRun refuses a non-co-use-shaped name ${JSON.stringify(dbName)}.`,
+        );
       }
-      const client = await loadPgClient(connStringForDatabase(adminUrl, "postgres"));
+      const client = await createClient(connStringForDatabase(adminUrl, "postgres"));
       await client.connect();
       try {
         await client.query(`DROP DATABASE IF EXISTS ${quoteIdent(dbName)} WITH (FORCE)`);
@@ -2930,7 +3161,34 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
         `(/^[a-z0-9][a-z0-9-]{0,29}$/).`,
     );
   }
-  const dbName = coUseDbName(slug);
+  // The database this install creates on the shared server, and the template it
+  // is created FROM. Both are the operator's when they named them (already
+  // validated at parse time, re-checked in the DB ops layer), else derived —
+  // `cinatra_inst_<slug>` from the built-in seed, exactly as before. Which of
+  // the two it is travels with the name as `operatorNamed`, because the name
+  // guard on the CREATE/DROP is a different one for each.
+  const operatorNamed = opts.couseSidecar?.dbName != null;
+  const dbName = operatorNamed ? opts.couseSidecar.dbName : coUseDbName(slug);
+  const dbTemplate = opts.couseSidecar?.dbTemplate ?? DEFAULT_DB_TEMPLATE;
+  const verifyTemplate = opts.couseSidecar?.dbTemplate != null;
+  const queueName = opts.couseSidecar?.bullmqQueue ?? null;
+
+  // A legal identifier is not yet a SAFE target. Two databases this instance
+  // must not BE are known before anything is opened — refuse both here.
+  //
+  // The template first (pure): a database created from a template and then
+  // pointed AT that template is not a copy, it is the original. Setup would
+  // write into the template, and an open session on a template makes every
+  // later `CREATE DATABASE … TEMPLATE …` fail for every other instance. The
+  // existence check inside the create short-circuits before the template probe,
+  // so nothing downstream would catch it.
+  if (dbName === dbTemplate) {
+    throw new Error(
+      `--db-name "${dbName}" is also the --db-template: an instance would run inside its own template ` +
+        `instead of a copy of it. Setup would write into the template, and a template with a live ` +
+        `connection cannot be copied again. Name a database of its own.`,
+    );
+  }
 
   // 1. Resolve the donor + its env (the shared infra source).
   const donorDir = resolveDonorDir(opts, targetDir);
@@ -2957,11 +3215,28 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
     );
   }
 
+  // The second unsafe target, now that the donor is known: the donor's OWN
+  // database. It passes every shape guard, the create finds it already there
+  // and reports "reusing", and the instance's SUPABASE_DB_URL ends up naming
+  // the donor's data — the separate database this road exists to give is gone
+  // behind a success line. The name only; a connection string never reaches a
+  // message here.
+  let donorDb = donorDatabaseName(adminUrl);
+  if (donorDb && dbName === donorDb) throw donorCollisionError(dbName, operatorNamed);
+
   log(`- Co-use: provisioning instance "${slug}" against the donor at ${donorDir} (separate DB ${dbName}).`);
 
+  // template0/template1 are valid templates and perfectly legal to copy — they
+  // just carry nothing. An operator reaching for a template usually means a
+  // prepared one, so name the consequence rather than refusing a valid choice.
+  if (PG_SYSTEM_TEMPLATES.includes(dbTemplate)) {
+    log(`  Note: ${dbTemplate} is one of PostgreSQL's own system templates, so ${dbName} will be EMPTY — ` +
+      `no schema and no data. Setup migrates it from scratch, which is slower than copying a prepared template.`);
+  }
+
   if (opts.dryRun) {
-    log(`  [dry-run] would create database ${dbName} (TEMPLATE cinatra_seed) on the donor Postgres,`);
-    log(`  [dry-run] write a co-use .env.local (cookie-prefix ${coUseCookiePrefix(slug)}, queue ${coUseQueueName(slug)}),`);
+    log(`  [dry-run] would use database ${dbName} on the donor Postgres — creating it from template ${dbTemplate} if it does not exist yet,`);
+    log(`  [dry-run] write a co-use .env.local (cookie-prefix ${coUseCookiePrefix(slug)}, queue ${queueName ?? coUseQueueName(slug)}),`);
     log("  [dry-run] and run setup with --no-infra (no second Docker stack). No changes made.");
     return { infraPlan: "co-use", instance: { slug, dbName, dryRun: true }, dryRun: true };
   }
@@ -2984,7 +3259,12 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
     // Idempotent re-run: an existing READY co-use row for this dir → converge.
     const existing = getInstance(instanceRegistry, slug);
     if (existing && path.resolve(existing.installDir) === path.resolve(targetDir) && existing.state === "ready") {
-      log(`  Co-use instance "${slug}" already recorded ready — converging (idempotent).`);
+      // Name the RECORDED database here: the provisioning line above announced
+      // the one this run would have used, and a converge uses neither it nor
+      // any other — it uses what the instance is already on.
+      const recorded = recordedInstanceDbName(existing);
+      log(`  Co-use instance "${slug}" already recorded ready on database ${recorded ?? "(unrecorded)"} — ` +
+        `converging (idempotent).`);
       return { slot: existing, idempotent: true, appPort: existing.appPort };
     }
 
@@ -3051,6 +3331,31 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
   });
 
   if (persisted.idempotent) {
+    // A converge runs NO SQL and rewrites no `.env.local`, so every database
+    // choice passed to it is inert. The recorded row is the only truth about
+    // which database this instance actually uses — read it back, refuse a
+    // `--db-name` that disagrees (reporting success under a name nothing will
+    // ever create is a plain untruth), say so for the other two, and carry the
+    // recorded name out so the closing summary prints what IS, not what was
+    // asked for.
+    const recordedDb = recordedInstanceDbName(persisted.slot);
+    if (operatorNamed && recordedDb && recordedDb !== dbName) {
+      throw new Error(
+        `Instance "${slug}" is already recorded ready on database "${recordedDb}", so this re-run converges ` +
+          `and creates nothing — it cannot move it to the --db-name "${dbName}" you passed. Re-run without ` +
+          `--db-name to converge on "${recordedDb}", or tear the instance down ` +
+          `(\`cinatra install --down --instance ${slug} --yes\`) and install it again under the new name.`,
+      );
+    }
+    for (const [flag, value] of [
+      ["--db-template", opts.couseSidecar?.dbTemplate],
+      ["--bullmq-queue", opts.couseSidecar?.bullmqQueue],
+    ]) {
+      if (value != null) {
+        log(`  ⚠ ${flag} ${value} had no effect: this re-run converges on the recorded instance and ` +
+          `creates no database and rewrites no environment.`);
+      }
+    }
     // cinatra-cli#143: an idempotent converge still REPORTS success, so a prod
     // co-use instance whose .env.local is now missing/invalid a hard var must not
     // pass silently (it would crash on first boot). Validate the existing env; no
@@ -3058,7 +3363,11 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
     if (RUNTIME_MODE[opts.mode] === "production") {
       assertProdEnvComplete({ targetDir, log });
     }
-    return { infraPlan: "co-use", instance: persisted.slot, idempotent: true };
+    return {
+      infraPlan: "co-use",
+      instance: { ...persisted.slot, dbName: recordedDb ?? dbName },
+      idempotent: true,
+    };
   }
   const appPort = persisted.appPort;
 
@@ -3093,14 +3402,54 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
       });
     }
 
-    const { created } = await dbOps.createCoUseDb({ adminUrl, dbName });
+    // The donor's database was not in its connection string. Ask the SERVER
+    // before the existence probe runs, so the collision guard is made rather
+    // than skipped — and when even that cannot answer, say so in one line
+    // instead of proceeding as if the check had passed. Only ever reached for a
+    // URL that names no database: the CLI's own always name one.
+    if (!donorDb) {
+      try {
+        donorDb =
+          typeof dbOps.resolveDatabaseName === "function"
+            ? await dbOps.resolveDatabaseName({ connectionString: adminUrl })
+            : null;
+      } catch {
+        donorDb = null;
+      }
+      if (donorDb && dbName === donorDb) throw donorCollisionError(dbName, operatorNamed);
+      if (!donorDb) {
+        log(`  ⚠ could not determine the donor instance's own database from its connection string or from ` +
+          `the server, so this run could NOT check that ${dbName} is a different database. Verify it yourself.`);
+      }
+    }
+
+    const { created, warnings = [] } = await dbOps.createCoUseDb({
+      adminUrl,
+      dbName,
+      template: dbTemplate,
+      operatorNamed,
+      verifyTemplate,
+    });
+    for (const w of warnings) log(`  ⚠ ${w}`);
     createdDb = created;
-    log(`  ${created ? "Created" : "Reusing existing"} co-use database ${dbName}.`);
+    // Name the template on a create: it is the one input that decides what is
+    // inside the new database. A reuse copied NOTHING — and when a template was
+    // named, say plainly that it was not used, so "reusing" is never read as
+    // "re-created from the template you gave me".
+    log(
+      created
+        ? `  Created co-use database ${dbName} from template ${dbTemplate}.`
+        : `  Reusing existing co-use database ${dbName} as it stands.`,
+    );
+    if (!created && verifyTemplate) {
+      log(`  ⚠ The template ${dbTemplate} was NOT used: ${dbName} already existed and its contents stand. ` +
+        `This install never drops or re-creates an existing database.`);
+    }
 
     // Build + write the co-use .env.local (0600). Separate DB URL on the donor
     // server; inherit shared-infra endpoints + crypto secrets from the donor.
     const dbUrl = connStringForDatabase(adminUrl, dbName);
-    const envMap = buildCoUseEnv({ sourceEnv: donorEnv, slug, appPort, dbUrl });
+    const envMap = buildCoUseEnv({ sourceEnv: donorEnv, slug, appPort, dbUrl, queueName });
     writeCoUseEnv({ targetDir, envMap, log });
 
     // Run setup with NO infra bring-up (the donor's stack is the backing infra).
@@ -3164,11 +3513,16 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
     return { infraPlan: "co-use", instance: { ...persisted.slot, state: "ready", appPort, dbName } };
   } catch (err) {
     log(`  ✗ Co-use provisioning failed — rolling back instance "${slug}".`);
-    const plan = coUseRollbackPlan({ createdDb, dbName, runtimeDir: null });
+    const plan = coUseRollbackPlan({ createdDb, dbName, runtimeDir: null, operatorNamed });
     for (const stepObj of plan) {
       try {
         if (stepObj.step === "dropDatabase") {
-          await dbOps.dropDbCreatedByThisRun({ adminUrl, dbName: stepObj.dbName, createdThisRun: true });
+          await dbOps.dropDbCreatedByThisRun({
+            adminUrl,
+            dbName: stepObj.dbName,
+            createdThisRun: true,
+            operatorNamed: stepObj.operatorNamed === true,
+          });
           log(`    rolled back: dropped ${stepObj.dbName}.`);
         } else if (stepObj.step === "releaseInstanceSlot") {
           await withAllocLock(lockPath, async () => {

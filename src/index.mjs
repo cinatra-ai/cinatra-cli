@@ -533,6 +533,7 @@ Usage:
                   [--on-conflict fail|prompt|isolated|stop-existing|attach|external|co-use]
                   [--infra new|external|share] [--instance <slug>] [--app-port <n>]
                   [--port-offset auto|<n>] [--db-url <url>] [--redis-url <url>]
+                  [--db-name <name>] [--db-template <name>] [--bullmq-queue <name>]
                   [--nango-url <url>] [--graphiti-url <url>] [--teardown-existing]
                   [--allow-shared-graphiti] [--external-db-disposable] [--resume]
                   [--dry-run] [--status] [--list-instances]
@@ -663,6 +664,19 @@ Commands:
                                             (REQUIRED non-interactively; a bare --yes won't arm it).
                     --allow-shared-graphiti With co-use: accept sharing the donor's Graphiti/Neo4j
                                             (org-scoped, not per-instance).
+                    --db-name <name>        Create the instance's database under THIS name instead of the
+                                            derived one (selects co-use). Lowercase letters, digits and
+                                            underscores, starting with a letter, at most 63 bytes; not a
+                                            reserved name, not one the CLI creates and drops itself
+                                            (cinatra_clone_…/cinatra_inst_…/cinatra_seed…), not the
+                                            donor's own database and not the template.
+                    --db-template <name>    Create that database FROM this template database instead of
+                                            the built-in seed (selects co-use). It must exist and be
+                                            marked: ALTER DATABASE … WITH IS_TEMPLATE true
+                                            ALLOW_CONNECTIONS false. Checked before anything is created;
+                                            an existing database is reused and the template not used.
+                    --bullmq-queue <name>   The instance's job-queue name on the shared Redis (selects
+                                            co-use; default: derived from the instance name).
                     --instance <slug>       Name the instance (default: the install-dir basename).
                     --app-port <n>          App port for an isolated instance.
                     --port-offset auto|<n>  Host-port shift for an isolated instance's infra band.
