@@ -38,6 +38,14 @@ import {
   registrySkewVerdictLines,
   seedLocalRegistryExtensions,
 } from "./seed-local-registry.mjs";
+// cinatra-cli#270: the generated extension maps are a DECLARED install
+// byproduct, and `--pinned-extensions` is the opt-in that avoids it — so the
+// typed exit code for "they drifted and setup refused to rewrite them" lives
+// with the declaration.
+import {
+  SETUP_EXIT_GENERATED_MAPS_DRIFT,
+  claimGeneratedMapsDriftExitCode,
+} from "./install-byproducts.mjs";
 import { parseDevRefreshFlags, describeDockerDecision } from "./dev-refresh.mjs";
 import {
   createComposeNangoDbTransport,
@@ -172,7 +180,7 @@ import {
   CLONE_NEXTJS_PORT_LIMIT,
   CLONE_WAYFLOW_PORT_LIMIT,
   acquireRuntimeLock,
-  assertPortBandOk,
+  assertCloneSlotPorts,
   cloneComposePath,
   cloneComposeProjectName,
   cloneLogPath,
@@ -193,6 +201,28 @@ import {
   truncateCloneLog,
   validateTailscaleAuthkey,
 } from "./clone-runtime.mjs";
+// cinatra-cli#260 — the per-instance agent runtime: the derivation behind
+// `instance wayflow start|stop --instance <name>`. Pure (no spawn, no Docker,
+// no registry read), so the names, the addresses and the argument lists this
+// verb uses are pinned by unit tests rather than by a live container.
+import {
+  INSTANCE_RUNTIME_BRIDGE_TOKEN_KEY,
+  INSTANCE_RUNTIME_CALLBACK_PROBE_TIMEOUT_MS,
+  INSTANCE_RUNTIME_SERVICE,
+  INSTANCE_RUNTIME_STOP_TIMEOUT_SECONDS,
+  callbackProbeFailureMessage,
+  callbackProbeVerdict,
+  composeInstanceRuntimeUpArgs,
+  containerCallbackProbeArgs,
+  dockerRuntimeInspectArgs,
+  dockerRuntimeRemoveArgs,
+  dockerRuntimeStopArgs,
+  instanceRuntimeRequested,
+  parseInstanceRuntimeFlags,
+  instanceRuntimeTemplateVars,
+  parseRuntimeContainerState,
+  resolveInstanceRuntimePlan,
+} from "./instance-runtime.mjs";
 // Pure URL-shape helper shared with the TS in-process MCP writer. The CLI
 // carries a package-LOCAL byte-identical copy (`./mcp-public-base-url-shape.mjs`)
 // instead of reaching across the package boundary into `../../mcp-server/src/`,
@@ -638,7 +668,13 @@ Commands:
                                       modes only (a prod install acquires its extensions
                                       pinned + integrity-verified already). Under --mode
                                       preview it pins the CHECKOUT's fleet; what the preview
-                                      IMAGE acquires is --fleet's business.
+                                      IMAGE acquires is --fleet's business. With the fleet at
+                                      that lock the generated extension maps
+                                      (src/lib/generated/) cannot legitimately move, so setup
+                                      CHECKS them instead of rewriting them: it names the
+                                      files that differ and exits 22 — the code the install
+                                      exits with too — leaving every tracked file as it
+                                      found it.
                     --frozen-lockfile Run EVERY dependency install of the run — this one (a
                                       prod install does two, around the extension
                                       acquisition) and the setup phase's workspace re-link —
@@ -1019,6 +1055,9 @@ Usage:
   cinatra instance wordpress start|stop
   cinatra instance drupal start|stop
   cinatra instance wayflow start|stop
+  cinatra instance wayflow start --instance <name> --runtime-port <n>
+                                 [--app-url http://127.0.0.1:<app port>]
+  cinatra instance wayflow stop --instance <name>
   cinatra instance a2a start|stop
   cinatra instance backup create [--file <path>]
   cinatra instance backup import [--file <path>|<filename>] [--yes]
@@ -1211,6 +1250,17 @@ Commands:
                       the bridge token matches the app, then builds + starts the
                       single \`wayflow\` compose service. Agent runs fail with
                       ECONNREFUSED until this runtime is up.
+                      With \`--instance <name>\` it starts or stops ONE
+                      instance's OWN runtime container instead of the shared
+                      one, so several instances can run side by side on one
+                      machine — each on the host port you name
+                      (\`--runtime-port <n>\`, taken as given), under its own
+                      container name, calling back to that instance's app
+                      (\`--app-url http://127.0.0.1:<app port>\`; the default
+                      comes from the instance's own .env.local). It returns only
+                      once the runtime answers AND the container can reach the
+                      app, refusing with that address named when it cannot; a
+                      re-run against a healthy container writes nothing.
   instance a2a start|stop
                       Start or stop the A2A dev test peers on THIS checkout's
                       ISOLATED stack (the \`a2a-peers\` compose profile), and wire
@@ -6620,7 +6670,7 @@ function decideManifestRegenGate({
 function regenerateExtensionManifestAfterSync(
   repoRoot,
   syncResult,
-  { failed = false, blockedBy = null, recovery = [] } = {},
+  { failed = false, blockedBy = null, recovery = [], checkOnly = false } = {},
 ) {
   const reconciled =
     !failed &&
@@ -6654,15 +6704,16 @@ function regenerateExtensionManifestAfterSync(
     );
     return;
   }
-  regenerateExtensionManifest(repoRoot);
+  regenerateExtensionManifest(repoRoot, { checkOnly });
 }
 
 // NOTE: the generator roots itself via import.meta.url (relative .mjs imports
 // only, no workspace install needed), so spawning the WORKTREE's copy of the
 // script — relative path + cwd — regenerates that worktree's maps.
-function regenerateExtensionManifest(repoRoot) {
-  console.log("- Regenerating the extension manifest against the on-disk extension set…");
+function regenerateExtensionManifest(repoRoot, { checkOnly = false } = {}) {
   const generator = path.join("scripts", "extensions", "generate-extension-manifest.mjs");
+  if (checkOnly) return checkExtensionManifest(repoRoot, generator);
+  console.log("- Regenerating the extension manifest against the on-disk extension set…");
   const regen = spawnSync(process.execPath, [generator], {
     cwd: repoRoot,
     stdio: "inherit",
@@ -6702,6 +6753,100 @@ function regenerateExtensionManifest(repoRoot) {
 }
 
 // ---------------------------------------------------------------------------
+// The generated maps as a CHECK rather than a rewrite (cinatra-cli#270)
+// ---------------------------------------------------------------------------
+//
+// `src/lib/generated/` is one of the install's two declared working-tree
+// byproducts (src/install-byproducts.mjs). `--frozen-lockfile` already keeps
+// the other one out of an unattended caller's checkout; this is the same idea
+// for this one. `--pinned-extensions` stands the dev fleet at the checkout's
+// OWN committed lock, so the emission for that fleet is the emission the
+// committed maps were generated from — the maps cannot legitimately move, and
+// a difference is drift in the checkout rather than news this run should write
+// into it.
+//
+// The generator already HAS the mode: its CANONICAL `--check` (no `--self`)
+// compares the on-disk generated files byte-exactly against a fresh emission,
+// writes nothing, and names every file that differs. That is exactly the
+// question here — the pinned fleet makes this tree's presence universe the
+// canonical one — so the check is the product's own, not a copy of its
+// comparison. `--self` stays where it was: it is the mode for a tree whose
+// presence universe legitimately differs, which is the write path's case.
+function checkExtensionManifest(repoRoot, generator) {
+  console.log(
+    "- Checking the committed extension maps against the pinned extension set (they are not rewritten)…",
+  );
+  const check = spawnSync(process.execPath, [generator, "--check"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: process.env,
+  });
+  // Piped rather than inherited so the verdict below can name the files the
+  // generator named — then echoed, unchanged, where it would have printed
+  // them: its own lines are the operator's evidence.
+  if (check.stdout) process.stdout.write(check.stdout);
+  if (check.stderr) process.stderr.write(check.stderr);
+  if (check.status === 0) {
+    console.log(
+      "- The committed extension maps already describe this extension set — not rewritten, the checkout stays clean.",
+    );
+    return;
+  }
+  const drifted = parseGeneratedMapDrift(`${check.stdout ?? ""}\n${check.stderr ?? ""}`);
+  if (drifted.length === 0) {
+    // The check never reached a per-file verdict: the script is missing, it
+    // threw, or it failed on something that names no file. That is a plain
+    // failure — the typed code below must keep meaning exactly one thing.
+    const detail = check.error ? check.error.message : `exit ${check.status}`;
+    console.error(
+      `\n⚠ Extension-manifest CHECK failed (${detail}) — the committed generated maps could not be verified ` +
+        `against this checkout's pinned extension set. Nothing was rewritten. Run \`node ${generator} --check\` ` +
+        `in ${repoRoot} to see why.\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  for (const line of generatedMapsDriftLines(repoRoot, drifted)) console.error(line);
+  process.exitCode = claimGeneratedMapsDriftExitCode(process.exitCode);
+}
+
+/** The generated files the manifest generator named as drifted or missing,
+ *  read from its own `--check` output: `[extension-manifest] DRIFT <path> — …`,
+ *  the `MISSING` form, and the `SELF-CHECK` variants of both. Every other line
+ *  it prints (catalog parity, the closing verdict) names no generated file and
+ *  is left alone. Sorted and de-duplicated, so the message reads the same way
+ *  twice. Pure. */
+function parseGeneratedMapDrift(output) {
+  const named = new Set();
+  for (const line of String(output ?? "").split("\n")) {
+    const match = /^\[extension-manifest\] (?:SELF-CHECK )?(?:DRIFT|MISSING) (\S+)/.exec(line.trim());
+    if (match) named.add(match[1]);
+  }
+  return [...named].sort();
+}
+
+/** What an operator is told when the committed maps differ from the emission
+ *  for their pinned fleet: which files, where, what to run, and that this run
+ *  changed nothing. Pure. */
+function generatedMapsDriftLines(repoRoot, drifted = []) {
+  const generator = path.join("scripts", "extensions", "generate-extension-manifest.mjs");
+  return [
+    "",
+    "⚠ The generated extension maps do NOT match this checkout's extension set — nothing was rewritten.",
+    "  --pinned-extensions stands the dev extension fleet at this checkout's OWN committed lock, so these",
+    "  maps cannot legitimately move. They differ from what the generator emits for that fleet:",
+    ...drifted.map((file) => `      ${file}`),
+    `  Regenerate them and COMMIT them on the commit this checkout is parked at, in ${repoRoot}:`,
+    `    1. node ${generator}`,
+    "    2. git add src/lib/generated && git commit",
+    `  Setup exits ${SETUP_EXIT_GENERATED_MAPS_DRIFT} for this — and so does the \`cinatra install\` it runs`,
+    "  under — and every tracked file is as you handed it over.",
+    "  Without --pinned-extensions setup regenerates these maps itself and the checkout comes back dirty.",
+    "",
+  ];
+}
+
+// ---------------------------------------------------------------------------
 // Agent skill auto-registration at setup time
 // ---------------------------------------------------------------------------
 //
@@ -6714,12 +6859,24 @@ function regenerateExtensionManifest(repoRoot) {
  *  args. Only that command reads them: `instance refresh` calls `runSetup`
  *  directly with its own explicit options and deliberately keeps a plain
  *  install (see the note at its dependency step), so a flag typed at `refresh`
- *  can never reach this. */
+ *  can never reach this.
+ *
+ *  `pinnedExtensions` reads the child's own `--pinned` — the token
+ *  `install --pinned-extensions` forwards — for ONE decision: whether the
+ *  generated extension maps are checked or rewritten (cinatra-cli#270). It is
+ *  deliberately NOT how the extension sync learns about the flag; that one
+ *  reads the ambient argv, for the reason spelled out at the sync call. */
 export function setupPhaseOptions(rest = []) {
-  return { frozenLockfile: rest.includes("--frozen-lockfile") };
+  return {
+    frozenLockfile: rest.includes("--frozen-lockfile"),
+    pinnedExtensions: rest.includes("--pinned"),
+  };
 }
 
-async function runSetup(mode, { skipDevApps = false, frozenLockfile = false } = {}) {
+async function runSetup(
+  mode,
+  { skipDevApps = false, frozenLockfile = false, pinnedExtensions = false } = {},
+) {
   const repoRoot = getRepoRoot();
   const env = collectEnvironment(repoRoot);
   const runtimeMode = readConfiguredRuntimeMode(env);
@@ -6916,10 +7073,16 @@ async function runSetup(mode, { skipDevApps = false, frozenLockfile = false } = 
         // No install ran (warm no-op) → still name a command THIS host can run.
         resolveInstallLabel: () => resolvePnpmInstallInvocation({ repoRoot }).label,
       });
+      // cinatra-cli#270 — with a PINNED fleet the maps cannot legitimately
+      // move, so they are checked, not rewritten: a caller that has to hand
+      // this checkout back byte-for-byte clean gets a refusal naming the
+      // drifted files instead of a dirty tree. Unpinned, the rewrite is
+      // unchanged — the fleet may genuinely have moved.
       regenerateExtensionManifestAfterSync(repoRoot, extensionSync, {
         failed: devGate.blocked,
         blockedBy: devGate.blockedBy,
         recovery: devGate.recovery,
+        checkOnly: pinnedExtensions,
       });
     }
     // A canonical single-instance main install declares its own database
@@ -10539,11 +10702,15 @@ function ensureWayflowImage({ forceRebuild = false, repoRoot } = {}) {
   }
 }
 
-function renderCloneComposeTemplate({ templatePath, outPath, vars }) {
-  // TS_AUTHKEY is rendered as the LITERAL string `${TS_AUTHKEY}` so docker
-  // compose substitutes from the spawned-process env at exec time. The raw
-  // secret never lands on disk.
-  let rendered = readFileSync(templatePath, "utf8");
+/**
+ * The substitution ALONE, template text in and document text out. Split from
+ * the writer (cinatra-cli#260) so a caller can ask "is the document already on
+ * disk the one I would write now?" without writing anything — which is what
+ * makes the per-instance runtime verb's idempotence answerable rather than
+ * assumed.
+ */
+function renderComposeTemplateText(template, vars) {
+  let rendered = String(template);
   for (const [name, value] of Object.entries(vars)) {
     const str = String(value);
     // Values are raw-substituted into double-quoted YAML scalars. Reject the
@@ -10557,6 +10724,14 @@ function renderCloneComposeTemplate({ templatePath, outPath, vars }) {
     }
     rendered = rendered.split(`@@${name}@@`).join(str);
   }
+  return rendered;
+}
+
+function renderCloneComposeTemplate({ templatePath, outPath, vars }) {
+  // TS_AUTHKEY is rendered as the LITERAL string `${TS_AUTHKEY}` so docker
+  // compose substitutes from the spawned-process env at exec time. The raw
+  // secret never lands on disk.
+  const rendered = renderComposeTemplateText(readFileSync(templatePath, "utf8"), vars);
   ensureDirOf(outPath);
   writeFileSync(outPath, rendered, { mode: 0o600 });
 }
@@ -11118,8 +11293,11 @@ async function runCloneStart(argv) {
   }
 
   const { slot } = loadReadyCloneSlot(slug);
-  assertPortBandOk(slot.nextjsPort, "nextjs");
-  assertPortBandOk(slot.wayflowPort, "wayflow");
+  // The REGISTRY caller of the port-band guard (cinatra-cli#260): these two
+  // ports came out of an index-derived registry slot, so a value outside the
+  // bands means the row is corrupt. A port an operator names on a flag takes
+  // the other road (`instance wayflow start --instance <name> --runtime-port`).
+  assertCloneSlotPorts(slot);
 
   // The registry slot is the source of truth for the clone's worktree — a
   // dormant clone has no listening socket, so `clone start --slug <s>` must
@@ -12738,6 +12916,263 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
 // command then refuses to launch. Pinning that gate by source-text ordering
 // alone left a later arm change free to stop returning a map and silently
 // disable it with every test still green. Production passes nothing.
+// ---------------------------------------------------------------------------
+// `cinatra instance wayflow start|stop --instance <name>` (cinatra-cli#260):
+// ONE agent-runtime container for ONE instance.
+//
+// The shared verb below manages the ONE runtime a checkout's own stack owns. An
+// operator running several isolated instances side by side on one machine — an
+// install pointed at a database, a cache and a connection service it does not
+// own starts no runtime at all — needs something else: a runtime per instance,
+// on a port they name, under a name that cannot collide with the instance next
+// to it, calling back to that instance's own app address.
+//
+// It renders the checkout's EXISTING runtime compose template rather than a
+// second one of its own, and brings up the single runtime service of a project
+// named after the instance. Three things make it safe to run beside anything
+// else already on the machine:
+//
+//   1. NOTHING ELSE IS TOUCHED. Every argument list names this instance's own
+//      project or its own container: `up` is scoped to the one service, and the
+//      stop stops and removes that one container by name.
+//   2. THE CREDENTIAL TRAVELS THE WAY IT ALREADY DOES. The bridge token is read
+//      from the instance's own environment file and handed to the launch
+//      through the launch environment, exactly as the per-clone road hands it
+//      over; the rendered document keeps the `${CINATRA_BRIDGE_TOKEN}`
+//      placeholder compose resolves at exec time. The value never reaches an
+//      argument list, the output, or a file this verb writes.
+//   3. IT IS HEALTH-GATED AT BOTH ENDS. The verb returns only once the runtime
+//      answers on the port it published AND the container itself can reach the
+//      app — the second question asked INSIDE the container, because that is
+//      the only place the answer is true. A container that cannot reach the app
+//      is a runtime whose every agent run fails at its first call, discovered
+//      late and by whoever was trying to use the instance, so the refusal NAMES
+//      THE CALLBACK ADDRESS.
+//
+// Re-running it against a healthy container writes nothing and returns — and
+// "healthy" is both halves: the container answers AND it was launched from the
+// document this invocation would write. A container answering on the port asked
+// for says nothing about the address it calls the app BACK on, so a changed
+// `--app-url` must not read as "nothing to do".
+async function runInstanceWayflow(verb, argv = [], deps = {}) {
+  // The argument list is judged before anything is read or resolved, so a
+  // malformed invocation never depends on where it was run.
+  const flags = parseInstanceRuntimeFlags(argv);
+  const repoRoot = (deps.getRepoRoot ?? getRepoRoot)();
+  const envPath = path.join(repoRoot, ".env.local");
+  const env = (deps.readEnvFile ?? parseEnvFile)(envPath) ?? {};
+  const plan = resolveInstanceRuntimePlan({ verb, flags, env, repoRoot, home: deps.home });
+
+  const log = deps.log ?? console.log;
+  const spawn = deps.spawnSync ?? spawnSync;
+  const probe = deps.probeHttp ?? probeHttp;
+  const homeOpts = deps.home === undefined ? undefined : { home: deps.home };
+
+  if (!(deps.isComposeAvailable ?? isComposeAvailable)()) {
+    throw new Error(
+      "`docker compose` is not available on PATH. Install Docker + the compose plugin, then retry.",
+    );
+  }
+
+  // Every docker call this verb makes is BOUNDED, the same discipline the rest
+  // of this file's docker calls carry: a wedged daemon must fail the command,
+  // not hang it. The graceful stop is given its own grace period on top of the
+  // `-t` it asks docker for, and the in-container probe the bound its own
+  // `AbortSignal` already carries.
+  const stopTimeoutMs = INSTANCE_RUNTIME_STOP_TIMEOUT_SECONDS * 1_000 + DOCKER_CLI_PROBE_TIMEOUT_MS;
+  const probeTimeoutMs = INSTANCE_RUNTIME_CALLBACK_PROBE_TIMEOUT_MS + DOCKER_CLI_PROBE_TIMEOUT_MS;
+
+  /** What the machine says about THIS instance's container right now. */
+  const readState = () =>
+    parseRuntimeContainerState(
+      spawn("docker", dockerRuntimeInspectArgs(plan), {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
+      }),
+    );
+
+  /** Take that one container down: gracefully when it runs, then remove it.
+   *  The REMOVAL's own answer is read and returned — a removal that failed
+   *  must never be reported as one that happened, and must never be followed
+   *  by a launch that will collide with what is still there. */
+  const removeContainer = (state) => {
+    if (state.running) {
+      spawn("docker", dockerRuntimeStopArgs(plan), {
+        stdio: ["ignore", "ignore", "inherit"],
+        timeout: stopTimeoutMs,
+      });
+    }
+    const removed = spawn("docker", dockerRuntimeRemoveArgs(plan), {
+      stdio: ["ignore", "ignore", "inherit"],
+      timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
+    });
+    return !removed?.error && (removed?.status ?? 1) === 0;
+  };
+
+  /** The refusal when that removal did not happen. */
+  const removalFailed = () =>
+    new Error(
+      `Instance "${plan.slug}": the agent runtime container ${plan.container} could not be ` +
+        `removed (docker's own words are above). Nothing else on this machine was touched. ` +
+        `Remove it by hand with \`docker rm -f ${plan.container}\`, then re-run this command.`,
+    );
+
+  if (verb === "stop") {
+    const state = readState();
+    if (!state.present) {
+      log(
+        `Instance "${plan.slug}": there is no agent runtime container named ${plan.container} — ` +
+          `nothing to stop.`,
+      );
+      return;
+    }
+    if (!removeContainer(state)) throw removalFailed();
+    log(
+      `Instance "${plan.slug}": agent runtime container ${plan.container} removed; nothing else on ` +
+        `this machine was touched. Agent runs for this instance fail with ECONNREFUSED until it is ` +
+        `started again.`,
+    );
+    return;
+  }
+
+  // The template is the cheapest thing that can be missing, and the document
+  // the idempotence check below compares against is rendered FROM it, so it is
+  // read before any container is touched.
+  const templatePath = path.join(repoRoot, "docker", "wayflow", "compose.clone.template.yml");
+  const readFile = deps.readFileSync ?? readFileSync;
+  const exists = deps.existsSync ?? existsSync;
+  if (!exists(templatePath)) {
+    throw new Error(
+      `Per-clone compose template missing at ${templatePath}. Is the clone runtime template present?`,
+    );
+  }
+
+  /** The document this invocation WOULD write, without writing it. */
+  const wantedCompose = () =>
+    renderComposeTemplateText(readFile(templatePath, "utf8"), instanceRuntimeTemplateVars(plan));
+
+  /** Is the document the running container was launched from the one this
+   *  invocation would write now? A container answering on the port asked for
+   *  says nothing about the address it calls the app BACK on, so a changed
+   *  `--app-url` (or app port, or checkout) would otherwise be reported as
+   *  "nothing to do" while every agent run kept dialling the old address. */
+  const composeDocumentIsCurrent = () => {
+    try {
+      if (!exists(plan.composePath)) return false;
+      return readFile(plan.composePath, "utf8") === wantedCompose();
+    } catch {
+      return false;
+    }
+  };
+
+  // IDEMPOTENCE, before anything is written. A container of this name that is
+  // running, answering AND launched from the document this invocation would
+  // write is the state this command exists to produce, so it is reported and
+  // left exactly as it stands. One that is up but silent, one launched from a
+  // document that no longer says what was asked for, and one that is merely in
+  // the way are all replaced.
+  const existing = readState();
+  if (existing.running) {
+    const already = await probe(plan.runtimeHealthUrl, { timeoutMs: 2_000, intervalMs: 500 });
+    if (already.ok && composeDocumentIsCurrent()) {
+      log(
+        `Instance "${plan.slug}": the agent runtime ${plan.container} is already running and ` +
+          `answering on ${plan.runtimeUrl} — nothing to do.`,
+      );
+      return;
+    }
+    log(
+      already.ok
+        ? `Instance "${plan.slug}": ${plan.container} is answering on ${plan.runtimeUrl}, but it ` +
+          `was not started from what this command would write now (it publishes ` +
+          `${plan.runtimePort} and calls the app back at ${plan.callbackUrl}) — replacing it.`
+        : `Instance "${plan.slug}": ${plan.container} is running but not answering on ` +
+          `${plan.runtimeHealthUrl} — replacing it.`,
+    );
+    if (!removeContainer(existing)) throw removalFailed();
+  } else if (existing.present) {
+    log(`Instance "${plan.slug}": a stopped ${plan.container} is in the way — removing it.`);
+    if (!removeContainer(existing)) throw removalFailed();
+  }
+
+  // The credential, by KEY. Without it the runtime crash-loops on its own
+  // refusal to start, so this is said before anything is built or launched —
+  // and said by naming the variable and the file, never the value.
+  const bridgeToken = String(env[INSTANCE_RUNTIME_BRIDGE_TOKEN_KEY] ?? "").trim();
+  if (!bridgeToken) {
+    throw new Error(
+      `Instance "${plan.slug}": ${envPath} carries no ${INSTANCE_RUNTIME_BRIDGE_TOKEN_KEY}. The ` +
+        `agent runtime authenticates every callback to the app with it and refuses to start ` +
+        `without one. Re-run \`cinatra install\` on this checkout to mint it, then retry. The ` +
+        `value is read from that file and never printed.`,
+    );
+  }
+
+  (deps.ensureWayflowImage ?? ensureWayflowImage)({ repoRoot });
+
+  (deps.ensureRuntimeDir ?? ensureCloneRuntimeDir)(plan.slug, homeOpts);
+  (deps.renderTemplate ?? renderCloneComposeTemplate)({
+    templatePath,
+    outPath: plan.composePath,
+    vars: instanceRuntimeTemplateVars(plan),
+  });
+
+  const upArgs = composeInstanceRuntimeUpArgs(plan);
+  log(`Starting the agent runtime for instance "${plan.slug}" (docker ${upArgs.join(" ")}) ...`);
+  // The token is handed over HERE and nowhere else — the same hand-over the
+  // per-clone road makes, and for the same reason: an operator's shell may
+  // carry ANOTHER instance's token, and the instance's own file must win.
+  const up = spawn("docker", upArgs, {
+    cwd: repoRoot,
+    env: { ...process.env, [INSTANCE_RUNTIME_BRIDGE_TOKEN_KEY]: bridgeToken },
+    stdio: ["ignore", "inherit", "inherit"],
+    // The image is already ensured above, so this is a create+start; the bound
+    // is the same one a cold image build is given, and it exists so a wedged
+    // daemon fails the command instead of holding it open for ever.
+    timeout: WAYFLOW_BUILD_TIMEOUT_MS,
+  });
+  const upStatus = up.error ? 1 : (up.status ?? 1);
+  if (upStatus !== 0) {
+    throw new Error(
+      `\`docker ${upArgs.join(" ")}\` failed (exit ${upStatus}).` +
+        (up.error ? ` ${up.error.message}` : ""),
+    );
+  }
+
+  log(`Waiting for the agent runtime at ${plan.runtimeHealthUrl} ...`);
+  const health = await probe(plan.runtimeHealthUrl, { timeoutMs: 120_000 });
+  if (!health.ok) {
+    throw new Error(
+      `Instance "${plan.slug}": the agent runtime container ${plan.container} did not answer ` +
+        `${plan.runtimeHealthUrl} (${health.error}). Read its own words with ` +
+        `\`docker logs ${plan.container}\`.`,
+    );
+  }
+
+  const reach = spawn("docker", containerCallbackProbeArgs(plan), {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: probeTimeoutMs,
+  });
+  // "Unreachable" is a VERDICT, not every non-zero exit: an image without node
+  // answers 126/127 and a docker CLI that never ran answers with an error, and
+  // naming the callback address for either would send the operator to fix an
+  // address that is fine. The probe's own output is never echoed — it is read
+  // for its exit status alone.
+  if (callbackProbeVerdict(reach) !== "ok") {
+    throw new Error(callbackProbeFailureMessage(plan, reach));
+  }
+
+  log(`Instance "${plan.slug}": agent runtime started.`);
+  log(`  runtime:   ${plan.runtimeUrl}`);
+  log(`  container: ${plan.container} (compose project ${plan.composeProject})`);
+  log(`  calls this instance's app back at: ${plan.callbackUrl}`);
+  log(
+    `  the loader mounts every agent installed in this checkout; allow up to ~2 min on a cold start.`,
+  );
+}
+
 async function runDevWayflow(argv = [], deps = {}) {
   rejectTailscaleAuthkeyFlag(argv);
   const verb = String(argv[0] ?? "").trim();
@@ -12747,10 +13182,19 @@ async function runDevWayflow(argv = [], deps = {}) {
         `Expected: cinatra instance wayflow <start|stop>.`,
     );
   }
+  // cinatra-cli#260 — `--instance <name>` addresses ONE instance's OWN agent
+  // runtime container instead of the checkout's shared one. Without the flag
+  // nothing below changes: the shared-service road keeps its argument list, its
+  // scoping and its "the verb is the only accepted argument" contract.
+  const rest = argv.slice(1);
+  if (instanceRuntimeRequested(rest)) {
+    await runInstanceWayflow(verb, rest, deps);
+    return;
+  }
   // The verb is the ONLY accepted argument (same contract as the CMS commands):
   // a malformed `instance wayflow start oops` / `--foo` fails fast rather than
   // silently performing a container action.
-  const extra = argv.slice(1).filter((tok) => String(tok ?? "").trim() !== "");
+  const extra = rest.filter((tok) => String(tok ?? "").trim() !== "");
   if (extra.length > 0) {
     throw new Error(
       `Unexpected argument(s) for 'cinatra instance wayflow ${verb}': ${extra.join(" ")}. ` +
@@ -16382,6 +16826,11 @@ export {
   // compose file is rewritten inside the window the reconcile opens, and the
   // launch must refuse rather than bind whatever the file now says.
   runDevWayflow,
+  // cinatra-cli#260 — the per-instance arm of that verb, exported with its own
+  // `deps` seam: the health gate, the idempotent no-op and the refusal that
+  // names the callback address are pinned by BEHAVIOUR, hermetically, with no
+  // Docker and no network.
+  runInstanceWayflow,
   // cinatra-cli#240 — the printed start endpoint, derived from the instance's
   // recorded port map instead of a hardcoded default.
   recordedWayflowHostPort,
@@ -16431,6 +16880,8 @@ export {
   // cinatra#2637 — the manifest-regeneration gate: one decision that names the
   // blocker and the exact, host-resolved recovery commands a blocked run needs.
   decideManifestRegenGate,
+  generatedMapsDriftLines,
+  parseGeneratedMapDrift,
   regenerateExtensionManifestAfterSync,
   // cinatra-cli#41 — clone link-invariant seams (pure; injectable fs).
   linkedSetMatchesEmittedSet,

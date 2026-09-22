@@ -375,6 +375,19 @@ pretending to honour it. With `--mode preview` it pins the fleet of the
 **checkout** (the dev half of that composition); what the preview *image*
 acquires is chosen by `--fleet` and is not affected.
 
+It also decides what happens to the **generated extension maps**
+(`src/lib/generated/`) — the other file set an install writes into your
+checkout. The setup phase normally regenerates them for the extension set it
+just synced. With the fleet pinned to the committed lock those maps cannot
+legitimately move, so they are checked instead: setup compares them with what
+the generator emits for that fleet and, if any differ, names them, leaves every
+tracked file exactly as it found it, and exits `22` — the code the `cinatra
+install` it runs under exits with too, so a caller reading exit codes can tell a
+stale committed map apart from any other failure. Regenerate them with
+`node scripts/extensions/generate-extension-manifest.mjs` and commit them on the
+commit the checkout is parked at, then re-run. Without the flag the maps are
+regenerated in place, as before.
+
 `--frozen-lockfile` reaches every dependency install of the run — the install's
 own, and the one the setup phase runs when it re-links the workspace after its
 extension sync — on every package-manager tier. A `--mode prod` install performs
@@ -529,6 +542,52 @@ command is safe to re-run.
 `--db-name` must be the database the install itself points at: naming a
 different one would create a database nothing then uses while setup migrated
 another, so `cinatra install` refuses that, naming both databases.
+
+### Giving an instance its own agent runtime
+
+An instance needs an agent runtime: the container that runs your installed
+agents and calls the app back for every model request. An install that owns a
+local stack starts one for you. An install pointed at a database, a cache and a
+connection service you run yourself (`--infra=external`) does not — it says so —
+and an instance without one fails at its first agent run.
+
+Start one for a named instance, on the port you choose:
+
+    cinatra instance wayflow start --instance team-a --runtime-port 3910
+    cinatra instance wayflow start --instance team-b --runtime-port 3911 \
+        --app-url http://127.0.0.1:3301
+
+Each instance gets its own container (`cinatra-instance-<name>-wayflow-1`) in
+its own compose project, so a second instance starts its runtime beside the
+first and neither can address the other's. The port is taken as given: it is
+yours to pick, not drawn from a pool.
+
+`--app-url` is the address on **this machine** that the runtime calls the app
+back on. Leave it out and it comes from the instance's own `.env.local`. Inside
+a container your machine's loopback means the container itself, so the runtime
+is given the address through the container's gateway to the host — which is also
+what makes this work on an engine that runs containers without root.
+
+The command returns only once both halves are true: the runtime answers on the
+port it published, **and** the container can reach the app. It asks that second
+question inside the container, because that is the only place the answer is
+true, and if the answer is no it refuses and names the address the runtime was
+trying to reach — rather than leaving you a runtime that looks up and fails at
+its first agent run. Re-run it against a healthy container and it writes nothing
+and exits 0; "healthy" means it answers **and** it is the container this command
+would start now, so one that was started on a different port or for a different
+app address is replaced rather than reported as fine.
+
+The runtime's shared secret with the app is read from that instance's own
+`.env.local` and handed to the container at launch. It is never printed, never
+passed on a command line, and never written into any file this command creates.
+
+To take one down — and nothing else on the machine with it:
+
+    cinatra instance wayflow stop --instance team-a
+
+Without `--instance`, `cinatra instance wayflow start|stop` still manages the one
+shared runtime of the checkout you run it in, exactly as before.
 
 ## Author an extension
 

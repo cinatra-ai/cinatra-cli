@@ -8,6 +8,43 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Every instance on a machine can now have its own agent runtime.** An
+  instance needs an agent runtime — the container that runs your installed
+  agents and calls the app back for every model request — and an install told
+  that the database, the cache and the connection service are somebody else's
+  problem (`--infra=external`) starts none, so that instance failed at its first
+  agent run. The roads that did start one either owned a whole local stack or
+  belonged to the clone registry, whose ports come from a fixed range, so an
+  operator running several isolated instances side by side had no way to give
+  each one a runtime. `cinatra instance wayflow start --instance <name>
+  --runtime-port <n> [--app-url http://127.0.0.1:<port>]` is that way: one
+  runtime container for one instance, on the port you choose, in its own compose
+  project and under its own container name, so a second instance starts its
+  runtime beside the first and neither can address the other's. The port is
+  taken as given — the fixed range belongs to the clone registry's own rows and
+  is still enforced there, where a port outside it means a corrupt row. The
+  address the runtime calls the app back on is yours to name, and defaults to
+  what the instance's own `.env.local` already says; because your machine's
+  loopback means the container itself from inside a container, the runtime is
+  given that address through the container's gateway to the host, which is also
+  what makes this work on an engine that runs containers without root. The
+  command returns only once the runtime answers on the port it published AND the
+  container can actually reach the app — the second question asked inside the
+  container, since that is the only place the answer is true — and refuses,
+  naming the address it could not reach, rather than leaving behind a runtime
+  that looks up and fails at its first call. Re-running it against a healthy
+  container writes nothing and exits 0 — "healthy" meaning it answers AND it is
+  the container this command would start now, so one that was started on a
+  different port or for a different app address is replaced rather than
+  reported as fine. A container that is up but silent, or merely in the way, is
+  replaced too. The runtime's shared secret with the app is
+  read from that instance's own `.env.local` and handed to the container at
+  launch — never printed, never on a command line, and never written into a file
+  the command creates. `cinatra instance wayflow stop --instance <name>` takes
+  that one container down and nothing else on the machine with it. Without
+  `--instance` the command still manages the one shared runtime of the checkout
+  you run it in, unchanged.
+
 - **An `install --infra=external` can now create the instance's database from
   your own template.** An operator who points `cinatra install` at a PostgreSQL
   server they run themselves, and names the instance database plus the template
@@ -78,6 +115,26 @@ project adheres to [Semantic Versioning](https://semver.org/).
   fetch it suppresses. That one fetch is all it suppresses — the run still
   clones the declared companion extension repos and installs from a registry.
   All three are off by default and nothing about a hand-run install changes.
+
+- **An unattended install can now keep the generated extension maps clean
+  too.** `--frozen-lockfile` kept the lockfile out of the caller's checkout,
+  but the other file set an install writes into it — the generated extension
+  maps under `src/lib/generated/` — was rewritten by the setup phase on every
+  run, so a caller working in a checkout parked at an exact commit and required
+  to hand it back byte-for-byte clean still got a dirty tree. With
+  `--pinned-extensions` the dev extension fleet stands at the checkout's own
+  committed lock, so those maps cannot legitimately move: the setup phase now
+  compares them with what the generator emits for that fleet instead of
+  regenerating them in place. When they match, nothing is written and the
+  checkout stays clean. When they differ, the setup phase stops with its own
+  exit code `22` — and the `cinatra install` it runs under fails with that same
+  code, so a caller reading exit codes can tell this apart from any other
+  failure — naming each file that differs and what clears it: regenerate the
+  maps and commit them on the commit the checkout is parked at. Every tracked file is left exactly as it was
+  handed over. Without `--pinned-extensions` the maps are regenerated in place,
+  unchanged, because the fleet may genuinely have moved. Each of the two paths
+  an install writes into a checkout now names the flag that avoids it, and
+  `cinatra install` says so wherever it reports its own byproducts.
 
 - **An instance on a shared PostgreSQL server can be given its own database
   name and its own template database.** Running several isolated instances on
