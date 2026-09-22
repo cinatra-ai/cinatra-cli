@@ -663,7 +663,10 @@ Commands:
                                             Add --db-name AND --db-template to have the instance's
                                             database created from that template, on the server this
                                             install points at, before setup + migrations run.
-                    --external-db-disposable Acknowledge an external --db-url target is disposable
+                    --external-db-disposable Acknowledge that the external database setup +
+                                            migrations are pointed at is disposable: the --db-url
+                                            one, or the SUPABASE_DB_URL your own environment names
+                                            (.env.local, or an exported value, which wins)
                                             (REQUIRED non-interactively; a bare --yes won't arm it).
                     --allow-shared-graphiti With co-use: accept sharing the donor's Graphiti/Neo4j
                                             (org-scoped, not per-instance).

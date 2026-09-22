@@ -334,7 +334,7 @@ option up front with a flag:
     cinatra install --infra=external \       # point at your own database/cache
         --db-url <url> --redis-url <url> --nango-url <url> --graphiti-url <url> \
         --external-db-disposable             # confirm the external DB is disposable
-                                             # (setup may write to it; required for --db-url)
+                                             # (setup may write to it; required unattended)
     cinatra install --infra=external \       # …and let the CLI create that database
         --db-name <name> --db-template <name>  # from your own template first
 
@@ -395,9 +395,14 @@ exactly as it did before.
 
 `--list-instances` / `--status` are read-only. Stopping or wiping an existing
 instance always asks for confirmation first; `--yes` alone never deletes data
-(and pointing setup at your own external database with `--db-url` likewise needs
-the explicit `--external-db-disposable` acknowledgement — a bare `--yes` won't do
-it, because setup can write to that database).
+(and pointing setup at your own external database likewise needs the explicit
+`--external-db-disposable` acknowledgement — a bare `--yes` won't do it, because
+setup can write to that database). That acknowledgement follows the database,
+not the flag that named it: it is required whether the database comes from
+`--db-url`, from the `SUPABASE_DB_URL` in your own `.env.local`, or from a
+`SUPABASE_DB_URL` exported in your shell — setup overlays the shell over the
+file, so the exported one is the database it would write to and the one you are
+asked about. `--external-db-disposable` may therefore be given on its own.
 
 > **Co-use (sharing one set of services).** `--on-conflict=co-use` /
 > `--infra=share` runs a second instance against the first one's running services
@@ -477,7 +482,19 @@ You do not have to put the credential on the command line. With no `--db-url`,
 the install reads the `SUPABASE_DB_URL` your checkout's `.env.local` already
 carries and creates the database on that server. The value is read by key and
 used in the process — it is never passed to another command and never printed;
-every line the run writes names the database and the template only.
+every line the run writes names the database and the template only:
+
+    cinatra install --infra=external \
+        --db-name team_instance_a --db-template team_seed_template \
+        --external-db-disposable
+
+That database takes the same acknowledgement a `--db-url` one takes, because it
+is the database setup and migrations are pointed at: on a terminal `cinatra
+install` names it and asks you to type the confirmation, and with nobody
+watching it needs `--external-db-disposable` — which stands on its own, so
+acknowledging the target never means putting a password on a command line. A
+`.env.local` that names no database has nothing to acknowledge, and the run then
+says for itself what it is missing.
 
 The database is created on the server's maintenance database, from the template
 exactly as on the shared road: the template must exist and be marked one
