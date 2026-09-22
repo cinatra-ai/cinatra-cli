@@ -116,6 +116,26 @@ project adheres to [Semantic Versioning](https://semver.org/).
   clones the declared companion extension repos and installs from a registry.
   All three are off by default and nothing about a hand-run install changes.
 
+- **An unattended install can now keep the generated extension maps clean
+  too.** `--frozen-lockfile` kept the lockfile out of the caller's checkout,
+  but the other file set an install writes into it — the generated extension
+  maps under `src/lib/generated/` — was rewritten by the setup phase on every
+  run, so a caller working in a checkout parked at an exact commit and required
+  to hand it back byte-for-byte clean still got a dirty tree. With
+  `--pinned-extensions` the dev extension fleet stands at the checkout's own
+  committed lock, so those maps cannot legitimately move: the setup phase now
+  compares them with what the generator emits for that fleet instead of
+  regenerating them in place. When they match, nothing is written and the
+  checkout stays clean. When they differ, the setup phase stops with its own
+  exit code `22` — and the `cinatra install` it runs under fails with that same
+  code, so a caller reading exit codes can tell this apart from any other
+  failure — naming each file that differs and what clears it: regenerate the
+  maps and commit them on the commit the checkout is parked at. Every tracked file is left exactly as it was
+  handed over. Without `--pinned-extensions` the maps are regenerated in place,
+  unchanged, because the fleet may genuinely have moved. Each of the two paths
+  an install writes into a checkout now names the flag that avoids it, and
+  `cinatra install` says so wherever it reports its own byproducts.
+
 - **An instance on a shared PostgreSQL server can be given its own database
   name and its own template database.** Running several isolated instances on
   one machine against ONE PostgreSQL server is the cheap way to do it, and the

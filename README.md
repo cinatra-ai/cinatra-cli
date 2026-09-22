@@ -375,6 +375,19 @@ pretending to honour it. With `--mode preview` it pins the fleet of the
 **checkout** (the dev half of that composition); what the preview *image*
 acquires is chosen by `--fleet` and is not affected.
 
+It also decides what happens to the **generated extension maps**
+(`src/lib/generated/`) — the other file set an install writes into your
+checkout. The setup phase normally regenerates them for the extension set it
+just synced. With the fleet pinned to the committed lock those maps cannot
+legitimately move, so they are checked instead: setup compares them with what
+the generator emits for that fleet and, if any differ, names them, leaves every
+tracked file exactly as it found it, and exits `22` — the code the `cinatra
+install` it runs under exits with too, so a caller reading exit codes can tell a
+stale committed map apart from any other failure. Regenerate them with
+`node scripts/extensions/generate-extension-manifest.mjs` and commit them on the
+commit the checkout is parked at, then re-run. Without the flag the maps are
+regenerated in place, as before.
+
 `--frozen-lockfile` reaches every dependency install of the run — the install's
 own, and the one the setup phase runs when it re-links the workspace after its
 extension sync — on every package-manager tier. A `--mode prod` install performs
