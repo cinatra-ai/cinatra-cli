@@ -5822,6 +5822,99 @@ function withoutEmbeddedCredentials(text) {
   return String(text ?? "").replace(/\/\/[^/\s]*:[^/\s]*@/g, "//***@");
 }
 
+/** How an external install's own `.env.local` is named in the messages below —
+ *  the KEY and the file, never the value either carries. */
+const CHECKOUT_DB_URL_SOURCE = "the SUPABASE_DB_URL in .env.local";
+
+/** The same, for a `SUPABASE_DB_URL` EXPORTED in the operator's shell — the key
+ *  and where it came from, never its value. */
+const AMBIENT_DB_URL_SOURCE = "the exported SUPABASE_DB_URL";
+
+/** The `SUPABASE_DB_URL` the checkout's own `.env.local` carries. Read BY KEY
+ *  and used in process — it is never printed and never passed on a command
+ *  line, so the credential it carries stays in that file. */
+function checkoutExternalDbUrl(targetDir) {
+  return readCheckoutEnvLocal(targetDir).SUPABASE_DB_URL ?? null;
+}
+
+/** The database server setup and migrations are ACTUALLY pointed at when the
+ *  command line named none — and therefore the one the acknowledgement below
+ *  must be about. Setup resolves its environment the way `collectEnvironment`
+ *  does: the checkout's `.env.local` OVERLAID BY `process.env`. So an EXPORTED
+ *  `SUPABASE_DB_URL` is what setup migrates, and a gate that read only the file
+ *  could acknowledge one database while setup wrote to another. Both are read
+ *  by key and used in process; neither value is ever printed.
+ *
+ *  Returns the URL and the SOURCE it came from, so every message can say which
+ *  one the operator has to look at without quoting either. */
+function effectiveExternalDbUrl(targetDir, env = process.env) {
+  const ambient = typeof env.SUPABASE_DB_URL === "string" ? env.SUPABASE_DB_URL.trim() : "";
+  if (ambient) return { url: ambient, namedBy: AMBIENT_DB_URL_SOURCE };
+  const fromFile = checkoutExternalDbUrl(targetDir);
+  return fromFile
+    ? { url: fromFile, namedBy: CHECKOUT_DB_URL_SOURCE }
+    : { url: null, namedBy: null };
+}
+
+/** cinatra-cli#269 — the eyes-open acknowledgement setup + migrations take
+ *  before they are pointed at an EXTERNAL database, WHICHEVER source named it:
+ *  the `--db-url` on the command line, or the `SUPABASE_DB_URL` the operator's
+ *  own environment carries — their `.env.local`, or an exported value, which is
+ *  the one setup overlays over it. The database is the thing at risk — it is not
+ *  install-owned, it is never auto-rolled-back, and setup may mutate a
+ *  non-empty or production database irreversibly — so the gate follows the
+ *  database and not the flag that happened to name it. Reaching it only through
+ *  `--db-url` meant the one way to ARM the acknowledgement was to put a
+ *  credential-bearing URL on a command line, while the road that keeps the
+ *  credential in a file ran with no acknowledgement at all.
+ *
+ *  Non-interactively the operator must pass `--external-db-disposable`: a bare
+ *  `--yes` must NOT silently authorise it (the same class as
+ *  `--teardown-existing`'s `-v`). On a terminal a typed confirmation is
+ *  accepted, and `--yes` pre-accepts that prompt only when the disposable
+ *  acknowledgement is ALSO present.
+ *
+ *  Everything this writes names the database, never the connection string it was
+ *  read from: the string carries the credential and the name does not. */
+async function acknowledgeExternalDb({ dbUrl, namedBy, opts, log }) {
+  const name = connStringDatabaseName(dbUrl);
+  const which = name
+    ? `"${name}" (named by ${namedBy})`
+    : `the one ${namedBy} names (that value states no database name)`;
+
+  if (opts.externalDbDisposable) {
+    log(
+      `- External database ${which}: acknowledged as disposable (--external-db-disposable). Setup + ` +
+        `migrations may write to it; it is operator-owned and never auto-rolled-back.`,
+    );
+    return;
+  }
+  if (opts.yes) {
+    throw new Error(
+      `Refusing to point setup + migrations at the EXTERNAL database ${which} on a bare --yes. This ` +
+        `database is NOT install-owned and is NEVER auto-rolled-back; setup may mutate a non-empty/production ` +
+        `database irreversibly. Re-run with --external-db-disposable to acknowledge the target is disposable ` +
+        `(or run interactively to type the confirmation).`,
+    );
+  }
+  const ok = await typedConfirm(
+    `⚠ --infra=external points setup + migrations at the EXTERNAL database ${which}.\n` +
+      `  This database is NOT install-owned and will NEVER be auto-rolled-back. If it is non-empty\n` +
+      `  or production, setup may mutate it irreversibly.`,
+    "I understand",
+  );
+  if (!ok) {
+    throw new Error(
+      `Aborted: the EXTERNAL database ${which} was not confirmed (type "I understand", or pass ` +
+        `--external-db-disposable if the target is disposable).`,
+    );
+  }
+  log(
+    `- External database ${which}: confirmed as disposable at the prompt. Setup + migrations may write ` +
+      `to it; it is operator-owned and never auto-rolled-back.`,
+  );
+}
+
 /** cinatra-cli#268 — create the instance's database on the EXTERNAL server this
  *  install is pointed at, from the template the operator named, unless it is
  *  already there. Runs BEFORE setup and migrations, so the database they are
@@ -5843,14 +5936,18 @@ async function createExternalInstanceDb({ targetDir, opts, dbUrl = null, log, de
   const { name, template } = request;
 
   // The server the install is pointed at. `--db-url` wins because it is what
-  // the env write just put in the file; otherwise the operator owns their own
-  // `.env.local` and the key in it is the whole answer.
-  const adminUrl = dbUrl ?? readCheckoutEnvLocal(targetDir).SUPABASE_DB_URL ?? null;
+  // the env write just put in the file; otherwise it is the server the
+  // operator's own environment names — the SAME effective value setup will
+  // resolve, and the same one the acknowledgement above was taken for, so the
+  // database is created where setup and migrations will actually look for it
+  // (cinatra-cli#269).
+  const adminUrl = dbUrl ?? effectiveExternalDbUrl(targetDir).url;
   if (!adminUrl) {
     throw new Error(
       `--db-name ${name} --db-template ${template} needs a PostgreSQL server to create that database on, ` +
-        `but this install was given no --db-url and ${path.join(targetDir, ".env.local")} carries no ` +
-        `SUPABASE_DB_URL. Pass --db-url, or write the key into that file first.`,
+        `but this install was given no --db-url, no SUPABASE_DB_URL is exported, and ` +
+        `${path.join(targetDir, ".env.local")} carries no SUPABASE_DB_URL. Pass --db-url, or write the ` +
+        `key into that file first.`,
     );
   }
 
@@ -5894,8 +5991,10 @@ async function createExternalInstanceDb({ targetDir, opts, dbUrl = null, log, de
 /** Validate the four external URLs + write them into .env.local with the
  *  sanitized-env guard so an exported SUPABASE_DB_URL/REDIS_URL/NANGO_* cannot
  *  override the generated values; record the instance as `external` (never
- *  auto-dropped). A destructive-leaning target needs a typed NON-ROLLBACKABLE
- *  confirm. When the operator named a database and a template, create that
+ *  auto-dropped). The database setup and migrations are pointed at needs the
+ *  NON-ROLLBACKABLE acknowledgement first, whether `--db-url` named it or the
+ *  checkout's own `.env.local` did (cinatra-cli#269). When the operator named a
+ *  database and a template, create that
  *  database on the server this install points at before returning, so setup and
  *  migrations find it there (cinatra-cli#268). Returns the env keys written and
  *  what was done about the database. */
@@ -5916,8 +6015,9 @@ async function executeExternalEnv({ targetDir, opts, conflictResolution = false,
   // re-points it OFF the localhost default, setup would migrate that CONFLICTING
   // local DB. Require --db-url SPECIFICALLY here — another external URL (e.g.
   // only --redis-url) does NOT move the DB off localhost and must NOT satisfy the
-  // guard. (The no-conflict --no-infra path is unaffected — there the operator
-  // owns their own .env.local; see the no-URL skip below.)
+  // guard. (The no-conflict --no-infra path keeps its own shape — there the
+  // operator owns their own .env.local, and the database that file names takes
+  // the acknowledgement rather than this refusal; see the no-URL branch below.)
   if (conflictResolution && ext.dbUrl == null) {
     throw new Error(
       "Refusing --infra=external as a conflict resolution without --db-url: a local stack is holding the " +
@@ -5928,11 +6028,24 @@ async function executeExternalEnv({ targetDir, opts, conflictResolution = false,
   }
 
   if (provided.length === 0) {
-    // No-conflict --no-infra / --infra=external with no URLs: skip bring-up only
-    // (the operator owns their own .env.local). The conflict path is already
-    // handled by the --db-url guard above, so this branch is the legacy case.
+    // No-conflict --no-infra / --infra=external with no URLs: nothing is written
+    // into the env and no infra is started (the operator owns their own
+    // .env.local). The conflict path is already handled by the --db-url guard
+    // above, so this branch is the one that reads the operator's own file.
     log("- External infra (--infra=external): no --db-url/--redis-url/--nango-url/--graphiti-url given; " +
       "skipping infra bring-up only (ensure your external Postgres/Redis/Nango are reachable before setup).");
+    // cinatra-cli#269: no URL on the command line does NOT mean no database.
+    // Setup and migrations are pointed at whatever the operator's own
+    // environment names — their `.env.local`, or an exported `SUPABASE_DB_URL`,
+    // which is the one setup overlays over the file — so THAT database takes the
+    // SAME acknowledgement the `--db-url` one takes: read by key, and refused
+    // BEFORE setup runs. An environment that names no database names no target:
+    // there is nothing to acknowledge, and the database creation below still
+    // says for itself what it is missing.
+    const effective = effectiveExternalDbUrl(targetDir);
+    if (effective.url) {
+      await acknowledgeExternalDb({ dbUrl: effective.url, namedBy: effective.namedBy, opts, log });
+    }
     // cinatra-cli#268: this is exactly the operator whose `.env.local` is
     // already authored, so the database they named is created against the
     // server that file points at. Creating a database that is not there adds
@@ -5954,49 +6067,27 @@ async function executeExternalEnv({ targetDir, opts, conflictResolution = false,
 
   // Guard against an exported env var silently overriding the generated value
   // (setup overlays process.env over .env.local — same precedent as
-  // assertAmbientModeMatches). Refuse a contradicting export.
+  // assertAmbientModeMatches). Refuse a contradicting export. The refusal names
+  // the KEY and the flag only: these values are connection strings, and the
+  // exported one is the operator's own — echoing it back would put a password
+  // in a log the way the command line the gate exists to avoid does
+  // (cinatra-cli#269).
   for (const [key, want] of Object.entries(values)) {
     const ambient = process.env[key];
     if (typeof ambient === "string" && ambient.trim().length > 0 && ambient.trim() !== want) {
       throw new Error(
-        `Exported ${key}=${ambient.trim()} would override the --${externalFlagFor(key)} value you passed ` +
-          `(setup overlays the shell env over .env.local). Unset ${key} (or align it) and retry.`,
+        `An exported ${key} (a different value from the --${externalFlagFor(key)} you passed) would ` +
+          `override it — setup overlays the shell env over .env.local. Unset ${key} (or align it) and retry.`,
       );
     }
   }
 
   // A DB pointed at a non-empty / production database is destructive-leaning:
-  // setup/migrations CAN mutate it. Require a NON-ROLLBACKABLE acknowledgement
-  // (URL validation alone is insufficient). A bare --yes must NOT silently
-  // authorise this (same class as --teardown-existing's `-v`): non-interactively
-  // the operator must pass the explicit --external-db-disposable ack; on a TTY a
-  // typed confirm is accepted. (`--yes` still pre-accepts the TTY prompt only
-  // when the disposable ack is ALSO present.)
+  // setup/migrations CAN mutate it. Require the NON-ROLLBACKABLE acknowledgement
+  // (URL validation alone is insufficient) — the same one the no-URL road above
+  // takes for the database its own `.env.local` names.
   if (values.SUPABASE_DB_URL) {
-    let ok = false;
-    if (opts.externalDbDisposable) {
-      ok = true; // explicit acknowledgement the target is disposable.
-    } else if (opts.yes) {
-      // A bare --yes is NOT enough for a non-rollbackable external DB.
-      throw new Error(
-        `Refusing to point setup + migrations at an EXTERNAL database (${redactUrl(values.SUPABASE_DB_URL)}) ` +
-          `on a bare --yes. These resources are NOT install-owned and are NEVER auto-rolled-back; setup may ` +
-          `mutate a non-empty/production DB irreversibly. Re-run with --external-db-disposable to acknowledge ` +
-          `the target is disposable (or run interactively to type the confirmation).`,
-      );
-    } else {
-      ok = await typedConfirm(
-        `⚠ --infra=external points setup + migrations at an EXTERNAL database (${redactUrl(values.SUPABASE_DB_URL)}).\n` +
-          `  These resources are NOT install-owned and will NEVER be auto-rolled-back. If this DB is non-empty\n` +
-          `  or production, setup may mutate it irreversibly.`,
-        "I understand",
-      );
-    }
-    if (!ok) {
-      throw new Error(
-        "Aborted: external DB not confirmed (type \"I understand\", or pass --external-db-disposable if the target is disposable).",
-      );
-    }
+    await acknowledgeExternalDb({ dbUrl: values.SUPABASE_DB_URL, namedBy: "--db-url", opts, log });
   }
 
   // Write into .env.local (preserve existing unrelated keys).
@@ -6028,17 +6119,6 @@ function externalFlagFor(key) {
     NANGO_SERVER_URL: "nango-url",
     GRAPHITI_URL: "graphiti-url",
   }[key] ?? key;
-}
-
-/** Redact credentials from a URL for display (user:pass@host → user:***@host). */
-function redactUrl(url) {
-  try {
-    const u = new URL(url);
-    if (u.password) u.password = "***";
-    return u.toString();
-  } catch {
-    return url;
-  }
 }
 
 /** Rewrite a connection-URL's host PORT to `newPort`, preserving scheme, auth,

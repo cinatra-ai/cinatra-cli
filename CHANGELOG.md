@@ -107,9 +107,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
   and `--bullmq-queue` are read by the shared road alone and are refused beside
   `--infra=external` rather than silently ignored, an `--on-conflict`/`--infra`
   naming a different road is still two roads, and `--db-name` must be the
-  database the install itself points at. `--external-db-disposable` is
-  unchanged: creating a database that is not there adds one and touches nothing
-  existing.
+  database the install itself points at. Creating a database that is not there
+  adds one and touches nothing existing, so the creation itself needs no
+  acknowledgement of its own — the database setup and migrations are then
+  pointed at does, whichever source named it (see Changed, below).
 
 - **`cinatra install` can now be run unattended, by a caller that has to hand
   its checkout back clean.** `install --mode dev` is the one command that makes
@@ -262,6 +263,34 @@ project adheres to [Semantic Versioning](https://semver.org/).
   the gap.
 
 ### Changed
+
+- **The acknowledgement an external database takes now follows the database,
+  not the flag that named it.** Pointing `cinatra install --infra=external` at a
+  database you run yourself has always taken an eyes-open acknowledgement —
+  `--external-db-disposable` when nobody is watching, a typed confirmation on a
+  terminal — because setup and migrations write to a database this install does
+  not own and will never roll back, and it may be non-empty or production. That
+  gate could only be reached through `--db-url`, so the one way to ARM it was to
+  put a credential-bearing URL on the command line, where any process listing
+  can read it — while the install that leaves the URL in its own `.env.local`,
+  the road this CLI itself documents as the one where you own your own file, ran
+  setup and migrations against whatever that file names with no acknowledgement
+  at all. The gate now follows the database: with no `--db-url` the install
+  reads the `SUPABASE_DB_URL` its checkout is really pointed at — by key, used
+  in the process, never printed — and takes the same acknowledgement for it,
+  before setup runs. That is the value setup itself would resolve: the
+  checkout's `.env.local`, or a `SUPABASE_DB_URL` exported in your shell, which
+  setup overlays over the file, so the database you acknowledge is always the
+  database it writes to. `--external-db-disposable` stands on its own, so a
+  target can be acknowledged without a password ever reaching a command line. Both
+  roads now speak of the database by its bare NAME — the refusal, the prompt and
+  the line that records the acknowledgement — instead of printing the connection
+  string it was read from, and a `.env.local` that names no database has nothing
+  to acknowledge: the run proceeds as before and still says for itself what it
+  is missing. **This changes the behaviour of an unattended external install
+  that passes no URLs:** a run whose `.env.local` names a database used to
+  proceed on a bare `--yes` and is now refused, naming the flag and the
+  database. Add `--external-db-disposable` to such a call.
 
 - **Three install flags that did nothing now say so, or say which road they
   take.** `--redis-db` was accepted and never read. No install road applies a
