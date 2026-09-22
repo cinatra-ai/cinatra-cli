@@ -1682,16 +1682,15 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
     // it ensures the key is present; downgrading demo → dev/prod clears it.
     const original = readFileSync(envPath, "utf8");
     const { body: reconciled, changed: profileChanged } = reconcileInstallProfile(original, profile);
-    // cinatra-cli#143 + cinatra#2654: self-heal the instance secrets in an
-    // existing file — mint CINATRA_CONTEXT_ATTEST_KEY / CINATRA_BRIDGE_TOKEN
-    // (every mode, both feed the WayFlow runtime this install now starts) and
-    // CINATRA_ENCRYPTION_KEY (prod only) when MISSING, carry a valid existing
-    // value forward untouched, and THROW on a malformed encryption key
-    // (rotating it would orphan encrypted data). The source values come from
-    // the existing file itself, so a valid key never changes.
+    // cinatra-cli#143 + cinatra#2654 + cinatra-cli#265: self-heal the instance
+    // secrets in an existing file — mint CINATRA_ENCRYPTION_KEY /
+    // CINATRA_CONTEXT_ATTEST_KEY / CINATRA_BRIDGE_TOKEN (every mode) when
+    // MISSING, carry a valid existing value forward untouched, and THROW on a
+    // malformed encryption key (rotating it would orphan encrypted data). The
+    // source values come from the existing file itself, so a valid key never
+    // changes — a re-run on a healthy checkout rewrites nothing.
     const { body: withSecrets, changed: secretsChanged, minted } = ensureInstanceSecrets({
       body: reconciled,
-      mode,
       envPath,
       sourceValues: parseEnvBody(original),
     });
@@ -1714,15 +1713,15 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
   if (!existsSync(examplePath)) {
     throw new Error(`Cannot create .env.local — ${examplePath} is missing from the cloned checkout.`);
   }
-  // cinatra-cli#143: capture any prod secrets from an EXISTING file BEFORE the
-  // copyFileSync overwrite so a --reset-env regen preserves a valid existing
+  // cinatra-cli#143: capture any instance secrets from an EXISTING file BEFORE
+  // the copyFileSync overwrite so a --reset-env regen preserves a valid existing
   // CINATRA_ENCRYPTION_KEY / CINATRA_CONTEXT_ATTEST_KEY (rotating the encryption
   // key would orphan already-encrypted data). Empty on a fresh install.
   const priorSecrets = existsSync(envPath) ? parseEnvBody(readFileSync(envPath, "utf8")) : {};
   // Validate the prior encryption key BEFORE overwriting — a malformed key must
   // abort with the file still intact (never destroy it, then let a retry mint a
-  // replacement that orphans encrypted data). No-op for dev/demo or fresh.
-  assertPriorEncryptionKeyDecodable({ mode, sourceValues: priorSecrets, envPath });
+  // replacement that orphans encrypted data). No-op when no key is present yet.
+  assertPriorEncryptionKeyDecodable({ sourceValues: priorSecrets, envPath });
   copyFileSync(examplePath, envPath);
   const secret = randomBytes(32).toString("hex");
   // Mint the other required secrets too, otherwise a fresh install is broken
@@ -1739,14 +1738,14 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
   // cinatra-cli#122: stamp the demo install profile so `pnpm dev` seeds the demo
   // fixtures. dev/prod carry no profile line (default fixtures-off, cinatra#1237).
   if (profile) body = upsertEnvKey(body, "CINATRA_INSTALL_PROFILE", profile);
-  // cinatra-cli#143 + cinatra#2654: add CINATRA_CONTEXT_ATTEST_KEY and
-  // CINATRA_BRIDGE_TOKEN (every mode — the WayFlow runtime this install starts
-  // needs both) plus CINATRA_ENCRYPTION_KEY for prod (app prod-boot hard
-  // requirement) — preserving valid prior values across a --reset-env regen
-  // (throws on a malformed prior encryption key).
+  // cinatra-cli#143 + cinatra#2654 + cinatra-cli#265: add CINATRA_ENCRYPTION_KEY,
+  // CINATRA_CONTEXT_ATTEST_KEY and CINATRA_BRIDGE_TOKEN — every mode needs all
+  // three (the WayFlow runtime this install starts needs the latter two, and the
+  // checkout's provisioning command seals its instance secrets with the first
+  // BEFORE the first boot) — preserving valid prior values across a --reset-env
+  // regen (throws on a malformed prior encryption key).
   const { body: withProdSecrets, minted: prodMinted, preserved: prodPreserved } = ensureInstanceSecrets({
     body,
-    mode,
     envPath,
     sourceValues: priorSecrets,
   });
@@ -1769,76 +1768,89 @@ export function ensureEnvLocal({ targetDir, mode, resetEnv = false, log = consol
 }
 
 /**
- * cinatra-cli#143 — for `--mode prod` ONLY, ensure `.env.local` carries the two
- * prod-only secrets the dev flow never provisions:
- *   - `CINATRA_ENCRYPTION_KEY` — HARD-required by the app's prod-boot preflight
- *     (a valid 32-byte key). The app's dev auto-generator explicitly skips
- *     production, so a prod install must mint it here.
+ * cinatra-cli#143 + cinatra-cli#265 — ensure `.env.local` carries the instance
+ * secrets the copied `.env.example` leaves empty, in EVERY mode:
+ *   - `CINATRA_ENCRYPTION_KEY` — the at-rest key for instance/connector secrets.
+ *     HARD-required by the app's prod-boot preflight, and equally required
+ *     BEFORE the first boot of a dev or demo instance: the checkout's own
+ *     provisioning command seals an instance's secrets with it and refuses
+ *     without it. The app mints one on its first DEVELOPMENT boot, which is
+ *     exactly the boot a one-command setup exists to make unnecessary, so the
+ *     install writes it itself (cinatra-cli#265).
  *   - `CINATRA_CONTEXT_ATTEST_KEY` — the DISTINCT WayFlow attestation contract
  *     (soft: its absence degrades the WayFlow runtime; it is NOT in the app's
  *     hard/soft required-env set).
+ *   - `CINATRA_BRIDGE_TOKEN` — the shared secret for the runtime's bridge
+ *     callbacks (soft, same runtime).
  *
  * Lifecycle: mint a fresh `randomBytes(32).toString("hex")` value ONLY when the
  * key is MISSING; carry a VALID existing value forward UNTOUCHED (never rotate —
  * rotating the encryption key would orphan already-encrypted instance/connector
  * secrets, and rotating the attestation key can invalidate in-flight WayFlow
  * callbacks). A MALFORMED existing `CINATRA_ENCRYPTION_KEY` THROWS (naming the
- * var + file) rather than silently rotating or proceeding.
+ * var + file) rather than silently rotating or proceeding. Only the key NAMES
+ * are ever logged — never a minted value.
  *
  * `sourceValues` is the parsed prior env — the existing file on the preserve
  * path, or the OLD file captured BEFORE a `--reset-env` overwrite — so a valid
- * key survives a reset. No-op for dev/demo. Returns `{ body, changed, minted,
- * preserved }`.
+ * key survives a reset. Returns `{ body, changed, minted, preserved }`.
  */
-const PROD_ENCRYPTION_KEY = "CINATRA_ENCRYPTION_KEY";
+const INSTANCE_ENCRYPTION_KEY = "CINATRA_ENCRYPTION_KEY";
 
 /**
- * cinatra-cli#143 — THROW (prod only) if a prior `CINATRA_ENCRYPTION_KEY` is
- * present but does not decode to 32 bytes (hex-64 OR base64). Extracted so the
- * fresh/`--reset-env` path can call it BEFORE `copyFileSync` overwrites
- * `.env.local` — otherwise a malformed key would abort only AFTER the file (and
- * its key line) was destroyed, and a retry would then mint a replacement,
- * SILENTLY ROTATING the key and orphaning already-encrypted data (the exact
- * hazard the throw exists to prevent). No-op for dev/demo or an absent key.
+ * cinatra-cli#143 — THROW if a prior `CINATRA_ENCRYPTION_KEY` is present but does
+ * not decode to 32 bytes (hex-64 OR base64). Extracted so the fresh/`--reset-env`
+ * path can call it BEFORE `copyFileSync` overwrites `.env.local` — otherwise a
+ * malformed key would abort only AFTER the file (and its key line) was destroyed,
+ * and a retry would then mint a replacement, SILENTLY ROTATING the key and
+ * orphaning already-encrypted data (the exact hazard the throw exists to
+ * prevent). No-op when no key is present.
+ *
+ * cinatra-cli#265: MODE-INDEPENDENT. The guard used to run for production only,
+ * because only a production install wrote the key. Now every mode does, and a
+ * dev or demo instance has sealed rows as soon as its provisioning command has
+ * run — so rotating a dev key orphans exactly as much data as rotating a prod
+ * one. The fix is the same in every mode: refuse, name the var and the file, and
+ * let the operator decide.
  */
-function assertPriorEncryptionKeyDecodable({ mode, sourceValues = {}, envPath }) {
-  if (RUNTIME_MODE[mode] !== "production") return;
-  const existing = String(sourceValues[PROD_ENCRYPTION_KEY] ?? "").trim();
+function assertPriorEncryptionKeyDecodable({ sourceValues = {}, envPath }) {
+  const existing = String(sourceValues[INSTANCE_ENCRYPTION_KEY] ?? "").trim();
   if (!existing) return;
   const err = validateEncryptionKey(existing);
   if (err) {
     throw new Error(
-      `.env.local has a malformed ${PROD_ENCRYPTION_KEY} (${err}) at ${envPath}. Refusing to rotate it — ` +
+      `.env.local has a malformed ${INSTANCE_ENCRYPTION_KEY} (${err}) at ${envPath}. Refusing to rotate it — ` +
         `a fresh key would orphan already-encrypted instance/connector secrets. Fix or remove the ` +
-        `${PROD_ENCRYPTION_KEY} line (or delete ${envPath} to provision a new instance), then retry.`,
+        `${INSTANCE_ENCRYPTION_KEY} line (or delete ${envPath} to provision a new instance), then retry.`,
     );
   }
 }
 
-function ensureInstanceSecrets({ body, mode, envPath, sourceValues = {} }) {
-  const isProd = RUNTIME_MODE[mode] === "production";
+function ensureInstanceSecrets({ body, envPath, sourceValues = {} }) {
   // A malformed prior encryption key aborts (never rotate). On the preserve path
   // this throws before any write; the fresh/reset path calls the same guard
-  // BEFORE copyFileSync so the existing file is never destroyed first. No-op
-  // for dev/demo (the key is prod-only).
-  assertPriorEncryptionKeyDecodable({ mode, sourceValues, envPath });
+  // BEFORE copyFileSync so the existing file is never destroyed first.
+  assertPriorEncryptionKeyDecodable({ sourceValues, envPath });
   let next = body;
   const minted = [];
   const preserved = [];
 
-  // HARD, PROD ONLY: CINATRA_ENCRYPTION_KEY — a present value is already
-  // validated (hex-64 OR base64 32-byte, matching the app); carry it forward,
-  // else mint. Dev/demo boot without it (the app auto-generates in development).
-  if (isProd) {
-    const ENC = PROD_ENCRYPTION_KEY;
-    const encExisting = String(sourceValues[ENC] ?? "").trim();
-    if (encExisting) {
-      next = upsertEnvKey(next, ENC, encExisting);
-      preserved.push(ENC);
-    } else {
-      next = upsertEnvKey(next, ENC, randomBytes(32).toString("hex"));
-      minted.push(ENC);
-    }
+  // EVERY MODE: CINATRA_ENCRYPTION_KEY — a present value is already validated
+  // (hex-64 OR base64 32-byte, matching the app); carry it forward byte for
+  // byte, else mint 32 bytes as hex — the SAME shape the app's own first
+  // development boot writes, so a later boot finds it and generates nothing.
+  // cinatra-cli#265: minting this for prod alone broke the unattended order
+  // install → provision → first boot, because the checkout's provisioning
+  // command runs BEFORE any boot and refuses without the key; dev and demo were
+  // left waiting on a boot that was supposed to come after them.
+  const ENC = INSTANCE_ENCRYPTION_KEY;
+  const encExisting = String(sourceValues[ENC] ?? "").trim();
+  if (encExisting) {
+    next = upsertEnvKey(next, ENC, encExisting);
+    preserved.push(ENC);
+  } else {
+    next = upsertEnvKey(next, ENC, randomBytes(32).toString("hex"));
+    minted.push(ENC);
   }
 
   // EVERY MODE: CINATRA_CONTEXT_ATTEST_KEY — the WayFlow runtime signs its
@@ -5786,7 +5798,7 @@ export function writeIsolatedAppEnv({ targetDir, appPort, ports = {}, log = cons
 
 /** Minimal `.env` body → { KEY: value } map (last wins; quotes stripped). Used
  *  to PRESERVE existing credentials when re-pointing an isolated URL, to read the
- *  prior prod secrets ensureEnvLocal carries forward, and by the post-install
+ *  prior instance secrets ensureEnvLocal carries forward, and by the post-install
  *  prod-env gate (cinatra-cli#143) — a single dotenv parser for all three. */
 export function parseEnvBody(body) {
   const out = {};

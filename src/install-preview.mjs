@@ -51,10 +51,12 @@
 //                            own endpoints for the implicit keys
 //                            (`instance-endpoints.mjs`), and an explicit
 //                            `.env.local` value always wins over them.
-//   AC4  ENCRYPTION KEY    — a runtime-BOOT requirement of preview that a dev
-//                            install deliberately does not mint. Provisioned +
-//                            persisted HERE, outside the checkout, so the dev
-//                            `.env.local` contract gains no prod-only secret.
+//   AC4  ENCRYPTION KEY    — a runtime-BOOT requirement of preview. A preview
+//                            container holds its OWN durable volume, so its
+//                            sealed rows are not the checkout's: the key is
+//                            provisioned + persisted HERE, per slug and outside
+//                            any checkout, never taken from the install's
+//                            `.env.local` (cinatra-cli#265).
 //   AC5  REACHABILITY      — a dev install's `.env.local` carries host-loopback
 //                            infra endpoints (127.0.0.1:<port>), which inside
 //                            the container resolve to the container itself.
@@ -137,8 +139,8 @@ export const PREVIEW_APP_URL_KEYS = Object.freeze([
 ]);
 
 /** Where the front door persists the previews' boot encryption keys (#188 AC4).
- *  Deliberately OUTSIDE any checkout: the dev `.env.local` contract must not
- *  gain a prod-only secret. */
+ *  Deliberately OUTSIDE any checkout: a preview's key belongs to the preview's
+ *  own durable volume, not to the checkout that created it. */
 export function previewSecretsPath() {
   return path.join(os.homedir(), ".cinatra", "preview-secrets.json");
 }
@@ -292,12 +294,12 @@ export function isValidEncryptionKey(key) {
  * Provision + persist the preview's `CINATRA_ENCRYPTION_KEY` (#188 AC4).
  *
  * `preview` requires the key as a RUNTIME-BOOT requirement, explicitly
- * independent of the image build. A dev install deliberately does not mint this
- * prod-only secret, so the front door must supply one — WITHOUT adding it to the
- * dev checkout's `.env.local` contract. It is therefore persisted per-slug in
- * the CLI's own state dir at 0600, beside (never inside) `previews.json`:
- * `previews.json` is a reported, human-read registry, so a secret has no
- * business in it.
+ * independent of the image build. The install's own `CINATRA_ENCRYPTION_KEY`
+ * belongs to the CHECKOUT's instance and its data, while a preview boots its own
+ * durable volume, so the front door supplies a SEPARATE key rather than
+ * forwarding that one. It is persisted per-slug in the CLI's own state dir at
+ * 0600, beside (never inside) `previews.json`: `previews.json` is a reported,
+ * human-read registry, so a secret has no business in it.
  *
  * Persisting (rather than minting per run) matters: the key encrypts
  * instance-secrets in the preview's DURABLE volume, so a rerun/refresh that

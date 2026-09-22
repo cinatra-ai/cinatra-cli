@@ -39,6 +39,21 @@ scratch, or re-run it on an existing checkout to reconcile it (it skips the clon
 and just re-runs the in-repo provisioning phase — there is no separate `setup`
 command to remember).
 
+Every mode writes the instance's `.env.local` from the checkout's `.env.example`
+and mints the secrets an instance needs before anything starts: the auth secret,
+the connection service's at-rest key, the agent runtime's bridge token and
+attestation key, and `CINATRA_ENCRYPTION_KEY` — the key that seals an instance's
+stored secrets. That last one is written for **every** mode, not production
+alone, because the checkout's own provisioning step seals its secrets with it and
+runs *before* the first boot; leaving it to the app's first-boot generator made
+the intended order — install, provision, then boot — fail at the second step. A
+value that is already there is carried forward byte for byte and never rotated,
+because a fresh key would make everything the instance has already sealed
+unreadable, so a re-run leaves the line exactly as it found it. A value that is
+present but malformed stops the install, naming the variable and the file, rather
+than being replaced. Minted values are never printed — the install names the
+variables it minted, never their contents.
+
 `--mode demo` is a **strict superset of `--mode dev`**: identical dev base (same
 runtime, extensions, and setup), plus the demo overlay — it brings up the bundled
 third-party apps (WordPress, Drupal, Twenty, Plane), loads coherent sample data

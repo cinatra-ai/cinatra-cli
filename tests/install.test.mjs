@@ -341,9 +341,9 @@ describe("ensureEnvLocal", () => {
     expect(r.created).toBe(true);
     const after = readFileSync(path.join(dir, ".env.local"), "utf8");
     expect(after).toMatch(/^BETTER_AUTH_SECRET=[0-9a-f]{64}$/m);
-    // A fresh secret almost-certainly differs. (dev mode mints no
-    // encryption/attest keys, so this whole-body assertion is unaffected by the
-    // prod-mode preserve-on-reset behaviour — see the prod-secrets block below.)
+    // A fresh secret almost-certainly differs. (The encryption/attest keys are
+    // preserved across a reset in every mode, so this whole-body assertion
+    // rests on BETTER_AUTH_SECRET alone — see the instance-secrets blocks below.)
     expect(after).not.toBe(before);
   });
 });
@@ -379,12 +379,14 @@ describe("ensureEnvLocal — prod secrets (cinatra-cli#143)", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("dev install keeps CINATRA_ENCRYPTION_KEY prod-gated but mints the WayFlow secrets (cinatra#2654)", () => {
+  it("dev install mints the encryption key and the WayFlow secrets (cinatra#2654 + cinatra-cli#265)", () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "cinatra-devsecrets-"));
     writeFileSync(path.join(dir, ".env.example"), "BETTER_AUTH_SECRET=\nCINATRA_RUNTIME_MODE=development\n");
     ensureEnvLocal({ targetDir: dir, mode: "dev", log: () => {} });
     const body = readLocal(dir);
-    expect(body).not.toMatch(/^CINATRA_ENCRYPTION_KEY=/m);
+    // cinatra-cli#265: the dev provisioning command seals instance secrets with
+    // this key BEFORE the first boot, so the install writes it in every mode.
+    expect(body).toMatch(/^CINATRA_ENCRYPTION_KEY=[0-9a-f]{64}$/m);
     // A dev install now STARTS the WayFlow runtime, so both secrets it needs
     // must exist before the stack comes up.
     expect(body).toMatch(/^CINATRA_CONTEXT_ATTEST_KEY=[0-9a-f]{64}$/m);
@@ -514,6 +516,168 @@ describe("ensureEnvLocal — prod secrets (cinatra-cli#143)", () => {
     expect(() => ensureEnvLocal({ targetDir: dir, mode: "prod", resetEnv: true, log: () => {} })).not.toThrow();
     expect(enc(readLocal(dir))).toBe(validHex);
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4b-ter. ensureEnvLocal — the instance encryption key in EVERY mode
+// (cinatra-cli#265).
+//
+// The intended unattended order is install → provision → first boot: the
+// product's development provisioning command seals the instance's secrets with
+// `CINATRA_ENCRYPTION_KEY` BEFORE anything has booted. The app mints that key on
+// its first development boot, so leaving it to the app made provisioning refuse
+// with "CINATRA_ENCRYPTION_KEY env var is required for instance-secrets
+// encryption". The install therefore authors it for every mode. Once a dev
+// instance has been provisioned its rows are sealed with that key, so the
+// never-rotate contract (preserve a valid value; THROW on a malformed one) is
+// the SAME in every mode — a mode-split would let a dev install silently orphan
+// its own sealed rows.
+// ---------------------------------------------------------------------------
+describe("ensureEnvLocal — the instance encryption key in every mode (cinatra-cli#265)", () => {
+  function mkTarget(prefix) {
+    const dir = mkdtempSync(path.join(os.tmpdir(), prefix));
+    writeFileSync(
+      path.join(dir, ".env.example"),
+      "SUPABASE_DB_URL=set-by-example\nBETTER_AUTH_SECRET=\nCINATRA_RUNTIME_MODE=development\n",
+    );
+    return dir;
+  }
+  const readLocal = (dir) => readFileSync(path.join(dir, ".env.local"), "utf8");
+  const enc = (body) => /^CINATRA_ENCRYPTION_KEY=(\S+)$/m.exec(body)?.[1];
+  /** Every ACTIVE (uncommented) key line — the acceptance is "exactly one". */
+  const encLines = (body) => body.split("\n").filter((l) => /^CINATRA_ENCRYPTION_KEY=/.test(l));
+
+  it("a fresh dev install writes exactly ONE active 64-hex CINATRA_ENCRYPTION_KEY line", () => {
+    const dir = mkTarget("cinatra-devenc-fresh-");
+    const r = ensureEnvLocal({ targetDir: dir, mode: "dev", log: () => {} });
+    expect(r.created).toBe(true);
+    const body = readLocal(dir);
+    expect(encLines(body)).toHaveLength(1);
+    expect(body).toMatch(/^CINATRA_ENCRYPTION_KEY=[0-9a-f]{64}$/m);
+    // Distinct from the other minted secrets (no value is conflated).
+    expect(enc(body)).not.toBe(/^CINATRA_CONTEXT_ATTEST_KEY=(\S+)$/m.exec(body)[1]);
+    expect(enc(body)).not.toBe(/^CINATRA_BRIDGE_TOKEN=(\S+)$/m.exec(body)[1]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("a fresh demo install writes it too (demo provisions before its first boot as well)", () => {
+    const dir = mkTarget("cinatra-demoenc-fresh-");
+    ensureEnvLocal({ targetDir: dir, mode: "demo", log: () => {} });
+    const body = readLocal(dir);
+    expect(encLines(body)).toHaveLength(1);
+    expect(body).toMatch(/^CINATRA_ENCRYPTION_KEY=[0-9a-f]{64}$/m);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("a SECOND dev install leaves the key line byte for byte and reports no minting of it", () => {
+    const dir = mkTarget("cinatra-devenc-rerun-");
+    ensureEnvLocal({ targetDir: dir, mode: "dev", log: () => {} });
+    const first = readLocal(dir);
+    const firstLine = encLines(first)[0];
+    const lines = [];
+    const r = ensureEnvLocal({ targetDir: dir, mode: "dev", log: (m) => lines.push(m) });
+    expect(r.created).toBe(false);
+    const second = readLocal(dir);
+    expect(encLines(second)).toHaveLength(1);
+    expect(encLines(second)[0]).toBe(firstLine);
+    // Nothing at all was rewritten on the re-run.
+    expect(second).toBe(first);
+    const joined = lines.join("\n");
+    expect(joined).not.toMatch(/minted missing instance secret/);
+    expect(joined).not.toMatch(/CINATRA_ENCRYPTION_KEY/);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("preserve path: a valid base64 32-byte prior key is carried forward unchanged in dev", () => {
+    const dir = mkTarget("cinatra-devenc-b64-");
+    const b64 = randomBytes(32).toString("base64");
+    // A pre-existing dev file WITHOUT the WayFlow secrets, so the self-heal
+    // really rewrites the file — the key must survive that rewrite untouched.
+    writeFileSync(
+      path.join(dir, ".env.local"),
+      `SUPABASE_DB_URL=set\nBETTER_AUTH_SECRET=x\nCINATRA_ENCRYPTION_KEY=${b64}\nCINATRA_RUNTIME_MODE=development\n`,
+    );
+    const lines = [];
+    expect(() => ensureEnvLocal({ targetDir: dir, mode: "dev", log: (m) => lines.push(m) })).not.toThrow();
+    const body = readLocal(dir);
+    expect(enc(body)).toBe(b64);
+    expect(encLines(body)).toHaveLength(1);
+    // The rewrite really happened (the WayFlow secrets were healed in).
+    expect(body).toMatch(/^CINATRA_CONTEXT_ATTEST_KEY=[0-9a-f]{64}$/m);
+    // …and the key it preserved is not reported as minted.
+    expect(lines.join("\n")).not.toMatch(/minted missing instance secret\(s\): [^\n]*CINATRA_ENCRYPTION_KEY/);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("a MALFORMED prior key in dev HARD-FAILS before any write, leaving the file intact", () => {
+    const dir = mkTarget("cinatra-devenc-bad-");
+    const original =
+      "SUPABASE_DB_URL=set\nBETTER_AUTH_SECRET=x\nCINATRA_ENCRYPTION_KEY=too-short\nCINATRA_RUNTIME_MODE=development\n";
+    writeFileSync(path.join(dir, ".env.local"), original);
+    // Preserve path: throws, file untouched (a dev instance that has been
+    // provisioned has sealed rows — rotating would orphan them).
+    expect(() => ensureEnvLocal({ targetDir: dir, mode: "dev", log: () => {} })).toThrow(
+      /malformed CINATRA_ENCRYPTION_KEY/,
+    );
+    expect(readLocal(dir)).toBe(original);
+    // …and under --reset-env it must abort BEFORE the overwrite, so a retry can
+    // never see an absent key and mint a silent replacement.
+    expect(() => ensureEnvLocal({ targetDir: dir, mode: "dev", resetEnv: true, log: () => {} })).toThrow(
+      /malformed CINATRA_ENCRYPTION_KEY/,
+    );
+    expect(readLocal(dir)).toBe(original);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("--reset-env in dev preserves a valid prior key while regenerating BETTER_AUTH_SECRET", () => {
+    const dir = mkTarget("cinatra-devenc-reset-");
+    ensureEnvLocal({ targetDir: dir, mode: "dev", log: () => {} });
+    const first = readLocal(dir);
+    const auth1 = /^BETTER_AUTH_SECRET=(\S+)$/m.exec(first)[1];
+    const r = ensureEnvLocal({ targetDir: dir, mode: "dev", resetEnv: true, log: () => {} });
+    expect(r.created).toBe(true);
+    const after = readLocal(dir);
+    expect(enc(after)).toBe(enc(first));
+    expect(encLines(after)).toHaveLength(1);
+    expect(/^BETTER_AUTH_SECRET=(\S+)$/m.exec(after)[1]).not.toBe(auth1);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("NEVER prints the value — the log names the KEY only, on both the fresh and the self-heal path", () => {
+    // Fresh install.
+    const fresh = mkTarget("cinatra-devenc-log-fresh-");
+    const freshLines = [];
+    ensureEnvLocal({ targetDir: fresh, mode: "dev", log: (m) => freshLines.push(m) });
+    const freshBody = readLocal(fresh);
+    const freshJoined = freshLines.join("\n");
+    expect(freshJoined).not.toContain(enc(freshBody));
+    expect(freshJoined).toMatch(/Instance secrets minted: [^\n]*CINATRA_ENCRYPTION_KEY/);
+
+    // Existing file, key missing → the self-heal mints it and names it ONLY.
+    const heal = mkTarget("cinatra-devenc-log-heal-");
+    writeFileSync(
+      path.join(heal, ".env.local"),
+      "SUPABASE_DB_URL=set\nBETTER_AUTH_SECRET=x\nCINATRA_RUNTIME_MODE=development\n",
+    );
+    const healLines = [];
+    ensureEnvLocal({ targetDir: heal, mode: "dev", log: (m) => healLines.push(m) });
+    const healBody = readLocal(heal);
+    const healJoined = healLines.join("\n");
+    expect(healBody).toMatch(/^CINATRA_ENCRYPTION_KEY=[0-9a-f]{64}$/m);
+    expect(healJoined).toMatch(/minted missing instance secret\(s\): [^\n]*CINATRA_ENCRYPTION_KEY/);
+    expect(healJoined).not.toContain(enc(healBody));
+    // Not one minted secret's value reaches the log.
+    for (const value of [
+      enc(healBody),
+      /^CINATRA_CONTEXT_ATTEST_KEY=(\S+)$/m.exec(healBody)[1],
+      /^CINATRA_BRIDGE_TOKEN=(\S+)$/m.exec(healBody)[1],
+    ]) {
+      expect(healJoined).not.toContain(value);
+    }
+
+    rmSync(fresh, { recursive: true, force: true });
+    rmSync(heal, { recursive: true, force: true });
   });
 });
 
