@@ -335,13 +335,15 @@ option up front with a flag:
         --db-url <url> --redis-url <url> --nango-url <url> --graphiti-url <url> \
         --external-db-disposable             # confirm the external DB is disposable
                                              # (setup may write to it; required for --db-url)
+    cinatra install --infra=external \       # …and let the CLI create that database
+        --db-name <name> --db-template <name>  # from your own template first
 
 Useful extras:
 
     cinatra install --instance <name>        # name the instance (default: the folder name)
     cinatra install --app-port <n>           # pick the app port for an isolated instance
     cinatra install --port-offset auto|<n>   # how far to shift an isolated instance's ports
-    cinatra install --db-name <name>         # name the co-use instance's own database
+    cinatra install --db-name <name>         # name the instance's own database
     cinatra install --db-template <name>     # create it from your own template database
     cinatra install --bullmq-queue <name>    # name its job queue on the shared Redis
     cinatra install --dry-run                # show what would happen, change nothing
@@ -413,9 +415,11 @@ it, because setup can write to that database).
 > database is called and what it is copied from: `--db-name <name>` and
 > `--db-template <name>`. A template database you prepared yourself — migrated
 > and seeded once, then marked a template — makes each new instance's database a
-> copy made in an instant rather than a full migration run. Either flag selects
-> this shared-services road, so `cinatra install` refuses them beside an
-> `--on-conflict`/`--infra` that asks for a different one.
+> copy made in an instant rather than a full migration run. Either flag on its
+> own selects this shared-services road, so `cinatra install` refuses it beside
+> an `--on-conflict`/`--infra` that asks for a different one — with one
+> exception: the two TOGETHER also work on `--infra=external`, where they name a
+> database to create on your own server (below).
 >
 > Both names must be plain PostgreSQL identifiers: a lowercase letter, then
 > lowercase letters, digits or underscores, at most 63 bytes. A `--db-name` may
@@ -449,6 +453,43 @@ it, because setup can write to that database).
 > own template was seeded under different keys, its encrypted rows will not
 > decrypt in the new instance. Prepare the template on the same keys, or expect
 > to re-enter whatever was encrypted.
+
+### Your own PostgreSQL server: letting the install create the database
+
+`--infra=external` points an instance at a PostgreSQL server, a Redis and a
+Nango you run yourself. If the instance's database does not exist there yet, say
+what it is called and what to copy it from and `cinatra install` will create it
+for you, before setup and migrations run:
+
+    cinatra install --infra=external \
+        --db-url postgresql://…/team_instance_a \
+        --db-name team_instance_a --db-template team_seed_template \
+        --external-db-disposable
+
+Both flags are needed together on this road: there is no built-in seed on a
+server the CLI does not run, so a `--db-name` with no `--db-template` is
+refused and names what is missing. They select the shared-services road when
+you pass them without `--infra=external`, and `--reuse-from` / `--bullmq-queue`
+belong to that road alone — the external install reads neither, so it refuses
+them rather than ignoring them.
+
+You do not have to put the credential on the command line. With no `--db-url`,
+the install reads the `SUPABASE_DB_URL` your checkout's `.env.local` already
+carries and creates the database on that server. The value is read by key and
+used in the process — it is never passed to another command and never printed;
+every line the run writes names the database and the template only.
+
+The database is created on the server's maintenance database, from the template
+exactly as on the shared road: the template must exist and be marked one
+(`ALTER DATABASE "<name>" WITH IS_TEMPLATE true ALLOW_CONNECTIONS false`), and
+that is checked before anything is created. A database of that name that is
+already there is said out loud and left exactly as it stands — nothing is
+dropped, nothing is created over, and the template is then not used. So the
+command is safe to re-run.
+
+`--db-name` must be the database the install itself points at: naming a
+different one would create a database nothing then uses while setup migrated
+another, so `cinatra install` refuses that, naming both databases.
 
 ## Author an extension
 
