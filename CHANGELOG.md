@@ -8,6 +8,42 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **An `install --infra=external` can now create the instance's database from
+  your own template.** An operator who points `cinatra install` at a PostgreSQL
+  server they run themselves, and names the instance database plus the template
+  it should be copied from, used to be refused: `--db-name` / `--db-template`
+  selected the shared-services road and were rejected beside an explicit
+  `--infra=external`, and the one place the CLI copies a database lived on that
+  shared road — which needs a donor checkout on the same machine. So the
+  operator whose `.env.local` was already authored had no way to let the CLI
+  create the database, and had to create it by hand before every install. The
+  two flags together are now that road's own database creation: `cinatra
+  install --infra=external --db-name <name> --db-template <template>` creates
+  `<name>` from `<template>` on the server the install points at — before setup
+  and migrations run, so they find it there. It is the SAME creation both roads
+  now share, so the identifier quoting, the `TEMPLATE` clause, the existence
+  probe and the template checks cannot drift apart: the template must exist and
+  be marked one (`ALTER DATABASE … WITH IS_TEMPLATE true ALLOW_CONNECTIONS
+  false`), which is checked before anything is created, and the statement runs
+  against the server's maintenance database, never the database being created.
+  A database of that name that is ALREADY there is said out loud and left
+  exactly as it stands — never dropped, never created over, and the template
+  then not used — so the command is safe to re-run. The credential never has to
+  reach a command line: with no `--db-url` the server is taken from the
+  `SUPABASE_DB_URL` the checkout's `.env.local` already carries, read by key and
+  used in the process, and every line the run prints names the database and the
+  template only. A failure names the database and the template and carries the
+  server's own words, with any embedded credential stripped. Both flags are
+  needed together on this road — there is no built-in seed on a server the CLI
+  does not run, so a lone `--db-name` is still refused and now says what is
+  missing — and every refusal that still applies is unchanged: `--reuse-from`
+  and `--bullmq-queue` are read by the shared road alone and are refused beside
+  `--infra=external` rather than silently ignored, an `--on-conflict`/`--infra`
+  naming a different road is still two roads, and `--db-name` must be the
+  database the install itself points at. `--external-db-disposable` is
+  unchanged: creating a database that is not there adds one and touches nothing
+  existing.
+
 - **`cinatra install` can now be run unattended, by a caller that has to hand
   its checkout back clean.** `install --mode dev` is the one command that makes
   an instance exist or makes it healthy, but three small things kept it out of
