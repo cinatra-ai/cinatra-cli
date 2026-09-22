@@ -736,8 +736,28 @@ export function parseInstallArgs(argv = []) {
     ["--db-template", dbTemplate],
     ["--bullmq-queue", bullmqQueue],
   ].filter(([, v]) => v != null);
+  // cinatra-cli#268: `--db-name` + `--db-template` beside the EXTERNAL road is
+  // no longer a contradiction — it is THAT road's own database creation. An
+  // external install points at a PostgreSQL server the operator owns, and the
+  // pair says which database to create on it and which template to copy. Only
+  // the PAIR qualifies: the external road has no built-in seed to fall back on,
+  // so half of it is still the shared road's signal and is refused below. And
+  // nothing may ride along — `--reuse-from` and `--bullmq-queue` are read by
+  // the shared road alone, so they would be silently ignored here. `--infra` is
+  // required (its `--no-infra` spelling included): `--on-conflict=external`
+  // alone takes the external road only IF a port turns out to be held, and a
+  // database must not be created on a road the run may never take.
+  const externalDbPair =
+    infra === "external" &&
+    (onConflict == null || onConflict === "external") &&
+    dbName != null &&
+    dbTemplate != null &&
+    reuseFrom == null &&
+    bullmqQueue == null;
+
   const couseRequested =
-    infra === GATED_INFRA || onConflict === GATED_ON_CONFLICT || sidecarFlags.length > 0;
+    !externalDbPair &&
+    (infra === GATED_INFRA || onConflict === GATED_ON_CONFLICT || sidecarFlags.length > 0);
 
   // cinatra-cli#17: the sidecar flags SELECT the shared-infra road — they are
   // read nowhere else. Combined with an explicit `--on-conflict`/`--infra` that
@@ -745,7 +765,7 @@ export function parseInstallArgs(argv = []) {
   // the explicit choice was silently ignored. Refuse the contradiction here,
   // before any side effect, in the same position as the `--mode preview`
   // refusal below: the operator asked for two roads and must say which.
-  if (sidecarFlags.length > 0) {
+  if (sidecarFlags.length > 0 && !externalDbPair) {
     const contradiction =
       onConflict != null && onConflict !== GATED_ON_CONFLICT
         ? `--on-conflict=${onConflict}`
@@ -755,11 +775,22 @@ export function parseInstallArgs(argv = []) {
             : "--no-infra"
           : null;
     if (contradiction) {
+      // cinatra-cli#268: the external road DOES create a database of its own —
+      // but only from the complete pair, and only for itself. When that is the
+      // road the operator named, say what is missing rather than only that the
+      // combination is refused.
+      const externalRemedy =
+        infra === "external"
+          ? ` The ${contradiction} road creates the instance's database itself when BOTH --db-name <name> ` +
+            `and --db-template <template> are given, on the server it is pointed at — it reads neither ` +
+            `--reuse-from nor --bullmq-queue.`
+          : "";
       throw new Error(
         `${contradiction} cannot be combined with ${sidecarFlags.map(([f]) => f).join(" / ")}: those flags ` +
           `configure the shared-infra install (one Postgres server, a separate database per instance, no ` +
           `second stack) and select it, so ${contradiction} would be ignored. Drop the flags to take the ` +
-          `${contradiction} road, or ask for the shared-infra road with --on-conflict=co-use / --infra=share.`,
+          `${contradiction} road, or ask for the shared-infra road with --on-conflict=co-use / --infra=share.` +
+          externalRemedy,
       );
     }
   }
@@ -938,6 +969,11 @@ export function parseInstallArgs(argv = []) {
     // setup at an arbitrary external database (non-rollbackable data path).
     externalDbDisposable: argv.includes("--external-db-disposable"),
     external: { dbUrl, redisUrl, nangoUrl, graphitiUrl },
+    // cinatra-cli#268: the database this EXTERNAL install creates on the server
+    // it is pointed at, and the template it is copied from — or null when the
+    // operator named neither (every other road). Read by the external executor
+    // alone; the shared road keeps reading `couseSidecar`.
+    externalDb: externalDbPair ? { name: dbName, template: dbTemplate } : null,
     // The presence of ANY gated co-use signal (the gated enum values or the
     // co-use sidecar flags) routes to the T5b loud-fail. Computed above.
     couseRequested,
@@ -2907,12 +2943,16 @@ function resolveDonorDir(opts, targetDir) {
   return path.resolve(path.dirname(path.resolve(targetDir)), DEFAULT_INSTALL_DIRNAME);
 }
 
-/** Read a donor checkout's `.env.local` into a { KEY: value } map (best-effort —
- *  returns {} when absent/unreadable). The executor uses it as the source env for
- *  buildCoUseEnv (inherit shared-infra endpoints + crypto secrets). */
-function readDonorEnv(donorDir) {
+/** Read a checkout's `.env.local` into a { KEY: value } map (best-effort —
+ *  returns {} when absent/unreadable). The shared-road executor uses it on the
+ *  DONOR checkout as the source env for buildCoUseEnv (inherit shared-infra
+ *  endpoints + crypto secrets); the external road uses it on the checkout being
+ *  installed, to read the database server it is already pointed at BY KEY. A
+ *  value read here is used in process — it is never printed and never passed on
+ *  a command line. */
+function readCheckoutEnvLocal(checkoutDir) {
   try {
-    const p = path.join(donorDir, ".env.local");
+    const p = path.join(checkoutDir, ".env.local");
     if (!existsSync(p)) return {};
     return parseEnvBody(readFileSync(p, "utf8"));
   } catch {
@@ -2980,14 +3020,15 @@ function recordedInstanceDbName(slot) {
 }
 
 /** The database a connection string names, or null when it names none FROM THE
- *  STRING ALONE. Used to keep a co-use instance off the donor's OWN database —
- *  the name only, never the URL it came from. A URL may carry the database in
- *  the path (what the CLI itself always writes) or, libpq-style, as a `dbname`
- *  parameter — a hand-written or provider-issued URL often does the latter, and
- *  reading only the path made the collision guard skip itself in silence. When
- *  neither is present the caller asks the SERVER (`resolveDatabaseName`) rather
- *  than guessing or giving up quietly. */
-function donorDatabaseName(connectionString) {
+ *  STRING ALONE. Used to keep an instance off a database that is not its own —
+ *  the donor's on the shared road, the one the install is already pointed at on
+ *  the external road — the name only, never the URL it came from. A URL may
+ *  carry the database in the path (what the CLI itself always writes) or,
+ *  libpq-style, as a `dbname` parameter — a hand-written or provider-issued URL
+ *  often does the latter, and reading only the path made the collision guard
+ *  skip itself in silence. When neither is present the caller asks the SERVER
+ *  (`resolveDatabaseName`) rather than guessing or giving up quietly. */
+function connStringDatabaseName(connectionString) {
   try {
     const u = new URL(connectionString);
     const fromPath = u.pathname.replace(/^\//, "");
@@ -3025,22 +3066,111 @@ function dbNameUsableInStatement(dbName, operatorNamed) {
   return operatorNamed ? isOperatorDbName(dbName) : isCoUseDbNameShape(dbName);
 }
 
+/**
+ * Create `dbName` from `template` on the server `adminUrl` names, unless a
+ * database of that name is already there. THE one place this CLI copies a
+ * database: the shared-services road and the external road both come here, so
+ * the identifier quoting, the TEMPLATE clause, the existence probe and the
+ * template checks cannot drift apart between them (cinatra-cli#268).
+ *
+ * It always runs against the server's MAINTENANCE database (`postgres`), never
+ * the database being created — PostgreSQL cannot create a database from a
+ * session connected to it. The connection string is used in process only: it
+ * never reaches a command line, and no message raised here carries it.
+ *
+ * Idempotent: an EXISTING database of that name is REUSED, never dropped and
+ * never created over — the existence probe returns early with `created: false`,
+ * which is also what keeps it out of the shared road's rollback plan.
+ * `verifyTemplate` is set when the operator NAMED the template: the built-in
+ * seed has its own build verb and its own failure message, while an
+ * operator-prepared template is the new input, so it is checked for existence
+ * and template-usability BEFORE the CREATE rather than through whatever error
+ * the server returns.
+ *
+ * @returns {Promise<{ created:boolean, warnings:string[] }>}
+ */
+export async function createDatabaseFromTemplate({
+  createClient = loadPgClient,
+  adminUrl,
+  dbName,
+  template = DEFAULT_DB_TEMPLATE,
+  operatorNamed = false,
+  verifyTemplate = false,
+}) {
+  if (!dbNameUsableInStatement(dbName, operatorNamed)) {
+    throw new Error(
+      operatorNamed
+        ? `Refusing to create a database under an invalid --db-name ${JSON.stringify(dbName)}.`
+        : `Refusing to create a non-co-use-shaped database ${JSON.stringify(dbName)}.`,
+    );
+  }
+  if (!isOperatorTemplateName(template)) {
+    throw new Error(`Refusing to create from a template with an invalid name ${JSON.stringify(template)}.`);
+  }
+  // Each executor refuses this too, before anything is opened. It is mirrored
+  // here because this layer is the last thing before SQL, and every other
+  // guard on it is: a database cannot be a copy of itself.
+  if (dbName === template) {
+    throw new Error(
+      `Refusing to create ${JSON.stringify(dbName)} from its own template: a database cannot be ` +
+        `created from itself.`,
+    );
+  }
+  const warnings = [];
+  const client = await createClient(connStringForDatabase(adminUrl, "postgres"));
+  await client.connect();
+  try {
+    const exists = await client.query("SELECT 1 FROM pg_database WHERE datname = $1", [dbName]);
+    if (exists.rowCount > 0) return { created: false, warnings };
+    if (verifyTemplate) {
+      const row = await client.query(
+        "SELECT datistemplate, datallowconn FROM pg_database WHERE datname = $1",
+        [template],
+      );
+      if (row.rows.length === 0) {
+        throw new Error(
+          `Template database "${template}" does not exist on this Postgres server. Create it first ` +
+            `(migrate and seed it once), then mark it: ALTER DATABASE "${template}" WITH IS_TEMPLATE true ` +
+            `ALLOW_CONNECTIONS false — PostgreSQL refuses to copy a database that has another session ` +
+            `connected, which is why the CLI's own seed is marked both ways. Or drop --db-template to use ` +
+            `the built-in seed.`,
+        );
+      }
+      if (row.rows[0].datistemplate !== true) {
+        throw new Error(
+          `Database "${template}" exists but is not marked as a template, so copying it is not reliably ` +
+            `permitted. Run: ALTER DATABASE "${template}" WITH IS_TEMPLATE true ALLOW_CONNECTIONS false ` +
+            `(the second half keeps sessions off it, which is what lets it be copied at all).`,
+        );
+      }
+      // Marked a template but still open to connections: the copy below
+      // succeeds only while nobody is connected to it, so this is a warning
+      // — the run may well be the lucky one — never a refusal.
+      if (row.rows[0].datallowconn === true) {
+        warnings.push(
+          `Template ${template} still allows connections. PostgreSQL cannot copy a database while ` +
+            `another session is connected to it, so this install fails if anyone connects to ` +
+            `${template} at the wrong moment. Close it: ALTER DATABASE "${template}" WITH ` +
+            `ALLOW_CONNECTIONS false`,
+        );
+      }
+    }
+    await client.query(`CREATE DATABASE ${quoteIdent(dbName)} TEMPLATE ${quoteIdent(template)}`);
+    return { created: true, warnings };
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
 /** Default real DB operations for co-use (injectable via deps for tests). All run
  *  against the DONOR's Postgres SERVER (admin/maintenance DB) so CREATE/DROP never
  *  run while connected to the DB being mutated. `createClient` is injectable so
  *  the exact statements these issue are testable without a live server. */
 export function defaultCoUseDbOps({ createClient = loadPgClient } = {}) {
   return {
-    // Idempotent create: SELECT 1 then CREATE … TEMPLATE <template>. Returns
+    // Idempotent create from the shared creation helper — see
+    // `createDatabaseFromTemplate` for what reaches PostgreSQL. Returns
     // { created: boolean } so rollback only drops a DB THIS run created.
-    //
-    // An EXISTING database of that name is REUSED, never dropped and never
-    // created over: the SELECT returns early with `created: false`, which is
-    // also what keeps it out of the rollback plan. `verifyTemplate` is set when
-    // the operator named the template: the built-in seed has its own build verb
-    // and its own failure message, while an operator-prepared template is the
-    // new input, so it is checked for existence and template-usability BEFORE
-    // the CREATE rather than through whatever error the server returns.
     async createCoUseDb({
       adminUrl,
       dbName,
@@ -3048,69 +3178,14 @@ export function defaultCoUseDbOps({ createClient = loadPgClient } = {}) {
       operatorNamed = false,
       verifyTemplate = false,
     }) {
-      if (!dbNameUsableInStatement(dbName, operatorNamed)) {
-        throw new Error(
-          operatorNamed
-            ? `Refusing to create a database under an invalid --db-name ${JSON.stringify(dbName)}.`
-            : `Refusing to create a non-co-use-shaped database ${JSON.stringify(dbName)}.`,
-        );
-      }
-      if (!isOperatorTemplateName(template)) {
-        throw new Error(`Refusing to create from a template with an invalid name ${JSON.stringify(template)}.`);
-      }
-      // The executor refuses this too, before anything is opened. It is mirrored
-      // here because this layer is the last thing before SQL, and every other
-      // guard on it is: a database cannot be a copy of itself.
-      if (dbName === template) {
-        throw new Error(
-          `Refusing to create ${JSON.stringify(dbName)} from its own template: a database cannot be ` +
-            `created from itself.`,
-        );
-      }
-      const warnings = [];
-      const client = await createClient(connStringForDatabase(adminUrl, "postgres"));
-      await client.connect();
-      try {
-        const exists = await client.query("SELECT 1 FROM pg_database WHERE datname = $1", [dbName]);
-        if (exists.rowCount > 0) return { created: false, warnings };
-        if (verifyTemplate) {
-          const row = await client.query(
-            "SELECT datistemplate, datallowconn FROM pg_database WHERE datname = $1",
-            [template],
-          );
-          if (row.rows.length === 0) {
-            throw new Error(
-              `Template database "${template}" does not exist on this Postgres server. Create it first ` +
-                `(migrate and seed it once), then mark it: ALTER DATABASE "${template}" WITH IS_TEMPLATE true ` +
-                `ALLOW_CONNECTIONS false — PostgreSQL refuses to copy a database that has another session ` +
-                `connected, which is why the CLI's own seed is marked both ways. Or drop --db-template to use ` +
-                `the built-in seed.`,
-            );
-          }
-          if (row.rows[0].datistemplate !== true) {
-            throw new Error(
-              `Database "${template}" exists but is not marked as a template, so copying it is not reliably ` +
-                `permitted. Run: ALTER DATABASE "${template}" WITH IS_TEMPLATE true ALLOW_CONNECTIONS false ` +
-                `(the second half keeps sessions off it, which is what lets it be copied at all).`,
-            );
-          }
-          // Marked a template but still open to connections: the copy below
-          // succeeds only while nobody is connected to it, so this is a warning
-          // — the run may well be the lucky one — never a refusal.
-          if (row.rows[0].datallowconn === true) {
-            warnings.push(
-              `Template ${template} still allows connections. PostgreSQL cannot copy a database while ` +
-                `another session is connected to it, so this install fails if anyone connects to ` +
-                `${template} at the wrong moment. Close it: ALTER DATABASE "${template}" WITH ` +
-                `ALLOW_CONNECTIONS false`,
-            );
-          }
-        }
-        await client.query(`CREATE DATABASE ${quoteIdent(dbName)} TEMPLATE ${quoteIdent(template)}`);
-        return { created: true, warnings };
-      } finally {
-        await client.end().catch(() => {});
-      }
+      return await createDatabaseFromTemplate({
+        createClient,
+        adminUrl,
+        dbName,
+        template,
+        operatorNamed,
+        verifyTemplate,
+      });
     },
     /** Ask the SERVER which database a connection string names. Used only when
      *  the string itself names none — neither in its path nor in a `dbname`
@@ -3178,7 +3253,7 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
   const readClone = deps.readCloneRegistry ?? (() => null);
   const dbOps = deps.coUseDbOps ?? defaultCoUseDbOps();
   const probeCapability = deps.probeCookiePrefixSupport ?? probeDonorCookiePrefixSupport;
-  const readDonor = deps.readDonorEnv ?? readDonorEnv;
+  const readDonor = deps.readDonorEnv ?? readCheckoutEnvLocal;
 
   // Slug + names (pure).
   const slug = deriveCoUseSlug(targetDir, opts);
@@ -3248,7 +3323,7 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
   // the donor's data — the separate database this road exists to give is gone
   // behind a success line. The name only; a connection string never reaches a
   // message here.
-  let donorDb = donorDatabaseName(adminUrl);
+  let donorDb = connStringDatabaseName(adminUrl);
   if (donorDb && dbName === donorDb) throw donorCollisionError(dbName, operatorNamed);
 
   log(`- Co-use: provisioning instance "${slug}" against the donor at ${donorDir} (separate DB ${dbName}).`);
@@ -5711,12 +5786,120 @@ function markInstanceReadyWithState(registry, slug, state, patch = {}) {
 }
 
 // ── T13 — external infra execution ──────────────────────────────────────────
+
+/** Default real DB operations for the EXTERNAL road (injectable via deps for
+ *  tests), on the shared creation helper. The name is always the operator's
+ *  (`--db-name`, guarded by the operator rule) and the template is always one
+ *  they named, so it is verified before anything is created. */
+export function defaultExternalDbOps({ createClient = loadPgClient } = {}) {
+  return {
+    async createExternalDb({ adminUrl, dbName, template }) {
+      return await createDatabaseFromTemplate({
+        createClient,
+        adminUrl,
+        dbName,
+        template,
+        operatorNamed: true,
+        verifyTemplate: true,
+      });
+    },
+  };
+}
+
+/** Strip an embedded `user:password@` from anything that is about to be shown.
+ *  A message from the server or from the pg client is passed through verbatim
+ *  otherwise, so the operator keeps the failure's own words.
+ *
+ *  The match runs to the LAST `@` before the authority ends — exactly where
+ *  `new URL` puts the userinfo/host boundary — because neither half of a
+ *  userinfo has to be percent-encoded to reach the pg client: a password (or a
+ *  username) carrying a literal `@` is accepted there, and a scrubber that
+ *  stopped at the FIRST `@` left the rest of it standing in the message. `/`
+ *  stays excluded on both sides, so the match cannot escape the authority into
+ *  a path that merely contains `:` and `@`, and a `host:port` with no
+ *  credential at all is left untouched. */
+function withoutEmbeddedCredentials(text) {
+  return String(text ?? "").replace(/\/\/[^/\s]*:[^/\s]*@/g, "//***@");
+}
+
+/** cinatra-cli#268 — create the instance's database on the EXTERNAL server this
+ *  install is pointed at, from the template the operator named, unless it is
+ *  already there. Runs BEFORE setup and migrations, so the database they are
+ *  pointed at exists by the time they run.
+ *
+ *  The server is the one the install itself uses: the `--db-url` when one was
+ *  passed, else the SUPABASE_DB_URL the checkout's `.env.local` already carries
+ *  — read BY KEY and used in process. The credential never reaches a command
+ *  line, and every line printed here names the database and the template only.
+ *
+ *  Nothing is dropped and nothing is created over: an existing database of that
+ *  name is said out loud and left exactly as it stands.
+ *
+ *  @returns {Promise<{ name:string, template:string, created:boolean }|null>}
+ */
+async function createExternalInstanceDb({ targetDir, opts, dbUrl = null, log, deps = {} }) {
+  const request = opts.externalDb ?? null;
+  if (!request) return null;
+  const { name, template } = request;
+
+  // The server the install is pointed at. `--db-url` wins because it is what
+  // the env write just put in the file; otherwise the operator owns their own
+  // `.env.local` and the key in it is the whole answer.
+  const adminUrl = dbUrl ?? readCheckoutEnvLocal(targetDir).SUPABASE_DB_URL ?? null;
+  if (!adminUrl) {
+    throw new Error(
+      `--db-name ${name} --db-template ${template} needs a PostgreSQL server to create that database on, ` +
+        `but this install was given no --db-url and ${path.join(targetDir, ".env.local")} carries no ` +
+        `SUPABASE_DB_URL. Pass --db-url, or write the key into that file first.`,
+    );
+  }
+
+  // A database created under one name while setup migrates another is a flag
+  // that silently does nothing — the class this parser refuses everywhere else.
+  // The two bare NAMES, never the connection they came from.
+  const pointedAt = connStringDatabaseName(adminUrl);
+  if (pointedAt && pointedAt !== name) {
+    throw new Error(
+      `--db-name ${name} is not the database this install is pointed at ("${pointedAt}"): the database ` +
+        `would be created and then nothing would use it, while setup + migrations ran against ` +
+        `"${pointedAt}". Point the install's database URL at ${name}, or drop --db-name/--db-template ` +
+        `and create the database yourself.`,
+    );
+  }
+  if (!pointedAt) {
+    log(`  ⚠ The database URL this install uses names no database, so this run could NOT check that it ` +
+      `is ${name}. Verify it yourself.`);
+  }
+
+  const dbOps = deps.externalDbOps ?? defaultExternalDbOps();
+  let result;
+  try {
+    result = await dbOps.createExternalDb({ adminUrl, dbName: name, template });
+  } catch (err) {
+    throw new Error(
+      `Could not create the database ${name} from template ${template} on the external PostgreSQL server: ` +
+        withoutEmbeddedCredentials(err?.message ?? err),
+    );
+  }
+  for (const w of result.warnings ?? []) log(`  ⚠ ${withoutEmbeddedCredentials(w)}`);
+  log(
+    result.created
+      ? `  Created database ${name} from template ${template} on the external PostgreSQL server.`
+      : `  Database ${name} already exists on the external PostgreSQL server — using it as it stands; ` +
+        `the template ${template} was not used. This install never drops or re-creates an existing database.`,
+  );
+  return { name, template, created: result.created === true };
+}
+
 /** Validate the four external URLs + write them into .env.local with the
  *  sanitized-env guard so an exported SUPABASE_DB_URL/REDIS_URL/NANGO_* cannot
  *  override the generated values; record the instance as `external` (never
  *  auto-dropped). A destructive-leaning target needs a typed NON-ROLLBACKABLE
- *  confirm. Returns the env keys written. */
-async function executeExternalEnv({ targetDir, opts, conflictResolution = false, log = console.log }) {
+ *  confirm. When the operator named a database and a template, create that
+ *  database on the server this install points at before returning, so setup and
+ *  migrations find it there (cinatra-cli#268). Returns the env keys written and
+ *  what was done about the database. */
+async function executeExternalEnv({ targetDir, opts, conflictResolution = false, log = console.log, deps = {} }) {
   const ext = opts.external ?? {};
   // At least one external URL must be supplied to wire anything; an --infra=
   // external with no URLs simply skips bring-up (today's --no-infra behaviour).
@@ -5750,7 +5933,13 @@ async function executeExternalEnv({ targetDir, opts, conflictResolution = false,
     // handled by the --db-url guard above, so this branch is the legacy case.
     log("- External infra (--infra=external): no --db-url/--redis-url/--nango-url/--graphiti-url given; " +
       "skipping infra bring-up only (ensure your external Postgres/Redis/Nango are reachable before setup).");
-    return { wrote: [] };
+    // cinatra-cli#268: this is exactly the operator whose `.env.local` is
+    // already authored, so the database they named is created against the
+    // server that file points at. Creating a database that is not there adds
+    // one; it never touches an existing one, which is why it needs no
+    // acknowledgement of its own.
+    const database = await createExternalInstanceDb({ targetDir, opts, dbUrl: null, log, deps });
+    return { wrote: [], database };
   }
 
   // Shape-validate each provided URL.
@@ -5818,7 +6007,18 @@ async function executeExternalEnv({ targetDir, opts, conflictResolution = false,
   }
   writeFileSync(envPath, body);
   log(`- External infra: wrote ${Object.keys(values).join(", ")} into .env.local (resources are operator-owned; not install-managed).`);
-  return { wrote: Object.keys(values) };
+  // cinatra-cli#268 — the database last, after the acknowledgement above and
+  // after the file it will be read from is current, and still before setup and
+  // migrations run. `values.SUPABASE_DB_URL` is the server when --db-url named
+  // one; otherwise the checkout's own key is (e.g. only --redis-url was given).
+  const database = await createExternalInstanceDb({
+    targetDir,
+    opts,
+    dbUrl: values.SUPABASE_DB_URL ?? null,
+    log,
+    deps,
+  });
+  return { wrote: Object.keys(values), database };
 }
 
 function externalFlagFor(key) {
@@ -8918,7 +9118,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   // exactly like the old refusal did.
   if (opts.couseRequested && deps.skipCoUsePreGate !== true) {
     const probeCapability = deps.probeCookiePrefixSupport ?? probeDonorCookiePrefixSupport;
-    const readDonor = deps.readDonorEnv ?? readDonorEnv;
+    const readDonor = deps.readDonorEnv ?? readCheckoutEnvLocal;
     const preTargetDir = path.resolve(opts.dir ?? path.resolve(process.cwd(), DEFAULT_INSTALL_DIRNAME));
     const donorDir = resolveDonorDir(opts, preTargetDir);
     const donorEnv = readDonor(donorDir);
@@ -9569,7 +9769,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   //     not fall back to the occupied local DB).
   if (infraPlan === "external") {
     const conflictResolution = resolution != null && resolution.infraPlan === "external";
-    await executeExternalEnv({ targetDir, opts, conflictResolution, log });
+    await executeExternalEnv({ targetDir, opts, conflictResolution, log, deps });
   }
 
   // 5c2. cinatra#2654 — record the WayFlow runtime decision for this install.

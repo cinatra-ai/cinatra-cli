@@ -674,21 +674,28 @@ Commands:
                                             with the app change needed, pointing at isolated).
                     --infra=external        Point at external Postgres/Redis/Nango (--db-url/
                                             --redis-url/--nango-url/--graphiti-url); no local infra.
+                                            Add --db-name AND --db-template to have the instance's
+                                            database created from that template, on the server this
+                                            install points at, before setup + migrations run.
                     --external-db-disposable Acknowledge an external --db-url target is disposable
                                             (REQUIRED non-interactively; a bare --yes won't arm it).
                     --allow-shared-graphiti With co-use: accept sharing the donor's Graphiti/Neo4j
                                             (org-scoped, not per-instance).
                     --db-name <name>        Create the instance's database under THIS name instead of the
-                                            derived one (selects co-use). Lowercase letters, digits and
-                                            underscores, starting with a letter, at most 63 bytes; not a
-                                            reserved name, not one the CLI creates and drops itself
+                                            derived one (selects co-use; with --infra=external it names
+                                            the database to create there, and needs --db-template).
+                                            Lowercase letters, digits and underscores, starting with a
+                                            letter, at most 63 bytes; not a reserved name, not one the
+                                            CLI creates and drops itself
                                             (cinatra_clone_…/cinatra_inst_…/cinatra_seed…), not the
                                             donor's own database and not the template.
                     --db-template <name>    Create that database FROM this template database instead of
-                                            the built-in seed (selects co-use). It must exist and be
-                                            marked: ALTER DATABASE … WITH IS_TEMPLATE true
-                                            ALLOW_CONNECTIONS false. Checked before anything is created;
-                                            an existing database is reused and the template not used.
+                                            the built-in seed (selects co-use; required beside --db-name
+                                            with --infra=external, which has no built-in seed to copy).
+                                            It must exist and be marked: ALTER DATABASE … WITH
+                                            IS_TEMPLATE true ALLOW_CONNECTIONS false. Checked before
+                                            anything is created; an existing database is reused and the
+                                            template not used.
                     --bullmq-queue <name>   The instance's job-queue name on the shared Redis (selects
                                             co-use; default: derived from the instance name).
                     --instance <slug>       Name the instance (default: the install-dir basename).
