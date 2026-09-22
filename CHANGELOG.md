@@ -96,6 +96,31 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`cinatra install` now mints the instance encryption key in every mode, so an
+  instance can be provisioned before its first boot.** The intended unattended
+  order is install, then the checkout's provisioning step, then the first boot.
+  That provisioning step seals the instance's secrets with
+  `CINATRA_ENCRYPTION_KEY`, and the install used to mint that key for `--mode
+  prod` only — in development the app generates one on its FIRST server boot and
+  writes it into `.env.local`. So a development or demo install produced a
+  checkout whose provisioning step refused (`CINATRA_ENCRYPTION_KEY env var is
+  required for instance-secrets encryption`) until the app had been started once,
+  which is exactly the boot a single-command setup exists to make unnecessary.
+  The install now authors the key itself whenever it is absent, in every mode: 32
+  bytes as 64 lowercase hex characters, the same shape the app's own first boot
+  writes, so a later boot finds it and generates nothing. Everything the
+  production path already guaranteed for this key now holds for every mode. A
+  value that is already present is carried forward byte for byte on every path —
+  a fresh checkout, a `--reset-env` regeneration, and the self-heal of an
+  existing file — because rotating it would orphan every secret the instance has
+  already sealed, and a second install on the same checkout therefore rewrites
+  nothing. A present but MALFORMED value (one that decodes to neither a 64-char
+  hex nor a base64 32-byte key) now aborts the install in every mode, naming the
+  variable and the file, before anything is written: a development instance has
+  sealed rows as soon as it has been provisioned, so silently replacing its key
+  would lose exactly as much as it would in production. No value is ever printed:
+  the install names the variables it minted and nothing else.
+
 - **`cinatra install --on-conflict=stop-existing` no longer leaks the stopped
   instance's ports, and no longer stops a stack the operator was never shown.**
   Three operator-visible changes. First, the teardown and the release of the

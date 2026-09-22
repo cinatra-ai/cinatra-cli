@@ -3270,7 +3270,7 @@ describe("preview — the passthrough list covers the dev install's set (enginee
       }
     }
     // …and the ALIASES the road binds them to right before the write
-    // (`const ATTEST = ATTEST_KEY.name;`, `const ENC = PROD_ENCRYPTION_KEY;`).
+    // (`const ATTEST = ATTEST_KEY.name;`, `const ENC = INSTANCE_ENCRYPTION_KEY;`).
     // Resolved to a fixpoint so an alias of an alias is read too.
     for (let pass = 0; pass < 4; pass += 1) {
       let grew = false;
