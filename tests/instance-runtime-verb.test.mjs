@@ -52,9 +52,11 @@ import {
   runInstanceWayflow,
 } from "../src/index.mjs";
 import {
+  INSTANCE_LOOPBACK_ADDRESS,
   INSTANCE_RUNTIME_BRIDGE_TOKEN_KEY,
   INSTANCE_RUNTIME_CALLBACK_PROBE_TIMEOUT_MS,
   INSTANCE_RUNTIME_COMPOSE_FILE,
+  INSTANCE_RUNTIME_CONTEXT_ATTEST_KEY,
   INSTANCE_RUNTIME_GATEWAY_HOST,
   INSTANCE_RUNTIME_SERVICE,
   callbackProbeScript,
@@ -96,6 +98,9 @@ const TEMPLATE = `services:
 `;
 
 const TOKEN = "bridge-token-value-that-must-never-be-echoed";
+// The runtime refuses to start without its context attest key, so every
+// instance these tests start carries one (cinatra-cli#281).
+const ATTEST = "attest-key-value-that-must-never-be-echoed";
 
 // An address the operator names for the app, handed to the container as
 // written (cinatra-cli#279).
@@ -105,7 +110,10 @@ let home;
 let checkout;
 const made = [];
 
-function makeCheckout(envBody = `${INSTANCE_RUNTIME_BRIDGE_TOKEN_KEY}=${TOKEN}\nPORT=3300\n`) {
+function makeCheckout(
+  envBody = `${INSTANCE_RUNTIME_BRIDGE_TOKEN_KEY}=${TOKEN}\n` +
+    `${INSTANCE_RUNTIME_CONTEXT_ATTEST_KEY}=${ATTEST}\nPORT=3300\n`,
+) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "cin-260-co-"));
   made.push(dir);
   mkdirSync(path.join(dir, "docker", "wayflow"), { recursive: true });
@@ -240,7 +248,7 @@ describe("the rendered compose carries the port, the name and the callback addre
     const { run, launches } = runner({ inspect: ABSENT });
     await run("start", ["--instance", "web-a", "--runtime-port", "3910", "--app-url", RELAY]);
     const rendered = readFileSync(instanceRuntimeComposePath("web-a", { home }), "utf8");
-    expect(rendered).toContain('"3910:3010"');
+    expect(rendered).toContain(`"${INSTANCE_LOOPBACK_ADDRESS}:3910:3010"`);
     expect(rendered).toContain(RELAY);
     expect(rendered).toContain(`${checkout}/extensions:/agents:ro`);
 

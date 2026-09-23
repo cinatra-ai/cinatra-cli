@@ -45,24 +45,33 @@
 //     verb settles for real: it probes that address FROM INSIDE the container
 //     it started, and refuses the start when it cannot be reached.
 //
+// WHAT EVERY START WRITES INTO THE RUNTIME SERVICE (cinatra-cli#281). Beside
+// whatever the operator names, two lines are the verb's own: the host address
+// the runtime's port is published on — this machine's loopback unless `--bind`
+// names another — and the context attest key, referenced beside the bridge
+// token, because the checkout's template names the token and not the key and
+// the runtime refuses to start without either.
+//
 // Public surface:
 //   - selector:   parseInstanceRuntimeFlags, instanceRuntimeRequested
 //   - derivation: instanceComposeProject, instanceRuntimeContainer,
 //                 containerNameIsChosen, instanceRuntimeComposePath,
 //                 appUrlFromEnv, resolveInstanceRuntimePlan,
 //                 instanceRuntimeTemplateVars
-//   - document:   instanceRuntimeComposeDocument, recordedContainerName
+//   - document:   instanceRuntimeComposeDocument, cloneRuntimeComposeDocument,
+//                 recordedContainerName
 //   - invocation: composeInstanceRuntimeUpArgs, dockerRuntimeInspectArgs,
 //                 dockerContainerProjectArgs, dockerRuntimeStopArgs,
 //                 dockerRuntimeRemoveArgs, dockerImageInspectArgs,
 //                 imageRevisionLabelArgs, containerCallbackProbeArgs,
-//                 callbackProbeScript
+//                 callbackProbeScript, callbackProbePythonScript
 //   - reading:    parseRuntimeContainerState, containerBelongsToInstance,
-//                 callbackProbeVerdict
+//                 callbackProbeVerdict, probeCallbackInsideContainer
 //   - refusal:    unreachableAppMessage, callbackProbeFailureMessage,
 //                 missingNamedImageMessage, foreignContainerMessage
 // ---------------------------------------------------------------------------
 
+import { isIP } from "node:net";
 import path from "node:path";
 
 import { isValidSlug } from "./clone-registry.mjs";
@@ -87,6 +96,15 @@ export const INSTANCE_RUNTIME_COMPOSE_FILE = "wayflow-compose.yml";
  *  never written into a file this verb creates. */
 export const INSTANCE_RUNTIME_BRIDGE_TOKEN_KEY = "CINATRA_BRIDGE_TOKEN";
 
+/** The key the runtime signs its context callbacks to the app with. The shared
+ *  runtime's own env-file check lists it as REQUIRED beside the bridge token
+ *  (`WAYFLOW_ENV_REQUIRED_KEYS` in `wayflow-runtime.mjs`), and the runtime's
+ *  loader refuses to start without it. It travels exactly as the bridge token
+ *  does: read from the instance's own environment file by key, handed to the
+ *  launch through the launch environment, and never written into a file this
+ *  verb creates — the document carries only its `${…}` reference. */
+export const INSTANCE_RUNTIME_CONTEXT_ATTEST_KEY = "CINATRA_CONTEXT_ATTEST_KEY";
+
 /** The container-side name for "the machine I am running on". The rendered
  *  document maps it to the host gateway, so a container reaches an app bound to
  *  this machine's loopback — including on a rootless engine. */
@@ -110,6 +128,19 @@ export const INSTANCE_RUNTIME_CALLBACK_PROBE_TIMEOUT_MS = 5_000;
  *  refusals — so no literal address is written into this tool. */
 export const INSTANCE_LOOPBACK_HOST = "localhost";
 
+/** The ADDRESS of that interface, for the one place a name will not do: the
+ *  host address a port is published on. Docker takes an IP address there and
+ *  refuses a name (`invalid IP address: localhost`), so the loopback a start
+ *  publishes on by default is written into the document as this address.
+ *  Assembled from its four octets rather than written out. */
+export const INSTANCE_LOOPBACK_ADDRESS = [127, 0, 0, 1].join(".");
+
+/** The interpreters the in-container probe asks with, in this order: `node`
+ *  first, the form the probe has always had, and `python3` next, because the
+ *  runtime image carries python and no node. An image without one answers 126
+ *  or 127 and the next one is asked; the first one that RUNS gives the answer. */
+export const INSTANCE_RUNTIME_PROBE_INTERPRETERS = Object.freeze(["node", "python3"]);
+
 /** The image this checkout builds for its own agent runtime, and the only image
  *  this verb ever builds. An image named with `--image` is the operator's, and
  *  is never built and never pulled. */
@@ -126,8 +157,22 @@ export const INSTANCE_RUNTIME_IMAGE_REVISION_LABEL = "org.opencontainers.image.r
 const CONTAINER_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const CONTAINER_NAME_MAX_LENGTH = 63;
 
+/** What `instance start --bind` accepts as an address (`instance-start.mjs`):
+ *  a bare IPv4, IPv6 or host token, never whitespace or a leading dash. The
+ *  same shape, so the two flags read one way; kept local so this module stays a
+ *  leaf. What this verb then accepts inside it is narrower — see `assertBind`. */
+const BIND_ADDRESS_PATTERN =
+  /^(?:[A-Za-z0-9][A-Za-z0-9._-]{0,62}|[0-9A-Fa-f:]{2,45}|\[[0-9A-Fa-f:]{2,45}\])$/;
+
 /** The flags this verb accepts, each taking one value. */
-const VALUE_FLAGS = ["--instance", "--runtime-port", "--app-url", "--image", "--container"];
+const VALUE_FLAGS = [
+  "--instance",
+  "--runtime-port",
+  "--app-url",
+  "--image",
+  "--container",
+  "--bind",
+];
 
 /** The flags this verb accepts that take no value. */
 const BOOLEAN_FLAGS = ["--rebuild"];
@@ -340,11 +385,53 @@ function assertContainerName(value) {
 }
 
 /**
+ * Validate `--bind` and return the address docker is given in front of the
+ * published runtime port. The SHAPE is the one `instance start --bind`
+ * accepts; what may stand in it is narrower, because docker publishes a port
+ * on an IP address and refuses a name there. So it is an IPv4 address, an IPv6
+ * address — returned bracketed, which docker's parser reads unambiguously in
+ * front of a port — or this machine's loopback name, which is written as the
+ * loopback address. Any other name is refused here, on the flag, rather than
+ * by `docker compose up` halfway through a start.
+ */
+function assertBind(value) {
+  const shown = String(value ?? "");
+  const raw = shown.trim();
+  const example = `\`--bind ${INSTANCE_LOOPBACK_HOST}\``;
+  if (!BIND_ADDRESS_PATTERN.test(raw)) {
+    throw new Error(
+      `Invalid --bind "${shown}". Pass a bare address — ${example} for a runtime only this ` +
+        `machine can reach.`,
+    );
+  }
+  if (raw.toLowerCase() === INSTANCE_LOOPBACK_HOST) return INSTANCE_LOOPBACK_ADDRESS;
+  const bare = /^\[.*\]$/.test(raw) ? raw.slice(1, -1) : raw;
+  const family = isIP(bare);
+  if (family === 4) return bare;
+  if (family === 6) return `[${bare}]`;
+  throw new Error(
+    `Invalid --bind "${shown}". Docker publishes a port on an IP address and refuses a name ` +
+      `there, and this is not an IP address. Name the interface by its address, or pass ` +
+      `${example} for this machine's loopback.`,
+  );
+}
+
+/** The host this machine dials to reach a runtime published on `bind`: its
+ *  loopback name when the port is published there or on every interface, and
+ *  the address itself when it is published on one other interface only — the
+ *  runtime then answers there and nowhere else. */
+function runtimeReachHost(bind) {
+  const bare = String(bind).replace(/^\[(.*)\]$/, "$1");
+  const everyInterface = /^[0.:]+$/.test(bare);
+  return isLoopbackHost(bare) || everyInterface ? INSTANCE_LOOPBACK_HOST : bind;
+}
+
+/**
  * The operator's explicit choices out of one argv. Absent flags are null —
  * "nothing was chosen" — so the plan can tell a choice apart from a default.
  *
  * @param {string[]} argv
- * @returns {{ slug: string|null, runtimePort: number|null, appUrl: string|null }}
+ * @returns {{ slug: string|null, runtimePort: number|null, appUrl: string|null, bind: string|null }}
  */
 export function parseInstanceRuntimeFlags(argv = []) {
   const extra = instanceRuntimeExtraTokens(argv);
@@ -352,8 +439,8 @@ export function parseInstanceRuntimeFlags(argv = []) {
     throw new Error(
       `Unexpected argument(s) for 'cinatra instance wayflow': ${extra.join(" ")}. ` +
         `Expected: cinatra instance wayflow start --instance <name> --runtime-port <port> ` +
-        `[--app-url <url>] [--image <tag>|--rebuild] [--container <name>], or ` +
-        `cinatra instance wayflow stop --instance <name>.`,
+        `[--app-url <url>] [--image <tag>|--rebuild] [--container <name>] ` +
+        `[--bind <address>], or cinatra instance wayflow stop --instance <name>.`,
     );
   }
   const rawSlug = readFlag(argv, "--instance");
@@ -361,6 +448,7 @@ export function parseInstanceRuntimeFlags(argv = []) {
   const rawAppUrl = readFlag(argv, "--app-url");
   const rawImage = readFlag(argv, "--image");
   const rawContainer = readFlag(argv, "--container");
+  const rawBind = readFlag(argv, "--bind");
   const image = rawImage === null ? null : assertImageRef(rawImage);
   const rebuild = (Array.isArray(argv) ? argv : []).includes("--rebuild");
   // TWO DIFFERENT IMAGES. `--rebuild` builds THIS CHECKOUT's own image again;
@@ -380,6 +468,7 @@ export function parseInstanceRuntimeFlags(argv = []) {
     appUrl: rawAppUrl === null ? null : assertAppUrl(rawAppUrl),
     image,
     container: rawContainer === null ? null : assertContainerName(rawContainer),
+    bind: rawBind === null ? null : assertBind(rawBind),
     rebuild,
   };
 }
@@ -491,6 +580,9 @@ export function resolveInstanceRuntimePlan({
     // template's tunnel sidecar, so the value only satisfies the substitution.
     tunnelHostname: `cinatra-instance-${slug}`,
     runtimePort: chosen.runtimePort ?? null,
+    // The host address the runtime port is published on: this machine's
+    // loopback unless the operator named another (set for a start below).
+    bind: null,
     runtimeUrl: null,
     runtimeHealthUrl: null,
     appUrl: null,
@@ -504,21 +596,23 @@ export function resolveInstanceRuntimePlan({
   if (verb !== "start") {
     // A flag this verb READS must be a flag this verb HONOURS. A stop removes
     // the container the instance already has — under the name its START
-    // recorded — so a port, an address, an image or a name given here would be
-    // validated and then dropped on the floor. It is refused instead of
-    // silently ignored.
+    // recorded — so a port, an address, an image, a name or an interface given
+    // here would be validated and then dropped on the floor. It is refused
+    // instead of silently ignored.
     if (
       chosen.runtimePort != null ||
       chosen.appUrl != null ||
       chosen.image != null ||
       chosen.container != null ||
+      chosen.bind != null ||
       chosen.rebuild
     ) {
       throw new Error(
         `\`cinatra instance wayflow ${verb} --instance ${slug}\` takes no \`--runtime-port\`, ` +
-          `\`--app-url\`, \`--image\`, \`--container\` or \`--rebuild\`: it removes the agent ` +
-          `runtime container this instance already has, under the name its start recorded, so ` +
-          `none of these values would be used. Drop them — \`start\` is the verb that takes them.`,
+          `\`--app-url\`, \`--image\`, \`--container\`, \`--bind\` or \`--rebuild\`: it removes ` +
+          `the agent runtime container this instance already has, under the name its start ` +
+          `recorded, so none of these values would be used. Drop them — \`start\` is the verb ` +
+          `that takes them.`,
       );
     }
     return plan;
@@ -538,7 +632,11 @@ export function resolveInstanceRuntimePlan({
     source: PORT_BAND_SOURCE_OPERATOR,
   });
   plan.runtimePort = chosen.runtimePort;
-  plan.runtimeUrl = `http://localhost:${plan.runtimePort}`;
+  plan.bind = chosen.bind ?? INSTANCE_LOOPBACK_ADDRESS;
+  // Where THIS machine reaches the runtime — the health wait and the printed
+  // address: the loopback name, unless the port is published on one other
+  // interface only, which is then the one place it answers.
+  plan.runtimeUrl = `http://${runtimeReachHost(plan.bind)}:${plan.runtimePort}`;
   plan.runtimeHealthUrl = `${plan.runtimeUrl}${INSTANCE_RUNTIME_HEALTH_PATH}`;
 
   plan.appUrl =
@@ -579,6 +677,11 @@ function isInertLine(line) {
   return /^\s*(?:#.*)?$/.test(line);
 }
 
+/** The indentation a line carries. */
+function indentOf(line) {
+  return /^\s*/.exec(line)[0];
+}
+
 /**
  * The runtime service's own block inside a rendered compose document, or null.
  * Line-oriented on purpose: this module substitutes into a template rather than
@@ -593,7 +696,6 @@ function isInertLine(line) {
 function runtimeServiceBlock(lines) {
   const servicesAt = lines.findIndex((line) => /^services:\s*(?:#.*)?$/.test(line));
   if (servicesAt === -1) return null;
-  const indentOf = (line) => /^\s*/.exec(line)[0];
   let serviceIndent = null;
   for (let i = servicesAt + 1; i < lines.length; i += 1) {
     if (isInertLine(lines[i])) continue;
@@ -632,11 +734,115 @@ function escapeRegExp(value) {
 }
 
 /**
+ * A key set on the runtime service whose value is the block of lines under
+ * it (`ports:`, `environment:`): the key's line, where its block ends — blank
+ * and comment lines trailing it excluded — and the indentation its entries
+ * carry, or null when it has none yet. Null when the service does not set the
+ * key, or sets it on its own line (`environment: {}`), where nothing can be
+ * added under it.
+ *
+ * @returns {{ at: number, end: number, entryIndent: string|null }|null}
+ */
+function serviceKeyBlock(lines, block, key) {
+  const at = serviceKeyLine(lines, block, key);
+  if (at === -1 || !new RegExp(`^\\s*${key}:\\s*(?:#.*)?$`).test(lines[at])) return null;
+  let end = at + 1;
+  while (
+    end < block.end &&
+    (isInertLine(lines[end]) || indentOf(lines[end]).length > block.childIndent.length)
+  ) {
+    end += 1;
+  }
+  while (end > at + 1 && isInertLine(lines[end - 1])) end -= 1;
+  const entry = lines.slice(at + 1, end).find((line) => !isInertLine(line));
+  return { at, end, entryIndent: entry ? indentOf(entry) : null };
+}
+
+/** The refusal when a template has no runtime service to write into. */
+function noRuntimeServiceError(who) {
+  return new Error(
+    `${who}: this checkout's runtime compose template declares no ` +
+      `\`${INSTANCE_RUNTIME_SERVICE}\` service, so there is no runtime to start and nowhere to ` +
+      `say what this start says about it. Update the checkout, then re-run this command.`,
+  );
+}
+
+/**
+ * Publish the runtime port on the plan's bind address. The template publishes
+ * `"<runtime-port>:<container-port>"` with no host address — every interface
+ * of the machine — so the address is put in front of it; one the template
+ * already names is replaced, so the document says exactly one. Written the way
+ * docker's parser reads it: `"<address>:<runtime-port>:<container-port>"`.
+ */
+function publishOnBind(lines, block, plan, who) {
+  const ports = serviceKeyBlock(lines, block, "ports");
+  const entry = new RegExp(
+    `^(\\s*-\\s*)(["']?)(?:(?:\\[[0-9A-Fa-f:.]*\\]|[^\\s"'\\[\\]:]*):)?` +
+      `(${plan.runtimePort}:\\d+(?:/[a-z]+)?)\\2(\\s*(?:#.*)?)$`,
+  );
+  let published = 0;
+  if (ports) {
+    for (let i = ports.at + 1; i < ports.end; i += 1) {
+      lines[i] = lines[i].replace(entry, (_, dash, _quote, spec, rest) => {
+        published += 1;
+        return `${dash}"${plan.bind}:${spec}"${rest}`;
+      });
+    }
+  }
+  if (published === 0) {
+    throw new Error(
+      `${who}: this checkout's runtime compose template does not publish the runtime on port ` +
+        `${plan.runtimePort}, so the address it is to be published on (${plan.bind}) could not ` +
+        `be put in front of it. Update the checkout, then re-run this command.`,
+    );
+  }
+}
+
+/**
+ * Hand the runtime service the context attest key by REFERENCE, beside the
+ * bridge token — `CINATRA_CONTEXT_ATTEST_KEY: "${CINATRA_CONTEXT_ATTEST_KEY}"`,
+ * which compose resolves from the launch environment, exactly as the template
+ * references the token. The checkout's template names the token and not this
+ * key, so the line is ADDED; a template that already names the key keeps its
+ * own line. A service with no environment mapping to add it to is refused
+ * rather than launched without it: the runtime refuses to start without it.
+ */
+function referenceAttestKey(lines, block, who) {
+  const key = INSTANCE_RUNTIME_CONTEXT_ATTEST_KEY;
+  const env = serviceKeyBlock(lines, block, "environment");
+  const entries = env ? lines.slice(env.at + 1, env.end) : [];
+  if (!env || entries.some((line) => /^\s*-/.test(line))) {
+    throw new Error(
+      `${who}: this checkout's runtime compose template gives its ` +
+        `\`${INSTANCE_RUNTIME_SERVICE}\` service no environment mapping, so ${key} could not be ` +
+        `added to it — and the runtime refuses to start without it. Update the checkout, then ` +
+        `re-run this command.`,
+    );
+  }
+  const entryIndent = env.entryIndent ?? `${block.childIndent}  `;
+  const sets = (name) => (line) => line.startsWith(`${entryIndent}${name}:`);
+  if (entries.some(sets(key))) return;
+  const token = entries.findIndex(sets(INSTANCE_RUNTIME_BRIDGE_TOKEN_KEY));
+  const at = token === -1 ? env.end : env.at + 2 + token; // just after the token's line
+  lines.splice(at, 0, `${entryIndent}${key}: "\${${key}}"`);
+  block.end += 1;
+}
+
+/**
  * The document this verb WRITES, from the document the template rendered.
  *
- * A start that names nothing writes exactly what the checkout's template
- * renders, as it always has. What an operator NAMES is this start's choice
- * rather than the checkout's, so it is said here, on the runtime service alone:
+ * Two things are said on every start, because the checkout's template does
+ * not say them and a runtime started without them cannot serve an instance:
+ *
+ *   * THE INTERFACE. The template publishes the runtime port on every
+ *     interface of the machine; the start publishes it on its bind address —
+ *     this machine's loopback unless `--bind` names another.
+ *   * THE CONTEXT ATTEST KEY. The template hands the container the bridge
+ *     token and not this key, so its line is added beside the token's, as a
+ *     reference the launch environment resolves.
+ *
+ * What an operator NAMES is this start's choice rather than the checkout's,
+ * so it is said here too, on the runtime service alone:
  *
  *   * THE CALLBACK. The template dials the app through the container's gateway
  *     to the host, which is right when nobody named an address and wrong when
@@ -650,20 +856,15 @@ function escapeRegExp(value) {
  * already on disk to answer "is there anything to do?".
  */
 export function instanceRuntimeComposeDocument(rendered, plan) {
-  const document = String(rendered);
+  const who = `Instance "${plan.slug}"`;
   const templateCallback = `http://${INSTANCE_RUNTIME_GATEWAY_HOST}:${plan.appPort}`;
   const callbackNamed = plan.callbackUrl !== templateCallback;
-  if (!callbackNamed && !plan.imageNamed && !plan.containerNamed) return document;
 
-  const lines = document.split("\n");
+  const lines = String(rendered).split("\n");
   const block = runtimeServiceBlock(lines);
-  if (!block) {
-    throw new Error(
-      `Instance "${plan.slug}": this checkout's runtime compose template declares no ` +
-        `\`${INSTANCE_RUNTIME_SERVICE}\` service, so what you named could not be written into it. ` +
-        `Update the checkout, then re-run this command.`,
-    );
-  }
+  if (!block) throw noRuntimeServiceError(who);
+
+  publishOnBind(lines, block, plan, who);
 
   if (callbackNamed) {
     // The full port only: the callback on 3301 must never match the front of an
@@ -689,6 +890,8 @@ export function instanceRuntimeComposeDocument(rendered, plan) {
     }
   }
 
+  referenceAttestKey(lines, block, who);
+
   /** Set one key on the service: in place when the template has it, else added. */
   const setServiceKey = (key, value) => {
     const line = `${block.childIndent}${key}: "${value}"`;
@@ -702,6 +905,22 @@ export function instanceRuntimeComposeDocument(rendered, plan) {
   };
   if (plan.imageNamed) setServiceKey("image", plan.image);
   if (plan.containerNamed) setServiceKey("container_name", plan.container);
+  return lines.join("\n");
+}
+
+/**
+ * The document the per-clone road (`instance clone start`) writes from the
+ * same template: what it renders, with the context attest key referenced
+ * beside the bridge token — the one line that road's container would
+ * otherwise never be given. Nothing else changes: that road publishes the
+ * ports its registry row holds, as the template says.
+ */
+export function cloneRuntimeComposeDocument(rendered, slug) {
+  const who = `Clone "${slug}"`;
+  const lines = String(rendered).split("\n");
+  const block = runtimeServiceBlock(lines);
+  if (!block) throw noRuntimeServiceError(who);
+  referenceAttestKey(lines, block, who);
   return lines.join("\n");
 }
 
@@ -796,11 +1015,41 @@ export function callbackProbeScript(callbackUrl) {
   );
 }
 
-/** The probe, as an ARGUMENT VECTOR: the script is one argv element, so it is
- *  handed to `node -e` by the kernel and never to a shell — no quoting of the
- *  callback address, and nothing in it for a shell to interpret. */
-export function containerCallbackProbeArgs(plan) {
-  return ["exec", plan.container, "node", "-e", callbackProbeScript(plan.callbackUrl)];
+/** The same question for an image without node — which the runtime image is:
+ *  it carries python only. A GET of the app's health route under the same
+ *  bound, and any 2xx or 3xx answer is an app that answered. */
+export function callbackProbePythonScript(callbackUrl) {
+  const target = JSON.stringify(`${callbackUrl}${INSTANCE_APP_HEALTH_PATH}`);
+  const seconds = INSTANCE_RUNTIME_CALLBACK_PROBE_TIMEOUT_MS / 1_000;
+  return [
+    "import sys, urllib.error, urllib.request",
+    "try:",
+    `    status = urllib.request.urlopen(${target}, timeout=${seconds}).status`,
+    "except urllib.error.HTTPError as err:",
+    "    status = err.code",
+    "except Exception:",
+    "    status = 0",
+    "sys.exit(0 if 200 <= status < 400 else 1)",
+  ].join("\n");
+}
+
+/** Each interpreter's probe, as the words that follow `docker exec <container>`. */
+const CALLBACK_PROBE_COMMANDS = {
+  node: (callbackUrl) => ["node", "-e", callbackProbeScript(callbackUrl)],
+  python3: (callbackUrl) => ["python3", "-c", callbackProbePythonScript(callbackUrl)],
+};
+
+/** The probe for one interpreter, as an ARGUMENT VECTOR: the script is one argv
+ *  element, so it is handed to the interpreter by the kernel and never to a
+ *  shell — no quoting of the callback address, and nothing in it for a shell
+ *  to interpret. */
+export function containerCallbackProbeArgs(
+  plan,
+  interpreter = INSTANCE_RUNTIME_PROBE_INTERPRETERS[0],
+) {
+  const command = CALLBACK_PROBE_COMMANDS[interpreter];
+  if (!command) throw new Error(`There is no callback probe for "${interpreter}".`);
+  return ["exec", plan.container, ...command(plan.callbackUrl)];
 }
 
 // --- reading ---------------------------------------------------------------
@@ -824,12 +1073,12 @@ export function containerBelongsToInstance(plan, result = {}) {
 }
 
 /**
- * What the in-container probe ANSWERED. "The app is unreachable" is only one of
- * the things a non-zero `docker exec` means: an image without `node` on its
- * PATH answers 127 (and a non-executable one 126), and a docker CLI that never
- * ran at all answers with a spawn error. Reading all three as "cannot reach the
- * app" would send the operator to fix an address that is fine, so they are told
- * apart here.
+ * What ONE in-container probe ANSWERED. "The app is unreachable" is only one
+ * of the things a non-zero `docker exec` means: an image without the
+ * interpreter on its PATH answers 127 (and a non-executable one 126), and a
+ * docker CLI that never ran at all answers with a spawn error. Reading all
+ * three as "cannot reach the app" would send the operator to fix an address
+ * that is fine, so they are told apart here.
  *
  * @returns {"ok"|"unreachable"|"no-interpreter"|"probe-failed"}
  */
@@ -842,20 +1091,47 @@ export function callbackProbeVerdict(result = {}) {
   return "unreachable";
 }
 
+/**
+ * Ask the callback question inside the container with each interpreter in
+ * turn, until one RUNS. An image without an interpreter answers 126 or 127,
+ * and then the next one is asked: the runtime image carries python and no
+ * node, and reading its answer to `node` as the answer would refuse a runtime
+ * that reaches the app fine. The answer names the interpreter that gave it;
+ * `no-interpreter`, with none named, is left for an image that has none of
+ * them.
+ *
+ * @param {object} plan
+ * @param {(args: string[]) => object} exec  runs one `docker` argument list and
+ *        returns its spawn result
+ * @returns {{ verdict: "ok"|"unreachable"|"no-interpreter"|"probe-failed",
+ *             interpreter: string|null, result: object }}
+ */
+export function probeCallbackInsideContainer(plan, exec) {
+  let result = {};
+  for (const interpreter of INSTANCE_RUNTIME_PROBE_INTERPRETERS) {
+    result = exec(containerCallbackProbeArgs(plan, interpreter)) ?? {};
+    const verdict = callbackProbeVerdict(result);
+    if (verdict !== "no-interpreter") return { verdict, interpreter, result };
+  }
+  return { verdict: "no-interpreter", interpreter: null, result };
+}
+
 // --- the refusal -----------------------------------------------------------
 
 /** The refusal when the container cannot reach the app. It NAMES THE CALLBACK
  *  ADDRESS — whatever that address turned out to be — because that address is
  *  the thing that is wrong and the operator cannot see it from outside the
- *  container. It carries no credential: it is an origin and nothing more. */
-export function unreachableAppMessage(plan) {
+ *  container, and the interpreter the question was asked with. It carries no
+ *  credential: it is an origin and nothing more. */
+export function unreachableAppMessage(plan, interpreter = null) {
+  const asked = interpreter ? ` (asked from inside it with ${interpreter})` : "";
   return (
     `Instance "${plan.slug}": the agent runtime container ${plan.container} cannot reach this ` +
-    `instance's app at ${plan.callbackUrl}. That is the address the runtime calls back on, and ` +
-    `every agent run fails until it answers. Start this instance's app on port ${plan.appPort} ` +
-    `first, or name an address the CONTAINER can reach it on — \`--app-url\` is honoured exactly ` +
-    `as you write it, and inside a container this machine's own loopback means the container ` +
-    `itself. Then re-run this command.`
+    `instance's app at ${plan.callbackUrl}${asked}. That is the address the runtime calls back ` +
+    `on, and every agent run fails until it answers. Start this instance's app on port ` +
+    `${plan.appPort} first, or name an address the CONTAINER can reach it on — \`--app-url\` ` +
+    `is honoured exactly as you write it, and inside a container this machine's own loopback ` +
+    `means the container itself. Then re-run this command.`
   );
 }
 
@@ -886,13 +1162,17 @@ export function missingNamedImageMessage(plan) {
 }
 
 /** The refusal for a callback probe that did not answer "ok" — the address when
- *  the address is the thing that is wrong, and the probe itself when it is. */
-export function callbackProbeFailureMessage(plan, result = {}) {
-  const verdict = callbackProbeVerdict(result);
-  if (verdict === "unreachable") return unreachableAppMessage(plan);
+ *  the address is the thing that is wrong, and the probe itself when it is.
+ *  Reads what `probeCallbackInsideContainer` answered (a bare spawn result is
+ *  read as the answer of one probe). */
+export function callbackProbeFailureMessage(plan, outcome = {}) {
+  const result = outcome?.result ?? outcome;
+  const verdict = outcome?.verdict ?? callbackProbeVerdict(result);
+  if (verdict === "unreachable") return unreachableAppMessage(plan, outcome?.interpreter ?? null);
+  const named = INSTANCE_RUNTIME_PROBE_INTERPRETERS.map((name) => `\`${name}\``).join(" nor ");
   const why =
     verdict === "no-interpreter"
-      ? `\`node\` could not be run inside it`
+      ? `the probe could not be run inside it: the image carries neither ${named}`
       : `the probe could not be run at all (${result?.error?.message ?? "docker exec failed"})`;
   return (
     `Instance "${plan.slug}": the agent runtime container ${plan.container} answered on ` +
@@ -900,6 +1180,6 @@ export function callbackProbeFailureMessage(plan, result = {}) {
     `${plan.callbackUrl} is not known — and a runtime that cannot reach the app fails every agent ` +
     `run at its first call. Read the container's own words with \`docker logs ${plan.container}\`, ` +
     `and build the image again (\`--rebuild\` for this checkout's own ` +
-    `${INSTANCE_RUNTIME_DEFAULT_IMAGE}) if it carries no node, then re-run this command.`
+    `${INSTANCE_RUNTIME_DEFAULT_IMAGE}) if it carries neither, then re-run this command.`
   );
 }
