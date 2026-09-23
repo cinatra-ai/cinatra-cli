@@ -619,6 +619,16 @@ could be any container's on the machine, neither command stops or removes a
 container under it unless it is this instance's own runtime. The port is taken
 as given: it is yours to pick, not drawn from a pool.
 
+The port is published on your machine's loopback, so the runtime answers this
+machine and no other. `--bind <address>` publishes it on another interface
+instead. Docker publishes a port on an IP address and refuses a name there, so
+name the interface by its address — `localhost` is taken as the loopback, and
+the all-zeros address is every IPv4 interface, much as a start published it
+before this flag existed. The document the start writes says
+`"<address>:<port>:3010"`, and a value that is not an address is refused before
+anything is started. `stop` takes no `--bind`: it removes the container,
+wherever it was published.
+
 `--app-url` is the address the runtime calls the app back on, and it is
 honoured **exactly as you write it** — scheme, host and port, nothing else. So
 it must be an address that answers **from inside the container**, not merely
@@ -659,15 +669,28 @@ port it published, **and** the container can reach the app at whatever callback
 address it was given. It asks that second question inside the container,
 because that is the only place the answer is true, and if the answer is no it
 refuses and names the address the runtime was trying to reach — rather than
-leaving you a runtime that looks up and fails at its first agent run. Re-run it
-against a healthy container and it writes nothing and exits 0 (`--rebuild`
-aside); "healthy" means it answers **and** it is the container this command
-would start now, so one that was started on a different port or for a different
-app address is replaced rather than reported as fine.
+leaving you a runtime that looks up and fails at its first agent run. The
+question is asked with `node`, or with `python3` when the image has no node
+(this checkout's own runtime image carries python only), and the answer says
+which of the two gave it; only an image that carries neither is reported as one
+the question could not be asked in. Re-run it against a healthy container and
+it writes nothing and exits 0 (`--rebuild` aside); "healthy" means it answers
+**and** it is the container this command would start now, so one that was
+started on a different port or interface, or for a different app address, is
+replaced rather than reported as fine.
 
-The runtime's shared secret with the app is read from that instance's own
-`.env.local` and handed to the container at launch. It is never printed, never
-passed on a command line, and never written into any file this command creates.
+The runtime needs two secrets from that instance's own `.env.local`: its shared
+secret with the app (`CINATRA_BRIDGE_TOKEN`), and the key it signs its context
+callbacks with (`CINATRA_CONTEXT_ATTEST_KEY`) — without either it refuses to
+start. Both are read by key and handed to the container at launch. The
+checkout's compose template names the first and not the second, so the document
+this command writes adds the second's `${CINATRA_CONTEXT_ATTEST_KEY}` reference
+beside the first's. Neither value is ever printed, passed on a command line, or
+written into any file this command creates, and a start whose `.env.local`
+lacks one is refused by name before anything is started.
+`cinatra instance clone start` hands its clone's runtime the attest key the
+same way, from the clone's own `.env.local`, and refuses by name a clone whose
+file carries none.
 
 To take one down — and nothing else on the machine with it:
 

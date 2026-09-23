@@ -377,6 +377,40 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`cinatra instance wayflow start --instance <name>` now starts a runtime that
+  can serve its instance.** Three things kept a runtime started this way from
+  ever doing so. First, the container was never handed the key the runtime
+  signs its context callbacks with (`CINATRA_CONTEXT_ATTEST_KEY`): the
+  checkout's compose template names the bridge token and not that key, the
+  command handed over the token alone, and the runtime's loader refuses to
+  start without the key — so the container never answered and every start
+  failed its health wait. The key now travels exactly as the token does: read
+  from the instance's own `.env.local` by key, handed to the container through
+  the launch environment, and never printed, never on a command line and never
+  in a file the command writes. The document the start writes gains the one
+  line the template lacks — the key's `${CINATRA_CONTEXT_ATTEST_KEY}`
+  reference, beside the token's — and a `.env.local` without the key is refused
+  by name before anything is built, replaced or started. `cinatra instance
+  clone start` had the same omission; it now hands its clone's runtime the key
+  from the clone's own `.env.local` and refuses by name the same way. Second,
+  the check that the container can reach the app ran `node` inside an image
+  that carries python only, so a runtime whose app was reachable was refused as
+  one whose check could not run. The question is now asked with `node` and,
+  when the image has none, with `python3` — a GET of the app's health route
+  under the same 5 s bound — the answer names which of the two gave it, only an
+  image with neither is reported as one the question could not be asked in, and
+  every refusal still names the callback address. Third, the runtime port was
+  published on every interface of the machine. It is now published on the
+  machine's loopback, and `--bind <address>` names another interface — by its
+  IP address, because docker publishes on addresses and refuses a name there
+  (`localhost` is taken as the loopback). The document says
+  `"<address>:<port>:3010"`, a value that is not an address is refused before
+  anything is started, and `stop` refuses `--bind` like every other start flag.
+  **This changes where a runtime started this way can be reached from:** a
+  caller on another machine that dialled this machine's own address no longer
+  reaches it — pass `--bind` with that interface's address, or the all-zeros
+  address for every IPv4 interface.
+
 - **`cinatra install` now mints the instance encryption key in every mode, so an
   instance can be provisioned before its first boot.** The intended unattended
   order is install, then the checkout's provisioning step, then the first boot.

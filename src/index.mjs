@@ -209,13 +209,13 @@ import {
 import {
   INSTANCE_RUNTIME_BRIDGE_TOKEN_KEY,
   INSTANCE_RUNTIME_CALLBACK_PROBE_TIMEOUT_MS,
+  INSTANCE_RUNTIME_CONTEXT_ATTEST_KEY,
   INSTANCE_RUNTIME_SERVICE,
   INSTANCE_RUNTIME_STOP_TIMEOUT_SECONDS,
   callbackProbeFailureMessage,
-  callbackProbeVerdict,
+  cloneRuntimeComposeDocument,
   composeInstanceRuntimeUpArgs,
   containerBelongsToInstance,
-  containerCallbackProbeArgs,
   containerNameIsChosen,
   dockerContainerProjectArgs,
   dockerImageInspectArgs,
@@ -230,6 +230,7 @@ import {
   parseInstanceRuntimeFlags,
   instanceRuntimeTemplateVars,
   parseRuntimeContainerState,
+  probeCallbackInsideContainer,
   recordedContainerName,
   resolveInstanceRuntimePlan,
 } from "./instance-runtime.mjs";
@@ -1096,7 +1097,7 @@ Usage:
   cinatra instance wayflow start --instance <name> --runtime-port <n>
                                  [--app-url <scheme://host:port>]
                                  [--image <tag> | --rebuild]
-                                 [--container <name>]
+                                 [--container <name>] [--bind <address>]
   cinatra instance wayflow stop --instance <name>
   cinatra instance a2a start|stop
   cinatra instance backup create [--file <path>]
@@ -1317,10 +1318,19 @@ Commands:
                       \`--container <name>\` names the container, and \`stop\`
                       reads that name back; left out it is
                       \`cinatra-instance-<name>-wayflow-1\` in compose project
-                      \`cinatra-instance-<name>\`. It returns only
+                      \`cinatra-instance-<name>\`. The runtime port is
+                      published on this machine's loopback; \`--bind <address>\`
+                      names another interface by its IP address (\`localhost\`
+                      is the loopback), and \`stop\` takes no \`--bind\`. The
+                      bridge token and the context attest key are read from the
+                      instance's .env.local by key and handed to the container
+                      at launch; a missing one is refused by name before
+                      anything starts. It returns only
                       once the runtime answers AND the container can reach the
-                      app, refusing with that address named when it cannot; a
-                      re-run against a healthy container writes nothing.
+                      app — asked inside it with node, or python3 when the
+                      image has no node — refusing with that address named
+                      when it cannot; a re-run against a healthy container
+                      writes nothing.
   instance a2a start|stop
                       Start or stop the A2A dev test peers on THIS checkout's
                       ISOLATED stack (the \`a2a-peers\` compose profile), and wire
@@ -11401,6 +11411,25 @@ async function runCloneStart(argv) {
   }
   const worktreePath = slot.worktreePath;
 
+  // The key the runtime signs its context callbacks with (cinatra-cli#281),
+  // read from the clone's own .env.local by KEY and refused by name before
+  // anything is started: the runtime's loader refuses to start without it. It
+  // reaches the container through the compose launch environment alone — the
+  // rendered document carries only its `${…}` reference — and is never printed.
+  const cloneEnvPath = path.join(worktreePath, ".env.local");
+  const attestKey = String(
+    readEnvVarFromWorktree(worktreePath, INSTANCE_RUNTIME_CONTEXT_ATTEST_KEY) ?? "",
+  ).trim();
+  if (!attestKey) {
+    throw new Error(
+      `Clone "${slug}": ${cloneEnvPath} carries no ${INSTANCE_RUNTIME_CONTEXT_ATTEST_KEY}. The ` +
+        `agent runtime signs its context callbacks to the app with it and refuses to start ` +
+        `without one. Re-run \`cinatra install\` on the main checkout to mint it, then ` +
+        `'cinatra instance clone new --force' to carry it into this clone, and retry. The value ` +
+        `is read from that file and never printed.`,
+    );
+  }
+
   const repoRoot = findRepoRootFromWorktree(worktreePath);
   const projectName = cloneComposeProjectName(slug, slot.index);
   // Legacy hostname kept as the backfill candidate for already-
@@ -11608,6 +11637,9 @@ async function runCloneStart(argv) {
         CLONE_STATE_DIR: cloneRuntimeDir(slug),
         TAILSCALE_NETWORK_MODE: tailscaleHostNetwork ? "host" : "bridge",
       },
+      // The template hands the runtime the bridge token and not the attest
+      // key, so the key's reference is added beside the token's.
+      transform: (rendered) => cloneRuntimeComposeDocument(rendered, slug),
     });
 
     // Write Tailscale serve config only when the sidecar is enabled.
@@ -11686,11 +11718,12 @@ async function runCloneStart(argv) {
     }
 
     // Bring up WayFlow (+ Tailscale if enabled). Pass the clone-specific
-    // bridge token so the per-clone WayFlow doesn't inherit main's
-    // CINATRA_BRIDGE_TOKEN from the operator's shell.
+    // bridge token and the clone's own attest key so the per-clone WayFlow
+    // doesn't inherit main's values from the operator's shell.
     const composeEnv = {
       ...process.env,
       CINATRA_BRIDGE_TOKEN: bridgeToken,
+      [INSTANCE_RUNTIME_CONTEXT_ATTEST_KEY]: attestKey,
     };
     if (tailscaleEnabled) composeEnv.TS_AUTHKEY = tsAuthkey;
     const services = ["wayflow"];
@@ -13074,19 +13107,24 @@ async function reconcileIsolatedWayflowRoute({ repoRoot, composeFiles, row, log 
 //   1. NOTHING ELSE IS TOUCHED. Every argument list names this instance's own
 //      project or its own container: `up` is scoped to the one service, and the
 //      stop stops and removes that one container by name.
-//   2. THE CREDENTIAL TRAVELS THE WAY IT ALREADY DOES. The bridge token is read
-//      from the instance's own environment file and handed to the launch
-//      through the launch environment, exactly as the per-clone road hands it
-//      over; the rendered document keeps the `${CINATRA_BRIDGE_TOKEN}`
-//      placeholder compose resolves at exec time. The value never reaches an
-//      argument list, the output, or a file this verb writes.
+//   2. THE CREDENTIALS TRAVEL THE WAY THEY ALREADY DO. The bridge token and the
+//      context attest key (cinatra-cli#281) are read from the instance's own
+//      environment file by key and handed to the launch through the launch
+//      environment, exactly as the per-clone road hands them over; the rendered
+//      document keeps only the `${…}` references compose resolves at exec time
+//      — the template's own for the token, and one this verb adds beside it
+//      for the key, which the template does not name. No value reaches an
+//      argument list, the output, or a file this verb writes. The runtime is
+//      published on this machine's loopback unless `--bind` names another
+//      address.
 //   3. IT IS HEALTH-GATED AT BOTH ENDS. The verb returns only once the runtime
 //      answers on the port it published AND the container itself can reach the
 //      app — the second question asked INSIDE the container, because that is
-//      the only place the answer is true. A container that cannot reach the app
-//      is a runtime whose every agent run fails at its first call, discovered
-//      late and by whoever was trying to use the instance, so the refusal NAMES
-//      THE CALLBACK ADDRESS.
+//      the only place the answer is true, with `node` and else `python3`,
+//      whichever the image carries. A container that cannot reach the app is a
+//      runtime whose every agent run fails at its first call, discovered late
+//      and by whoever was trying to use the instance, so the refusal NAMES THE
+//      CALLBACK ADDRESS.
 //
 // Re-running it against a healthy container writes nothing and returns — and
 // "healthy" is both halves: the container answers AND it was launched from the
@@ -13219,8 +13257,9 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
   }
 
   /** What THIS start says in the rendered document beyond the template: the
-   *  callback, the image and the container's name the operator named — and
-   *  nothing at all when they named none of them. */
+   *  interface the runtime port is published on and the attest key's
+   *  reference on every start, and the callback, the image and the
+   *  container's name when the operator named them. */
   const ownDocument = (rendered) => instanceRuntimeComposeDocument(rendered, plan);
 
   /** The document this invocation WOULD write, without writing it. */
@@ -13300,6 +13339,18 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
         `value is read from that file and never printed.`,
     );
   }
+  // Its sibling, the same way (cinatra-cli#281): the key the runtime signs its
+  // context callbacks with. The runtime's loader refuses to start without it,
+  // so a launch without it is a container that never answers.
+  const attestKey = String(env[INSTANCE_RUNTIME_CONTEXT_ATTEST_KEY] ?? "").trim();
+  if (!attestKey) {
+    throw new Error(
+      `Instance "${plan.slug}": ${envPath} carries no ${INSTANCE_RUNTIME_CONTEXT_ATTEST_KEY}. ` +
+        `The agent runtime signs its context callbacks to the app with it and refuses to start ` +
+        `without one. Re-run \`cinatra install\` on this checkout to mint it, then retry. The ` +
+        `value is read from that file and never printed.`,
+    );
+  }
 
   // THE IMAGE THE CONTAINER RUNS (cinatra-cli#279). An image the operator NAMED
   // is theirs: this verb neither pulls it nor builds it, so an absent one is a
@@ -13343,12 +13394,16 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
 
   const upArgs = composeInstanceRuntimeUpArgs(plan);
   log(`Starting the agent runtime for instance "${plan.slug}" (docker ${upArgs.join(" ")}) ...`);
-  // The token is handed over HERE and nowhere else — the same hand-over the
-  // per-clone road makes, and for the same reason: an operator's shell may
-  // carry ANOTHER instance's token, and the instance's own file must win.
+  // The two keys are handed over HERE and nowhere else — the same hand-over
+  // the per-clone road makes, and for the same reason: an operator's shell may
+  // carry ANOTHER instance's values, and the instance's own file must win.
   const up = spawn("docker", upArgs, {
     cwd: repoRoot,
-    env: { ...process.env, [INSTANCE_RUNTIME_BRIDGE_TOKEN_KEY]: bridgeToken },
+    env: {
+      ...process.env,
+      [INSTANCE_RUNTIME_BRIDGE_TOKEN_KEY]: bridgeToken,
+      [INSTANCE_RUNTIME_CONTEXT_ATTEST_KEY]: attestKey,
+    },
     stdio: ["ignore", "inherit", "inherit"],
     // The image is already ensured above, so this is a create+start; the bound
     // is the same one a cold image build is given, and it exists so a wedged
@@ -13373,25 +13428,32 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
     );
   }
 
-  const reach = spawn("docker", containerCallbackProbeArgs(plan), {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: probeTimeoutMs,
-  });
-  // "Unreachable" is a VERDICT, not every non-zero exit: an image without node
-  // answers 126/127 and a docker CLI that never ran answers with an error, and
-  // naming the callback address for either would send the operator to fix an
-  // address that is fine. The probe's own output is never echoed — it is read
-  // for its exit status alone.
-  if (callbackProbeVerdict(reach) !== "ok") {
+  // Asked with `node`, and with `python3` when the image has no node — the
+  // runtime image carries python only (cinatra-cli#281).
+  const reach = probeCallbackInsideContainer(plan, (args) =>
+    spawn("docker", args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: probeTimeoutMs,
+    }),
+  );
+  // "Unreachable" is a VERDICT, not every non-zero exit: an image with neither
+  // interpreter answers 126/127 and a docker CLI that never ran answers with an
+  // error, and naming the callback address for either would send the operator
+  // to fix an address that is fine. The probe's own output is never echoed —
+  // it is read for its exit status alone.
+  if (reach.verdict !== "ok") {
     throw new Error(callbackProbeFailureMessage(plan, reach));
   }
 
   log(`Instance "${plan.slug}": agent runtime started.`);
-  log(`  runtime:   ${plan.runtimeUrl}`);
+  log(`  runtime:   ${plan.runtimeUrl} (published on ${plan.bind})`);
   log(`  container: ${plan.container} (compose project ${plan.composeProject})`);
   log(`  image:     ${plan.image}`);
-  log(`  calls this instance's app back at: ${plan.callbackUrl}`);
+  log(
+    `  calls this instance's app back at: ${plan.callbackUrl} ` +
+      `(reached from inside the container with ${reach.interpreter})`,
+  );
   log(
     `  the loader mounts every agent installed in this checkout; allow up to ~2 min on a cold start.`,
   );

@@ -33,7 +33,15 @@
 //      the shared preamble) and `stop` never touches the connector source.
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -190,6 +198,12 @@ describe("extension-empty CLI bootstrap — post-config handlers degrade gracefu
     writeFileSync(
       path.join(worktree, ".env.local"),
       "SUPABASE_DB_URL=postgres://nope:nope@127.0.0.1:5999/cinatra_clone_coldtest\nSUPABASE_SCHEMA=cinatra\n",
+    );
+    // A clone start refuses a file that carries no context attest key before
+    // anything else (cinatra-cli#281), so this clone's file carries one.
+    appendFileSync(
+      path.join(worktree, ".env.local"),
+      "CINATRA_CONTEXT_ATTEST_KEY=cold-test-attest-key\n",
     );
     const registry = {
       version: 1,

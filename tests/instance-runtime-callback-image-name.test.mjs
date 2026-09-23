@@ -23,8 +23,8 @@
 //     is refused beside `--image`;
 //   * the name — `--container <name>` is validated the way the engine
 //     validates one and rendered as the runtime service's own
-//     `container_name`; without it the document is the template's, untouched,
-//     and compose's own naming gives the documented derivation. `stop` takes
+//     `container_name`; without it the document names no container, and
+//     compose's own naming gives the documented derivation. `stop` takes
 //     down the container the START RECORDED, and neither verb stops or removes
 //     a container under a chosen name that is not this instance's.
 //
@@ -79,6 +79,16 @@ const RELAY = "http://relay.internal:3301";
 // than written out.
 const DOTTED = [192, 0, 2, 10].join(".");
 
+// This machine's loopback address, assembled the same way: a start publishes
+// the runtime port on it unless `--bind` names another (cinatra-cli#281).
+const LOOPBACK = [127, 0, 0, 1].join(".");
+
+// The runtime refuses to start without its context attest key, so every
+// instance these tests start carries one, and the document references it
+// beside the bridge token (cinatra-cli#281).
+const ATTEST_KEY = "CINATRA_CONTEXT_ATTEST_KEY";
+const ATTEST = "attest-key-value-that-must-never-be-echoed";
+
 // The OCI annotation, spelled out rather than imported: it is the name a caller
 // reads off a running container's image, so it is a published contract and a
 // test that re-derives it from the source proves nothing about it.
@@ -93,7 +103,9 @@ let home;
 let checkout;
 const made = [];
 
-function makeCheckout(envBody = `${INSTANCE_RUNTIME_BRIDGE_TOKEN_KEY}=${TOKEN}\nPORT=3300\n`) {
+function makeCheckout(
+  envBody = `${INSTANCE_RUNTIME_BRIDGE_TOKEN_KEY}=${TOKEN}\n${ATTEST_KEY}=${ATTEST}\nPORT=3300\n`,
+) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "cin-279-co-"));
   made.push(dir);
   mkdirSync(path.join(dir, "docker", "wayflow"), { recursive: true });
@@ -201,10 +213,11 @@ function serviceAsRendered(callback, { image = "    image: cinatra-wayflow:local
   return [
     image,
     "    ports:",
-    '      - "3910:3010"',
+    `      - "${LOOPBACK}:3910:3010"`,
     "    environment:",
     `      CINATRA_BASE_URL: "${callback}"`,
     '      CINATRA_BRIDGE_TOKEN: "${CINATRA_BRIDGE_TOKEN}"',
+    '      CINATRA_CONTEXT_ATTEST_KEY: "${CINATRA_CONTEXT_ATTEST_KEY}"',
     '      WAYFLOW_BASE_URL: "http://localhost:3910"',
     "    volumes:",
     `      - "${checkout}/extensions:/agents:ro"`,
@@ -243,7 +256,8 @@ describe("the callback address the container is given", () => {
   // instance's own environment — which publishes the app under this machine's
   // loopback, and inside a container that means the container. The gateway
   // rewrite is the right default exactly here, and only here; and a start that
-  // names nothing writes the template's document untouched.
+  // names nothing writes the template's document with only what every start
+  // adds — the interface the port is published on, and the attest key.
   it("still dials the container's gateway to the host when nobody named one", async () => {
     expect(planFor([], { PORT: "3305" }).callbackUrl).toBe(
       `http://${INSTANCE_RUNTIME_GATEWAY_HOST}:3305`,
@@ -387,10 +401,12 @@ describe("the callback address the container is given", () => {
         "    # comments decide nothing",
         "    image: cinatra-wayflow:local",
         "    ports:",
-        '      - "3910:3010"',
+        `      - "${LOOPBACK}:3910:3010"`,
         "    environment:",
         `      CINATRA_BASE_URL: "${RELAY}"`,
         '      NEIGHBOUR_URL: "http://host.docker.internal:33010"',
+        // No bridge token to stand beside: the key closes the mapping.
+        '      CINATRA_CONTEXT_ATTEST_KEY: "${CINATRA_CONTEXT_ATTEST_KEY}"',
         "",
       ].join("\n"),
     );
