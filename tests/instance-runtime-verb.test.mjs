@@ -12,7 +12,10 @@
 //   * the rendered compose — the runtime port it publishes, the callback
 //     address the runtime dials the app on, and the bridge credential left as
 //     the literal `${CINATRA_BRIDGE_TOKEN}` placeholder compose resolves at
-//     exec time;
+//     exec time. An address the operator NAMES is handed over as written and a
+//     DERIVED one goes through the container's gateway to the host; the two
+//     roads and their refusals are pinned in full by
+//     `instance-runtime-callback-image-name.test.mjs` (cinatra-cli#279);
 //   * the health gate — the verb returns only once the runtime answers, and
 //     refuses NAMING THE CALLBACK ADDRESS when the container cannot reach the
 //     app;
@@ -93,6 +96,10 @@ const TEMPLATE = `services:
 `;
 
 const TOKEN = "bridge-token-value-that-must-never-be-echoed";
+
+// An address the operator names for the app, handed to the container as
+// written (cinatra-cli#279).
+const RELAY = "http://relay.internal:3301";
 
 let home;
 let checkout;
@@ -229,19 +236,12 @@ describe("two instances on one machine", () => {
 });
 
 describe("the rendered compose carries the port, the name and the callback address", () => {
-  it("publishes the operator's runtime port and dials the operator's app port", async () => {
+  it("publishes the operator's runtime port and dials the operator's app address", async () => {
     const { run, launches } = runner({ inspect: ABSENT });
-    await run("start", [
-      "--instance",
-      "web-a",
-      "--runtime-port",
-      "3910",
-      "--app-url",
-      "http://127.0.0.1:3301",
-    ]);
+    await run("start", ["--instance", "web-a", "--runtime-port", "3910", "--app-url", RELAY]);
     const rendered = readFileSync(instanceRuntimeComposePath("web-a", { home }), "utf8");
     expect(rendered).toContain('"3910:3010"');
-    expect(rendered).toContain(`http://${INSTANCE_RUNTIME_GATEWAY_HOST}:3301`);
+    expect(rendered).toContain(RELAY);
     expect(rendered).toContain(`${checkout}/extensions:/agents:ro`);
 
     const up = launches.find(({ args }) => args.includes("up"));
@@ -270,20 +270,23 @@ describe("the rendered compose carries the port, the name and the callback addre
     expect(instanceRuntimeTemplateVars(plan).NEXTJS_PORT).toBe(3305);
   });
 
-  it("refuses an address that does not name this machine", () => {
-    expect(() =>
-      parseInstanceRuntimeFlags(["--instance", "web-a", "--app-url", "http://example.test:3000"]),
-    ).toThrow(/--app-url/);
+  // The HOST is the operator's to name: they name it because they know what
+  // the container can reach, and the verb proves it with its own in-container
+  // probe rather than checking it against a list of names for this machine.
+  it("takes any host the operator names", () => {
+    expect(
+      parseInstanceRuntimeFlags(["--instance", "web-a", "--app-url", "http://example.test:3000"])
+        .appUrl,
+    ).toBe("http://example.test:3000");
   });
 
-  // The rendered document dials the app at `http://host.docker.internal:<port>`
-  // and this verb has no other scheme to give it, so an https address would be
-  // taken and then not used — the same silent no-op the foreign-host check
-  // above exists to prevent.
-  it("refuses an https address rather than accepting it and dialling http", () => {
+  // A refusal is kept where the CONTAINER could not dial what was written: the
+  // runtime has an http client and no other, so a scheme it cannot dial would
+  // be taken here and then not used.
+  it("refuses a scheme the runtime has no client for", () => {
     expect(() =>
-      parseInstanceRuntimeFlags(["--instance", "web-a", "--app-url", "https://127.0.0.1:3000"]),
-    ).toThrow(/http/);
+      parseInstanceRuntimeFlags(["--instance", "web-a", "--app-url", "ftp://example.test:3000"]),
+    ).toThrow(/--app-url/);
   });
 
   it("never echoes a credential the operator typed into the address", () => {
@@ -304,22 +307,18 @@ describe("the rendered compose carries the port, the name and the callback addre
     expect(message).not.toContain(secret);
   });
 
-  it("drops a path or a query instead of carrying it into the document", () => {
-    const plan = resolveInstanceRuntimePlan({
-      verb: "start",
-      argv: [
+  // The address is handed to the container as an ORIGIN it appends its own
+  // paths to, so a path or a query would be taken and then not used — refused
+  // rather than silently dropped (cinatra-cli#279).
+  it("refuses a path or a query instead of dropping it", () => {
+    expect(() =>
+      parseInstanceRuntimeFlags([
         "--instance",
         "web-a",
-        "--runtime-port",
-        "3910",
         "--app-url",
-        "http://127.0.0.1:3301/app?tenant=a#top",
-      ],
-      repoRoot: checkout,
-      home,
-    });
-    expect(plan.appUrl).toBe("http://127.0.0.1:3301");
-    expect(plan.callbackUrl).toBe(`http://${INSTANCE_RUNTIME_GATEWAY_HOST}:3301`);
+        "http://localhost:3301/app?tenant=a#top",
+      ]),
+    ).toThrow(/--app-url/);
   });
 });
 
@@ -341,8 +340,8 @@ describe("the health gate", () => {
   it("refuses NAMING THE CALLBACK ADDRESS when the container cannot reach the app", async () => {
     const { run } = runner({ inspect: ABSENT, exec: { status: 1, stdout: "" } });
     await expect(
-      run("start", ["--instance", "web-a", "--runtime-port", "3910", "--app-url", "http://127.0.0.1:3301"]),
-    ).rejects.toThrow(`http://${INSTANCE_RUNTIME_GATEWAY_HOST}:3301`);
+      run("start", ["--instance", "web-a", "--runtime-port", "3910", "--app-url", RELAY]),
+    ).rejects.toThrow(`cannot reach this instance's app at ${RELAY}`);
   });
 
   // A refused address fails at once; a BLACK-HOLED one leaves `fetch` waiting
@@ -372,18 +371,18 @@ describe("the health gate", () => {
   it("asks the question INSIDE the container, at the address the runtime dials", () => {
     const plan = resolveInstanceRuntimePlan({
       verb: "start",
-      argv: ["--instance", "web-a", "--runtime-port", "3910", "--app-url", "http://127.0.0.1:3301"],
+      argv: ["--instance", "web-a", "--runtime-port", "3910", "--app-url", RELAY],
       repoRoot: checkout,
       home,
     });
     const args = containerCallbackProbeArgs(plan);
     expect(args.slice(0, 2)).toEqual(["exec", "cinatra-instance-web-a-wayflow-1"]);
-    expect(args.join(" ")).toContain(`http://${INSTANCE_RUNTIME_GATEWAY_HOST}:3301`);
+    expect(args.join(" ")).toContain(RELAY);
   });
 });
 
 describe("idempotence", () => {
-  const FLAGS = ["--instance", "web-a", "--runtime-port", "3910", "--app-url", "http://127.0.0.1:3301"];
+  const FLAGS = ["--instance", "web-a", "--runtime-port", "3910", "--app-url", RELAY];
 
   it("a healthy container of this document is left alone: nothing written, nothing launched, exit 0", async () => {
     // A first start writes the document this instance's runtime was launched
@@ -414,7 +413,7 @@ describe("idempotence", () => {
       "--runtime-port",
       "3910",
       "--app-url",
-      "http://127.0.0.1:3400",
+      "http://relay.internal:3400",
     ]);
     const verbs = launches.map(({ args }) => args[0]);
     expect(verbs).toContain("rm");
@@ -422,8 +421,8 @@ describe("idempotence", () => {
     expect(lines.join("\n")).not.toMatch(/nothing to do/i);
 
     const rendered = readFileSync(instanceRuntimeComposePath("web-a", { home }), "utf8");
-    expect(rendered).toContain(`http://${INSTANCE_RUNTIME_GATEWAY_HOST}:3400`);
-    expect(rendered).not.toContain(`http://${INSTANCE_RUNTIME_GATEWAY_HOST}:3301`);
+    expect(rendered).toContain("http://relay.internal:3400");
+    expect(rendered).not.toContain(RELAY);
   });
 
   it("a running container with no document of its own is replaced, never assumed current", async () => {

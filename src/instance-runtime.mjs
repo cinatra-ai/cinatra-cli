@@ -27,24 +27,40 @@
 // starts an instance and the verb that starts its runtime can never name two
 // different containers for one instance.
 //
-// THE CALLBACK ADDRESS. The runtime calls the app back on the address the
-// rendered compose gives it, and inside a container the host's own loopback
-// means the container itself. So the operator names the address on THIS machine
-// (`--app-url http://127.0.0.1:<port>`, or the instance's own environment) and
-// the rendered document dials it through the container's host gateway. That is
-// also what makes the verb work on a rootless engine, where a container cannot
-// otherwise reach a loopback-bound app.
+// THE CALLBACK ADDRESS, AND WHO OWNS IT. The runtime calls the app back on the
+// address the rendered compose gives it, and inside a container this machine's
+// own loopback means the container itself. So there are two roads, and they are
+// deliberately different:
+//
+//   * NOBODY NAMED ONE. The address is derived from the instance's own
+//     environment, which publishes the app under this machine's loopback — and
+//     a container cannot dial that. It is therefore dialled through the
+//     container's gateway to the host, which is also what makes the verb work
+//     on an engine running containers without root.
+//   * THE OPERATOR NAMED ONE (`--app-url`). It is honoured EXACTLY as written.
+//     An operator who puts a relay address on this machine's loopback interface
+//     and forwards the app port to it has an address the container can dial,
+//     and second-guessing it would hand the container an address the operator
+//     has already found does not work. What a string check cannot settle the
+//     verb settles for real: it probes that address FROM INSIDE the container
+//     it started, and refuses the start when it cannot be reached.
 //
 // Public surface:
 //   - selector:   parseInstanceRuntimeFlags, instanceRuntimeRequested
 //   - derivation: instanceComposeProject, instanceRuntimeContainer,
-//                 instanceRuntimeComposePath, appUrlFromEnv,
-//                 resolveInstanceRuntimePlan, instanceRuntimeTemplateVars
+//                 containerNameIsChosen, instanceRuntimeComposePath,
+//                 appUrlFromEnv, resolveInstanceRuntimePlan,
+//                 instanceRuntimeTemplateVars
+//   - document:   instanceRuntimeComposeDocument, recordedContainerName
 //   - invocation: composeInstanceRuntimeUpArgs, dockerRuntimeInspectArgs,
-//                 dockerRuntimeStopArgs, dockerRuntimeRemoveArgs,
-//                 containerCallbackProbeArgs, callbackProbeScript
-//   - reading:    parseRuntimeContainerState, callbackProbeVerdict
-//   - refusal:    unreachableAppMessage, callbackProbeFailureMessage
+//                 dockerContainerProjectArgs, dockerRuntimeStopArgs,
+//                 dockerRuntimeRemoveArgs, dockerImageInspectArgs,
+//                 imageRevisionLabelArgs, containerCallbackProbeArgs,
+//                 callbackProbeScript
+//   - reading:    parseRuntimeContainerState, containerBelongsToInstance,
+//                 callbackProbeVerdict
+//   - refusal:    unreachableAppMessage, callbackProbeFailureMessage,
+//                 missingNamedImageMessage, foreignContainerMessage
 // ---------------------------------------------------------------------------
 
 import path from "node:path";
@@ -89,19 +105,32 @@ export const INSTANCE_RUNTIME_STOP_TIMEOUT_SECONDS = 10;
  *  own header timeout (minutes), and `docker exec` waits with it. */
 export const INSTANCE_RUNTIME_CALLBACK_PROBE_TIMEOUT_MS = 5_000;
 
-/** The addresses that mean "the app on THIS machine". Anything else is refused:
- *  the rendered document reaches the app through the host gateway, so an address
- *  naming another machine would be accepted and then silently not used. */
-const APP_URL_HOSTS = new Set([
-  "localhost",
-  "127.0.0.1",
-  "::1",
-  "[::1]",
-  INSTANCE_RUNTIME_GATEWAY_HOST,
-]);
+/** The name this machine answers to on its own loopback interface. Used where a
+ *  loopback address is MEANT — the derivation below, and the examples in the
+ *  refusals — so no literal address is written into this tool. */
+export const INSTANCE_LOOPBACK_HOST = "localhost";
+
+/** The image this checkout builds for its own agent runtime, and the only image
+ *  this verb ever builds. An image named with `--image` is the operator's, and
+ *  is never built and never pulled. */
+export const INSTANCE_RUNTIME_DEFAULT_IMAGE = "cinatra-wayflow:local";
+
+/** The label a built image carries so a caller can read a running container's
+ *  image and know which commit of the checkout it was built from. The OCI
+ *  annotation, under its standard name — nothing invented. */
+export const INSTANCE_RUNTIME_IMAGE_REVISION_LABEL = "org.opencontainers.image.revision";
+
+/** What docker accepts as a container name, and how long. Pinned here because
+ *  `--container` hands the value to the engine, and a name the engine refuses
+ *  must fail on the flag rather than halfway through a launch. */
+const CONTAINER_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+const CONTAINER_NAME_MAX_LENGTH = 63;
 
 /** The flags this verb accepts, each taking one value. */
-const VALUE_FLAGS = ["--instance", "--runtime-port", "--app-url"];
+const VALUE_FLAGS = ["--instance", "--runtime-port", "--app-url", "--image", "--container"];
+
+/** The flags this verb accepts that take no value. */
+const BOOLEAN_FLAGS = ["--rebuild"];
 
 // --- flag parsing ----------------------------------------------------------
 
@@ -133,6 +162,7 @@ export function instanceRuntimeExtraTokens(argv = []) {
       continue;
     }
     if (VALUE_FLAGS.some((flag) => token.startsWith(`${flag}=`))) continue;
+    if (BOOLEAN_FLAGS.includes(token)) continue;
     extra.push(token);
   }
   return extra;
@@ -178,48 +208,135 @@ function quotableAppUrl(value) {
   return String(value ?? "").replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/?#]*@/, "$1");
 }
 
-/** Validate the callback address and reduce it to its origin. */
+/** Is this a name for the machine speaking it? Every address in the loopback
+ *  block counts, not only the first, and so do both spellings of the v6 one.
+ *  Inside a container these mean the CONTAINER, which is why a DERIVED address
+ *  naming one is dialled through the container's gateway to the host instead. */
+function isLoopbackHost(hostname) {
+  const host = String(hostname ?? "").toLowerCase();
+  if (host === INSTANCE_LOOPBACK_HOST || host === "::1" || host === "[::1]") return true;
+  return /^127(?:\.\d{1,3}){3}$/.test(host);
+}
+
+/** The port the operator actually TYPED. `new URL` ELIDES a scheme's own
+ *  default port, and this verb renders that number into the document and dials
+ *  it from inside the container, so an address written with the default port
+ *  spelled out must not read as an address with no port at all. */
+function typedPort(raw, parsed) {
+  if (parsed.port) return parsed.port;
+  const authority = raw.slice(raw.indexOf("//") + 2).split(/[/?#]/)[0];
+  const host = authority.slice(authority.lastIndexOf("@") + 1);
+  const match = /:(\d+)$/.exec(host);
+  return match ? match[1] : "";
+}
+
+/** The port an origin NAMES, read the same way on both roads — so an app on a
+ *  scheme's own default port renders as that number and not as nothing at all. */
+function originPort(origin) {
+  return Number.parseInt(typedPort(origin, new URL(origin)), 10);
+}
+
+/**
+ * Validate the callback address and reduce it to its origin.
+ *
+ * WHAT IS REFUSED is what the CONTAINER could not dial, or could not dial as
+ * written: a scheme the runtime has no client for, a missing or out-of-range
+ * port, and anything besides scheme, host and port — the address is handed
+ * over as an ORIGIN the runtime appends its own paths to, so a user name or a
+ * password before the host, or a path, a query or a fragment after it, would be
+ * accepted here and then not used.
+ *
+ * WHAT IS NOT REFUSED is the HOST. The address is honoured exactly as written,
+ * so any host the operator names is theirs to name: a relay address on this
+ * machine's loopback interface, a dotted address, a hostname, or the container's
+ * own gateway to the host. Whether it answers is not a question a string check
+ * can settle — the verb settles it by probing the address from INSIDE the
+ * container it started.
+ */
 function assertAppUrl(value) {
   const raw = String(value ?? "").trim();
   const shown = quotableAppUrl(value);
+  const example = `\`--app-url http://${INSTANCE_LOOPBACK_HOST}:3000\``;
   let parsed;
   try {
     parsed = new URL(raw);
   } catch {
     throw new Error(
-      `Invalid --app-url "${shown}". Pass the address this machine serves the instance's app ` +
-        `on, e.g. \`--app-url http://127.0.0.1:3000\`.`,
+      `Invalid --app-url "${shown}". Pass the address the agent runtime container reaches this ` +
+        `instance's app on — scheme, host and port — e.g. ${example}.`,
     );
   }
-  // http ONLY. The rendered document dials the app at
-  // `http://host.docker.internal:<port>` — the template writes that scheme and
-  // this verb has no other one to give it — so an https address would be taken
-  // and then not used, which is exactly what the host check below refuses an
-  // address for.
-  if (parsed.protocol !== "http:") {
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new Error(
-      `Invalid --app-url "${shown}". The agent runtime dials the app over http through this ` +
-        `machine's gateway (http://${INSTANCE_RUNTIME_GATEWAY_HOST}:<port>), so any other scheme ` +
-        `would be accepted here and then not used. Name the http address the app listens on, ` +
-        `e.g. \`--app-url http://127.0.0.1:3000\`.`,
+      `Invalid --app-url "${shown}". The agent runtime dials the app over http or https and has ` +
+        `no client for "${parsed.protocol.replace(/:$/, "")}", so this address would be accepted ` +
+        `here and then not used. Name the address the app listens on, e.g. ${example}.`,
     );
   }
-  if (!APP_URL_HOSTS.has(parsed.hostname.toLowerCase())) {
+  // A CREDENTIAL is refused rather than dropped. Only an origin reaches the
+  // container, and this address is also written into the document this command
+  // writes and named in its refusals — no place for a password. The message
+  // quotes the address without it.
+  if (parsed.username !== "" || parsed.password !== "") {
     throw new Error(
-      `Invalid --app-url "${shown}". The agent runtime reaches the app through this machine's own ` +
-        `gateway, so the address must name THIS machine (${[...APP_URL_HOSTS].join(", ")}); the ` +
-        `runtime dials it as http://${INSTANCE_RUNTIME_GATEWAY_HOST}:<port>.`,
+      `Invalid --app-url "${shown}". It carries a user name or a password before the host, and ` +
+        `the runtime is handed an ORIGIN — scheme, host and port — so they would be taken here ` +
+        `and then not used. Drop them, e.g. ${example}.`,
     );
   }
-  if (!parsed.port) {
+  if (parsed.pathname !== "/" || parsed.search !== "" || parsed.hash !== "") {
     throw new Error(
-      `Invalid --app-url "${shown}". Name the port the app listens on, ` +
-        `e.g. \`--app-url http://127.0.0.1:3000\`.`,
+      `Invalid --app-url "${shown}". This is an ORIGIN — scheme, host and port — because the ` +
+        `runtime appends its own paths to it, so a path, a query or a fragment here would be ` +
+        `taken and then not used. Drop everything after the port, e.g. ${example}.`,
     );
   }
-  // The origin ALONE: a path, a query or a fragment is dropped here rather than
-  // carried into the rendered document, which takes a port and nothing else.
-  return `${parsed.protocol}//${parsed.hostname}:${parsed.port}`;
+  const port = Number.parseInt(typedPort(raw, parsed), 10);
+  if (!Number.isInteger(port)) {
+    throw new Error(
+      `Invalid --app-url "${shown}". Name the port the app listens on, e.g. ${example}.`,
+    );
+  }
+  if (port < 1 || port > 65535) {
+    throw new Error(
+      `Invalid --app-url "${shown}". The port must be between 1 and 65535, and ${port} is not.`,
+    );
+  }
+  // The ORIGIN, as written: this is the address the container is handed, so the
+  // scheme and the host the operator named are both carried through.
+  return `${parsed.protocol}//${parsed.hostname}:${port}`;
+}
+
+/** Validate an image reference. It reaches a docker argument list and a
+ *  double-quoted scalar in a compose document, so whitespace, quotes, a
+ *  backslash, a `$` — which compose would read as a variable to substitute —
+ *  and a leading dash — which the engine would read as a flag — are refused
+ *  rather than passed on. None of them belongs in an image reference. */
+function assertImageRef(value) {
+  const ref = String(value ?? "").trim();
+  if (ref === "" || ref.startsWith("-") || /[\s"'`\\$]/.test(ref)) {
+    throw new Error(
+      `Invalid --image "${String(value ?? "")}". Pass the image the container should run, as ` +
+        `docker names one — a repository and a tag, e.g. ` +
+        `\`--image ${INSTANCE_RUNTIME_DEFAULT_IMAGE}\`.`,
+    );
+  }
+  return ref;
+}
+
+/** Validate a container name the way the engine does, so a name it would refuse
+ *  fails on the flag rather than halfway through a launch. */
+function assertContainerName(value) {
+  const name = String(value ?? "").trim();
+  if (!CONTAINER_NAME_PATTERN.test(name) || name.length > CONTAINER_NAME_MAX_LENGTH) {
+    throw new Error(
+      `Invalid --container "${String(value ?? "")}". A container name is what the engine accepts ` +
+        `as one: it starts with a letter or a digit and carries letters, digits, \`_\`, \`.\` and ` +
+        `\`-\` after that, at most ${CONTAINER_NAME_MAX_LENGTH} characters. Leave the flag out and ` +
+        `this instance's runtime is named cinatra-instance-<name>-wayflow-1.`,
+    );
+  }
+  return name;
 }
 
 /**
@@ -235,16 +352,35 @@ export function parseInstanceRuntimeFlags(argv = []) {
     throw new Error(
       `Unexpected argument(s) for 'cinatra instance wayflow': ${extra.join(" ")}. ` +
         `Expected: cinatra instance wayflow start --instance <name> --runtime-port <port> ` +
-        `[--app-url <url>], or cinatra instance wayflow stop --instance <name>.`,
+        `[--app-url <url>] [--image <tag>|--rebuild] [--container <name>], or ` +
+        `cinatra instance wayflow stop --instance <name>.`,
     );
   }
   const rawSlug = readFlag(argv, "--instance");
   const rawPort = readFlag(argv, "--runtime-port");
   const rawAppUrl = readFlag(argv, "--app-url");
+  const rawImage = readFlag(argv, "--image");
+  const rawContainer = readFlag(argv, "--container");
+  const image = rawImage === null ? null : assertImageRef(rawImage);
+  const rebuild = (Array.isArray(argv) ? argv : []).includes("--rebuild");
+  // TWO DIFFERENT IMAGES. `--rebuild` builds THIS CHECKOUT's own image again;
+  // `--image` runs one the operator built or pulled themselves, which this verb
+  // never builds. Asked for together they name two images to run, so both are
+  // named back rather than one of them silently winning.
+  if (rebuild && image !== null) {
+    throw new Error(
+      `\`--rebuild\` and \`--image ${image}\` cannot be used together: --rebuild builds this ` +
+        `checkout's own ${INSTANCE_RUNTIME_DEFAULT_IMAGE} again and runs that, while --image runs ` +
+        `an image you built or pulled yourself and is never built here. Pass one or the other.`,
+    );
+  }
   return {
     slug: rawSlug === null ? null : assertSlug(rawSlug),
     runtimePort: rawPort === null ? null : assertPort("--runtime-port", rawPort),
     appUrl: rawAppUrl === null ? null : assertAppUrl(rawAppUrl),
+    image,
+    container: rawContainer === null ? null : assertContainerName(rawContainer),
+    rebuild,
   };
 }
 
@@ -267,6 +403,14 @@ export function instanceRuntimeContainer(slug) {
   return `${instanceComposeProject(slug)}-${INSTANCE_RUNTIME_SERVICE}-1`;
 }
 
+/** Must a container found under this plan's name PROVE it is this instance's
+ *  before this verb stops or removes it? The derived name is this instance's
+ *  by construction. A name the operator chose could be any container's on the
+ *  machine. */
+export function containerNameIsChosen(plan) {
+  return plan.container !== instanceRuntimeContainer(plan.slug);
+}
+
 /** Where this instance's rendered runtime compose lives. */
 export function instanceRuntimeComposePath(slug, opts) {
   return path.join(cloneRuntimeDir(slug, opts), INSTANCE_RUNTIME_COMPOSE_FILE);
@@ -281,14 +425,14 @@ export function instanceRuntimeComposePath(slug, opts) {
  */
 export function appUrlFromEnv(env = {}) {
   const port = Number.parseInt(String(env?.PORT ?? ""), 10);
-  if (Number.isInteger(port) && port > 0) return `http://127.0.0.1:${port}`;
+  if (Number.isInteger(port) && port > 0) return `http://${INSTANCE_LOOPBACK_HOST}:${port}`;
   for (const key of ["NEXT_PUBLIC_APP_URL", "BETTER_AUTH_URL"]) {
     const raw = typeof env?.[key] === "string" ? env[key].trim() : "";
     if (!raw) continue;
     try {
       const parsed = new URL(raw);
       const parsedPort = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
-      return `http://127.0.0.1:${parsedPort}`;
+      return `http://${INSTANCE_LOOPBACK_HOST}:${parsedPort}`;
     } catch {
       /* not an address — keep looking */
     }
@@ -336,7 +480,11 @@ export function resolveInstanceRuntimePlan({
     repoRoot,
     service: INSTANCE_RUNTIME_SERVICE,
     composeProject: instanceComposeProject(slug),
-    container: instanceRuntimeContainer(slug),
+    // Without `--container` the name is compose's own for the project's one
+    // service, and the document says nothing about it; with it, the document
+    // records it and a `stop` reads it back.
+    container: chosen.container ?? instanceRuntimeContainer(slug),
+    containerNamed: chosen.container != null,
     composePath: instanceRuntimeComposePath(slug, opts),
     stateDir,
     // Inert: this verb brings up the runtime service alone and never the
@@ -348,17 +496,29 @@ export function resolveInstanceRuntimePlan({
     appUrl: null,
     appPort: null,
     callbackUrl: null,
+    image: chosen.image ?? INSTANCE_RUNTIME_DEFAULT_IMAGE,
+    // The operator NAMED the image, so it is theirs: never built, never pulled.
+    imageNamed: chosen.image != null,
+    rebuild: chosen.rebuild === true,
   };
   if (verb !== "start") {
     // A flag this verb READS must be a flag this verb HONOURS. A stop removes
-    // the container the instance already has; a port or an address named here
-    // would be validated and then dropped on the floor, so it is refused
-    // instead of silently ignored.
-    if (chosen.runtimePort != null || chosen.appUrl != null) {
+    // the container the instance already has — under the name its START
+    // recorded — so a port, an address, an image or a name given here would be
+    // validated and then dropped on the floor. It is refused instead of
+    // silently ignored.
+    if (
+      chosen.runtimePort != null ||
+      chosen.appUrl != null ||
+      chosen.image != null ||
+      chosen.container != null ||
+      chosen.rebuild
+    ) {
       throw new Error(
-        `\`cinatra instance wayflow ${verb} --instance ${slug}\` takes no \`--runtime-port\` or ` +
-          `\`--app-url\`: it removes the agent runtime container this instance already has, so ` +
-          `neither value would be used. Drop them — \`start\` is the verb that takes them.`,
+        `\`cinatra instance wayflow ${verb} --instance ${slug}\` takes no \`--runtime-port\`, ` +
+          `\`--app-url\`, \`--image\`, \`--container\` or \`--rebuild\`: it removes the agent ` +
+          `runtime container this instance already has, under the name its start recorded, so ` +
+          `none of these values would be used. Drop them — \`start\` is the verb that takes them.`,
       );
     }
     return plan;
@@ -381,9 +541,21 @@ export function resolveInstanceRuntimePlan({
   plan.runtimeUrl = `http://localhost:${plan.runtimePort}`;
   plan.runtimeHealthUrl = `${plan.runtimeUrl}${INSTANCE_RUNTIME_HEALTH_PATH}`;
 
-  plan.appUrl = chosen.appUrl ?? appUrlFromEnv(env) ?? `http://127.0.0.1:${DEFAULT_APP_PORT}`;
-  plan.appPort = Number.parseInt(new URL(plan.appUrl).port, 10);
-  plan.callbackUrl = `http://${INSTANCE_RUNTIME_GATEWAY_HOST}:${plan.appPort}`;
+  plan.appUrl =
+    chosen.appUrl ?? appUrlFromEnv(env) ?? `http://${INSTANCE_LOOPBACK_HOST}:${DEFAULT_APP_PORT}`;
+  const app = new URL(plan.appUrl);
+  plan.appPort = originPort(plan.appUrl);
+  // THE TWO ROADS. An address the operator NAMED is the address the container
+  // is given, character for character: they named it because they know what the
+  // container can reach, and rewriting it would undo the only thing the flag is
+  // for. A DERIVED address comes from the instance's own environment, which
+  // publishes the app under this machine's loopback — which inside a container
+  // means the container — so that one is dialled through the container's
+  // gateway to the host, exactly as it always was.
+  plan.callbackUrl =
+    chosen.appUrl == null && isLoopbackHost(app.hostname)
+      ? `http://${INSTANCE_RUNTIME_GATEWAY_HOST}:${plan.appPort}`
+      : plan.appUrl;
   return plan;
 }
 
@@ -398,6 +570,157 @@ export function instanceRuntimeTemplateVars(plan) {
     CLONE_STATE_DIR: plan.stateDir,
     TAILSCALE_NETWORK_MODE: "bridge",
   };
+}
+
+// --- the document this verb writes -----------------------------------------
+
+/** Neither a key nor a value: a blank line, or a comment at any indentation. */
+function isInertLine(line) {
+  return /^\s*(?:#.*)?$/.test(line);
+}
+
+/**
+ * The runtime service's own block inside a rendered compose document, or null.
+ * Line-oriented on purpose: this module substitutes into a template rather than
+ * serializing YAML, and the same discipline holds here. The service is found by
+ * its key AT THE INDENTATION OF A SERVICE, so a `wayflow:` nested inside another
+ * service (under its `depends_on:`, say) is never taken for it; its block runs
+ * to the next line indented no deeper than that key; comments decide nothing;
+ * and nothing outside the block is ever touched.
+ *
+ * @returns {{ at: number, end: number, childIndent: string }|null}
+ */
+function runtimeServiceBlock(lines) {
+  const servicesAt = lines.findIndex((line) => /^services:\s*(?:#.*)?$/.test(line));
+  if (servicesAt === -1) return null;
+  const indentOf = (line) => /^\s*/.exec(line)[0];
+  let serviceIndent = null;
+  for (let i = servicesAt + 1; i < lines.length; i += 1) {
+    if (isInertLine(lines[i])) continue;
+    const indent = indentOf(lines[i]);
+    if (indent === "") return null; // the next top-level key ends `services:`
+    serviceIndent ??= indent;
+    if (indent !== serviceIndent) continue; // a key of some service, not a service
+    const key = lines[i].slice(indent.length).replace(/\s*(?:#.*)?$/, "");
+    if (key !== `${INSTANCE_RUNTIME_SERVICE}:`) continue;
+    let end = i + 1;
+    while (
+      end < lines.length &&
+      (isInertLine(lines[end]) || indentOf(lines[end]).length > indent.length)
+    ) {
+      end += 1;
+    }
+    // Blank and comment lines trailing the block introduce whatever follows it.
+    while (end > i + 1 && isInertLine(lines[end - 1])) end -= 1;
+    const child = lines.slice(i + 1, end).find((line) => !isInertLine(line));
+    return { at: i, end, childIndent: child ? indentOf(child) : `${indent}  ` };
+  }
+  return null;
+}
+
+/** The line of a key set directly on the runtime service, or -1. */
+function serviceKeyLine(lines, block, key) {
+  for (let i = block.at + 1; i < block.end; i += 1) {
+    if (lines[i].startsWith(`${block.childIndent}${key}:`)) return i;
+  }
+  return -1;
+}
+
+/** A literal string, as a regular expression matches it. */
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * The document this verb WRITES, from the document the template rendered.
+ *
+ * A start that names nothing writes exactly what the checkout's template
+ * renders, as it always has. What an operator NAMES is this start's choice
+ * rather than the checkout's, so it is said here, on the runtime service alone:
+ *
+ *   * THE CALLBACK. The template dials the app through the container's gateway
+ *     to the host, which is right when nobody named an address and wrong when
+ *     somebody did — so an address the operator named replaces it.
+ *   * THE IMAGE. The tag is theirs; the template's own is this checkout's.
+ *   * THE CONTAINER'S NAME. Written as the service's `container_name`, which is
+ *     what makes the engine use it — and what a later `stop` reads back,
+ *     instead of re-deriving a name this start did not use.
+ *
+ * Pure: text in, text out. The caller writes it, or compares it with what is
+ * already on disk to answer "is there anything to do?".
+ */
+export function instanceRuntimeComposeDocument(rendered, plan) {
+  const document = String(rendered);
+  const templateCallback = `http://${INSTANCE_RUNTIME_GATEWAY_HOST}:${plan.appPort}`;
+  const callbackNamed = plan.callbackUrl !== templateCallback;
+  if (!callbackNamed && !plan.imageNamed && !plan.containerNamed) return document;
+
+  const lines = document.split("\n");
+  const block = runtimeServiceBlock(lines);
+  if (!block) {
+    throw new Error(
+      `Instance "${plan.slug}": this checkout's runtime compose template declares no ` +
+        `\`${INSTANCE_RUNTIME_SERVICE}\` service, so what you named could not be written into it. ` +
+        `Update the checkout, then re-run this command.`,
+    );
+  }
+
+  if (callbackNamed) {
+    // The full port only: the callback on 3301 must never match the front of an
+    // address on 33010.
+    const pattern = new RegExp(`${escapeRegExp(templateCallback)}(?![0-9])`, "g");
+    let replaced = 0;
+    for (let i = block.at + 1; i < block.end; i += 1) {
+      lines[i] = lines[i].replace(pattern, () => {
+        replaced += 1;
+        return plan.callbackUrl;
+      });
+    }
+    // Said out loud rather than written silently: an address that could not be
+    // put in place is an address the container would not be given, and the
+    // operator would find that out at the probe with no idea why.
+    if (replaced === 0) {
+      throw new Error(
+        `Instance "${plan.slug}": this checkout's runtime compose template does not dial the app ` +
+          `at ${templateCallback}, so the address you named (${plan.callbackUrl}) could not be put ` +
+          `in its place and the container would not have been given it. Update the checkout, or ` +
+          `drop \`--app-url\` to use the address the template names.`,
+      );
+    }
+  }
+
+  /** Set one key on the service: in place when the template has it, else added. */
+  const setServiceKey = (key, value) => {
+    const line = `${block.childIndent}${key}: "${value}"`;
+    const at = serviceKeyLine(lines, block, key);
+    if (at !== -1) {
+      lines[at] = line;
+      return;
+    }
+    lines.splice(block.at + 1, 0, line);
+    block.end += 1;
+  };
+  if (plan.imageNamed) setServiceKey("image", plan.image);
+  if (plan.containerNamed) setServiceKey("container_name", plan.container);
+  return lines.join("\n");
+}
+
+/** The container name a written document RECORDS on the runtime service, or
+ *  `fallback`. A `stop` reads this instead of re-deriving a name: a start given
+ *  `--container <name>` wrote that name here, and the derivation would then
+ *  stop nothing at all. A document that is not there, or that names no
+ *  container, falls back to what the caller derived — the name compose itself
+ *  gives the service. */
+export function recordedContainerName(document, fallback = null) {
+  const lines = String(document ?? "").split("\n");
+  const block = runtimeServiceBlock(lines);
+  if (!block) return fallback;
+  const at = serviceKeyLine(lines, block, "container_name");
+  if (at === -1) return fallback;
+  const match = /^\s*container_name:\s*(["']?)([A-Za-z0-9][A-Za-z0-9_.-]*)\1\s*(?:#.*)?$/.exec(
+    lines[at],
+  );
+  return match ? match[2] : fallback;
 }
 
 // --- the invocations -------------------------------------------------------
@@ -418,10 +741,36 @@ export function composeInstanceRuntimeUpArgs(plan) {
   ];
 }
 
+/** Is that image on this machine? Asked of a NAMED image before anything is
+ *  started, because an image the operator named is one this verb never pulls
+ *  and never builds — so its absence is a refusal, not a build. */
+export function dockerImageInspectArgs(image) {
+  return ["image", "inspect", image];
+}
+
+/** The label that ties a built image to the commit it was built from, so a
+ *  caller can read a running container's image and know which checkout it
+ *  carries. Outside a checkout there is no commit to name, and no label. */
+export function imageRevisionLabelArgs(revision) {
+  const sha = String(revision ?? "").trim();
+  return sha ? ["--label", `${INSTANCE_RUNTIME_IMAGE_REVISION_LABEL}=${sha}`] : [];
+}
+
 /** Read one container's state. A container that is not there answers non-zero,
  *  which `parseRuntimeContainerState` reads as absent. */
 export function dockerRuntimeInspectArgs(plan) {
   return ["inspect", "--format", "{{.State.Status}}", plan.container];
+}
+
+/** Read the compose project off a container's own labels — asked of one found
+ *  under a name the operator chose, before it is stopped or removed. */
+export function dockerContainerProjectArgs(plan) {
+  return [
+    "inspect",
+    "--format",
+    '{{index .Config.Labels "com.docker.compose.project"}}',
+    plan.container,
+  ];
 }
 
 /** Stop THAT ONE container, gracefully. */
@@ -466,6 +815,14 @@ export function parseRuntimeContainerState(result = {}) {
   return { present: true, running: status === "running", status };
 }
 
+/** Is the container that label read was asked of THIS instance's own? Only a
+ *  label naming this instance's compose project says yes. One that could not
+ *  be read is not taken on trust. */
+export function containerBelongsToInstance(plan, result = {}) {
+  if (result?.error || (result?.status ?? 1) !== 0) return false;
+  return String(result?.stdout ?? "").trim() === plan.composeProject;
+}
+
 /**
  * What the in-container probe ANSWERED. "The app is unreachable" is only one of
  * the things a non-zero `docker exec` means: an image without `node` on its
@@ -488,15 +845,43 @@ export function callbackProbeVerdict(result = {}) {
 // --- the refusal -----------------------------------------------------------
 
 /** The refusal when the container cannot reach the app. It NAMES THE CALLBACK
- *  ADDRESS, because that address is the thing that is wrong and the operator
- *  cannot see it from outside the container. */
+ *  ADDRESS — whatever that address turned out to be — because that address is
+ *  the thing that is wrong and the operator cannot see it from outside the
+ *  container. It carries no credential: it is an origin and nothing more. */
 export function unreachableAppMessage(plan) {
   return (
     `Instance "${plan.slug}": the agent runtime container ${plan.container} cannot reach this ` +
     `instance's app at ${plan.callbackUrl}. That is the address the runtime calls back on, and ` +
     `every agent run fails until it answers. Start this instance's app on port ${plan.appPort} ` +
-    `first, or name the port it listens on (\`--app-url http://127.0.0.1:<port>\`), then re-run ` +
-    `this command.`
+    `first, or name an address the CONTAINER can reach it on — \`--app-url\` is honoured exactly ` +
+    `as you write it, and inside a container this machine's own loopback means the container ` +
+    `itself. Then re-run this command.`
+  );
+}
+
+/** The refusal when a container found under a name the operator chose is not
+ *  this instance's. This command stops and removes only its own container, and
+ *  a chosen name can belong to anything on the machine. */
+export function foreignContainerMessage(plan) {
+  return (
+    `Instance "${plan.slug}": the container named ${plan.container} on this machine is not this ` +
+    `instance's agent runtime — it does not belong to compose project ${plan.composeProject} — so ` +
+    `this command has neither stopped nor removed it. It touches only its own container: remove ` +
+    `that one yourself if it is yours to remove, or start this instance's runtime under another ` +
+    `name with \`--container\`.`
+  );
+}
+
+/** The refusal when the image the operator NAMED is not on this machine. The
+ *  tag is theirs, so what belongs under it is their answer and not this verb's
+ *  guess — it neither pulls it nor builds it, and says so. */
+export function missingNamedImageMessage(plan) {
+  return (
+    `Instance "${plan.slug}": there is no image named ${plan.image} on this machine. An image you ` +
+    `name with \`--image\` is yours: this verb never pulls it and never builds it, because what ` +
+    `belongs under your own tag is your answer and not its guess. Put it there, then re-run this ` +
+    `command — or drop \`--image\` to run this checkout's own ${INSTANCE_RUNTIME_DEFAULT_IMAGE}, ` +
+    `which \`--rebuild\` builds again from the checkout you are in.`
   );
 }
 
@@ -514,6 +899,7 @@ export function callbackProbeFailureMessage(plan, result = {}) {
     `${plan.runtimeUrl}, but ${why}, so whether it can reach this instance's app at ` +
     `${plan.callbackUrl} is not known — and a runtime that cannot reach the app fails every agent ` +
     `run at its first call. Read the container's own words with \`docker logs ${plan.container}\`, ` +
-    `rebuild the \`cinatra-wayflow:local\` image if it carries no node, then re-run this command.`
+    `and build the image again (\`--rebuild\` for this checkout's own ` +
+    `${INSTANCE_RUNTIME_DEFAULT_IMAGE}) if it carries no node, then re-run this command.`
   );
 }

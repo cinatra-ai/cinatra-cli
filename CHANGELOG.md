@@ -262,6 +262,48 @@ project adheres to [Semantic Versioning](https://semver.org/).
   stopped or absent) alongside the registry row's, and says which verb closes
   the gap.
 
+- **`cinatra instance wayflow start --instance <name>` now honours the callback
+  address you name, and lets you name the image and the container.** The
+  callback is the address the agent runtime dials the app on, and the command
+  used to keep only the PORT of an `--app-url`: whatever you wrote, the
+  container was handed the app through the container engine's gateway to the
+  host. On an engine that runs containers without root that gateway cannot
+  reach an app bound to the machine's loopback, and the usual answer — put a
+  relay address on the loopback interface, forward the app port to it, and name
+  that address — was refused outright, because the address had to come from a
+  fixed list of names for this machine. `--app-url` is now honoured exactly as
+  written, scheme, host and port: any host you name is yours to name, and the
+  command proves it rather than trusting it, by probing that exact address from
+  inside the container it started and refusing the start, naming the address,
+  when it cannot be reached. What the container could not dial as written is
+  still refused — a scheme the runtime has no client for, a missing or
+  out-of-range port — and so, now, is anything besides scheme, host and port:
+  a user name or a password, a path, a query or a fragment used to be dropped
+  without a word, and the runtime is handed an origin it appends its own paths
+  to, so they would be taken and then not used. Leaving `--app-url` out is
+  unchanged: the address still comes from the instance's own `.env.local`, and
+  that one names this machine's loopback, which inside a container means the
+  container, so it is still dialled through the container's gateway to the
+  host. `--image <tag>` runs an image you built or pulled yourself; it is never
+  pulled and never built here, because what belongs under your own tag is your
+  answer and not the command's guess, so an absent one is refused before
+  anything is started or replaced. `--rebuild` builds this checkout's own image
+  again, so a checkout you have moved forward gets an image to match, and
+  replaces a running container even when that one is healthy — once the new
+  image is built, so a build that fails leaves it running. Every build of that
+  image now carries the checkout's commit under the standard
+  `org.opencontainers.image.revision` label, which is what lets a caller read a
+  running container's image and know which commit it carries. The two flags
+  name two different images to run and are refused together, naming both.
+  `--container <name>` names the container, validated the way the engine
+  validates one; the name is written into the compose document the start
+  launches from and `stop` reads it back, so a container started under a name
+  you chose is the container `stop` takes down — and because such a name could
+  be any container's on the machine, neither command stops or removes one under
+  it that is not this instance's own runtime. Without it nothing changes, and
+  the derivation is now documented: `cinatra-instance-<name>-wayflow-1` in
+  compose project `cinatra-instance-<name>`.
+
 ### Changed
 
 - **The acknowledgement an external database takes now follows the database,

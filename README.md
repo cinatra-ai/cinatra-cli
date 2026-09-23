@@ -604,26 +604,64 @@ Start one for a named instance, on the port you choose:
 
     cinatra instance wayflow start --instance team-a --runtime-port 3910
     cinatra instance wayflow start --instance team-b --runtime-port 3911 \
-        --app-url http://127.0.0.1:3301
+        --app-url http://relay.internal:3301
 
-Each instance gets its own container (`cinatra-instance-<name>-wayflow-1`) in
-its own compose project, so a second instance starts its runtime beside the
-first and neither can address the other's. The port is taken as given: it is
-yours to pick, not drawn from a pool.
+Each instance gets its own container in its own compose project, so a second
+instance starts its runtime beside the first and neither can address the
+other's. Left to itself the container is named `cinatra-instance-<name>-wayflow-1`
+in compose project `cinatra-instance-<name>` — a derivation you can compute —
+and `--container <name>` names it yourself, as the engine names containers (a
+letter or a digit, then letters, digits, `_`, `.` and `-`, at most 63
+characters). A name you give is written into the document the start launches
+from, and `cinatra instance wayflow stop --instance <name>` reads it back, so it
+takes down the container that start actually created. Because a name you choose
+could be any container's on the machine, neither command stops or removes a
+container under it unless it is this instance's own runtime. The port is taken
+as given: it is yours to pick, not drawn from a pool.
 
-`--app-url` is the address on **this machine** that the runtime calls the app
-back on. Leave it out and it comes from the instance's own `.env.local`. Inside
-a container your machine's loopback means the container itself, so the runtime
-is given the address through the container's gateway to the host — which is also
-what makes this work on an engine that runs containers without root.
+`--app-url` is the address the runtime calls the app back on, and it is
+honoured **exactly as you write it** — scheme, host and port, nothing else. So
+it must be an address that answers **from inside the container**, not merely
+one that answers from your shell: if your app is bound to your machine's
+loopback and your container engine runs without root, put a relay address on
+that interface, forward the app port to it, and name that address here. You do
+not have to take this on trust — the command proves it, by probing that exact
+address from inside the container it just started and refusing the start when
+it cannot be reached.
+
+Leave `--app-url` out and the address comes from the instance's own
+`.env.local`, which publishes the app under this machine's loopback. Inside a
+container your machine's loopback means the container itself, so that address —
+and only that one — is dialled through the container's gateway to the host,
+which is what makes the default work on an engine that runs containers without
+root.
+
+An address with a scheme the runtime cannot dial, without a port, or with a
+port out of range is refused. So is one carrying anything besides scheme, host
+and port — a user name or a password, a path, a query or a fragment — because
+the runtime is handed an origin and appends its own paths to it, so the rest
+would be taken and then not used.
+
+The container runs this checkout's own `cinatra-wayflow:local` image, built for
+you the first time it is missing. Every build labels the image with the
+checkout's commit (`org.opencontainers.image.revision`) — read it back off the
+image and you know which commit a running container carries. `--rebuild`
+builds it again before starting, so a checkout you have moved forward gets an
+image to match, and replaces a running container even when that one is healthy
+— only once the new image is built, so a build that fails leaves it running.
+`--image <tag>` runs an image you built or pulled yourself instead; that tag is
+yours, so the command never pulls it and never builds it, and refuses to start —
+touching nothing — when there is nothing under it. The two cannot be combined:
+they name two different images to run.
 
 The command returns only once both halves are true: the runtime answers on the
-port it published, **and** the container can reach the app. It asks that second
-question inside the container, because that is the only place the answer is
-true, and if the answer is no it refuses and names the address the runtime was
-trying to reach — rather than leaving you a runtime that looks up and fails at
-its first agent run. Re-run it against a healthy container and it writes nothing
-and exits 0; "healthy" means it answers **and** it is the container this command
+port it published, **and** the container can reach the app at whatever callback
+address it was given. It asks that second question inside the container,
+because that is the only place the answer is true, and if the answer is no it
+refuses and names the address the runtime was trying to reach — rather than
+leaving you a runtime that looks up and fails at its first agent run. Re-run it
+against a healthy container and it writes nothing and exits 0 (`--rebuild`
+aside); "healthy" means it answers **and** it is the container this command
 would start now, so one that was started on a different port or for a different
 app address is replaced rather than reported as fine.
 
