@@ -214,14 +214,23 @@ import {
   callbackProbeFailureMessage,
   callbackProbeVerdict,
   composeInstanceRuntimeUpArgs,
+  containerBelongsToInstance,
   containerCallbackProbeArgs,
+  containerNameIsChosen,
+  dockerContainerProjectArgs,
+  dockerImageInspectArgs,
   dockerRuntimeInspectArgs,
   dockerRuntimeRemoveArgs,
   dockerRuntimeStopArgs,
+  foreignContainerMessage,
+  imageRevisionLabelArgs,
+  instanceRuntimeComposeDocument,
   instanceRuntimeRequested,
+  missingNamedImageMessage,
   parseInstanceRuntimeFlags,
   instanceRuntimeTemplateVars,
   parseRuntimeContainerState,
+  recordedContainerName,
   resolveInstanceRuntimePlan,
 } from "./instance-runtime.mjs";
 // Pure URL-shape helper shared with the TS in-process MCP writer. The CLI
@@ -1085,7 +1094,9 @@ Usage:
   cinatra instance drupal start|stop
   cinatra instance wayflow start|stop
   cinatra instance wayflow start --instance <name> --runtime-port <n>
-                                 [--app-url http://127.0.0.1:<app port>]
+                                 [--app-url <scheme://host:port>]
+                                 [--image <tag> | --rebuild]
+                                 [--container <name>]
   cinatra instance wayflow stop --instance <name>
   cinatra instance a2a start|stop
   cinatra instance backup create [--file <path>]
@@ -1289,9 +1300,24 @@ Commands:
                       one, so several instances can run side by side on one
                       machine — each on the host port you name
                       (\`--runtime-port <n>\`, taken as given), under its own
-                      container name, calling back to that instance's app
-                      (\`--app-url http://127.0.0.1:<app port>\`; the default
-                      comes from the instance's own .env.local). It returns only
+                      container name, calling back to that instance's app.
+                      \`--app-url <scheme://host:port>\` is that callback
+                      address — scheme, host and port, nothing else — and is
+                      honoured EXACTLY as you write it, so it must be reachable
+                      FROM INSIDE the container: the command proves that with
+                      its own probe, run inside the container it started. Left
+                      out, the address comes from the instance's own .env.local
+                      and, naming this machine's loopback, is dialled through
+                      the container's gateway to the host. \`--image <tag>\`
+                      runs an image you built or pulled yourself; it is never
+                      pulled and never built here, so an absent one is refused.
+                      \`--rebuild\` (not with \`--image\`) builds this checkout's
+                      own image again, labelled with the checkout's commit, and
+                      replaces a running container even when it is healthy.
+                      \`--container <name>\` names the container, and \`stop\`
+                      reads that name back; left out it is
+                      \`cinatra-instance-<name>-wayflow-1\` in compose project
+                      \`cinatra-instance-<name>\`. It returns only
                       once the runtime answers AND the container can reach the
                       app, refusing with that address named when it cannot; a
                       re-run against a healthy container writes nothing.
@@ -10703,12 +10729,19 @@ async function ensureCloneBridgeToken(cloneConnString) {
   }
 }
 
-function ensureWayflowImage({ forceRebuild = false, repoRoot } = {}) {
+function ensureWayflowImage({
+  forceRebuild = false,
+  repoRoot,
+  readRevision = readCheckoutHeadSha,
+  rebuildFlag = "--rebuild-wayflow",
+  spawnFn = spawnSync,
+  log = console.log,
+} = {}) {
   // Stable local tag, build-on-first-start, and --rebuild-wayflow escape
   // hatch. The shared docker-compose.yml currently builds the WayFlow image
   // into an auto-named tag on every `up`; we tag it as `cinatra-wayflow:local`
   // here so the per-clone compose can reference it without rebuilding.
-  const inspect = spawnSync(
+  const inspect = spawnFn(
     "docker",
     ["image", "inspect", "cinatra-wayflow:local"],
     // Bounded (cinatra#260 Step 3): now on the setup auto-bring-up path. On
@@ -10716,10 +10749,24 @@ function ensureWayflowImage({ forceRebuild = false, repoRoot } = {}) {
     { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", timeout: DOCKER_CLI_PROBE_TIMEOUT_MS },
   );
   if (inspect.status === 0 && !forceRebuild) return;
-  console.log("Building cinatra-wayflow:local image (one-time per host)...");
-  const build = spawnSync(
+  log(
+    forceRebuild
+      ? "Rebuilding cinatra-wayflow:local image from this checkout..."
+      : "Building cinatra-wayflow:local image (one-time per host)...",
+  );
+  // WHICH COMMIT THIS IMAGE CARRIES (cinatra-cli#279). The tag is stable, so a
+  // running container says nothing about the checkout it was built from — the
+  // standard OCI revision label does, and a caller can read it back off the
+  // image. Read only now, because only a build can record it; outside a
+  // checkout there is no commit to name and the label is simply absent.
+  const sha = readRevision(repoRoot);
+  const build = spawnFn(
     "docker",
-    ["build", "-t", "cinatra-wayflow:local", path.join(repoRoot, "docker", "wayflow")],
+    [
+      "build", "-t", "cinatra-wayflow:local",
+      ...imageRevisionLabelArgs(sha),
+      path.join(repoRoot, "docker", "wayflow"),
+    ],
     // Finite safety bound (cinatra#260 Step 3): a HUNG docker build must not
     // block forever — the dev-tunnel auto-bring-up from `cinatra instance setup dev`
     // calls this path, and setup must never hang. Generous (10m) so a normal
@@ -10731,7 +10778,7 @@ function ensureWayflowImage({ forceRebuild = false, repoRoot } = {}) {
     throw new Error(
       "docker build of cinatra-wayflow:local failed" +
         (build.error?.code === "ETIMEDOUT" ? " (timed out)" : "") +
-        ". Re-run with --rebuild-wayflow once the underlying error is fixed.",
+        `. Re-run with ${rebuildFlag} once the underlying error is fixed.`,
     );
   }
 }
@@ -10761,13 +10808,17 @@ function renderComposeTemplateText(template, vars) {
   return rendered;
 }
 
-function renderCloneComposeTemplate({ templatePath, outPath, vars }) {
+function renderCloneComposeTemplate({ templatePath, outPath, vars, transform = null }) {
   // TS_AUTHKEY is rendered as the LITERAL string `${TS_AUTHKEY}` so docker
   // compose substitutes from the spawned-process env at exec time. The raw
   // secret never lands on disk.
   const rendered = renderComposeTemplateText(readFileSync(templatePath, "utf8"), vars);
+  // A caller that has something to say about the rendered document says it
+  // HERE, so the text that is written is the same text a caller can compute and
+  // compare against without writing anything (cinatra-cli#279).
+  const document = transform ? transform(rendered) : rendered;
   ensureDirOf(outPath);
-  writeFileSync(outPath, rendered, { mode: 0o600 });
+  writeFileSync(outPath, document, { mode: 0o600 });
 }
 
 function ensureDirOf(filePath) {
@@ -13054,7 +13105,18 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
   const log = deps.log ?? console.log;
   const spawn = deps.spawnSync ?? spawnSync;
   const probe = deps.probeHttp ?? probeHttp;
+  const readFile = deps.readFileSync ?? readFileSync;
+  const exists = deps.existsSync ?? existsSync;
   const homeOpts = deps.home === undefined ? undefined : { home: deps.home };
+
+  /** What the LAST start of this instance wrote, or "" when it wrote nothing. */
+  const writtenCompose = () => {
+    try {
+      return exists(plan.composePath) ? readFile(plan.composePath, "utf8") : "";
+    } catch {
+      return "";
+    }
+  };
 
   if (!(deps.isComposeAvailable ?? isComposeAvailable)()) {
     throw new Error(
@@ -13098,6 +13160,20 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
     return !removed?.error && (removed?.status ?? 1) === 0;
   };
 
+  /** A container found under a name the operator CHOSE is stopped or removed
+   *  only when its own labels say it is this instance's: that name could be
+   *  any container's on this machine, and this command touches its own alone.
+   *  The derived name is this instance's by construction and is not asked. */
+  const assertOwnContainer = () => {
+    if (!containerNameIsChosen(plan)) return;
+    const labels = spawn("docker", dockerContainerProjectArgs(plan), {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
+    });
+    if (!containerBelongsToInstance(plan, labels)) throw new Error(foreignContainerMessage(plan));
+  };
+
   /** The refusal when that removal did not happen. */
   const removalFailed = () =>
     new Error(
@@ -13107,6 +13183,13 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
     );
 
   if (verb === "stop") {
+    // THE NAME THE START RECORDED, not one re-derived now. A start given
+    // `--container <name>` wrote that name into the document it launched from,
+    // and stopping the derived name instead would stop nothing while reporting
+    // that there was nothing to stop. With no document — nothing was ever
+    // started here, or it was started by an older build — the derivation stands,
+    // because that is the name compose itself would have given the service.
+    plan.container = recordedContainerName(writtenCompose(), plan.container);
     const state = readState();
     if (!state.present) {
       log(
@@ -13115,6 +13198,7 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
       );
       return;
     }
+    assertOwnContainer();
     if (!removeContainer(state)) throw removalFailed();
     log(
       `Instance "${plan.slug}": agent runtime container ${plan.container} removed; nothing else on ` +
@@ -13128,17 +13212,26 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
   // the idempotence check below compares against is rendered FROM it, so it is
   // read before any container is touched.
   const templatePath = path.join(repoRoot, "docker", "wayflow", "compose.clone.template.yml");
-  const readFile = deps.readFileSync ?? readFileSync;
-  const exists = deps.existsSync ?? existsSync;
   if (!exists(templatePath)) {
     throw new Error(
       `Per-clone compose template missing at ${templatePath}. Is the clone runtime template present?`,
     );
   }
 
+  /** What THIS start says in the rendered document beyond the template: the
+   *  callback, the image and the container's name the operator named — and
+   *  nothing at all when they named none of them. */
+  const ownDocument = (rendered) => instanceRuntimeComposeDocument(rendered, plan);
+
   /** The document this invocation WOULD write, without writing it. */
   const wantedCompose = () =>
-    renderComposeTemplateText(readFile(templatePath, "utf8"), instanceRuntimeTemplateVars(plan));
+    ownDocument(
+      renderComposeTemplateText(readFile(templatePath, "utf8"), instanceRuntimeTemplateVars(plan)),
+    );
+
+  // A document this start could not write is refused NOW, before any container
+  // is looked at, let alone touched.
+  wantedCompose();
 
   /** Is the document the running container was launched from the one this
    *  invocation would write now? A container answering on the port asked for
@@ -13148,7 +13241,7 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
   const composeDocumentIsCurrent = () => {
     try {
       if (!exists(plan.composePath)) return false;
-      return readFile(plan.composePath, "utf8") === wantedCompose();
+      return writtenCompose() === wantedCompose();
     } catch {
       return false;
     }
@@ -13157,31 +13250,42 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
   // IDEMPOTENCE, before anything is written. A container of this name that is
   // running, answering AND launched from the document this invocation would
   // write is the state this command exists to produce, so it is reported and
-  // left exactly as it stands. One that is up but silent, one launched from a
-  // document that no longer says what was asked for, and one that is merely in
-  // the way are all replaced.
+  // left exactly as it stands — unless `--rebuild` asked for a fresh image,
+  // which a container that is already running cannot be running. One that is
+  // up but silent, one launched from a document that no longer says what was
+  // asked for, and one that is merely in the way are all replaced: once
+  // everything that can still refuse this start has passed, so a refused start
+  // leaves the container it found exactly as it was.
   const existing = readState();
+  if (existing.present) assertOwnContainer();
+  let replacement = null;
   if (existing.running) {
     const already = await probe(plan.runtimeHealthUrl, { timeoutMs: 2_000, intervalMs: 500 });
-    if (already.ok && composeDocumentIsCurrent()) {
+    const current = already.ok && composeDocumentIsCurrent();
+    if (current && !plan.rebuild) {
       log(
         `Instance "${plan.slug}": the agent runtime ${plan.container} is already running and ` +
           `answering on ${plan.runtimeUrl} — nothing to do.`,
       );
       return;
     }
-    log(
-      already.ok
-        ? `Instance "${plan.slug}": ${plan.container} is answering on ${plan.runtimeUrl}, but it ` +
-          `was not started from what this command would write now (it publishes ` +
-          `${plan.runtimePort} and calls the app back at ${plan.callbackUrl}) — replacing it.`
-        : `Instance "${plan.slug}": ${plan.container} is running but not answering on ` +
-          `${plan.runtimeHealthUrl} — replacing it.`,
-    );
-    if (!removeContainer(existing)) throw removalFailed();
+    replacement = {
+      state: existing,
+      why: current
+        ? `Instance "${plan.slug}": ${plan.container} is answering on ${plan.runtimeUrl}, but on ` +
+          `the image as it was before this rebuild — replacing it.`
+        : already.ok
+          ? `Instance "${plan.slug}": ${plan.container} is answering on ${plan.runtimeUrl}, but it ` +
+            `was not started from what this command would write now (it publishes ` +
+            `${plan.runtimePort} and calls the app back at ${plan.callbackUrl}) — replacing it.`
+          : `Instance "${plan.slug}": ${plan.container} is running but not answering on ` +
+            `${plan.runtimeHealthUrl} — replacing it.`,
+    };
   } else if (existing.present) {
-    log(`Instance "${plan.slug}": a stopped ${plan.container} is in the way — removing it.`);
-    if (!removeContainer(existing)) throw removalFailed();
+    replacement = {
+      state: existing,
+      why: `Instance "${plan.slug}": a stopped ${plan.container} is in the way — removing it.`,
+    };
   }
 
   // The credential, by KEY. Without it the runtime crash-loops on its own
@@ -13197,13 +13301,44 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
     );
   }
 
-  (deps.ensureWayflowImage ?? ensureWayflowImage)({ repoRoot });
+  // THE IMAGE THE CONTAINER RUNS (cinatra-cli#279). An image the operator NAMED
+  // is theirs: this verb neither pulls it nor builds it, so an absent one is a
+  // refusal — a build under someone else's tag is not this command's to make.
+  // The checkout's OWN image is the other road, unchanged: built when it is
+  // missing, and built again on `--rebuild` so a new checkout commit gets a
+  // fresh one. Either way this happens before the container found above is
+  // replaced, so a refusal or a failed build leaves it running.
+  if (plan.imageNamed) {
+    const present = spawn("docker", dockerImageInspectArgs(plan.image), {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
+    });
+    if (present?.error || (present?.status ?? 1) !== 0) {
+      throw new Error(missingNamedImageMessage(plan));
+    }
+  } else {
+    (deps.ensureWayflowImage ?? ensureWayflowImage)({
+      repoRoot,
+      forceRebuild: plan.rebuild,
+      readRevision: deps.readCheckoutHeadSha ?? readCheckoutHeadSha,
+      rebuildFlag: "--rebuild",
+      spawnFn: spawn,
+      log,
+    });
+  }
+
+  if (replacement) {
+    log(replacement.why);
+    if (!removeContainer(replacement.state)) throw removalFailed();
+  }
 
   (deps.ensureRuntimeDir ?? ensureCloneRuntimeDir)(plan.slug, homeOpts);
   (deps.renderTemplate ?? renderCloneComposeTemplate)({
     templatePath,
     outPath: plan.composePath,
     vars: instanceRuntimeTemplateVars(plan),
+    transform: ownDocument,
   });
 
   const upArgs = composeInstanceRuntimeUpArgs(plan);
@@ -13255,6 +13390,7 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
   log(`Instance "${plan.slug}": agent runtime started.`);
   log(`  runtime:   ${plan.runtimeUrl}`);
   log(`  container: ${plan.container} (compose project ${plan.composeProject})`);
+  log(`  image:     ${plan.image}`);
   log(`  calls this instance's app back at: ${plan.callbackUrl}`);
   log(
     `  the loader mounts every agent installed in this checkout; allow up to ~2 min on a cold start.`,
