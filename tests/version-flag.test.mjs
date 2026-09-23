@@ -1,7 +1,12 @@
 // `cinatra --version` / `-v` reserved for the CLI's own SemVer (cinatra#255
-// §6 Q5). Today `--version` falls through to "Unknown command"; this guard pins
-// the new behavior: it prints the value of `packages/cli/package.json` `version`
-// and exits 0, and is NOT aliased to `--ref` (which selects the app version).
+// §6 Q5): it prints the value of the CLI `package.json` `version` and exits 0,
+// and is NOT aliased to `--ref` (which selects the app version).
+//
+// Since cinatra-cli#271 the line names the program and, when the build can
+// prove one, the commit it was built from: `cinatra <version>` or
+// `cinatra <version> (commit <12 hex>)`. The provenance half — which sources
+// are read, and what each one proves — is pinned in version-provenance.test.mjs;
+// this file keeps the flag's own contract.
 
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -23,19 +28,31 @@ function runCli(args) {
   });
 }
 
+/** The version line with its optional `(commit …)` half removed. */
+function versionOnly(line) {
+  return line.trim().replace(/^cinatra /, "").replace(/ \(commit [0-9a-f]{12}\)$/, "");
+}
+
 describe("cinatra --version", () => {
   it("prints the CLI package.json version and exits 0", () => {
     const res = runCli(["--version"]);
     expect(res.status).toBe(0);
-    expect(res.stdout.trim()).toBe(PKG.version);
+    expect(res.stdout.trim().startsWith("cinatra ")).toBe(true);
+    expect(versionOnly(res.stdout)).toBe(PKG.version);
     // Sanity: it is a SemVer-shaped string, not an apiVersion (`cinatra.ai/v1`).
-    expect(res.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+    expect(versionOnly(res.stdout)).toMatch(/^\d+\.\d+\.\d+/);
   });
 
   it("`-v` is an alias for `--version`", () => {
     const res = runCli(["-v"]);
     expect(res.status).toBe(0);
-    expect(res.stdout.trim()).toBe(PKG.version);
+    expect(versionOnly(res.stdout)).toBe(PKG.version);
+  });
+
+  it("`--json` reports the same version for a machine caller", () => {
+    const res = runCli(["--version", "--json"]);
+    expect(res.status).toBe(0);
+    expect(JSON.parse(res.stdout).version).toBe(PKG.version);
   });
 
   it("does not print the help banner for --version", () => {

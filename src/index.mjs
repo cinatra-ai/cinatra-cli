@@ -15,6 +15,10 @@ import net from "node:net";
 // behind the single `createClient` chokepoint via `getPgClientCtor()` below, so
 // only a command that actually opens a DB connection pulls it.
 import { resolveTeardownNames } from "./teardown-config.mjs";
+// What `--version` answers beside the SemVer: the commit this build came from,
+// whenever the installed package can prove one (cinatra-cli#271). Builtins-only
+// file reads — it stays inside the lean-startup contract.
+import { formatVersionLine, readBuildProvenance } from "./cli-provenance.mjs";
 // The migration runner (`@cinatra-ai/migrations`) is NOT bundled into the
 // published thin CLI — it is resolved at COMMAND ENTRY from the operator's
 // cinatra checkout (see ./checkout-resolve.mjs). `loadMigrations(repoRoot)`
@@ -17007,18 +17011,53 @@ export {
   buildDbDownStatusReport,
 };
 
+/** The name the CLI answers to on a command line. */
+const CLI_PROGRAM_NAME = "cinatra";
+
 /**
- * Read the CLI's own SemVer from `packages/cli/package.json`. Decoupled from
- * the app's `cinatra.apiVersion` string and from any `--ref` value: `--version`
- * prints THIS tool's version (cinatra#255 §6 Q5 — never aliased to `--ref`).
+ * This package's own directory: the repository root in a checkout,
+ * `<install>/node_modules/@cinatra-ai/cinatra` once installed. index.mjs lives
+ * in `src/`, so the package root is one dir up.
  *
  * @returns {string}
  */
-function readCliVersion() {
-  // index.mjs lives at packages/cli/src/, so package.json is one dir up.
-  const pkgPath = fileURLToPath(new URL("../package.json", import.meta.url));
-  const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-  return String(pkg.version ?? "0.0.0");
+function cliPackageDir() {
+  return fileURLToPath(new URL("..", import.meta.url));
+}
+
+/**
+ * The CLI's own manifest. Unreadable is not fatal — `--version` must answer
+ * something rather than fail.
+ *
+ * @returns {Record<string, unknown>}
+ */
+function readCliManifest() {
+  try {
+    return JSON.parse(readFileSync(path.join(cliPackageDir(), "package.json"), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * What `--version` reports. The SemVer is the CLI's own, decoupled from the
+ * app's `cinatra.apiVersion` string and from any `--ref` value (cinatra#255 §6
+ * Q5 — never aliased to `--ref`). Beside it comes the commit this build came
+ * from, whenever the installed package can prove one (cinatra-cli#271): a
+ * published build proves nothing and stays silent, while a build installed
+ * from a git ref, or run from a checkout, names its commit.
+ *
+ * @returns {{ name: string, version: string, commit: string|null, commitSource: string|null }}
+ */
+function describeCliBuild() {
+  const manifest = readCliManifest();
+  const { commit, source } = readBuildProvenance(cliPackageDir(), manifest);
+  return {
+    name: String(manifest.name ?? CLI_PROGRAM_NAME),
+    version: String(manifest.version ?? "0.0.0"),
+    commit,
+    commitSource: source,
+  };
 }
 
 /**
@@ -17351,8 +17390,25 @@ export async function runCli(argv) {
   // Reserve `--version` / `-v` for THIS CLI's SemVer (cinatra#255 §6 Q5). It is
   // handled at the very top so it never falls through to "Unknown command", and
   // it is deliberately NOT aliased to `--ref` (which selects the app version).
+  //
+  // The line also names the commit this build came from when it can prove one
+  // (cinatra-cli#271), so a caller that pinned the CLI to a commit can verify
+  // the pin here instead of asking its package manager. `--json` is this
+  // repository's machine-output convention and carries the FULL commit plus
+  // which source proved it, so an unattended caller never parses prose.
   if (command === "--version" || command === "-v") {
-    console.log(readCliVersion());
+    const build = describeCliBuild();
+    if (argv.includes("--json")) {
+      console.log(JSON.stringify(build, null, 2));
+      return;
+    }
+    console.log(
+      formatVersionLine({
+        program: CLI_PROGRAM_NAME,
+        version: build.version,
+        commit: build.commit,
+      }),
+    );
     return;
   }
 

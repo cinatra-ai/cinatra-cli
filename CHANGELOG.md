@@ -291,6 +291,30 @@ project adheres to [Semantic Versioning](https://semver.org/).
   that passes no URLs:** a run whose `.env.local` names a database used to
   proceed on a bare `--yes` and is now refused, naming the flag and the
   database. Add `--external-db-disposable` to such a call.
+- **`cinatra --version` now names the build it came from, so a pinned install
+  can be verified from the command itself.** `package.json` carries the same
+  version at the published build and at every commit of main, so a caller that
+  pinned the CLI to an exact commit could not tell the two apart with `cinatra
+  --version`: it had to ask its package manager which ref it had resolved, and
+  a machine still running the published build answered the same string as one
+  running the pin. The line is now `cinatra <version>`, followed by `(commit
+  <12 hex>)` whenever the installed build can prove which commit it is, and
+  `cinatra --version --json` is the machine form — the full commit and which
+  source proved it, beside the package name and version. What a build can prove
+  was measured rather than assumed: an install from a git ref into a directory,
+  and the same spec run through `npx`, are recorded by npm as a resolved ref
+  ending in the commit, in the lockfile it writes beside the installed package;
+  a CLI run from a clone is named by that checkout's own HEAD; and a package
+  whose manifest carries npm's `gitHead` field states its build outright. Those
+  are the three the CLI reads, in that order, and each is a plain file read —
+  no subprocess, no network, and no failure when none of them knows anything. A
+  published build proves none of them and prints the version alone, which is
+  itself the answer to "is this the published build?"; a GLOBAL install from a
+  git ref records nothing either — npm writes it no lockfile, no resolved ref
+  and no repository — so a pin that has to stay verifiable belongs in a
+  directory install or an `npx` run. The flag is otherwise unchanged: `-v` is
+  still its alias, it is still this tool's own version and never the app's, and
+  it still exits 0 without printing the help banner.
 
 - **Three install flags that did nothing now say so, or say which road they
   take.** `--redis-db` was accepted and never read. No install road applies a
