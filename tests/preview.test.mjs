@@ -3464,6 +3464,7 @@ describe("preview — the passthrough list covers the dev install's set (enginee
     CINATRA_WAYFLOW_RUNTIME:
       "the CLI's record of what THIS install decided about the local runtime (doctor reads it); the container dials the runtime by address, not by that record",
     CINATRA_A2A_DEV_PEER_URLS: "a DEV-boot peer list; a preview runs production runtime semantics",
+    CINATRA_TWENTY_MODE: "the CLI's record of the install's Twenty CRM choice (refresh and start read it); host-side, meaningless in the container",
     // The co-use topology's namespacing. Written only on the co-use path, and
     // Queue names now forward explicitly for isolated captures; these other
     // co-use values still have independent contracts.

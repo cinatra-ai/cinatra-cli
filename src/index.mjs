@@ -47,6 +47,7 @@ import {
   claimGeneratedMapsDriftExitCode,
 } from "./install-byproducts.mjs";
 import { parseDevRefreshFlags, describeDockerDecision } from "./dev-refresh.mjs";
+import { ensureDevTwentyCrm, readDevTwentyConnection, readTwentyMode } from "./dev-twenty.mjs";
 import {
   createComposeNangoDbTransport,
   ensureNangoSecretKey,
@@ -587,6 +588,7 @@ Usage:
   cinatra install [dev|prod|demo] [--dir <path>] [--ref <main|tag|sha>]
                   [--mode dev|prod|demo] [--repo-url <url>] [--yes] [--force] [--reset-env]
                   [--skip-dev-apps] [--no-infra] [--no-install] [--no-setup] [--no-wayflow]
+                  [--no-twenty]
                   [--pinned-extensions] [--frozen-lockfile] [--no-fetch]
                   [--on-conflict fail|prompt|isolated|stop-existing|attach|external|co-use]
                   [--infra new|external|share] [--instance <slug>] [--app-port <n>]
@@ -681,6 +683,12 @@ Commands:
                                       owns a local stack starts it by default, so agents work
                                       out of the box; pass this for a deliberately lean install
                                       (agent runs then fail until you start it by hand).
+                    --no-twenty       Do not bring up the Twenty CRM. A dev or preview install
+                                      otherwise starts one Twenty CRM shared by every instance
+                                      on this machine (http://localhost:3300), seeds two example
+                                      contact views in it, and the product connects it at the
+                                      first development start. \`--mode demo\` leaves the CRM
+                                      to its demo overlay.
                     For an UNATTENDED install — a CI job or an automated verification runner
                     that creates many instances in a checkout already parked at an exact
                     commit and has to hand it back byte-for-byte clean. All three are off by
@@ -8554,6 +8562,18 @@ async function runDevRefresh(rest) {
     }
   }
 
+  // 3c. cinatra-cli#287 — the machine-shared Twenty CRM, once the reconcile
+  //     above succeeded: an existing dev or preview installation gains the
+  //     stack and the example views on its next upgrade (the connection follows
+  //     at its next development start). The install's recorded choice is
+  //     honoured, and a demo checkout is left to its demo overlay.
+  await ensureDevTwentyCrm({
+    targetDir: repoRoot,
+    mode: fileEnv.CINATRA_INSTALL_PROFILE === "demo" ? "demo" : "dev",
+    noTwenty: readTwentyMode(repoRoot) === "off",
+    log: console.log,
+  });
+
   // 4. Advisory: additive schema is reconciled automatically and the versioned
   //    migration chain has been applied (or ledger-faked on a fresh schema) by
   //    runSetup above — transformational changes no longer require manual,
@@ -11984,6 +12004,9 @@ async function runDevStart(argv) {
                   "to rebuild against the new HEAD (a live .next purge is unsafe, so start left it in place).",
               );
             }
+            // cinatra-cli#287: read back the product's Twenty CRM connection
+            // (two booleans, never a write, never a failure).
+            await readDevTwentyConnection({ repoRoot, log: console.log });
             success = true;
             return;
           }
@@ -12129,6 +12152,9 @@ async function runDevStart(argv) {
       console.log(`  runtime:  http://localhost:${plan.runtimePort} (container ${plan.runtimeContainer})`);
       if (plan.queueName) console.log(`  queue:    ${plan.queueName}`);
     }
+    // cinatra-cli#287: the same read-back after a start that answered its
+    // health probe — never after one that did not.
+    if (health.ok) await readDevTwentyConnection({ repoRoot, log: console.log });
   } finally {
     if (!success && spawnedChildPid != null) {
       // We spawned `pnpm dev` THIS run but start ultimately failed — don't
