@@ -51,6 +51,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
+import { ensureDevTwentyCrm } from "./dev-twenty.mjs";
 import { SEED_DB_NAME, isValidSlug } from "./clone-registry.mjs";
 import {
   createComposeNangoDbTransport,
@@ -932,6 +933,10 @@ export function parseInstallArgs(argv = []) {
     // It changes NOTHING on a path that owns no local stack (external, co-use,
     // --no-infra) — those never started a runtime to begin with, and say so.
     wayflow: !argv.includes("--no-wayflow"),
+    // cinatra-cli#287: a development install (and the preview composition)
+    // brings up the machine-shared Twenty CRM after its setup child.
+    // `--no-twenty` is the opt-out; the choice is persisted in `.env.local`.
+    noTwenty: argv.includes("--no-twenty"),
     // --no-install ⇒ clone + env only; pnpm install + setup both skipped
     // (setup needs the installed deps, so skipping install implies skipping setup).
     noInstall: argv.includes("--no-install"),
@@ -2075,6 +2080,29 @@ export function recordWayflowRuntimeMode({ targetDir, mode, log = console.log })
     return { recorded: true, mode };
   } catch (err) {
     log(`  ⚠ Could not record ${WAYFLOW_RUNTIME_KEY} in .env.local (${err instanceof Error ? err.message : err}).`);
+    return { recorded: false, mode };
+  }
+}
+
+/** cinatra-cli#287 — record this install's Twenty CRM choice into `.env.local`
+ *  as ONE line: `off` with `--no-twenty`, `shared` without it. `instance
+ *  refresh` and `instance start` read it back; a missing line reads `shared`.
+ *  Best-effort, like the WayFlow record above: a missing `.env.local` is a
+ *  no-op, and a write failure never fails an otherwise-complete install. */
+export function recordTwentyMode({ targetDir, noTwenty = false, log = console.log }) {
+  const envPath = path.join(targetDir, ".env.local");
+  const mode = noTwenty ? "off" : "shared";
+  try {
+    if (!existsSync(envPath)) return { recorded: false, mode };
+    const body = readFileSync(envPath, "utf8");
+    const next = upsertEnvKey(body, "CINATRA_TWENTY_MODE", mode);
+    if (next !== body) {
+      writeFileSync(envPath, next, { mode: 0o600 });
+      tightenEnvLocalPerms(envPath);
+    }
+    return { recorded: true, mode };
+  } catch (err) {
+    log(`  ⚠ Could not record CINATRA_TWENTY_MODE in .env.local (${err instanceof Error ? err.message : err}).`);
     return { recorded: false, mode };
   }
 }
@@ -9860,6 +9888,9 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   //      explicit, non-failing statement on the paths that never did.
   const wayflowRuntimeMode = resolveWayflowRuntimeMode({ infraPlan, wayflow: opts.wayflow });
   recordWayflowRuntimeMode({ targetDir, mode: wayflowRuntimeMode, log });
+  // cinatra-cli#287 — persist the Twenty CRM choice on every development-like
+  // install run (a prod install never provisions the CRM).
+  if (isDevLikeMode(opts.mode)) recordTwentyMode({ targetDir, noTwenty: opts.noTwenty === true, log });
 
   // 5d + 6. cinatra-cli#35 — resolve the EXPLICIT default Compose project name +
   //     OWNERSHIP PREFLIGHT, THEN bring the default stack up — all UNDER ONE
@@ -9951,6 +9982,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   const installDeps = deps.pnpmInstall ?? pnpmInstall;
   const runSetupChild = deps.runSetupInTarget ?? runSetupInTarget;
   const acquireProd = deps.acquireProdExtensions ?? acquireProdExtensions;
+  const ensureTwenty = deps.ensureDevTwentyCrm ?? ensureDevTwentyCrm;
   // `--frozen-lockfile` is the same opt-in on every dependency install this run
   // performs (prod does two), so it is resolved once here.
   const frozenLockfile = opts.frozenLockfile === true;
@@ -9994,6 +10026,12 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
           log,
         });
         setupRegistrySkew = setupVerdict?.registrySkew === true;
+        // cinatra-cli#287 — the machine-shared Twenty CRM, right after the
+        // setup child and whatever `--infra`, `--skip-dev-apps` or
+        // `--no-wayflow` say. `--no-twenty` is its one skip line, demo is
+        // left to the product's demo overlay, and the preview composition
+        // arrives here as the dev install it performs.
+        await ensureTwenty({ targetDir, mode: opts.mode, noTwenty: opts.noTwenty === true, log });
       }
     }
   } else if (opts.noInstall) {
