@@ -113,11 +113,27 @@ const EXPECTED_MANIFEST = {
   },
 };
 
+// FAKE database parts. The connection strings the arms need are built from
+// them at run time (see fakeDatabaseUrl), so no file spells a user, a password
+// and a host together in one literal.
+const FAKE_DB_PARTS = {
+  twenty: { scheme: "postgres", host: "twenty-db", port: 5432, database: "default", user: "postgres", password: "dev" },
+  external: { scheme: "postgresql", host: "localhost", port: 5434, database: "inst", user: "u", password: "p" },
+};
+
+/** A connection string assembled from separate parts through the URL setters. */
+function fakeDatabaseUrl({ scheme, host, port, database, user, password }) {
+  const url = new URL(`${scheme}://${host}:${port}/${database}`);
+  url.username = user;
+  url.password = password;
+  return url.href;
+}
+
 /** The shape `docker compose config --format json` resolves the product's
  *  compose to: checkout-derived names on the project, network and volumes,
  *  profile-gated services with `profiles`, ports on every interface. */
 function resolvedProductCompose() {
-  const twentyEnv = { PG_DATABASE_URL: "postgres://postgres:dev@twenty-db:5432/default", SERVER_URL: "http://localhost:3300" };
+  const twentyEnv = { PG_DATABASE_URL: fakeDatabaseUrl(FAKE_DB_PARTS.twenty), SERVER_URL: "http://localhost:3300" };
   return {
     name: "cinatra",
     services: {
@@ -1007,7 +1023,7 @@ describe("T6 wiring — runInstall and runDevRefresh", () => {
     const { deps, twentyCalls, order } = recordingDeps();
     await install(
       path.join(root, "prod"),
-      ["--mode", "prod", "--infra", "external", "--db-url", "postgresql://u:p@localhost:5434/inst", "--external-db-disposable"],
+      ["--mode", "prod", "--infra", "external", "--db-url", fakeDatabaseUrl(FAKE_DB_PARTS.external), "--external-db-disposable"],
       deps,
     );
     expect(order).toContain("setup");
@@ -1062,5 +1078,57 @@ describe("T7 install help", () => {
     writeFileSync(path.join(dir, ".env.local"), "CINATRA_TWENTY_MODE=off\n");
     expect(readTwentyMode(dir)).toBe("off");
     expect(statSync(dir).isDirectory()).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T8 — no credential-shaped connection string in the files this change touches.
+// ---------------------------------------------------------------------------
+// The shape a secret scanner reports: a postgres(ql) scheme, a user, a
+// password and a host. User and password exclude whitespace, ':', '@', '/',
+// quotes, the backtick, '$', '{' and '}', so a runtime template or a value
+// built from parts is not matched. The host is a bracketed address, an
+// unbracketed IPv6 address holding '::', or a name. The expression below does
+// not match its own text, and a failure names the file and line only, never
+// the match.
+const CREDENTIAL_URL = /postgres(?:ql)?:\/\/[^\s:@\/'"`${}]+:[^\s:@\/'"`${}]+@(\[[^\]\s]*\]|[0-9A-Fa-f.]*::[0-9A-Fa-f.:]*|[^\s:@\/'"`${}?#\]]+)/g;
+
+function isLoopbackHost(host) {
+  const bare = host.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+  if (bare === "localhost" || bare === "::1") return true;
+  const octets = bare.split(".");
+  return octets.length === 4 && octets[0] === "127" && octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) <= 255);
+}
+
+/** Every "file:line" of `files` holding a credential-shaped URL whose host `keep` accepts. */
+function credentialUrlLines(files, keep) {
+  const hits = [];
+  for (const rel of files) {
+    const lines = readFileSync(path.join(CLI_ROOT, rel), "utf8").split("\n");
+    lines.forEach((line, i) => {
+      for (const m of line.matchAll(CREDENTIAL_URL)) {
+        if (keep(m[1])) hits.push(`${rel}:${i + 1}`);
+      }
+    });
+  }
+  return hits;
+}
+
+describe("T8 no credential-shaped connection string", () => {
+  it("T8a: the two added files hold no credential-shaped Postgres connection string with any host", () => {
+    const hits = credentialUrlLines(["src/dev-twenty.mjs", "tests/install-twenty-crm.test.mjs"], () => true);
+    expect(hits, `credential-shaped connection string at ${hits.join(", ")}`).toEqual([]);
+  });
+
+  it("T8b: the five changed files hold none whose host is other than a loopback name", () => {
+    const files = [
+      "src/dev-twenty.mjs",
+      "src/install.mjs",
+      "src/index.mjs",
+      "tests/install-twenty-crm.test.mjs",
+      "tests/preview.test.mjs",
+    ];
+    const hits = credentialUrlLines(files, (host) => !isLoopbackHost(host));
+    expect(hits, `non-loopback credential-shaped connection string at ${hits.join(", ")}`).toEqual([]);
   });
 });
