@@ -861,6 +861,8 @@ describe("runInstall — the unattended opt-ins reach the children", () => {
         seen.setup.push(args);
         return { tolerated: true, registrySkew: false, lines: [] };
       },
+      // The email safety step writes to the instance database; its own suite drives it.
+      ensureDevEmailSafety: async () => ({ action: "stubbed" }),
       ...extra,
     };
     return { seen, deps };

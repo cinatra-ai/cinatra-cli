@@ -100,6 +100,53 @@ Accepted range **1000 .. 21600000** ms (1 second .. 6 hours). Notes:
   step starts over from the beginning. So if a *single* step takes longer than
   the budget, retrying will never get past it; raise the budget instead.
 
+### Email safety on a development install and a preview
+
+A Cinatra instance has an email safety switch: the page
+`/configuration/development`, tab **Email**, box **Override recipient email**,
+with its **Recipient override** address. While the switch is on, outgoing email
+goes to that one address instead of the addresses stored on its recipients. An
+instance that has no such setting stored reads the switch as off.
+
+`cinatra install --mode dev`, `--mode demo` and `--mode preview` therefore turn
+the switch on while they provision the instance, right after the setup phase,
+so a development installation never delivers email to a stored recipient by
+default. A preview's container uses the checkout's database, so the same
+setting covers it. The recipient override is, in this order:
+
+1. the address you pass with `--email-recipient-override <address>`;
+2. else the address in `CINATRA_EMAIL_RECIPIENT_OVERRIDE`, when the environment
+   you run the install in sets it;
+3. else `nobody@example.invalid` — an address under `.invalid`, the top-level
+   domain that is reserved never to resolve (RFC 2606, RFC 6761), so no mail
+   system delivers to it.
+
+```
+cinatra install --mode dev --email-recipient-override you@example.com
+```
+
+The install prints one line that says the switch is on and where the address
+came from — the flag, the variable or the default — and never the address
+itself. A flag or a variable that is given but empty, or that is not one email
+address (`name@domain`, the shape the page's field accepts), is refused while
+the install reads its arguments, before it changes anything.
+
+A setting that is already stored is never changed. A re-run of the install,
+`cinatra instance refresh` and `cinatra update` of a development instance write
+the setting only when none is stored — refresh and update take the address from
+the variable or the default — and otherwise keep the stored switch and address
+exactly as they are, and say whether the switch is on or off. Change it on the
+page. If the setting cannot be written, the run stops with an error that says
+so, rather than leave a development installation that delivers email.
+
+A production install (`--mode prod`) stores nothing for this setting and refuses
+the flag. A co-use install (`--on-conflict=co-use`, `--infra=share`) runs its
+own install tail, which does not write the setting, so it refuses the flag too.
+
+With the default address, the mail an instance sends reaches nobody — its own
+account mail, such as a password reset, included. Pass your own inbox to
+receive it.
+
 ### What a preview instance receives
 
 A preview container is not handed your whole environment: it gets the runtime

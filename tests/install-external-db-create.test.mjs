@@ -326,6 +326,8 @@ describe("runInstall --infra=external — the instance database is created from 
         order.push("setup");
         return { tolerated: true, registrySkew: false, lines: [] };
       },
+      // The email safety step writes to the instance database; its own suite drives it.
+      ensureDevEmailSafety: async () => ({ action: "stubbed" }),
       externalDbOps: defaultExternalDbOps({ createClient: pg.createClient }),
     };
     return { order, lines, pg, deps, log: (l) => lines.push(String(l)) };

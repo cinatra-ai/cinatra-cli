@@ -48,6 +48,7 @@ import {
 } from "./install-byproducts.mjs";
 import { parseDevRefreshFlags, describeDockerDecision } from "./dev-refresh.mjs";
 import { ensureDevTwentyCrm, readDevTwentyConnection, readTwentyMode } from "./dev-twenty.mjs";
+import { ensureDevEmailSafety, resolveEmailRecipientOverride } from "./dev-email-safety.mjs";
 import {
   createComposeNangoDbTransport,
   ensureNangoSecretKey,
@@ -588,7 +589,7 @@ Usage:
   cinatra install [dev|prod|demo] [--dir <path>] [--ref <main|tag|sha>]
                   [--mode dev|prod|demo] [--repo-url <url>] [--yes] [--force] [--reset-env]
                   [--skip-dev-apps] [--no-infra] [--no-install] [--no-setup] [--no-wayflow]
-                  [--no-twenty]
+                  [--no-twenty] [--email-recipient-override <address>]
                   [--pinned-extensions] [--frozen-lockfile] [--no-fetch]
                   [--on-conflict fail|prompt|isolated|stop-existing|attach|external|co-use]
                   [--infra new|external|share] [--instance <slug>] [--app-port <n>]
@@ -689,6 +690,16 @@ Commands:
                                       contact views in it, and the product connects it at the
                                       first development start. \`--mode demo\` leaves the CRM
                                       to its demo overlay.
+                    --email-recipient-override <address>
+                                      The address the email safety switch sends every outgoing
+                                      email to. A dev, demo or preview install turns that switch
+                                      on right after its setup phase (the page
+                                      /configuration/development, tab Email), with this address,
+                                      else CINATRA_EMAIL_RECIPIENT_OVERRIDE, else
+                                      nobody@example.invalid, which no mail system delivers to.
+                                      A setting already stored is kept as it is. It prints where
+                                      the address came from, never the address. Refused on a
+                                      prod or co-use install, which write no such setting.
                     For an UNATTENDED install — a CI job or an automated verification runner
                     that creates many instances in a checkout already parked at an exact
                     commit and has to hand it back byte-for-byte clean. All three are off by
@@ -8450,6 +8461,9 @@ async function runDevRefresh(rest) {
 
   const { dockerMode, withDevApps } = parseDevRefreshFlags(rest);
   const dockerDecision = describeDockerDecision({ dockerMode, env: fileEnv });
+  // cinatra-cli#291: the email safety switch's override address, validated
+  // before anything runs — CINATRA_EMAIL_RECIPIENT_OVERRIDE, else the default.
+  const emailRecipientOverride = resolveEmailRecipientOverride({ env: process.env });
 
   console.log("Refreshing the dev environment to match the checked-out code…");
 
@@ -8535,6 +8549,17 @@ async function runDevRefresh(rest) {
   //    --with-dev-apps to opt into dev-app reconciliation.
   console.log("- Database + settings: running idempotent dev setup…");
   await runSetup("dev", { skipDevApps: !withDevApps });
+
+  // 3a. cinatra-cli#291 — the email safety switch, once the reconcile above
+  //     succeeded: an existing development or preview installation that has
+  //     no setting stored gets the switch on (a stored one is kept as it is).
+  //     Refresh is development-only (guard 2 above), so every profile gets it.
+  await ensureDevEmailSafety({
+    targetDir: repoRoot,
+    mode: "dev",
+    override: emailRecipientOverride,
+    log: console.log,
+  });
 
   // 3b. Execution plane (cinatra-cli#174): when this instance runs the sandbox
   //     locally (execution mode local-dev), rebuild the L0 image so the worker

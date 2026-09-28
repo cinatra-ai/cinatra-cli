@@ -170,6 +170,8 @@ describe("cinatra-cli#269 — the acknowledgement an external database takes, wh
         order.push("setup");
         return { tolerated: true, registrySkew: false, lines: [] };
       },
+      // The email safety step writes to the instance database; its own suite drives it.
+      ensureDevEmailSafety: async () => ({ action: "stubbed" }),
     };
     return { order, lines, deps, log: (l) => lines.push(String(l)) };
   }
