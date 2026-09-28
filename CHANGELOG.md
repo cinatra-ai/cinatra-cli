@@ -8,6 +8,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A development install and a preview now start with the email safety switch
+  on.** The product's email safety switch (the page `/configuration/development`,
+  tab Email, "Override recipient email") reads as off while no setting is
+  stored, so a fresh development installation or preview whose mail transport
+  was connected later delivered to the stored recipient addresses until someone
+  ticked the box by hand. `cinatra install --mode dev|demo|preview` now writes
+  the setting right after its setup phase: the switch on, with the recipient
+  override from `--email-recipient-override <address>`, else
+  `CINATRA_EMAIL_RECIPIENT_OVERRIDE`, else `nobody@example.invalid`, an address
+  under the reserved `.invalid` top-level domain that no mail system delivers
+  to. It prints one line that names where the address came from, never the
+  address. A stored setting is kept as it is: a re-run, `instance refresh` and
+  `update` write the setting only when none is stored. A malformed value is
+  refused before the install changes anything, a write that cannot be made stops
+  the run, and a production or co-use install refuses the flag and stores
+  nothing for the setting.
+
 - **`cinatra instance start` can now run several dev instances on one machine.**
   The command booted the app for the checkout you were in, and it was written
   for exactly one such checkout: the process-id file, the log and the lock all

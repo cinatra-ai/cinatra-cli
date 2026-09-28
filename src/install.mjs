@@ -52,6 +52,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
 import { ensureDevTwentyCrm } from "./dev-twenty.mjs";
+import {
+  EMAIL_RECIPIENT_OVERRIDE_FLAG,
+  ensureDevEmailSafety,
+  resolveEmailRecipientOverride,
+} from "./dev-email-safety.mjs";
 import { SEED_DB_NAME, isValidSlug } from "./clone-registry.mjs";
 import {
   createComposeNangoDbTransport,
@@ -447,6 +452,7 @@ const VALUE_TAKING_INSTALL_FLAGS = new Set([
   "--instance",
   "--bind", // cinatra-cli#248 (preview-only; its value is an address, not a mode)
   "--fleet", // engineering#666 (preview-only; its value is a fleet name, not a mode)
+  "--email-recipient-override", // cinatra-cli#291 (its value is an address, not a mode)
   "--execution-mode",
   "--sandbox-broker-url",
   "--sandbox-broker-secret",
@@ -867,6 +873,34 @@ export function parseInstallArgs(argv = []) {
   const previewFleet =
     surfaceMode === PREVIEW_SURFACE_MODE_VALUE ? resolveFleet(argv, { fallback: null }) : null;
 
+  // cinatra-cli#291: a development install (dev, demo, and the preview
+  // composition) turns the product's email safety switch on after its setup
+  // child. Its override address comes from `--email-recipient-override`, else
+  // CINATRA_EMAIL_RECIPIENT_OVERRIDE, else a reserved address no mail system
+  // delivers to — resolved and validated HERE, before any side effect, so a
+  // malformed value costs nothing. A production install stores no such setting
+  // and the co-use tail does not write it, so the flag is refused on both
+  // rather than silently ignored; the variable, which a shell profile may
+  // carry, is simply not read there.
+  const emailOverrideOpt = readOption(argv, EMAIL_RECIPIENT_OVERRIDE_FLAG);
+  if (emailOverrideOpt != null && !isDevLikeMode(mode)) {
+    throw new Error(
+      `${EMAIL_RECIPIENT_OVERRIDE_FLAG} applies only to a development install (dev, demo or preview) — ` +
+        `a ${surfaceMode} install stores no email safety setting.`,
+    );
+  }
+  if (emailOverrideOpt != null && couseRequested) {
+    throw new Error(
+      `${EMAIL_RECIPIENT_OVERRIDE_FLAG} cannot be combined with co-use (--infra=share / --on-conflict=co-use / ` +
+        "--reuse-from / --db-name / --db-template / --bullmq-queue): the co-use install runs its own tail, which " +
+        "does not write the email safety setting, so the address would be silently ignored. Install without it " +
+        'and tick "Override recipient email" at /configuration/development, tab Email.',
+    );
+  }
+  const emailRecipientOverride = isDevLikeMode(mode)
+    ? resolveEmailRecipientOverride({ flagValue: emailOverrideOpt, env: process.env })
+    : null;
+
   // ── The unattended opt-ins ────────────────────────────────────────────────
   // Three value-less booleans for the operator who creates MANY instances with
   // nobody watching — a CI job or an automated verification runner, working in a
@@ -937,6 +971,9 @@ export function parseInstallArgs(argv = []) {
     // brings up the machine-shared Twenty CRM after its setup child.
     // `--no-twenty` is the opt-out; the choice is persisted in `.env.local`.
     noTwenty: argv.includes("--no-twenty"),
+    // cinatra-cli#291: the resolved `{ address, source }` the email safety
+    // switch is turned on with (validated above), or null for production.
+    emailRecipientOverride,
     // --no-install ⇒ clone + env only; pnpm install + setup both skipped
     // (setup needs the installed deps, so skipping install implies skipping setup).
     noInstall: argv.includes("--no-install"),
@@ -9983,6 +10020,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   const runSetupChild = deps.runSetupInTarget ?? runSetupInTarget;
   const acquireProd = deps.acquireProdExtensions ?? acquireProdExtensions;
   const ensureTwenty = deps.ensureDevTwentyCrm ?? ensureDevTwentyCrm;
+  const ensureEmailSafety = deps.ensureDevEmailSafety ?? ensureDevEmailSafety;
   // `--frozen-lockfile` is the same opt-in on every dependency install this run
   // performs (prod does two), so it is resolved once here.
   const frozenLockfile = opts.frozenLockfile === true;
@@ -10026,8 +10064,21 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
           log,
         });
         setupRegistrySkew = setupVerdict?.registrySkew === true;
-        // cinatra-cli#287 — the machine-shared Twenty CRM, right after the
-        // setup child and whatever `--infra`, `--skip-dev-apps` or
+        // cinatra-cli#291 — the email safety switch, the moment the setup
+        // child has created the settings table and before any step that can
+        // take long or fail on its own: on, with the override address resolved
+        // above; a setting already stored is kept. The preview composition
+        // arrives here as the dev install it performs, and its container reads
+        // this same database. A write that cannot be made stops the install.
+        await ensureEmailSafety({
+          targetDir,
+          mode: opts.mode,
+          override: opts.emailRecipientOverride,
+          log,
+          deps: deps.emailSafetyDeps ?? {},
+        });
+        // cinatra-cli#287 — the machine-shared Twenty CRM, after the setup
+        // child and the email safety switch, whatever `--infra`, `--skip-dev-apps` or
         // `--no-wayflow` say. `--no-twenty` is its one skip line, demo is
         // left to the product's demo overlay, and the preview composition
         // arrives here as the dev install it performs.

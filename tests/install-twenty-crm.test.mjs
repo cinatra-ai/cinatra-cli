@@ -952,6 +952,8 @@ describe("T6 wiring — runInstall and runDevRefresh", () => {
         order.push("setup");
         return { tolerated: true, registrySkew: false, lines: [] };
       },
+      // The email safety step writes to the instance database; its own suite drives it.
+      ensureDevEmailSafety: async () => ({ action: "stubbed" }),
       ensureDevTwentyCrm: async (args) => {
         order.push("twenty");
         twentyCalls.push(args);
