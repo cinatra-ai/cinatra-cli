@@ -17,8 +17,11 @@
 // setting right after its setup child — the step that creates the `metadata`
 // table — with the switch ON and the override address from
 // `--email-recipient-override`, else `CINATRA_EMAIL_RECIPIENT_OVERRIDE`, else
-// the reserved default below. `instance refresh` (and `update`, which runs it)
-// does the same after its reconcile, from the variable or the default. The
+// the reserved default below. A development co-use install, whose own install
+// tail returns before the default path's, makes the same call right after that
+// tail's setup call, against the co-use instance's own database
+// (cinatra-cli#292). `instance refresh` (and `update`, which runs it) does the
+// same after its reconcile, from the variable or the default. The
 // write is INSERT-IF-ABSENT, the product's own seeding shape: a setting that is
 // already stored is kept exactly as it is, switch and address — a person
 // changes it on the page, the install never does. A production install never

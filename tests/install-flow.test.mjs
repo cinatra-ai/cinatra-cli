@@ -3757,6 +3757,8 @@ describe("runInstall — co-use executor (cinatra-cli#40)", () => {
       },
       runSetup: () => {}, // stub setup (no real pnpm/migrations)
       skipCoUseInstall: true, // skip pnpm install in the test
+      // The email safety step writes to the instance database; its own suite drives it.
+      ensureDevEmailSafety: async () => ({ action: "stubbed" }),
       ...extra,
     };
   }

@@ -22,8 +22,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
   address. A stored setting is kept as it is: a re-run, `instance refresh` and
   `update` write the setting only when none is stored. A malformed value is
   refused before the install changes anything, a write that cannot be made stops
-  the run, and a production or co-use install refuses the flag and stores
-  nothing for the setting.
+  the run, and a production install refuses the flag and stores nothing for the
+  setting. A development co-use install (`--on-conflict=co-use`, `--infra=share`,
+  or Co-use picked from the port-conflict menu) writes the setting the same way
+  from its own install tail, right after its setup, and accepts the flag.
 
 - **`cinatra instance start` can now run several dev instances on one machine.**
   The command booted the app for the checkout you were in, and it was written

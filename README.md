@@ -140,8 +140,11 @@ page. If the setting cannot be written, the run stops with an error that says
 so, rather than leave a development installation that delivers email.
 
 A production install (`--mode prod`) stores nothing for this setting and refuses
-the flag. A co-use install (`--on-conflict=co-use`, `--infra=share`) runs its
-own install tail, which does not write the setting, so it refuses the flag too.
+the flag. A development co-use install (`--on-conflict=co-use`, `--infra=share`,
+or Co-use picked from the port-conflict menu) runs its own install tail, which
+writes the setting the same way, into the co-use instance's own database right
+after its setup; a re-run that finds that co-use instance already set up runs no
+setup and writes nothing.
 
 With the default address, the mail an instance sends reaches nobody — its own
 account mail, such as a password reset, included. Pass your own inbox to
@@ -504,7 +507,9 @@ asked about. `--external-db-disposable` may therefore be given on its own.
 > would share a session, so `cinatra install` refuses with the exact app change
 > needed and points you at `--on-conflict=isolated`). When the donor sets a
 > Graphiti URL, add `--allow-shared-graphiti` to accept sharing it (it is
-> org-scoped, not per-instance).
+> org-scoped, not per-instance). A dev or demo co-use install also turns on the
+> email safety switch in its own database right after its setup, exactly as
+> *Email safety on a development install and a preview* describes.
 >
 > **Your own database name and template.** By default the instance's database is
 > named after the instance and created from the seed template the CLI maintains.
