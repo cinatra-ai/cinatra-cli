@@ -575,6 +575,8 @@ describe("runInstall — a shared-Postgres instance with an operator-chosen name
     },
     runSetup: () => {},
     skipCoUseInstall: true,
+    // The email safety step writes to the instance database; its own suite drives it.
+    ensureDevEmailSafety: async () => ({ action: "stubbed" }),
     ...extra,
   });
 

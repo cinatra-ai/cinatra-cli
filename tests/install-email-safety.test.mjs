@@ -7,8 +7,9 @@
 //   E1  the address and its source: the flag wins over the variable, the
 //       variable over the reserved default; an empty or malformed value is
 //       refused by name and never echoed; the parser refuses the flag on a
-//       production or co-use install and never reads the variable for
-//       production; the flag's value is never read as the mode positional.
+//       production install and never reads the variable for production, and
+//       reads the flag beside a development co-use request like anywhere
+//       else; the flag's value is never read as the mode positional.
 //   E2  the write: INSERT-IF-ABSENT of the product's value shape under the
 //       product's key, in the instance schema; a stored setting is kept (on or
 //       off) and never overwritten; exactly one line, naming the source and
@@ -26,12 +27,20 @@
 //       --no-install, --no-setup or --dry-run; `instance refresh` resolves the
 //       variable before it changes anything and writes once after its reconcile.
 //   E6  the install help lists the flag.
+//   E7  the co-use install (cinatra-cli#292): its own tail turns the switch on
+//       in the co-use instance's own database right after its setup call, with
+//       the same flag, variable and default, the same insert-if-absent write
+//       and the same printed line; never under --no-setup or --dry-run, never
+//       for production; a write that cannot be made rolls the install back; a
+//       re-run that converges writes nothing and says the flag had no effect;
+//       co-use picked from the port-conflict menu runs the same tail.
 //
 // Hermetic: no database, no Docker, no network. The database is a fake that
 // keeps the product's key/value `metadata` rows in a Map and answers the two
 // statements the step issues.
 
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -48,7 +57,8 @@ import {
   ensureDevEmailSafety,
   resolveEmailRecipientOverride,
 } from "../src/dev-email-safety.mjs";
-import { parseInstallArgs, runInstall } from "../src/install.mjs";
+import { parseEnvBody, parseInstallArgs, runInstall } from "../src/install.mjs";
+import { readInstanceRegistry } from "../src/instance-registry.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CLI_ROOT = path.resolve(HERE, "..");
@@ -203,9 +213,16 @@ describe("E1 the override address and its source", () => {
     expect(() => parseInstallArgs(["--mode", "dev"])).toThrow(VARIABLE);
   });
 
-  it("E1: the flag is refused beside co-use, whose own tail does not write the setting", () => {
-    expect(() => parseInstallArgs(["--on-conflict=co-use", FLAG, FLAG_ADDRESS])).toThrow(/cannot be combined with co-use/);
-    expect(() => parseInstallArgs(["--infra=share", FLAG, FLAG_ADDRESS])).toThrow(/cannot be combined with co-use/);
+  it("E1: beside co-use, whose own tail writes the setting too, the flag is read as anywhere else; prod still refuses it", () => {
+    for (const couse of ["--on-conflict=co-use", "--infra=share"]) {
+      expect(parseInstallArgs([couse, FLAG, FLAG_ADDRESS]).emailRecipientOverride, couse).toEqual({
+        address: FLAG_ADDRESS,
+        source: "flag",
+      });
+    }
+    expect(() => parseInstallArgs(["--mode", "prod", "--on-conflict=co-use", FLAG, FLAG_ADDRESS])).toThrow(
+      /applies only to a development install/,
+    );
   });
 
   it("E1: a bare or empty flag is refused, and its value is never read as the mode positional", () => {
@@ -623,5 +640,195 @@ describe("E6 install help", () => {
     });
     expect(out).toContain("[--email-recipient-override <address>]");
     expect(out).toMatch(/--email-recipient-override <address>\s+The address the email safety switch/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E7 — the co-use install writes it from its own tail (cinatra-cli#292).
+// ---------------------------------------------------------------------------
+describe("E7 the co-use install over a fake database", () => {
+  let root;
+  let originRepo;
+
+  beforeAll(() => {
+    root = mkdtempSync(path.join(sandbox, "couse-"));
+    originRepo = buildFixtureOrigin(root);
+  });
+
+  beforeEach(() => {
+    const d = mkdtempSync(path.join(root, "home-"));
+    process.env.CINATRA_INSTANCE_REGISTRY = path.join(d, "instances.json");
+    process.env.CINATRA_ALLOC_LOCK = path.join(d, "alloc.lock");
+    delete process.env.CINATRA_RUNTIME_MODE;
+  });
+
+  // The donor: the running instance whose database server the co-use install
+  // creates its own database on.
+  const DONOR_ENV = { SUPABASE_DB_URL: FIXTURE_DB_URL };
+
+  /** The co-use suites' harness: a donor whose app isolates login cookies, a
+   *  database server that creates the co-use database, a recorded setup call.
+   *  The email safety step is the REAL one, over the fake database, and it
+   *  records the database the co-use checkout's own .env.local names. */
+  function couseHarness({ db = fakeDatabase(), donorEnv = DONOR_ENV } = {}) {
+    const order = [];
+    const lines = [];
+    const databases = [];
+    const drops = [];
+    const deps = {
+      runPreflight: () => ({ ok: true, failures: [], warnings: [], mode: "dev", infraWillStart: true }),
+      commandExists: () => true,
+      composeAvailable: () => true,
+      detectPortConflicts: async () => [],
+      readCloneRegistry: () => null,
+      readDonorEnv: () => ({ ...donorEnv }),
+      probeCookiePrefixSupport: () => true,
+      bringUpInfra: () => {
+        throw new Error("a co-use install must NOT bring up a stack");
+      },
+      coUseDbOps: {
+        createCoUseDb: async () => ({ created: true }),
+        dropDbCreatedByThisRun: async (a) => {
+          drops.push(a.dbName);
+        },
+      },
+      skipCoUseInstall: true,
+      runSetup: () => {
+        order.push("setup");
+        return { tolerated: true, registrySkew: false, lines: [] };
+      },
+      emailSafetyDeps: {
+        readEnv: async (dir) => {
+          const env = parseEnvBody(readFileSync(path.join(dir, ".env.local"), "utf8"));
+          databases.push(new URL(env.SUPABASE_DB_URL).pathname.slice(1));
+          return env;
+        },
+        query: async (text, values) => {
+          if (!order.includes("email-safety")) order.push("email-safety");
+          return db.query(text, values);
+        },
+        processEnv: {},
+      },
+    };
+    return { db, deps, order, lines, databases, drops, log: (l) => lines.push(String(l)) };
+  }
+
+  const couseInstall = (dir, extraArgs, h) =>
+    runInstall(
+      [
+        "--dir", dir,
+        "--repo-url", `file://${originRepo}`,
+        "--ref", "main",
+        "--on-conflict=co-use",
+        "--no-install",
+        "--yes",
+        ...extraArgs,
+      ],
+      { log: h.log, deps: h.deps },
+    );
+
+  it("E7: the switch is on in the co-use instance's own database, right after its setup call, with the standard line", async () => {
+    const h = couseHarness();
+    const res = await couseInstall(path.join(root, "fresh"), [], h);
+    expect(res.infraPlan).toBe("co-use");
+    expect(productReading(h.db)).toEqual({ developmentModeEnabled: true, overrideRecipientEmail: DEFAULT_ADDRESS });
+    expect(h.databases).toEqual(["cinatra_inst_fresh"]);
+    expect(h.db.statements[0].text).toContain('INSERT INTO "cinatra"."metadata" ');
+    expect(h.order).toEqual(["setup", "email-safety"]);
+    expect(safetyLines(h.lines)).toEqual([
+      "- Email safety: the switch is on; outgoing email goes to the default recipient override, a reserved address that no mail system delivers to.",
+    ]);
+    expect(h.lines.join("\n")).not.toContain(DEFAULT_ADDRESS);
+  });
+
+  it("E7: the variable, then the flag, set the address there too, and neither address is printed", async () => {
+    process.env[VARIABLE] = VARIABLE_ADDRESS;
+    const viaVariable = couseHarness();
+    await couseInstall(path.join(root, "variable"), [], viaVariable);
+    expect(productReading(viaVariable.db)).toEqual({ developmentModeEnabled: true, overrideRecipientEmail: VARIABLE_ADDRESS });
+    expect(safetyLines(viaVariable.lines)).toEqual([
+      `- Email safety: the switch is on; outgoing email goes to the recipient override set from ${VARIABLE}.`,
+    ]);
+
+    const viaFlag = couseHarness();
+    await couseInstall(path.join(root, "flag"), [FLAG, FLAG_ADDRESS], viaFlag);
+    expect(productReading(viaFlag.db)).toEqual({ developmentModeEnabled: true, overrideRecipientEmail: FLAG_ADDRESS });
+    expect(safetyLines(viaFlag.lines)).toEqual([
+      `- Email safety: the switch is on; outgoing email goes to the recipient override set from ${FLAG}.`,
+    ]);
+
+    for (const h of [viaVariable, viaFlag]) {
+      const out = h.lines.join("\n");
+      expect(out).not.toContain(VARIABLE_ADDRESS);
+      expect(out).not.toContain(FLAG_ADDRESS);
+    }
+  });
+
+  it("E7: a setting the co-use database already stores (copied from its template) is kept as it is", async () => {
+    const stored = JSON.stringify({ developmentModeEnabled: false, overrideRecipientEmail: STORED_ADDRESS });
+    const h = couseHarness({ db: fakeDatabase({ [SETTING_KEY]: stored }) });
+    await couseInstall(path.join(root, "templated"), [FLAG, FLAG_ADDRESS], h);
+    expect(h.db.rows.get(SETTING_KEY)).toBe(stored);
+    expect(safetyLines(h.lines)).toEqual([
+      '- Email safety: the stored setting is kept as it is (the switch is off; tick "Override recipient email" at ' +
+        `/configuration/development, tab Email, to turn it on); ${FLAG} was not applied.`,
+    ]);
+    for (const { text } of h.db.statements) expect(INSERT_IF_ABSENT.test(text) || SELECT_STORED.test(text), text).toBe(true);
+  });
+
+  it("E7: never under --no-setup or --dry-run, and a production co-use install stores nothing", async () => {
+    for (const flag of ["--no-setup", "--dry-run"]) {
+      const h = couseHarness();
+      await couseInstall(path.join(root, `skip${flag}`), [flag], h);
+      expect(h.order, flag).toEqual([]);
+      expect(h.db.statements, flag).toEqual([]);
+      expect(safetyLines(h.lines), flag).toEqual([]);
+    }
+
+    process.env[VARIABLE] = "not an address";
+    const prod = couseHarness({
+      donorEnv: {
+        ...DONOR_ENV,
+        BETTER_AUTH_SECRET: randomBytes(16).toString("hex"),
+        CINATRA_ENCRYPTION_KEY: randomBytes(32).toString("hex"),
+      },
+    });
+    const res = await couseInstall(path.join(root, "prod"), ["--mode", "prod"], prod);
+    expect(res.infraPlan).toBe("co-use");
+    expect(prod.order).toEqual(["setup"]);
+    expect(prod.db.statements).toEqual([]);
+    expect(safetyLines(prod.lines)).toEqual([]);
+  });
+
+  it("E7: a write that cannot be made fails the co-use install and rolls back the database it created", async () => {
+    const db = fakeDatabase();
+    db.failWith(new Error("connection refused"));
+    const h = couseHarness({ db });
+    await expect(couseInstall(path.join(root, "fails"), [], h)).rejects.toThrow(/could not store the email safety setting/);
+    expect(h.order).toEqual(["setup", "email-safety"]);
+    expect(h.drops).toEqual(["cinatra_inst_fails"]);
+    expect(readInstanceRegistry(process.env.CINATRA_INSTANCE_REGISTRY).registry.instances.fails).toBeUndefined();
+  });
+
+  it("E7: a re-run that converges on the recorded instance writes nothing and says the flag had no effect", async () => {
+    const dir = path.join(root, "converge");
+    const db = fakeDatabase();
+    await couseInstall(dir, [], couseHarness({ db }));
+    const written = db.statements.length;
+    const again = couseHarness({ db });
+    await couseInstall(dir, [FLAG, FLAG_ADDRESS], again);
+    expect(again.order).toEqual([]);
+    expect(db.statements).toHaveLength(written);
+    expect(safetyLines(again.lines)).toEqual([]);
+    expect(again.lines.filter((l) => l.includes(`${FLAG} had no effect`))).toHaveLength(1);
+    expect(again.lines.join("\n")).not.toContain(FLAG_ADDRESS);
+  });
+
+  it("E7: co-use picked from the port-conflict menu runs this same tail", () => {
+    const source = readFileSync(path.join(CLI_ROOT, "src", "install.mjs"), "utf8");
+    const start = source.indexOf("async function dispatchChoice(");
+    expect(start).toBeGreaterThan(-1);
+    const body = source.slice(start, source.indexOf("\n}\n", start));
+    expect(body).toMatch(/case "co-use":[\s\S]*?return executeCoUse\(\{ targetDir, opts, resolvedSha, log, deps \}\);/);
   });
 });

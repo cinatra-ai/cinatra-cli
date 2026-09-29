@@ -698,8 +698,9 @@ Commands:
                                       else CINATRA_EMAIL_RECIPIENT_OVERRIDE, else
                                       nobody@example.invalid, which no mail system delivers to.
                                       A setting already stored is kept as it is. It prints where
-                                      the address came from, never the address. Refused on a
-                                      prod or co-use install, which write no such setting.
+                                      the address came from, never the address. A dev or demo
+                                      co-use install does the same after its own setup. Refused
+                                      on a prod install, which writes no such setting.
                     For an UNATTENDED install — a CI job or an automated verification runner
                     that creates many instances in a checkout already parked at an exact
                     commit and has to hand it back byte-for-byte clean. All three are off by

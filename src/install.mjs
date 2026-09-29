@@ -875,26 +875,19 @@ export function parseInstallArgs(argv = []) {
 
   // cinatra-cli#291: a development install (dev, demo, and the preview
   // composition) turns the product's email safety switch on after its setup
-  // child. Its override address comes from `--email-recipient-override`, else
-  // CINATRA_EMAIL_RECIPIENT_OVERRIDE, else a reserved address no mail system
-  // delivers to — resolved and validated HERE, before any side effect, so a
-  // malformed value costs nothing. A production install stores no such setting
-  // and the co-use tail does not write it, so the flag is refused on both
-  // rather than silently ignored; the variable, which a shell profile may
-  // carry, is simply not read there.
+  // child, and a development co-use install makes the same call from its own
+  // tail (cinatra-cli#292). Its override address comes from
+  // `--email-recipient-override`, else CINATRA_EMAIL_RECIPIENT_OVERRIDE, else a
+  // reserved address no mail system delivers to — resolved and validated HERE,
+  // before any side effect, so a malformed value costs nothing. A production
+  // install stores no such setting, so the flag is refused there rather than
+  // silently ignored; the variable, which a shell profile may carry, is simply
+  // not read there.
   const emailOverrideOpt = readOption(argv, EMAIL_RECIPIENT_OVERRIDE_FLAG);
   if (emailOverrideOpt != null && !isDevLikeMode(mode)) {
     throw new Error(
       `${EMAIL_RECIPIENT_OVERRIDE_FLAG} applies only to a development install (dev, demo or preview) — ` +
         `a ${surfaceMode} install stores no email safety setting.`,
-    );
-  }
-  if (emailOverrideOpt != null && couseRequested) {
-    throw new Error(
-      `${EMAIL_RECIPIENT_OVERRIDE_FLAG} cannot be combined with co-use (--infra=share / --on-conflict=co-use / ` +
-        "--reuse-from / --db-name / --db-template / --bullmq-queue): the co-use install runs its own tail, which " +
-        "does not write the email safety setting, so the address would be silently ignored. Install without it " +
-        'and tick "Override recipient email" at /configuration/development, tab Email.',
     );
   }
   const emailRecipientOverride = isDevLikeMode(mode)
@@ -3523,6 +3516,13 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
           `creates no database and rewrites no environment.`);
       }
     }
+    // cinatra-cli#292: the email safety switch is written after the setup
+    // call, which a converge never makes, so an address the flag names is not
+    // applied either. Said by the flag's name only, never with the address.
+    if (opts.emailRecipientOverride?.source === "flag") {
+      log(`  ⚠ ${EMAIL_RECIPIENT_OVERRIDE_FLAG} had no effect: this re-run converges on the recorded instance ` +
+        "and writes no email safety setting — change it at /configuration/development, tab Email.");
+    }
     // cinatra-cli#143: an idempotent converge still REPORTS success, so a prod
     // co-use instance whose .env.local is now missing/invalid a hard var must not
     // pass silently (it would crash on first boot). Validate the existing env; no
@@ -3637,6 +3637,23 @@ async function executeCoUse({ targetDir, opts, resolvedSha, log = console.log, d
       if (setupVerdict?.registrySkew === true) {
         for (const line of registrySkewVerdictLines([], { context: "install-tail" })) log(line);
         process.exitCode = claimRegistrySkewExitCode(process.exitCode);
+      }
+      // cinatra-cli#292 — the email safety switch (cinatra-cli#291). The
+      // default path turns it on right after its setup child; co-use returns
+      // on its OWN tail, so it makes the same call here, once setup has
+      // migrated the co-use database (the one this checkout's .env.local
+      // names): the same resolved override, the same insert-if-absent write
+      // and the same printed line. A write that cannot be made fails the
+      // install, and the catch below rolls the provisioning back. Production
+      // stores no such setting.
+      if (isDevLikeMode(opts.mode)) {
+        await (deps.ensureDevEmailSafety ?? ensureDevEmailSafety)({
+          targetDir,
+          mode: opts.mode,
+          override: opts.emailRecipientOverride,
+          log,
+          deps: deps.emailSafetyDeps ?? {},
+        });
       }
     }
 
