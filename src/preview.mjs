@@ -846,8 +846,9 @@ function assertContainerDialedEndpointsOwned({ env, checkoutDir, deps }) {
  *    a 401 for a connection refused.
  *  - NEVER forwards CINATRA_DISABLE_REQUIRED_EXTENSION_MATERIALIZE (AC7-iii): it
  *    is not in PASSTHROUGH_ENV_KEYS and is asserted-absent before boot.
- *  - Forwards CINATRA_E2E_SETUP_BYPASS=true ONLY for a `--fleet dev` PROOF
- *    instance, and only when the instance env sets exactly "true". A development
+ *  - Forwards CINATRA_E2E_SETUP_BYPASS ONLY for a `--fleet dev` PROOF
+ *    instance, and only when the instance env sets exactly "true" or "false"
+ *    (a round that proves the normal sign-in sets "false"). A development
  *    boot reaches its pages past the first-run setup gate through this switch
  *    (the app honours it under a production build too); a proof instance that
  *    drops it lands every page on /setup. The required fleet — the set a real
@@ -874,7 +875,10 @@ export function buildPreviewRunEnvArgs({ encryptionKey, env = process.env, fleet
     }
   }
   const proofInstance = fleet === PREVIEW_PROOF_FLEET;
-  if (proofInstance && env[SETUP_BYPASS_ENV] === "true") pairs.push([ SETUP_BYPASS_ENV, "true" ]);
+  // Exactly "true" or "false": a proof round that tests the real sign-in flow sets it "false" and checks the container for that
+  // literal value, so an explicit false travels too. Any other value is not forwarded.
+  const bypass = env[SETUP_BYPASS_ENV];
+  if (proofInstance && (bypass === "true" || bypass === "false")) pairs.push([ SETUP_BYPASS_ENV, bypass ]);
   // Defense in depth: even if a caller mutated PASSTHROUGH_ENV_KEYS, never emit
   // the bypass flag, and never the setup bypass outside a proof instance.
   const args = [];
