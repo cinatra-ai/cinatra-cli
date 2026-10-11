@@ -3905,8 +3905,18 @@ describe("preview extension fleet — --fleet required|dev (engineering#666)", (
     }
   });
 
-  it("forwards the setup bypass only when the instance env sets exactly \"true\"", () => {
-    for (const value of [undefined, "", "1", "TRUE", "yes", "false"]) {
+  it("forwards an explicit \"false\" to a proof instance, for a round that proves the normal sign-in", () => {
+    const env = { [ENCRYPTION_KEY_ENV]: KEY_64, [SETUP_BYPASS_ENV]: "false" };
+    const proof = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env, fleet: "dev" });
+    expect(proof.filter((a) => a.startsWith(`${SETUP_BYPASS_ENV}=`))).toEqual([`${SETUP_BYPASS_ENV}=false`]);
+    for (const fleet of [undefined, "required"]) {
+      const args = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env, ...(fleet ? { fleet } : {}) }).join(" ");
+      expect(args).not.toContain(SETUP_BYPASS_ENV);
+    }
+  });
+
+  it("forwards the setup bypass only when the instance env sets exactly \"true\" or \"false\"", () => {
+    for (const value of [undefined, "", "1", "TRUE", "yes", "False", "0"]) {
       const env = { [ENCRYPTION_KEY_ENV]: KEY_64, ...(value === undefined ? {} : { [SETUP_BYPASS_ENV]: value }) };
       const args = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env, fleet: "dev" }).join(" ");
       expect(args).not.toContain(SETUP_BYPASS_ENV);
@@ -3956,13 +3966,15 @@ describe("preview extension fleet — --fleet required|dev (engineering#666)", (
     }
   });
 
-  it("the setup bypass is emitted once, as \"true\", even if the passthrough list names it", () => {
+  it("the setup bypass is emitted once, with its exact value, even if the passthrough list names it", () => {
     PASSTHROUGH_ENV_KEYS.push(SETUP_BYPASS_ENV);
     try {
       const on = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env: { [ENCRYPTION_KEY_ENV]: KEY_64, [SETUP_BYPASS_ENV]: "true" }, fleet: "dev" });
       expect(on.filter((a) => a.startsWith(`${SETUP_BYPASS_ENV}=`))).toEqual([`${SETUP_BYPASS_ENV}=true`]);
       const off = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env: { [ENCRYPTION_KEY_ENV]: KEY_64, [SETUP_BYPASS_ENV]: "false" }, fleet: "dev" });
-      expect(off.join(" ")).not.toContain(SETUP_BYPASS_ENV);
+      expect(off.filter((a) => a.startsWith(`${SETUP_BYPASS_ENV}=`))).toEqual([`${SETUP_BYPASS_ENV}=false`]);
+      const odd = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env: { [ENCRYPTION_KEY_ENV]: KEY_64, [SETUP_BYPASS_ENV]: "1" }, fleet: "dev" });
+      expect(odd.join(" ")).not.toContain(SETUP_BYPASS_ENV);
     } finally {
       PASSTHROUGH_ENV_KEYS.pop();
     }
