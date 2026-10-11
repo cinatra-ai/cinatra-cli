@@ -175,7 +175,14 @@ import {
 // cinatra-cli#194: the preview image-build budget lever. `preview.mjs` is plain
 // ESM over node builtins (importable from the light CLI core), and only the pure
 // validator is used here — the lifecycle itself stays lazy-imported below.
-import { resolveBuildTimeoutMs, buildPreviewBuildArgs, resolveBuildCacheMode, resolveBindHost, resolveFleet } from "./preview.mjs";
+import {
+  resolveBuildTimeoutMs,
+  buildPreviewBuildArgs,
+  resolveBuildCacheMode,
+  resolveBindHost,
+  resolveFleet,
+  resolvePinExtension,
+} from "./preview.mjs";
 // cinatra#2654: the WayFlow agent runtime starts with every install-owned local
 // stack. The decision, the operator-facing status text, and the two pre-`up`
 // steps (bridge-token env, image build) live in their own builtins-only module
@@ -452,6 +459,7 @@ const VALUE_TAKING_INSTALL_FLAGS = new Set([
   "--instance",
   "--bind", // cinatra-cli#248 (preview-only; its value is an address, not a mode)
   "--fleet", // engineering#666 (preview-only; its value is a fleet name, not a mode)
+  "--pin-extension", // cinatra-cli#295 (preview-only; its value is <owner>/<repo>@<sha>, not a mode)
   "--email-recipient-override", // cinatra-cli#291 (its value is an address, not a mode)
   "--execution-mode",
   "--sandbox-broker-url",
@@ -872,6 +880,17 @@ export function parseInstallArgs(argv = []) {
   }
   const previewFleet =
     surfaceMode === PREVIEW_SURFACE_MODE_VALUE ? resolveFleet(argv, { fallback: null }) : null;
+  // cinatra-cli#295: `--pin-extension` is preview-only for the same reason —
+  // it edits the preview IMAGE's build context — and is validated here by the
+  // lifecycle's own resolver, before any side effect.
+  const previewPinOpt = readOption(argv, "--pin-extension");
+  if (previewPinOpt != null && surfaceMode !== PREVIEW_SURFACE_MODE_VALUE) {
+    throw new Error(
+      `--pin-extension applies only to \`install --mode preview\` — it pins one extension in the preview ` +
+        `IMAGE's build context, and a ${surfaceMode} install builds no preview image.`,
+    );
+  }
+  const previewPin = surfaceMode === PREVIEW_SURFACE_MODE_VALUE ? (resolvePinExtension(argv)?.id ?? null) : null;
 
   // cinatra-cli#291: a development install (dev, demo, and the preview
   // composition) turns the product's email safety switch on after its setup
@@ -949,6 +968,8 @@ export function parseInstallArgs(argv = []) {
     // engineering#666: the validated preview extension fleet, or null when the
     // operator said nothing. Handed to the lifecycle as its own `--fleet`.
     previewFleet,
+    // cinatra-cli#295: the validated `<owner>/<repo>@<sha>` pin, or null.
+    previewPin,
     yes: argv.includes("--yes"),
     force: argv.includes("--force"),
     resetEnv: argv.includes("--reset-env"),
@@ -10394,6 +10415,7 @@ async function bootstrapPreviewFrontDoor({
     rest: [
       ...(opts.previewBind ? ["--bind", opts.previewBind] : []),
       ...(opts.previewFleet ? ["--fleet", opts.previewFleet] : []),
+      ...(opts.previewPin ? ["--pin-extension", opts.previewPin] : []),
     ],
     log,
     deps: deps.previewDeps ?? {},

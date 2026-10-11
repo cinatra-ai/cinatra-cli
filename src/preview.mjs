@@ -81,6 +81,22 @@ import { spawnSync } from "node:child_process";
 // dependency-free in the other direction (it never imports this module), so
 // there is no cycle and the light CLI core stays importable.
 import { assertEndpointOwnership, resolveEndpointOwnershipMode } from "./preview-endpoint-ownership.mjs";
+// cinatra-cli#295: one extension pinned at a given commit (node builtins only,
+// like this module; its `tar` reader is imported lazily by the real describer).
+import {
+  PIN_EXTENSION_FLAG,
+  PIN_EXTENSION_LABEL,
+  isValidPinId,
+  pinExtensionTagSuffix,
+  prepareExtensionPin,
+  resolvePinExtension,
+  parsePinExtension,
+  planExtensionPin,
+  pinnedLockText,
+  foldTreeHash,
+  describeExtensionTarball,
+  defaultDescribePinnedCommit,
+} from "./preview-extension-pin.mjs";
 
 // --- constants -------------------------------------------------------------
 
@@ -528,12 +544,16 @@ export function isImmutableSha(s) {
  * The DEFAULT fleet keeps the historical tag byte-for-byte, so every row and
  * image written before this lever still matches.
  */
-export function previewImageTag(sha, fleet = PREVIEW_FLEET_DEFAULT) {
+export function previewImageTag(sha, fleet = PREVIEW_FLEET_DEFAULT, pin = null) {
   if (!isImmutableSha(sha)) {
     throw new Error(`previewImageTag requires a 40-hex SHA (got ${JSON.stringify(sha)}).`);
   }
   const f = PREVIEW_FLEETS.includes(fleet) ? fleet : PREVIEW_FLEET_DEFAULT;
-  return `${PREVIEW_IMAGE_TAG_PREFIX}${sha}${f === PREVIEW_FLEET_DEFAULT ? "" : `-${f}`}`;
+  // cinatra-cli#295: a pinned extension is part of the image's identity too, so
+  // an image built without the pin (or with another one) at the same SHA is
+  // never this one. No pin keeps the tag byte-for-byte.
+  const pinned = pin == null ? "" : pinExtensionTagSuffix(pin);
+  return `${PREVIEW_IMAGE_TAG_PREFIX}${sha}${f === PREVIEW_FLEET_DEFAULT ? "" : `-${f}`}${pinned}`;
 }
 
 /** The recorded provenance value for a resolved SHA (AC2). */
@@ -968,7 +988,9 @@ function isValidPreviewSlot(slug, slot) {
   // absent field (a row written before the lever) still reads as the required
   // set, which is what it was built with.
   if (slot.fleet != null && !PREVIEW_FLEETS.includes(slot.fleet)) return false;
-  if (slot.imageTag !== previewImageTag(slot.sha, slot.fleet ?? PREVIEW_FLEET_DEFAULT)) return false;
+  // cinatra-cli#295: a present pin must be the canonical `<owner>/<repo>@<sha>`.
+  if (slot.pin != null && !isValidPinId(slot.pin)) return false;
+  if (slot.imageTag !== previewImageTag(slot.sha, slot.fleet ?? PREVIEW_FLEET_DEFAULT, slot.pin ?? null)) return false;
   if (slot.provenance !== previewProvenance(slot.sha)) return false;
   if (slot.runtimeMode !== PREVIEW_RUNTIME_MODE) return false;
   if (slot.containerName !== previewContainerName(slug)) return false;
@@ -1170,13 +1192,13 @@ export function listPreviews(registry) {
  * the recorded value for "docker's default", which is also what a row written
  * before #248 reads as.
  */
-export function makePreviewSlot({ slug, ref, sha, hostPort, bind = null, fleet = PREVIEW_FLEET_DEFAULT, state = "ready", now }) {
+export function makePreviewSlot({ slug, ref, sha, hostPort, bind = null, fleet = PREVIEW_FLEET_DEFAULT, pin = null, state = "ready", now }) {
   if (!isValidSlug(slug)) throw new Error(`Invalid preview slug "${slug}".`);
   if (!isImmutableSha(sha)) throw new Error(`makePreviewSlot requires a 40-hex SHA (got ${JSON.stringify(sha)}).`);
   const at = (now ?? (() => new Date().toISOString()))();
   // engineering#666: normalise the fleet FIRST — the image tag is derived from it.
   const fleetValue = PREVIEW_FLEETS.includes(fleet) ? fleet : PREVIEW_FLEET_DEFAULT;
-  const imageTag = previewImageTag(sha, fleetValue);
+  const imageTag = previewImageTag(sha, fleetValue, pin);
   return {
     slug,
     ref: String(ref),
@@ -1194,6 +1216,9 @@ export function makePreviewSlot({ slug, ref, sha, hostPort, bind = null, fleet =
     // start/refresh reuses it and a row written before the lever reads as the
     // required set rather than as nothing.
     fleet: fleetValue,
+    // cinatra-cli#295: the pinned extension, recorded only when there is one so
+    // an unpinned row is byte-unchanged.
+    ...(pin == null ? {} : { pin }),
     state,
     createdAt: at,
     refreshedAt: at,
@@ -1207,7 +1232,7 @@ export function makePreviewSlot({ slug, ref, sha, hostPort, bind = null, fleet =
  * logs old→new. The volumeName/containerName are stable (the durable volume is
  * REUSED, AC4). Pure — returns a new slot.
  */
-export function refreshPreviewSlot(slot, { ref, sha, hostPort, bind, fleet, state = "ready", now }) {
+export function refreshPreviewSlot(slot, { ref, sha, hostPort, bind, fleet, pin, state = "ready", now }) {
   if (!isImmutableSha(sha)) throw new Error(`refreshPreviewSlot requires a 40-hex SHA (got ${JSON.stringify(sha)}).`);
   const at = (now ?? (() => new Date().toISOString()))();
   // engineering#666, the same reading as `bind`: UNDEFINED carries the row's own
@@ -1215,9 +1240,13 @@ export function refreshPreviewSlot(slot, { ref, sha, hostPort, bind, fleet, stat
   // Resolved BEFORE the tag, which is derived from it.
   const asked = fleet !== undefined ? (fleet ?? PREVIEW_FLEET_DEFAULT) : (slot.fleet ?? PREVIEW_FLEET_DEFAULT);
   const fleetValue = PREVIEW_FLEETS.includes(asked) ? asked : PREVIEW_FLEET_DEFAULT;
-  const imageTag = previewImageTag(sha, fleetValue);
+  // cinatra-cli#295, the same reading: UNDEFINED carries the row's pin forward.
+  const pinValue = pin !== undefined ? (pin ?? null) : (slot.pin ?? null);
+  const imageTag = previewImageTag(sha, fleetValue, pinValue);
+  const { pin: _priorPin, ...rest } = slot;
   return {
-    ...slot,
+    ...rest,
+    ...(pinValue == null ? {} : { pin: pinValue }),
     ref: ref !== undefined ? String(ref) : slot.ref,
     sha,
     imageTag,
@@ -1309,6 +1338,17 @@ function defaultPrepareContext({ sha, checkoutDir }) {
 }
 
 /**
+ * cinatra-cli#295: one file of the checkout at an immutable SHA (`git show`), or
+ * null when the file does not exist at that commit. Any other failure throws.
+ */
+function defaultReadFileAtSha({ sha, file, checkoutDir }) {
+  const r = runSpawn("git", ["-C", checkoutDir, "show", `${sha}:${file}`], { timeoutMs: 60_000 });
+  if (r.status === 0) return r.stdout;
+  if (/does not exist|exists on disk, but not in/i.test(r.stderr ?? "")) return null;
+  throw new Error(`Could not read ${file} at ${sha} in ${checkoutDir}` + (r.stderr ? `: ${r.stderr.trim()}` : "."));
+}
+
+/**
  * Real host-port probe: resolves true iff `port` can be bound on 0.0.0.0 — the
  * interface `docker run -p <host>:3000` publishes on when no bind address is
  * given. A bind error (EADDRINUSE / EACCES) means the port is busy. Best-effort;
@@ -1357,6 +1397,9 @@ export function defaultDeps({ registryPath = defaultRegistryPath(), log = consol
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     resolveSha: defaultResolveSha,
     prepareContext: defaultPrepareContext,
+    // cinatra-cli#295: the pin reads the app commit's locks and the pinned commit.
+    readFileAtSha: defaultReadFileAtSha,
+    describePinnedCommit: defaultDescribePinnedCommit,
     probeHealth: defaultProbeHealth,
     probePort: (port) => defaultProbePort(port),
     runDocker: (args, opts = {}) => runSpawn("docker", args, opts),
@@ -1827,6 +1870,7 @@ export function previewBuildDockerArgs({
   sha,
   cacheDir = null,
   cacheWrite = true,
+  pin = null,
 }) {
   const args = cacheDir
     ? ["buildx", "build", "--load", "--progress=plain", "-t", tag, ...buildArgs]
@@ -1839,6 +1883,8 @@ export function previewBuildDockerArgs({
   }
   if (provenance) args.push("--label", `cinatra.preview.provenance=${provenance}`);
   if (sha) args.push("--label", `cinatra.preview.sha=${sha}`);
+  // cinatra-cli#295: the pinned extension is stamped like the SHA.
+  if (pin) args.push("--label", `${PIN_EXTENSION_LABEL}=${pin}`);
   args.push(contextDir);
   return args;
 }
@@ -1861,7 +1907,7 @@ export function previewBuildDockerArgs({
  * operator's environment and is immune to any future env composition; the
  * injectable `buildControlEnv` seam keeps the unit suite hermetic.
  */
-export function buildPreviewImage({ tag, contextDir, deps, provenance, sha, fleet = PREVIEW_FLEET_DEFAULT }) {
+export function buildPreviewImage({ tag, contextDir, deps, provenance, sha, fleet = PREVIEW_FLEET_DEFAULT, pin = null }) {
   assertNotProductionImageTag(tag);
   const buildEnv = deps.buildControlEnv ?? process.env;
   const timeoutMs = resolveBuildTimeoutMs(buildEnv);
@@ -1991,6 +2037,7 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha, flee
     sha,
     cacheDir,
     cacheWrite,
+    pin,
   });
   let r;
   try {
@@ -2156,14 +2203,19 @@ export function dockerObjectExists({ kind, ref, deps }) {
  * "unknown" is kept distinct from "absent" for the same reason it is for
  * containers: a timed-out or erroring probe observed nothing (cinatra-cli#220).
  */
-export function previewImagePresence({ tag, sha, deps }) {
-  const r = deps.runDocker(["image", "inspect", "-f", "{{index .Config.Labels \"cinatra.preview.sha\"}}", tag], {
-    timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS,
-  });
+export function previewImagePresence({ tag, sha, pin = null, deps }) {
+  // cinatra-cli#295: the pin stamp is read beside the SHA stamp — an image whose
+  // pin differs from the one asked for (none included) is not this artifact.
+  const r = deps.runDocker(
+    ["image", "inspect", "-f", `{{index .Config.Labels "cinatra.preview.sha"}} {{index .Config.Labels "${PIN_EXTENSION_LABEL}"}}`, tag],
+    { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS },
+  );
   if (r.status === 0) {
-    const stamped = (r.stdout ?? "").trim();
-    if (!sha) return { state: "present", sha: stamped };
-    return stamped === sha ? { state: "present", sha: stamped } : { state: "mismatch", sha: stamped };
+    const [stamped = "", stampedPin = ""] = (r.stdout ?? "").trim().split(/\s+/);
+    if (!sha) return { state: "present", sha: stamped, pin: stampedPin };
+    return stamped === sha && stampedPin === (pin ?? "")
+      ? { state: "present", sha: stamped, pin: stampedPin }
+      : { state: "mismatch", sha: stamped, pin: stampedPin };
   }
   const said = `${r.stderr ?? ""}`;
   if (!r.timedOut && !r.error && /no such (image|object)/i.test(said)) return { state: "absent" };
@@ -2215,9 +2267,18 @@ export function containerState(name, deps) {
  *
  * @returns {{ built: boolean, tag: string }}
  */
-export function ensurePreviewImage({ tag, sha, checkoutDir, rebuild = false, provenance, deps, fleet = PREVIEW_FLEET_DEFAULT }) {
+export function ensurePreviewImage({
+  tag,
+  sha,
+  checkoutDir,
+  rebuild = false,
+  provenance,
+  deps,
+  fleet = PREVIEW_FLEET_DEFAULT,
+  pin = null,
+}) {
   if (!rebuild) {
-    const present = previewImagePresence({ tag, sha, deps });
+    const present = previewImagePresence({ tag, sha, pin: pin?.id ?? null, deps });
     if (present.state === "present") {
       deps.log?.(
         `  reusing the image already present for this SHA: ${tag} — no docker build ` +
@@ -2231,7 +2292,9 @@ export function ensurePreviewImage({ tag, sha, checkoutDir, rebuild = false, pro
     if (present.state === "mismatch") {
       deps.log?.(
         `  the image tagged ${tag} was NOT built from this SHA ` +
-          `(cinatra.preview.sha=${present.sha || "<unstamped>"}), so it is rebuilt rather than trusted.`,
+          `(cinatra.preview.sha=${present.sha || "<unstamped>"}` +
+          (present.pin || pin ? `, ${PIN_EXTENSION_LABEL}=${present.pin || "<none>"}` : "") +
+          `), so it is rebuilt rather than trusted.`,
       );
     } else if (present.state === "unknown") {
       deps.log?.(
@@ -2242,7 +2305,12 @@ export function ensurePreviewImage({ tag, sha, checkoutDir, rebuild = false, pro
   }
   const ctx = deps.prepareContext({ sha, checkoutDir });
   try {
-    buildPreviewImage({ tag, contextDir: ctx.contextDir, deps, provenance, sha, fleet });
+    // cinatra-cli#295: the build context's ONE change — the pinned lock entry.
+    if (pin) {
+      pin.apply(ctx.contextDir);
+      deps.log?.(`  extension pin: ${pin.id} in ${pin.lockFile} (was ${pin.fromSha}).`);
+    }
+    buildPreviewImage({ tag, contextDir: ctx.contextDir, deps, provenance, sha, fleet, pin: pin?.id ?? null });
   } finally {
     try {
       ctx.cleanup?.();
@@ -2628,6 +2696,8 @@ export async function runPreviewCreate(rest, injected = {}) {
   // and handed to the same single assembly seam every other build lever uses.
   const fleet = resolveFleet(rest);
   buildPreviewBuildArgs(deps.buildControlEnv ?? process.env, { fleet });
+  // cinatra-cli#295: the pin's value is parsed here too, before anything else.
+  const pinRequest = resolvePinExtension(rest);
   // cinatra-cli#248: the build-cache mode is one of those levers too.
   resolveBuildCacheMode(deps.buildControlEnv ?? process.env);
   // cinatra-cli#219: the endpoint-ownership mode lever gets the SAME fail-fast
@@ -2651,9 +2721,23 @@ export async function runPreviewCreate(rest, injected = {}) {
   const rebuild = readFlag(rest, "--rebuild", "--force-build");
 
   const sha = deps.resolveSha(ref, checkoutDir);
+  // cinatra-cli#295: the pin is planned against the app commit's own locks (and
+  // the pinned commit described) BEFORE the slug claim, so every refusal costs
+  // nothing to recover from and no build starts on a pin that cannot hold.
+  const pin = pinRequest
+    ? await prepareExtensionPin({
+        pin: pinRequest,
+        sha,
+        fleet,
+        checkoutDir,
+        readFileAtSha: deps.readFileAtSha,
+        describePinnedCommit: deps.describePinnedCommit,
+      })
+    : null;
   // engineering#666: the fleet is part of the image's identity, so it is part of
   // the tag — a dev proof instance never reuses (or overwrites) the required image.
-  const tag = previewImageTag(sha, fleet);
+  // cinatra-cli#295: so is the pin.
+  const tag = previewImageTag(sha, fleet, pin?.id ?? null);
   const provenance = previewProvenance(sha);
   const volumeName = previewVolumeName(slug);
   artifactVolumePresence(slug, deps);
@@ -2685,7 +2769,7 @@ export async function runPreviewCreate(rest, injected = {}) {
         // cinatra-cli#248: a narrowed publish is probed on ITS OWN address too.
         : await allocatePreviewHostPort({ registry: reg, probe: bindAwareProbePort({ probe: deps.probePort, bind }) });
     const next = cloneRegistry(reg);
-    next.previews[slug] = makePreviewSlot({ slug, ref, sha, hostPort, bind, fleet, state: "provisioning", now: () => new Date().toISOString() });
+    next.previews[slug] = makePreviewSlot({ slug, ref, sha, hostPort, bind, fleet, pin: pin?.id ?? null, state: "provisioning", now: () => new Date().toISOString() });
     writeRegistry(deps.registryPath, next);
   });
 
@@ -2748,7 +2832,7 @@ export async function runPreviewCreate(rest, injected = {}) {
     assertContainerDialedEndpointsOwned({ env: runtimeEnv, checkoutDir, deps });
 
     // cinatra-cli#220: an image already present for this SHA is reused.
-    imageBuiltHere = ensurePreviewImage({ tag, sha, checkoutDir, rebuild, provenance, deps, fleet }).built;
+    imageBuiltHere = ensurePreviewImage({ tag, sha, checkoutDir, rebuild, provenance, deps, fleet, pin }).built;
 
     // Establish and verify the separate artifact volume BEFORE the first app
     // process. Never remove it on failure: even a failed boot may have written data.
@@ -2791,7 +2875,7 @@ export async function runPreviewCreate(rest, injected = {}) {
     const reg = requireUsableRegistry(deps.registryPath);
     const cur = getPreview(reg, slug);
     const next = cloneRegistry(reg);
-    next.previews[slug] = makePreviewSlot({ slug, ref, sha, hostPort, bind, fleet, state: "ready", now: () => cur?.createdAt ?? new Date().toISOString() });
+    next.previews[slug] = makePreviewSlot({ slug, ref, sha, hostPort, bind, fleet, pin: pin?.id ?? null, state: "ready", now: () => cur?.createdAt ?? new Date().toISOString() });
     writeRegistry(deps.registryPath, next);
   });
   deps.log(`preview "${slug}" is healthy: ${tag} (sha ${sha}) on http://${previewReachHost(bind)}:${hostPort}`);
@@ -2821,6 +2905,9 @@ export async function runPreviewRefresh(rest, injected = {}) {
   buildPreviewBuildArgs(deps.buildControlEnv ?? process.env, { fleet: requestedFleet ?? PREVIEW_FLEET_DEFAULT }); // same fail-fast for every build-arg lever
   resolveBuildCacheMode(deps.buildControlEnv ?? process.env); // cinatra-cli#248
   resolveEndpointOwnershipMode(deps.ownershipControlEnv ?? deps.env ?? process.env); // cinatra-cli#219
+  // cinatra-cli#295: an explicit pin on THIS refresh, parsed before the claim.
+  // Saying nothing carries the row's own pin forward (the --fleet reading).
+  const requestedPin = resolvePinExtension(rest);
 
   // AC9: refuse a genuine `--mode prod` checkout up front — checkout-derived and
   // unconditional. Critically NOT gated on an existing registry row: refresh
@@ -2844,7 +2931,7 @@ export async function runPreviewRefresh(rest, injected = {}) {
   // CLAIM the slug under the lock: require an existing (non-in-flight) row,
   // capture the prior sha/tag + reuse the durable host port, and flip the row to
   // `provisioning` so a concurrent op can't race the container replacement.
-  let oldSha, oldTag, hostPort, bind, oldBind, volumeName, fleet;
+  let oldSha, oldTag, hostPort, bind, oldBind, volumeName, fleet, pinId;
   await withRegistryLock(deps.registryPath, async () => {
     const reg = requireUsableRegistry(deps.registryPath);
     const existing = getPreview(reg, slug);
@@ -2891,7 +2978,8 @@ export async function runPreviewRefresh(rest, injected = {}) {
       );
     }
     fleet = rowFleet;
-    newTag = previewImageTag(newSha, fleet);
+    pinId = requestedPin?.id ?? existing.pin ?? null;
+    newTag = previewImageTag(newSha, fleet, pinId);
     const next = cloneRegistry(reg);
     // Persist the (possibly freshly-allocated, for a legacy row) durable host
     // port in the SAME locked transaction as the claim — so a concurrent create
@@ -2959,12 +3047,25 @@ export async function runPreviewRefresh(rest, injected = {}) {
     // before the healthy old container is torn down, so `replaced` stays false
     // and abort restores the row to `ready` with the running preview untouched.
     assertContainerDialedEndpointsOwned({ env: runtimeEnv, checkoutDir, deps });
+    // cinatra-cli#295: the pin is planned against the NEW app commit's locks
+    // before any build; a refusal lands in abort with `replaced` still false,
+    // so the running preview and its row are left as they were.
+    const pin = pinId
+      ? await prepareExtensionPin({
+          pin: parsePinExtension(pinId),
+          sha: newSha,
+          fleet,
+          checkoutDir,
+          readFileAtSha: deps.readFileAtSha,
+          describePinnedCommit: deps.describePinnedCommit,
+        })
+      : null;
     // Acquire the NEW image FIRST (a build failure leaves the running preview
     // untouched — we only replace the container after the image is in hand).
     // cinatra-cli#220 AC1: when that image is ALREADY here, no build runs at all
     // — which is what makes re-pointing a preview at changed configuration cheap
     // enough to be possible on a host that cannot build (#210).
-    imageBuiltHere = ensurePreviewImage({ tag: newTag, sha: newSha, checkoutDir, rebuild, provenance, deps, fleet }).built;
+    imageBuiltHere = ensurePreviewImage({ tag: newTag, sha: newSha, checkoutDir, rebuild, provenance, deps, fleet, pin }).built;
 
     // Replace the running container (AC4: the replaced container is removed —
     // no orphan accumulation), REUSING the durable volume (never dropped).
@@ -3011,7 +3112,7 @@ export async function runPreviewRefresh(rest, injected = {}) {
     // correct old->new history entry (the claim had flipped state, not sha).
     const base = { ...cur, sha: oldSha, imageTag: oldTag, provenance: previewProvenance(oldSha) };
     const next = cloneRegistry(reg);
-    next.previews[slug] = refreshPreviewSlot(base, { ref, sha: newSha, hostPort, bind, fleet, state: "ready", now: () => new Date().toISOString() });
+    next.previews[slug] = refreshPreviewSlot(base, { ref, sha: newSha, hostPort, bind, fleet, pin: pinId, state: "ready", now: () => new Date().toISOString() });
     writeRegistry(deps.registryPath, next);
   });
   if (oldTag !== newTag) {
@@ -3295,7 +3396,7 @@ export async function runPreviewStart(rest, injected = {}) {
     // existence check would boot whatever currently carries this (mutable) tag —
     // and `--recreate` would replace a healthy preview with a stranger's image —
     // and would report a timed-out probe as "not present".
-    const image = previewImagePresence({ tag, sha: row.sha, deps });
+    const image = previewImagePresence({ tag, sha: row.sha, pin: row.pin ?? null, deps });
     if (image.state !== "present") {
       await release(row.state);
       throw new Error(
@@ -3472,7 +3573,9 @@ export function runPreviewStatus(rest, injected = {}) {
         `provenance=${r.provenance} volume=${r.volumeName} port=${r.hostPort ?? "-"} ref=${r.ref} ` +
         // engineering#666: which fleet the image carries, so `start`/`refresh`
         // reuse it knowingly and a proof instance is recognisable from a read.
-        `fleet=${r.fleet ?? PREVIEW_FLEET_DEFAULT}`,
+        `fleet=${r.fleet ?? PREVIEW_FLEET_DEFAULT}` +
+        // cinatra-cli#295: the pinned extension, only when there is one.
+        (r.pin ? ` pin=${r.pin}` : ""),
     );
     if (r.state === "ready" && container === "unknown") {
       deps.log(`  the container's state could NOT be read (docker did not answer) — this is not a claim that it is gone.`);
@@ -3625,4 +3728,20 @@ export const __test = {
   runPreviewList,
   readFlag,
   defaultDeps,
+  // cinatra-cli#295 — one extension pinned at a given commit
+  PIN_EXTENSION_FLAG,
+  PIN_EXTENSION_LABEL,
+  resolvePinExtension,
+  parsePinExtension,
+  isValidPinId,
+  pinExtensionTagSuffix,
+  planExtensionPin,
+  pinnedLockText,
+  prepareExtensionPin,
+  foldTreeHash,
+  describeExtensionTarball,
+  defaultReadFileAtSha,
 };
+
+// cinatra-cli#295: the pin's resolver for the install front door's argument parse.
+export { resolvePinExtension, PIN_EXTENSION_FLAG };

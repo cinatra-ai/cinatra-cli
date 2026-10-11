@@ -621,6 +621,24 @@ export function previewFleetArgs({ rest = [] } = {}) {
   return [];
 }
 
+/**
+ * The `--pin-extension` argv the front door hands the preview lifecycle
+ * (cinatra-cli#295), for the reason `previewBindArgs` and `previewFleetArgs`
+ * exist: the create argv is reconstructed, so a flag not extracted here is
+ * silently dropped and the preview would be built with the app commit's own
+ * pin. The value is left to `resolvePinExtension` inside `runPreviewCreate`; a
+ * bare trailing flag is forwarded EMPTY so that validator refuses it.
+ */
+export function previewPinExtensionArgs({ rest = [] } = {}) {
+  if (!Array.isArray(rest)) return [];
+  for (let i = 0; i < rest.length; i++) {
+    const token = String(rest[i]);
+    if (token === "--pin-extension") return ["--pin-extension", rest[i + 1] === undefined ? "" : String(rest[i + 1])];
+    if (token.startsWith("--pin-extension=")) return ["--pin-extension", token.slice("--pin-extension=".length)];
+  }
+  return [];
+}
+
 // --- orchestration ---------------------------------------------------------
 
 /**
@@ -763,7 +781,11 @@ export async function runInstallPreviewBootstrap({
   // cinatra-cli#248: `--bind` is forwarded EXPLICITLY, because this argv is
   // reconstructed rather than passed through (see `previewBindArgs`).
   // engineering#666: `--fleet` for the same reason (see `previewFleetArgs`).
-  const result = await runPreviewCreate(["--slug", slug, "--ref", ref, ...previewBindArgs({ rest }), ...previewFleetArgs({ rest })], {
+  // cinatra-cli#295: `--pin-extension` too (see `previewPinExtensionArgs`).
+  const result = await runPreviewCreate([
+    "--slug", slug, "--ref", ref,
+    ...previewBindArgs({ rest }), ...previewFleetArgs({ rest }), ...previewPinExtensionArgs({ rest }),
+  ], {
     ...injected,
     checkoutDir: targetDir,
     // The pre-port env: enough for create's fail-fast encryption-key gate; the
@@ -1058,6 +1080,7 @@ export const __test = {
   previewSlugArgs,
   previewBindArgs,
   previewFleetArgs, // engineering#666
+  previewPinExtensionArgs, // cinatra-cli#295
   decidePreviewAction,
   previewSkipReportLines,
   previewInFlightReportLines,
