@@ -867,6 +867,7 @@ export function buildPreviewRunEnvArgs({ encryptionKey, env = process.env, fleet
   pairs.push([ ENCRYPTION_KEY_ENV, encryptionKey ]);
   pairs.push([ "HOSTNAME", "0.0.0.0" ]);
   for (const key of PASSTHROUGH_ENV_KEYS) {
+    if (key === SETUP_BYPASS_ENV) continue; // only ever emitted by the proof-fleet rule below
     const value = env[key];
     if (typeof value === "string" && value.length > 0) {
       pairs.push([ key, rewriteKeys.has(key) ? rewriteLoopbackUrlForContainer(value) : value ]);

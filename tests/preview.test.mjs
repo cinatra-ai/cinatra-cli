@@ -3936,6 +3936,38 @@ describe("preview extension fleet — --fleet required|dev (engineering#666)", (
     expect(f2.calls.find((c) => c[0] === "run").join(" ")).not.toContain(SETUP_BYPASS_ENV);
   });
 
+  it("start --recreate forwards the setup bypass for a dev-fleet row only (a row with no fleet reads as required)", async () => {
+    const env = { [ENCRYPTION_KEY_ENV]: KEY_64, [SETUP_BYPASS_ENV]: "true" };
+    const owned = () => ({
+      containers: [
+        { id: "own-redis", name: "cinatra-redis-1", service: "redis", project: "cinatra", workingDir: tmp, ports: [["127.0.0.1", 6379, 6379]] },
+      ],
+    });
+    for (const [fleet, expected] of [["dev", true], ["required", false], [undefined, false]]) {
+      const slot = makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, ...(fleet ? { fleet } : {}), now: () => "T0" });
+      if (fleet === undefined) delete slot.fleet;
+      writeRegistry(registryPath, { version: 1, previews: { main: slot } });
+      const state = { containerRunning: true, health: healthy, images: new Set([slot.imageTag]), compose: owned() };
+      const { deps, fake } = makeDeps(state, { env });
+      await runPreviewStart(["--slug", "main", "--recreate"], deps);
+      const run = fake.calls.find((c) => c[0] === "run").join(" ");
+      if (expected) expect(run).toContain(`${SETUP_BYPASS_ENV}=true`);
+      else expect(run).not.toContain(SETUP_BYPASS_ENV);
+    }
+  });
+
+  it("the setup bypass is emitted once, as \"true\", even if the passthrough list names it", () => {
+    PASSTHROUGH_ENV_KEYS.push(SETUP_BYPASS_ENV);
+    try {
+      const on = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env: { [ENCRYPTION_KEY_ENV]: KEY_64, [SETUP_BYPASS_ENV]: "true" }, fleet: "dev" });
+      expect(on.filter((a) => a.startsWith(`${SETUP_BYPASS_ENV}=`))).toEqual([`${SETUP_BYPASS_ENV}=true`]);
+      const off = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env: { [ENCRYPTION_KEY_ENV]: KEY_64, [SETUP_BYPASS_ENV]: "false" }, fleet: "dev" });
+      expect(off.join(" ")).not.toContain(SETUP_BYPASS_ENV);
+    } finally {
+      PASSTHROUGH_ENV_KEYS.pop();
+    }
+  });
+
   it("a refresh of a dev-fleet preview keeps forwarding the setup bypass", async () => {
     const env = { [ENCRYPTION_KEY_ENV]: KEY_64, [SETUP_BYPASS_ENV]: "true" };
     const { deps } = makeDeps({ sha: SHA_A, health: healthy }, { env });
