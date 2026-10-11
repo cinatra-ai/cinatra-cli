@@ -475,8 +475,8 @@ export const PASSTHROUGH_ENV_KEYS = [
   //  - CINATRA_WAYFLOW_RUNTIME: what the instance recorded about its agent runtime
   //    (cinatra packages/agents/src/wayflow-url.ts). Forwarded verbatim.
   //  - GRAPHITI_URL: the knowledge-graph service the SERVER dials (cinatra
-  //    packages/objects/src/graphiti-client.ts), so it is also in
-  //    CONTAINER_REWRITE_ENV_KEYS and passes the same endpoint-ownership check.
+  //    packages/objects/src/graphiti-client.ts); forwarded only when it names a
+  //    reachable, non-loopback address (REACHABLE_ONLY_ENV_KEYS below).
   "BETTER_AUTH_TRUSTED_ORIGINS",
   "CINATRA_BOOT_READY_TIMEOUT_MS",
   "CINATRA_WAYFLOW_RUNTIME",
@@ -535,10 +535,17 @@ export const CONTAINER_REWRITE_ENV_KEYS = [
   // it verbatim would point the container at itself; `CINATRA_BRIDGE_TOKEN` is
   // its credential, not an address, so that one stays verbatim.
   "WAYFLOW_BASE_URL",
-  // cinatra-cli#300: the knowledge-graph service the server dials; a dev install
-  // writes a host-loopback address.
-  "GRAPHITI_URL",
 ];
+
+// cinatra-cli#300: container-dialed keys that are forwarded ONLY when their value
+// already names an address the container can reach (not host loopback), and are
+// otherwise dropped exactly as before. They stay out of CONTAINER_REWRITE_ENV_KEYS
+// on purpose: joining that list would put them under the endpoint-ownership gate,
+// and an existing preview whose env carries a loopback value with no owning
+// Compose service would then refuse refresh and recreate.
+//  - GRAPHITI_URL: the knowledge-graph service; a bring-up that runs one for the
+//    preview supplies its reachable address (e.g. a service-bridge address).
+export const REACHABLE_ONLY_ENV_KEYS = ["GRAPHITI_URL"];
 
 // --- slug / name / tag -----------------------------------------------------
 
@@ -813,6 +820,15 @@ export function rewriteLoopbackUrlForContainer(value, gatewayHost = CONTAINER_HO
  * Returns `{ key, value }` pairs. The values are credential-bearing; the caller
  * uses them only to derive a port.
  */
+/** True when `value` parses as a URL whose host is host loopback (cinatra-cli#300). */
+function isHostLoopbackUrl(value) {
+  try {
+    return isHostLoopbackHostname(new URL(value).hostname);
+  } catch {
+    return false;
+  }
+}
+
 export function containerDialedLoopbackEndpoints(env = {}) {
   const entries = [];
   for (const key of CONTAINER_REWRITE_ENV_KEYS) {
@@ -880,6 +896,7 @@ function assertContainerDialedEndpointsOwned({ env, checkoutDir, deps }) {
 export function buildPreviewRunEnvArgs({ encryptionKey, env = process.env, fleet = PREVIEW_FLEET_DEFAULT }) {
   assertMaterializeNotDisabled(env);
   const rewriteKeys = new Set(CONTAINER_REWRITE_ENV_KEYS);
+  const reachableOnly = new Set(REACHABLE_ONLY_ENV_KEYS);
   const pairs = [];
   pairs.push([ "CINATRA_RUNTIME_MODE", PREVIEW_RUNTIME_MODE ]);
   pairs.push([ EXTENSION_DATA_ROOT_ENV, EXTENSION_DATA_ROOT_IN_CONTAINER ]);
@@ -889,6 +906,7 @@ export function buildPreviewRunEnvArgs({ encryptionKey, env = process.env, fleet
   for (const key of PASSTHROUGH_ENV_KEYS) {
     if (key === SETUP_BYPASS_ENV) continue; // only ever emitted by the proof-fleet rule below
     const value = env[key];
+    if (reachableOnly.has(key) && typeof value === "string" && isHostLoopbackUrl(value)) continue;
     if (typeof value === "string" && value.length > 0) {
       pairs.push([ key, rewriteKeys.has(key) ? rewriteLoopbackUrlForContainer(value) : value ]);
     }
@@ -3683,6 +3701,7 @@ export const __test = {
   // engineering#666
   PREVIEW_FLEET_FLAG,
   PREVIEW_FLEETS,
+  REACHABLE_ONLY_ENV_KEYS,
   PREVIEW_FLEET_DEFAULT,
   PREVIEW_PROOF_FLEET,
   SETUP_BYPASS_ENV,

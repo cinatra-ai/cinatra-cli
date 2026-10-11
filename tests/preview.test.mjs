@@ -409,17 +409,41 @@ describe("preview — development-boot parity keys (cinatra-cli#300)", () => {
     }
   });
 
-  it("rewrites a host-loopback GRAPHITI_URL for the container and verifies its ownership", () => {
+  it("forwards GRAPHITI_URL only when it names a reachable, non-loopback address", () => {
     expect(PASSTHROUGH_ENV_KEYS).toContain("GRAPHITI_URL");
-    expect(CONTAINER_REWRITE_ENV_KEYS).toContain("GRAPHITI_URL");
+    expect(P.REACHABLE_ONLY_ENV_KEYS).toContain("GRAPHITI_URL");
+    // Never under the endpoint-ownership gate: it is not container-REWRITTEN.
+    expect(CONTAINER_REWRITE_ENV_KEYS).not.toContain("GRAPHITI_URL");
+    const bridge = { [ENCRYPTION_KEY_ENV]: KEY_64, GRAPHITI_URL: "http://172.17.0.2:8100" };
+    expect(buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env: bridge }).join(" ")).toContain("GRAPHITI_URL=http://172.17.0.2:8100");
+    for (const loopback of ["http://127.0.0.1:8100", "http://localhost:8100", "http://[::1]:8100"]) {
+      const env = { [ENCRYPTION_KEY_ENV]: KEY_64, GRAPHITI_URL: loopback };
+      expect(buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env }).join(" ")).not.toContain("GRAPHITI_URL=");
+      expect(P.containerDialedLoopbackEndpoints(env)).toEqual([]);
+    }
+  });
+
+  it("a loopback GRAPHITI_URL with no owning service changes nothing for create, refresh or start --recreate", async () => {
+    // cinatra-cli#300 review: joining the rewrite list would have put the key under the ownership gate and
+    // refused these lifecycles; as a reachable-only key it is dropped and the gate never sees it.
+    const healthy = { status: 200, body: '{"status":"ok"}' };
     const env = { [ENCRYPTION_KEY_ENV]: KEY_64, GRAPHITI_URL: "http://127.0.0.1:8100" };
-    const joined = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env }).join(" ");
-    expect(joined).toContain(`GRAPHITI_URL=http://${CONTAINER_HOST_GATEWAY}:8100`);
-    expect(P.containerDialedLoopbackEndpoints(env).map((e) => e.key)).toContain("GRAPHITI_URL");
-    // A non-loopback (hosted) service is forwarded as set and never ownership-checked.
-    const hosted = { [ENCRYPTION_KEY_ENV]: KEY_64, GRAPHITI_URL: "http://graphiti:8000" };
-    expect(buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env: hosted }).join(" ")).toContain("GRAPHITI_URL=http://graphiti:8000");
-    expect(P.containerDialedLoopbackEndpoints(hosted)).toEqual([]);
+    const { deps, fake } = makeDeps({ sha: SHA_A, health: healthy }, { env });
+    await runPreviewCreate(["--slug", "main"], deps);
+    expect(fake.calls.find((c) => c[0] === "run").join(" ")).not.toContain("GRAPHITI_URL=");
+    const { deps: rdeps, fake: rfake } = makeDeps({ sha: SHA_B, health: healthy }, { env });
+    await runPreviewRefresh(["--slug", "main"], rdeps);
+    expect(rfake.calls.find((c) => c[0] === "run").join(" ")).not.toContain("GRAPHITI_URL=");
+    const slot = getPreview(readRegistry(registryPath).registry, "main");
+    const state = {
+      containerRunning: true,
+      health: healthy,
+      images: new Set([slot.imageTag]),
+      compose: { containers: [{ id: "own-redis", name: "cinatra-redis-1", service: "redis", project: "cinatra", workingDir: tmp, ports: [["127.0.0.1", 6379, 6379]] }] },
+    };
+    const { deps: sdeps, fake: sfake } = makeDeps(state, { env });
+    await runPreviewStart(["--slug", "main", "--recreate"], sdeps);
+    expect(sfake.calls.find((c) => c[0] === "run").join(" ")).not.toContain("GRAPHITI_URL=");
   });
 
   it("forwards none of them when the instance env does not set them", () => {
