@@ -308,6 +308,10 @@ export const PREVIEW_BUILD_BUNDLER_ARG = "CINATRA_BUILD_BUNDLER";
 export const PREVIEW_FLEET_FLAG = "--fleet";
 export const PREVIEW_FLEETS = ["required", "dev"];
 export const PREVIEW_FLEET_DEFAULT = "required";
+/** The fleet that marks a PROOF instance (see buildPreviewRunEnvArgs). */
+export const PREVIEW_PROOF_FLEET = "dev";
+/** The app's first-run setup bypass; forwarded to proof instances only. */
+export const SETUP_BYPASS_ENV = "CINATRA_E2E_SETUP_BYPASS";
 // The build-arg NAME the Dockerfile must declare for the lever to bite.
 export const PREVIEW_FLEET_ARG = "CINATRA_EXTENSION_FLEET";
 
@@ -842,12 +846,18 @@ function assertContainerDialedEndpointsOwned({ env, checkoutDir, deps }) {
  *    a 401 for a connection refused.
  *  - NEVER forwards CINATRA_DISABLE_REQUIRED_EXTENSION_MATERIALIZE (AC7-iii): it
  *    is not in PASSTHROUGH_ENV_KEYS and is asserted-absent before boot.
+ *  - Forwards CINATRA_E2E_SETUP_BYPASS=true ONLY for a `--fleet dev` PROOF
+ *    instance, and only when the instance env sets exactly "true". A development
+ *    boot reaches its pages past the first-run setup gate through this switch
+ *    (the app honours it under a production build too); a proof instance that
+ *    drops it lands every page on /setup. The required fleet — the set a real
+ *    deployment carries — never receives it, whatever the env says.
  *
  * Returns a flat argv fragment: ["-e", "K=V", "-e", "K2=V2", ...].
  *
- * @param {{ encryptionKey: string, env?: Record<string,string> }} args
+ * @param {{ encryptionKey: string, env?: Record<string,string>, fleet?: string }} args
  */
-export function buildPreviewRunEnvArgs({ encryptionKey, env = process.env }) {
+export function buildPreviewRunEnvArgs({ encryptionKey, env = process.env, fleet = PREVIEW_FLEET_DEFAULT }) {
   assertMaterializeNotDisabled(env);
   const rewriteKeys = new Set(CONTAINER_REWRITE_ENV_KEYS);
   const pairs = [];
@@ -857,16 +867,20 @@ export function buildPreviewRunEnvArgs({ encryptionKey, env = process.env }) {
   pairs.push([ ENCRYPTION_KEY_ENV, encryptionKey ]);
   pairs.push([ "HOSTNAME", "0.0.0.0" ]);
   for (const key of PASSTHROUGH_ENV_KEYS) {
+    if (key === SETUP_BYPASS_ENV) continue; // only ever emitted by the proof-fleet rule below
     const value = env[key];
     if (typeof value === "string" && value.length > 0) {
       pairs.push([ key, rewriteKeys.has(key) ? rewriteLoopbackUrlForContainer(value) : value ]);
     }
   }
+  const proofInstance = fleet === PREVIEW_PROOF_FLEET;
+  if (proofInstance && env[SETUP_BYPASS_ENV] === "true") pairs.push([ SETUP_BYPASS_ENV, "true" ]);
   // Defense in depth: even if a caller mutated PASSTHROUGH_ENV_KEYS, never emit
-  // the bypass flag.
+  // the bypass flag, and never the setup bypass outside a proof instance.
   const args = [];
   for (const [k, v] of pairs) {
     if (k === MATERIALIZE_DISABLE_ENV) continue;
+    if (k === SETUP_BYPASS_ENV && !proofInstance) continue;
     args.push("-e", `${k}=${v}`);
   }
   return args;
@@ -2429,12 +2443,12 @@ function resolveRuntimeEnv({ deps, env, hostPort }) {
  *
  * @returns {string} the container name
  */
-export function bootPreviewContainer({ slug, tag, hostPort, bind = null, encryptionKey, provenance, sha, deps }) {
+export function bootPreviewContainer({ slug, tag, hostPort, bind = null, encryptionKey, provenance, sha, fleet = PREVIEW_FLEET_DEFAULT, deps }) {
   assertNotProductionImageTag(tag);
   const containerName = previewContainerName(slug);
   const volumeName = previewVolumeName(slug);
   if (artifactVolumePresence(slug, deps) !== "owned") throw new Error("Artifact volume disappeared before boot; refusing empty replacement.");
-  const envArgs = buildPreviewRunEnvArgs({ encryptionKey, env: deps.env ?? process.env });
+  const envArgs = buildPreviewRunEnvArgs({ encryptionKey, env: deps.env ?? process.env, fleet });
   const args = [
     "run", "-d",
     "--name", containerName,
@@ -2845,6 +2859,7 @@ export async function runPreviewCreate(rest, injected = {}) {
       encryptionKey: bootKey,
       provenance,
       sha,
+      fleet,
       deps: { ...deps, env: runtimeEnv },
     });
     deps.log(`  booted ${container}; health-gating http://${previewReachHost(bind)}:${hostPort}/api/health ...`);
@@ -3079,6 +3094,7 @@ export async function runPreviewRefresh(rest, injected = {}) {
       encryptionKey: bootKey,
       provenance,
       sha: newSha,
+      fleet,
       deps: { ...deps, env: runtimeEnv },
     });
     deps.log(`  booted ${container}; health-gating http://${previewReachHost(bind)}:${hostPort}/api/health ...`);
@@ -3493,6 +3509,7 @@ export async function runPreviewStart(rest, injected = {}) {
         encryptionKey: bootKey,
         provenance: row.provenance,
         sha: row.sha,
+        fleet: row.fleet ?? PREVIEW_FLEET_DEFAULT,
         deps: { ...deps, env: runtimeEnv },
       });
     } catch (err) {
@@ -3644,6 +3661,8 @@ export const __test = {
   PREVIEW_FLEET_FLAG,
   PREVIEW_FLEETS,
   PREVIEW_FLEET_DEFAULT,
+  PREVIEW_PROOF_FLEET,
+  SETUP_BYPASS_ENV,
   PREVIEW_FLEET_ARG,
   PREVIEW_STOP_TIMEOUT_MS,
   SUPERSEDED_CONTAINER_SUFFIX,
