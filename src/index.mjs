@@ -1025,8 +1025,18 @@ Usage:
   cinatra instance clone list
   cinatra instance preview create [--ref <git-ref>] [--slug <slug>] [--port <port>]
                                  [--bind <address>] [--fleet required|dev] [--rebuild]
+                                 [--pin-extension <owner>/<repo>@<sha>]
   cinatra instance preview refresh [--ref <git-ref>] [--slug <slug>] [--bind <address>]
                                  [--fleet required|dev] [--rebuild]
+                                 [--pin-extension <owner>/<repo>@<sha>]
+                               # --pin-extension builds the image with ONE extension at the
+                               # given commit: the one lock entry naming that repository takes
+                               # that sha (in the required lock also its packageVersion and
+                               # treeSha256); nothing else of the build context changes. A
+                               # repository in no lock, in both, listed twice, or only in the
+                               # dev lock without --fleet dev is refused before any build. The
+                               # pin is part of the image tag, its label and the preview's row;
+                               # refresh without it keeps the row's pin.
                                # The build is SKIPPED when the image for the target SHA is
                                # already present locally; --rebuild (--force-build) forces it.
   cinatra instance preview stop [--slug <slug>]
