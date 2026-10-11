@@ -104,6 +104,8 @@ const {
   // engineering#666 — the extension-fleet lever
   PREVIEW_FLEETS,
   PREVIEW_FLEET_DEFAULT,
+  PREVIEW_PROOF_FLEET,
+  SETUP_BYPASS_ENV,
   PREVIEW_FLEET_FLAG,
   PREVIEW_FLEET_ARG,
   resolveFleet,
@@ -3887,6 +3889,60 @@ describe("preview extension fleet — --fleet required|dev (engineering#666)", (
     const row = getPreview(readRegistry(registryPath).registry, "main");
     expect(row.fleet).toBe("required");
     expect(row.imageTag).toBe(previewImageTag(SHA_B));
+  });
+
+  // A development boot reaches its pages past the first-run setup gate through
+  // CINATRA_E2E_SETUP_BYPASS; a proof instance that drops it lands every page on
+  // /setup. Only the dev (proof) fleet ever receives it.
+  it("forwards the setup bypass to a --fleet dev proof instance only", () => {
+    expect(PREVIEW_PROOF_FLEET).toBe("dev");
+    const env = { [ENCRYPTION_KEY_ENV]: KEY_64, [SETUP_BYPASS_ENV]: "true" };
+    const proof = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env, fleet: "dev" }).join(" ");
+    expect(proof).toContain(`${SETUP_BYPASS_ENV}=true`);
+    for (const fleet of [undefined, "required", "unknown"]) {
+      const args = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env, ...(fleet ? { fleet } : {}) }).join(" ");
+      expect(args).not.toContain(SETUP_BYPASS_ENV);
+    }
+  });
+
+  it("forwards the setup bypass only when the instance env sets exactly \"true\"", () => {
+    for (const value of [undefined, "", "1", "TRUE", "yes", "false"]) {
+      const env = { [ENCRYPTION_KEY_ENV]: KEY_64, ...(value === undefined ? {} : { [SETUP_BYPASS_ENV]: value }) };
+      const args = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env, fleet: "dev" }).join(" ");
+      expect(args).not.toContain(SETUP_BYPASS_ENV);
+    }
+  });
+
+  it("never forwards the setup bypass outside a proof instance, even through the passthrough list", () => {
+    expect(PASSTHROUGH_ENV_KEYS).not.toContain(SETUP_BYPASS_ENV);
+    const env = { [ENCRYPTION_KEY_ENV]: KEY_64, [SETUP_BYPASS_ENV]: "true" };
+    PASSTHROUGH_ENV_KEYS.push(SETUP_BYPASS_ENV);
+    try {
+      const args = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env, fleet: "required" }).join(" ");
+      expect(args).not.toContain(SETUP_BYPASS_ENV);
+    } finally {
+      PASSTHROUGH_ENV_KEYS.pop();
+    }
+  });
+
+  it("the setup bypass REACHES the `docker run` argv of a dev-fleet `preview create`, never a required one", async () => {
+    const env = { [ENCRYPTION_KEY_ENV]: KEY_64, [SETUP_BYPASS_ENV]: "true" };
+    const { deps, fake } = makeDeps({ sha: SHA_A, health: healthy }, { env });
+    await runPreviewCreate(["--slug", "main", "--fleet", "dev"], deps);
+    expect(fake.calls.find((c) => c[0] === "run").join(" ")).toContain(`${SETUP_BYPASS_ENV}=true`);
+
+    const { deps: d2, fake: f2 } = makeDeps({ sha: SHA_A, health: healthy }, { env });
+    await runPreviewCreate(["--slug", "plain"], d2);
+    expect(f2.calls.find((c) => c[0] === "run").join(" ")).not.toContain(SETUP_BYPASS_ENV);
+  });
+
+  it("a refresh of a dev-fleet preview keeps forwarding the setup bypass", async () => {
+    const env = { [ENCRYPTION_KEY_ENV]: KEY_64, [SETUP_BYPASS_ENV]: "true" };
+    const { deps } = makeDeps({ sha: SHA_A, health: healthy }, { env });
+    await runPreviewCreate(["--slug", "main", "--fleet", "dev"], deps);
+    const { deps: rdeps, fake: rfake } = makeDeps({ sha: SHA_B, health: healthy }, { env });
+    await runPreviewRefresh(["--slug", "main"], rdeps);
+    expect(rfake.calls.find((c) => c[0] === "run").join(" ")).toContain(`${SETUP_BYPASS_ENV}=true`);
   });
 });
 
