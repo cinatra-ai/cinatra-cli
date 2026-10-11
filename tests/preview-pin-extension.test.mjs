@@ -309,7 +309,7 @@ describe("cinatra-cli#295 — the pin refuses by name before any build", () => {
   };
 
   it("a repository listed in no lock", async () => {
-    await refuses(["--pin-extension", `cinatra-ai/no-such-pack@${PACK_HEAD}`], /listed in no extension lock/);
+    await refuses(["--pin-extension", `example-org/no-such-pack@${PACK_HEAD}`], /listed in no extension lock/);
   });
 
   it("a repository listed more than once in one lock", async () => {
@@ -344,7 +344,7 @@ describe("cinatra-cli#295 — the pin refuses by name before any build", () => {
     const before = readRow("pin");
     const builds = calls.filter((c) => c[0] === "build").length;
     await expect(
-      P.runPreviewRefresh(["--slug", "pin", "--pin-extension", `cinatra-ai/no-such-pack@${PACK_HEAD}`], deps),
+      P.runPreviewRefresh(["--slug", "pin", "--pin-extension", `example-org/no-such-pack@${PACK_HEAD}`], deps),
     ).rejects.toThrow(/listed in no extension lock/);
     expect(calls.filter((c) => c[0] === "build").length).toBe(builds);
     expect(readRow("pin")).toEqual(before);
@@ -361,7 +361,7 @@ describe("cinatra-cli#295 — the pin is part of the image's identity", () => {
     expect(pinned).toContain(PACK_HEAD.slice(0, 12));
     expect(pinned).not.toBe(P.previewImageTag(SHA_A, "required", null));
     expect(pinned).not.toBe(P.previewImageTag(SHA_A, "required", OTHER));
-    expect(pinned).not.toBe(P.previewImageTag(SHA_A, "required", `cinatra-ai/other-pack@${PACK_HEAD}`));
+    expect(pinned).not.toBe(P.previewImageTag(SHA_A, "required", `example-org/other-pack@${PACK_HEAD}`));
     expect(pinned.length).toBeLessThanOrEqual("cinatra-preview:".length + 128);
   });
 
