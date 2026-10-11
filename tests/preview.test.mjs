@@ -392,6 +392,44 @@ describe("preview — hard NEVERs, unit level (AC7)", () => {
   });
 });
 
+describe("preview — development-boot parity keys (cinatra-cli#300)", () => {
+  it("forwards the trusted origins, the boot deadline and the runtime road verbatim", () => {
+    const env = {
+      [ENCRYPTION_KEY_ENV]: KEY_64,
+      BETTER_AUTH_TRUSTED_ORIGINS: "http://127.0.0.1:3041,http://localhost:3041",
+      CINATRA_BOOT_READY_TIMEOUT_MS: "600000",
+      CINATRA_WAYFLOW_RUNTIME: "external",
+    };
+    const joined = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env }).join(" ");
+    expect(joined).toContain("BETTER_AUTH_TRUSTED_ORIGINS=http://127.0.0.1:3041,http://localhost:3041");
+    expect(joined).toContain("CINATRA_BOOT_READY_TIMEOUT_MS=600000");
+    expect(joined).toContain("CINATRA_WAYFLOW_RUNTIME=external");
+    for (const key of ["BETTER_AUTH_TRUSTED_ORIGINS", "CINATRA_BOOT_READY_TIMEOUT_MS", "CINATRA_WAYFLOW_RUNTIME"]) {
+      expect(CONTAINER_REWRITE_ENV_KEYS).not.toContain(key);
+    }
+  });
+
+  it("rewrites a host-loopback GRAPHITI_URL for the container and verifies its ownership", () => {
+    expect(PASSTHROUGH_ENV_KEYS).toContain("GRAPHITI_URL");
+    expect(CONTAINER_REWRITE_ENV_KEYS).toContain("GRAPHITI_URL");
+    const env = { [ENCRYPTION_KEY_ENV]: KEY_64, GRAPHITI_URL: "http://127.0.0.1:8100" };
+    const joined = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env }).join(" ");
+    expect(joined).toContain(`GRAPHITI_URL=http://${CONTAINER_HOST_GATEWAY}:8100`);
+    expect(P.containerDialedLoopbackEndpoints(env).map((e) => e.key)).toContain("GRAPHITI_URL");
+    // A non-loopback (hosted) service is forwarded as set and never ownership-checked.
+    const hosted = { [ENCRYPTION_KEY_ENV]: KEY_64, GRAPHITI_URL: "http://graphiti:8000" };
+    expect(buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env: hosted }).join(" ")).toContain("GRAPHITI_URL=http://graphiti:8000");
+    expect(P.containerDialedLoopbackEndpoints(hosted)).toEqual([]);
+  });
+
+  it("forwards none of them when the instance env does not set them", () => {
+    const joined = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env: { [ENCRYPTION_KEY_ENV]: KEY_64 } }).join(" ");
+    for (const key of ["BETTER_AUTH_TRUSTED_ORIGINS", "CINATRA_BOOT_READY_TIMEOUT_MS", "CINATRA_WAYFLOW_RUNTIME", "GRAPHITI_URL"]) {
+      expect(joined).not.toContain(`${key}=`);
+    }
+  });
+});
+
 describe("preview — production runtime env (AC2)", () => {
   it("always sets CINATRA_RUNTIME_MODE=production and the durable data root, forwards the key", () => {
     const args = buildPreviewRunEnvArgs({ encryptionKey: KEY_64, env: { [ENCRYPTION_KEY_ENV]: KEY_64, SUPABASE_DB_URL: "postgres://x" } });
@@ -3408,6 +3446,11 @@ describe("preview — the passthrough list covers the dev install's set (enginee
   // connection service), or cannot run an agent. Every one MUST be in
   // PASSTHROUGH_ENV_KEYS.
   const FORWARDED_TO_A_PREVIEW = [
+    // cinatra-cli#300, development-boot parity: the knowledge-graph service the
+    // server dials (container-dialed, rewritten and ownership-checked), and the
+    // runtime record the app words its runtime-unreachable recovery hints from.
+    "GRAPHITI_URL",
+    "CINATRA_WAYFLOW_RUNTIME",
     "CINATRA_AGENT_REGISTRY_URL", // where an extension package is fetched FROM
     "CINATRA_AGENT_REGISTRY_UI_URL", // the registry's browser-facing twin
     "NANGO_SERVER_URL", // the connection service's ADDRESS
@@ -3459,12 +3502,9 @@ describe("preview — the passthrough list covers the dev install's set (enginee
     // Other subsystems entirely: neither is part of installing an extension,
     // holding a connection or running an agent, so #660 does not forward them;
     // a preview that needs the memory/graph subsystem is a separate decision.
-    GRAPHITI_URL: "a different subsystem (memory service), outside #660's three classes",
     NEO4J_URI: "a different subsystem (graph store), outside #660's three classes",
     // Host-side bookkeeping, meaningless inside the container.
     CINATRA_INSTALL_PROFILE: "host-install bookkeeping (the dev/demo overlay), meaningless in the container",
-    CINATRA_WAYFLOW_RUNTIME:
-      "the CLI's record of what THIS install decided about the local runtime (doctor reads it); the container dials the runtime by address, not by that record",
     CINATRA_A2A_DEV_PEER_URLS: "a DEV-boot peer list; a preview runs production runtime semantics",
     CINATRA_TWENTY_MODE: "the CLI's record of the install's Twenty CRM choice (refresh and start read it); host-side, meaningless in the container",
     // The co-use topology's namespacing. Written only on the co-use path, and
@@ -3540,6 +3580,8 @@ describe("preview — the passthrough list covers the dev install's set (enginee
   it("a dev-install-shaped env really reaches the container", () => {
     const env = {
       [ENCRYPTION_KEY_ENV]: KEY_64,
+      GRAPHITI_URL: "http://graphiti.example.test:8000",
+      CINATRA_WAYFLOW_RUNTIME: "external",
       CINATRA_AGENT_REGISTRY_URL: "http://registry.example.test:4873",
       CINATRA_AGENT_REGISTRY_UI_URL: "http://registry.example.test:4873",
       NANGO_SERVER_URL: "http://nango.example.test:3003",

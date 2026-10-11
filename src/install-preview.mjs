@@ -920,9 +920,14 @@ export function makePreviewComposition({
  *
  * Returns key NAMES only — never values.
  */
+// cinatra-cli#300: GRAPHITI_URL is container-dialed (rewritten when set) but optional: the app's own
+// fallback (`http://graphiti:8000`) is no host-loopback address, so an install that does not use the
+// knowledge-graph service is not warned about it here.
+const OPTIONAL_CONTAINER_DIALED_KEYS = new Set(["GRAPHITI_URL"]);
+
 export function continuationImplicitEndpointLines({
   envValues = {},
-  keys = CONTAINER_REWRITE_ENV_KEYS,
+  keys = CONTAINER_REWRITE_ENV_KEYS.filter((k) => !OPTIONAL_CONTAINER_DIALED_KEYS.has(k)),
 } = {}) {
   const implicit = keys.filter((k) => !(typeof envValues[k] === "string" && envValues[k].length > 0));
   if (implicit.length === 0) return [];

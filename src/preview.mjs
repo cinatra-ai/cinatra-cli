@@ -465,6 +465,22 @@ export const PASSTHROUGH_ENV_KEYS = [
   "CINATRA_DEPLOYMENT_REGISTRY_PUBLIC_READ_TOKEN",
   "CINATRA_DEPLOYMENT_REGISTRY_ROUTING_MODE",
   "CINATRA_DEPLOYMENT_REGISTRY_ALLOW_FIXTURE",
+  // Development-boot parity (cinatra-cli#300): keys a development boot's app reads
+  // from the instance env that a preview container used to lose.
+  //  - BETTER_AUTH_TRUSTED_ORIGINS: the extra origins sign-in accepts beside the
+  //    base URL (the app's legacy comma-separated list, cinatra src/lib/auth.ts).
+  //    Browser-resolved, so never rewritten.
+  //  - CINATRA_BOOT_READY_TIMEOUT_MS: the boot-stall watchdog's deadline (cinatra
+  //    src/lib/boot/boot-stall-watchdog.ts). A number, forwarded verbatim.
+  //  - CINATRA_WAYFLOW_RUNTIME: what the instance recorded about its agent runtime
+  //    (cinatra packages/agents/src/wayflow-url.ts). Forwarded verbatim.
+  //  - GRAPHITI_URL: the knowledge-graph service the SERVER dials (cinatra
+  //    packages/objects/src/graphiti-client.ts), so it is also in
+  //    CONTAINER_REWRITE_ENV_KEYS and passes the same endpoint-ownership check.
+  "BETTER_AUTH_TRUSTED_ORIGINS",
+  "CINATRA_BOOT_READY_TIMEOUT_MS",
+  "CINATRA_WAYFLOW_RUNTIME",
+  "GRAPHITI_URL",
 ];
 
 // The container-side name for "the operator's host" (cinatra-cli#190). Docker
@@ -519,6 +535,9 @@ export const CONTAINER_REWRITE_ENV_KEYS = [
   // it verbatim would point the container at itself; `CINATRA_BRIDGE_TOKEN` is
   // its credential, not an address, so that one stays verbatim.
   "WAYFLOW_BASE_URL",
+  // cinatra-cli#300: the knowledge-graph service the server dials; a dev install
+  // writes a host-loopback address.
+  "GRAPHITI_URL",
 ];
 
 // --- slug / name / tag -----------------------------------------------------
