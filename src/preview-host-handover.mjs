@@ -16,7 +16,9 @@
 //     container. The preview container joins each declared network, and ONE
 //     sidecar sharing its network namespace (`--network container:<preview>`)
 //     runs the preview image's own `node` to listen on 127.0.0.1:<port> and pipe
-//     every connection to <target>. No forwards, no sidecar.
+//     every connection to <target>. No forwards, no sidecar. The preview app's
+//     own port is never a forward port. Each listener reports whether it
+//     listens, and only a forward that reported so is said to be served.
 //
 // A declarer that throws, times out or returns a bad shape is skipped with a
 // warning that names the key and its package dir, never a value. Every docker
@@ -34,6 +36,17 @@ export const PREVIEW_HOST_HANDOVER_EXPORT = "previewHostHandover";
 export const PREVIEW_HOST_HANDOVER_TIMEOUT_MS = 120_000;
 /** The extension override namespace (the product's `CINATRA_EXT_<NS>__<KEY>`). */
 export const HANDOVER_ENV_NAME_RE = /^CINATRA_EXT_[A-Z0-9_]+__[A-Z0-9_]+$/;
+/** The port the preview app binds inside its container (the image's PORT, the
+ *  container side of `bootPreviewContainer`'s `-p <host>:3000`). The forwarder
+ *  shares that network namespace, so a forward on it would take the app's port. */
+export const PREVIEW_APP_CONTAINER_PORT = 3000;
+const RESERVED_FORWARD_PORTS = new Set([PREVIEW_APP_CONTAINER_PORT]);
+/** How long the CLI reads the forwarder's report of its listeners. */
+export const FORWARDER_READY_ATTEMPTS = 40;
+export const FORWARDER_READY_INTERVAL_MS = 250;
+const FORWARDER_REPORT_RE = /^forward-(ready|failed) ([0-9]{1,5})(?: ([A-Za-z0-9_]{1,40}))?$/;
+/** The label every forwarder carries; a plain start finds a leftover forwarder by it. */
+export const PREVIEW_FORWARDER_LABEL = "cinatra.preview.forwarder=true";
 const NETWORK_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const TARGET_HOST_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,252}$/;
 
@@ -124,6 +137,10 @@ export async function collectPreviewHostHandover({ checkoutDir, deps = {}, log =
     }
     for (const entry of result.forwards ?? []) {
       const target = parseForwardTarget(entry?.target);
+      if (isPlainObject(entry) && RESERVED_FORWARD_PORTS.has(entry.port)) {
+        warn(`skipped a forward of ${who}: port ${entry.port} is the preview app's own port.`);
+        continue;
+      }
       if (!isPlainObject(entry) || !validPort(entry.port, 1024) || ports.has(entry.port) ||
           typeof entry.network !== "string" || !NETWORK_RE.test(entry.network) || !target) {
         warn(`skipped a forward of ${who}: it needs a unique port 1024-65535, a network name and a host:port target.`);
@@ -162,16 +179,58 @@ export function previewForwarderName(containerName) {
   return `${containerName}.forward`;
 }
 
-/** The forwarder program: one loopback listener per row, each piping to its target. */
+/**
+ * The forwarder program: one loopback listener per row, each piping to its
+ * target. Each listener reports on its own line: `forward-ready <port>` once it
+ * listens, `forward-failed <port> <code>` when it cannot (a port in use). A
+ * listener that fails ends only itself; the others keep serving.
+ */
 export function previewForwarderScript(forwards) {
   const rows = JSON.stringify(forwards.map((f) => ({ port: f.port, host: f.host, targetPort: f.targetPort })));
   return (
     `const net=require("node:net");` +
     `for(const f of ${rows}){` +
-    `net.createServer((c)=>{const u=net.connect(f.targetPort,f.host);` +
-    `c.on("error",()=>u.destroy());u.on("error",()=>c.destroy());c.pipe(u);u.pipe(c);})` +
-    `.listen(f.port,"127.0.0.1");}`
+    `const s=net.createServer((c)=>{const u=net.connect(f.targetPort,f.host);` +
+    `c.on("error",()=>u.destroy());u.on("error",()=>c.destroy());c.pipe(u);u.pipe(c);});` +
+    `s.on("error",(e)=>console.error("forward-failed "+f.port+" "+String((e&&e.code)||"error").replace(/[^A-Za-z0-9_]/g,"")));` +
+    `s.listen(f.port,"127.0.0.1",()=>console.log("forward-ready "+f.port));}`
   );
+}
+
+/** Remove this preview's forwarder (best-effort, forced). A forwarder lives in
+ *  its preview container's network namespace, so it never outlives that
+ *  container: every removal or replacement of the container removes it too. */
+export function removePreviewForwarder(containerName, deps) {
+  deps.runDocker(["rm", "-f", previewForwarderName(containerName)], { timeoutMs: 60_000 });
+}
+
+/**
+ * Read the forwarder's own report of each listener from its log, until every
+ * port has reported or the attempts run out. Returns `{ ready: Set<port>,
+ * failed: Map<port, code> }`; a port in neither did not report.
+ */
+export async function readForwarderReadiness({ name, ports, deps }) {
+  const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const want = new Set(ports);
+  const ready = new Set();
+  const failed = new Map();
+  for (let i = 0; i < FORWARDER_READY_ATTEMPTS; i++) {
+    if (i > 0) await sleep(FORWARDER_READY_INTERVAL_MS);
+    const r = deps.runDocker(["logs", name], { timeoutMs: 15_000 });
+    for (const line of `${r.stdout ?? ""}\n${r.stderr ?? ""}`.split("\n")) {
+      const m = FORWARDER_REPORT_RE.exec(line.trim());
+      if (!m || !want.has(Number(m[2]))) continue;
+      const port = Number(m[2]);
+      if (m[1] === "failed") {
+        failed.set(port, m[3] ?? "error");
+        ready.delete(port);
+      } else if (!failed.has(port)) {
+        ready.add(port);
+      }
+    }
+    if (ready.size + failed.size >= want.size) break;
+  }
+  return { ready, failed };
 }
 
 /** The `docker run` argv of the forwarder beside `containerName`. */
@@ -180,7 +239,7 @@ export function previewForwarderRunArgs({ containerName, tag, forwards }) {
     "run", "-d",
     "--name", previewForwarderName(containerName),
     "--network", `container:${containerName}`,
-    "--label", "cinatra.preview.forwarder=true",
+    "--label", PREVIEW_FORWARDER_LABEL,
     "--entrypoint", "node",
     tag,
     "-e", previewForwarderScript(forwards),
@@ -190,25 +249,71 @@ export function previewForwarderRunArgs({ containerName, tag, forwards }) {
 /**
  * After the boot: join each declared network (an existing membership is fine),
  * then replace this preview's forwarder with one serving every forward whose
- * network was joined. A failure is a named WARNING, never a failed preview.
+ * network was joined, and read which listeners report that they listen. Only
+ * those are said to be served; a forwarder that serves none is removed. A
+ * failure is a named WARNING, never a failed preview. An earlier forwarder of
+ * this container is removed with the container (see removePreviewForwarder).
  */
-export function attachPreviewHostForwards({ containerName, tag, forwards, deps, log = () => {} }) {
+export async function attachPreviewHostForwards({ containerName, tag, forwards, deps, log = () => {} }) {
+  const warn = (line) => log(`  ⚠ preview host handover: ${line}`);
   if (!forwards.length) return { forwarder: null, forwards: [] };
   const joined = new Set();
   for (const network of [...new Set(forwards.map((f) => f.network))].sort()) {
     const r = deps.runDocker(["network", "connect", network, containerName], { timeoutMs: 15_000 });
     if (!r.error && (r.status === 0 || /already exists/i.test(r.stderr ?? ""))) joined.add(network);
-    else log(`  ⚠ preview host handover: could not join ${containerName} to the network ${network}; its forwards are skipped.`);
+    else warn(`could not join ${containerName} to the network ${network}; its forwards are skipped.`);
   }
-  const served = forwards.filter((f) => joined.has(f.network));
-  if (!served.length) return { forwarder: null, forwards: [] };
+  const joinedForwards = forwards.filter((f) => joined.has(f.network));
+  if (!joinedForwards.length) return { forwarder: null, forwards: [] };
   const name = previewForwarderName(containerName);
-  deps.runDocker(["rm", "-f", name], { timeoutMs: 60_000 });
-  const r = deps.runDocker(previewForwarderRunArgs({ containerName, tag, forwards: served }), { timeoutMs: 60_000 });
+  removePreviewForwarder(containerName, deps);
+  const r = deps.runDocker(previewForwarderRunArgs({ containerName, tag, forwards: joinedForwards }), { timeoutMs: 60_000 });
   if (r.error || r.status !== 0) {
-    log(`  ⚠ preview host handover: the forwarder ${name} did not start (exit ${r.status}).`);
+    removePreviewForwarder(containerName, deps);
+    warn(`the forwarder ${name} did not start (exit ${r.status}).`);
+    return { forwarder: null, forwards: [] };
+  }
+  const { ready, failed } = await readForwarderReadiness({ name, ports: joinedForwards.map((f) => f.port), deps });
+  for (const f of joinedForwards) {
+    if (failed.has(f.port)) warn(`127.0.0.1:${f.port} could not listen (${failed.get(f.port)}); that forward is not served.`);
+    else if (!ready.has(f.port)) warn(`127.0.0.1:${f.port} did not report that it listens; that forward is not served.`);
+  }
+  const served = joinedForwards.filter((f) => ready.has(f.port));
+  if (!served.length) {
+    removePreviewForwarder(containerName, deps);
+    warn(`no forward listens, so the forwarder ${name} was removed.`);
     return { forwarder: null, forwards: [] };
   }
   log(`  preview host handover: ${name} serves ${served.map((f) => `127.0.0.1:${f.port}`).join(", ")} in ${containerName}.`);
   return { forwarder: name, forwards: served };
+}
+
+/**
+ * A container that came back with `docker start` has a new network namespace,
+ * which an earlier forwarder does not share. It gets the forwards its
+ * declarers hand over now, exactly as after a boot (attachPreviewHostForwards:
+ * the joins, the earlier forwarder removed first, the readiness read). With no
+ * forward, a forwarder left from an earlier boot is removed when the forwarder
+ * label lists it, so a start with nothing to attach removes nothing. The env
+ * stays what the container was created with: only a new container takes an
+ * env file.
+ */
+export async function reattachPreviewHostForwards({ containerName, tag, handover, deps, log = () => {} }) {
+  if (handover.env.length > 0) {
+    log(`  preview host handover: ${containerName} keeps the env it was created with; ` +
+      "`instance preview start --recreate` hands the declared env over again.");
+  }
+  if (handover.forwards.length > 0) {
+    const attached = await attachPreviewHostForwards({ containerName, tag, forwards: handover.forwards, deps, log });
+    // No forwarder serves (every join refused, say): the one from before the stop is left over.
+    if (!attached.forwarder) removePreviewForwarder(containerName, deps);
+    return attached;
+  }
+  const r = deps.runDocker(
+    ["container", "ls", "-a", "--filter", `label=${PREVIEW_FORWARDER_LABEL}`, "--format", "{{.Names}}"],
+    { timeoutMs: 15_000 },
+  );
+  const listed = !r.error && r.status === 0 ? String(r.stdout ?? "").split("\n").map((line) => line.trim()) : [];
+  if (listed.includes(previewForwarderName(containerName))) removePreviewForwarder(containerName, deps);
+  return { forwarder: null, forwards: [] };
 }

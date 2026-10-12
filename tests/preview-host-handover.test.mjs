@@ -61,6 +61,9 @@ function makeDeps(state = {}) {
   const calls = [];
   const logs = [];
   state.envFiles = [];
+  // The forwarders docker holds, by name, and the ports of the last one run.
+  state.forwarders = new Set();
+  state.forwarderPorts = [];
   const runDocker = (args) => {
     calls.push(args);
     const ownership = answerComposeOwnership(args, state);
@@ -99,16 +102,41 @@ function makeDeps(state = {}) {
         state.envFiles.push({ file, mode: statSync(file).mode & 0o777, text: readFileSync(file, "utf8") });
       }
       if (!args.some((a) => String(a).startsWith("container:"))) state.containerRunning = true;
+      else {
+        state.forwarders.add(args[args.indexOf("--name") + 1]);
+        state.forwarderPorts = [...String(args.at(-1)).matchAll(/"port":([0-9]+)/g)].map((m) => Number(m[1]));
+      }
       return { status: 0, stdout: "deadbeef\n", stderr: "" };
     }
+    if (verb === "rm") {
+      state.forwarders.delete(args.at(-1));
+      return { status: 0, stdout: "", stderr: "" };
+    }
+    if (verb === "logs" && String(args.at(-1)).endsWith(".forward")) {
+      return state.forwarderLog?.(args) ??
+        { status: 0, stdout: state.forwarderPorts.map((port) => `forward-ready ${port}\n`).join(""), stderr: "" };
+    }
+    if (verb === "container" && sub === "ls") {
+      return { status: 0, stdout: [...state.forwarders].map((name) => `${name}\n`).join(""), stderr: "" };
+    }
+    if (verb === "stop" || verb === "start") {
+      state.containerRunning = verb === "start";
+      state.containerStopped = verb === "stop";
+      return { status: 0, stdout: "", stderr: "" };
+    }
     if (verb === "container" && sub === "inspect") {
+      if (!state.containerRunning && state.containerStopped) return { status: 0, stdout: "false\n", stderr: "" };
       const running = Boolean(state.containerRunning);
       return { status: running ? 0 : 1, stdout: running ? "true\n" : "", stderr: running ? "" : "No such object" };
     }
     if (verb === "volume" && sub === "inspect") {
       return { status: 1, stdout: "", stderr: `Error response from daemon: get ${args.at(-1)}: no such volume` };
     }
-    if (verb === "image" && sub === "inspect") return { status: 1, stdout: "", stderr: `Error: No such image: ${args.at(-1)}` };
+    if (verb === "image" && sub === "inspect") {
+      return state.imagePresent
+        ? { status: 0, stdout: `${SHA_A} \n`, stderr: "" }
+        : { status: 1, stdout: "", stderr: `Error: No such image: ${args.at(-1)}` };
+    }
     if (verb === "logs") return { status: 0, stdout: "log tail", stderr: "" };
     return { status: 0, stdout: "", stderr: "" };
   };
@@ -312,5 +340,260 @@ describe("cinatra-cli#287 — what a declarer hands over is validated, and a fai
     expect(skipped[0]).toContain(path.join("extensions", "acme", "a-throws"));
     expect(skipped[1]).toContain("timed out");
     for (const line of logs) for (const v of [SECRET_A, SECRET_B]) expect(line).not.toContain(v);
+  });
+});
+
+const FWD = "cinatra-preview-s1.forward";
+const forwarding = (extra = {}) => handing({ forwards: [{ port: 41001, network: "acme-net", target: "acme-svc:8080" }], ...extra });
+const unhealthy = async () => ({ status: 503, body: '{"status":"degraded"}' });
+
+describe("cinatra-cli#287 — a re-materialized preview gets the same handover as a created one", () => {
+  it("start --recreate boots the new container with the env file, the network joins and one forwarder", async () => {
+    declarer("acme", "alpha", { body: forwarding({ env: { [NAME_A]: SECRET_A } }) });
+    const { deps, calls, logs, state } = makeDeps({ imagePresent: true });
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    calls.length = 0;
+    state.envFiles.length = 0;
+    const out = await PV.runPreviewStart(["--slug", "s1", "--recreate"], deps);
+    expect(out.rematerialized).toBe(true);
+    const run = previewRun(calls);
+    expect(run).toContain("--env-file");
+    expect(state.envFiles.map((f) => f.text)).toEqual([`${NAME_A}=${SECRET_A}\n`]);
+    expect(existsSync(state.envFiles[0].file)).toBe(false);
+    expect(calls.filter((a) => a[0] === "network")).toEqual([["network", "connect", "acme-net", "cinatra-preview-s1"]]);
+    expect(forwarderRuns(calls)).toHaveLength(1);
+    const oldForwarderGone = calls.findIndex((a) => a[0] === "rm" && a[2] === FWD);
+    expect(oldForwarderGone).toBeGreaterThan(-1);
+    expect(oldForwarderGone).toBeLessThan(calls.indexOf(run));
+    expect([...state.forwarders]).toEqual([FWD]);
+    expect(logs.some((l) => l.includes(`${FWD} serves 127.0.0.1:41001`))).toBe(true);
+    for (const argv of calls) for (const a of argv) expect(String(a)).not.toContain(SECRET_A);
+  });
+
+  it("start re-materializes an absent container with the handover too", async () => {
+    declarer("acme", "alpha", { body: forwarding({ env: { [NAME_A]: SECRET_A } }) });
+    const { deps, calls, state } = makeDeps({ imagePresent: true });
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    state.containerRunning = false;
+    calls.length = 0;
+    state.envFiles.length = 0;
+    const out = await PV.runPreviewStart(["--slug", "s1"], deps);
+    expect(out.rematerialized).toBe(true);
+    expect(previewRun(calls)).toContain("--env-file");
+    expect(state.envFiles.map((f) => f.text)).toEqual([`${NAME_A}=${SECRET_A}\n`]);
+    expect(calls.filter((a) => a[0] === "network")).toEqual([["network", "connect", "acme-net", "cinatra-preview-s1"]]);
+    expect(forwarderRuns(calls)).toHaveLength(1);
+    expect([...state.forwarders]).toEqual([FWD]);
+  });
+
+  it("a recreate that fails its health gate gives the restored container its forwarder back", async () => {
+    declarer("acme", "alpha", { body: forwarding() });
+    const { deps, calls, state } = makeDeps({ imagePresent: true });
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    calls.length = 0;
+    deps.probeHealth = unhealthy;
+    await expect(PV.runPreviewStart(["--slug", "s1", "--recreate"], deps)).rejects.toThrow(/PREVIOUS container was restored/);
+    const restarted = calls.findIndex((a) => a[0] === "start" && a[1] === "cinatra-preview-s1");
+    expect(restarted).toBeGreaterThan(-1);
+    const runs = forwarderRuns(calls);
+    expect(runs).toHaveLength(2);
+    expect(calls.indexOf(runs[1])).toBeGreaterThan(restarted);
+    expect([...state.forwarders]).toEqual([FWD]);
+  });
+});
+
+describe("cinatra-cli#287 — the forwarder never outlives the container it served", () => {
+  it("a refresh after the declarers are gone removes the old forwarder", async () => {
+    const dir = declarer("acme", "alpha", { body: forwarding() });
+    const { deps, calls, state } = makeDeps();
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    expect([...state.forwarders]).toEqual([FWD]);
+    rmSync(dir, { recursive: true, force: true });
+    calls.length = 0;
+    await PV.runPreviewRefresh(["--slug", "s1"], deps);
+    expect(forwarderRuns(calls)).toHaveLength(0);
+    expect(calls).toContainEqual(["rm", "-f", FWD]);
+    expect(state.forwarders.size).toBe(0);
+  });
+
+  it("a refresh whose network joins all fail removes the old forwarder", async () => {
+    declarer("acme", "alpha", { body: forwarding() });
+    const state = {};
+    state.networkAnswer = () => state.joinFails
+      ? { status: 1, stdout: "", stderr: "Error response from daemon: network acme-net not found" }
+      : { status: 0, stdout: "", stderr: "" };
+    const { deps, calls, logs } = makeDeps(state);
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    expect([...state.forwarders]).toEqual([FWD]);
+    state.joinFails = true;
+    calls.length = 0;
+    await PV.runPreviewRefresh(["--slug", "s1"], deps);
+    expect(forwarderRuns(calls)).toHaveLength(0);
+    expect(state.forwarders.size).toBe(0);
+    expect(logs.some((l) => l.includes("could not join cinatra-preview-s1 to the network acme-net"))).toBe(true);
+  });
+
+  it("a failed health gate removes the forwarder with the container, on create and on refresh", async () => {
+    declarer("acme", "alpha", { body: forwarding() });
+    const failing = makeDeps();
+    failing.deps.probeHealth = unhealthy;
+    await expect(PV.runPreviewCreate(["--slug", "s1"], failing.deps)).rejects.toThrow(/did not reach healthy/);
+    expect(forwarderRuns(failing.calls)).toHaveLength(1);
+    expect(failing.state.forwarders.size).toBe(0);
+
+    rmSync(registryPath, { force: true });
+    const { deps, calls, state } = makeDeps();
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    calls.length = 0;
+    deps.probeHealth = unhealthy;
+    await expect(PV.runPreviewRefresh(["--slug", "s1"], deps)).rejects.toThrow(/did not reach healthy/);
+    expect(forwarderRuns(calls)).toHaveLength(1);
+    expect(state.forwarders.size).toBe(0);
+  });
+});
+
+describe("cinatra-cli#287 — a forward is said to be served only when its listener listens", () => {
+  it("a listener whose port is taken reports it, and the other listeners keep serving", async () => {
+    const H = await loadHandover();
+    const echo = net.createServer((c) => c.pipe(c));
+    await new Promise((r) => echo.listen(0, "127.0.0.1", r));
+    const taken = net.createServer();
+    await new Promise((r) => taken.listen(0, "127.0.0.1", r));
+    const probe = net.createServer();
+    await new Promise((r) => probe.listen(0, "127.0.0.1", r));
+    const free = probe.address().port;
+    await new Promise((r) => probe.close(r));
+    const busy = taken.address().port;
+    const script = H.previewForwarderScript([
+      { port: busy, host: "127.0.0.1", targetPort: echo.address().port },
+      { port: free, host: "127.0.0.1", targetPort: echo.address().port },
+    ]);
+    const child = spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { err += d; });
+    try {
+      for (let i = 0; i < 30 && child.exitCode === null &&
+        !(out.includes(`forward-ready ${free}`) && err.includes(`forward-failed ${busy}`)); i++) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(out.split("\n")).toContain(`forward-ready ${free}`);
+      expect(err.split("\n")).toContain(`forward-failed ${busy} EADDRINUSE`);
+      const answer = await new Promise((resolve) => {
+        const s = net.connect(free, "127.0.0.1");
+        s.on("error", () => resolve(null));
+        s.on("connect", () => s.write("ping"));
+        s.on("data", (d) => {
+          resolve(String(d));
+          s.destroy();
+        });
+      });
+      expect(answer).toBe("ping");
+      expect(child.exitCode).toBe(null);
+    } finally {
+      child.kill();
+      await new Promise((r) => taken.close(r));
+      await new Promise((r) => echo.close(r));
+    }
+  });
+
+  it("only the forwards whose listeners report ready are said to be served", async () => {
+    declarer("acme", "alpha", {
+      body: handing({ forwards: [
+        { port: 41001, network: "acme-net", target: "acme-svc:8080" },
+        { port: 41002, network: "acme-net", target: "acme-svc:8081" },
+      ] }),
+    });
+    const { deps, logs, state } = makeDeps({
+      forwarderLog: () => ({ status: 0, stdout: "forward-ready 41001\n", stderr: "forward-failed 41002 EADDRINUSE\n" }),
+    });
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    const serves = logs.filter((l) => l.includes(`${FWD} serves`));
+    expect(serves).toEqual([`  preview host handover: ${FWD} serves 127.0.0.1:41001 in cinatra-preview-s1.`]);
+    expect(logs.some((l) => l.includes("127.0.0.1:41002 could not listen (EADDRINUSE)"))).toBe(true);
+    expect([...state.forwarders]).toEqual([FWD]);
+  });
+
+  it("a forwarder none of whose listeners listens is removed, and no forward is said to be served", async () => {
+    declarer("acme", "alpha", { body: forwarding() });
+    const { deps, logs, state } = makeDeps({
+      forwarderLog: () => ({ status: 0, stdout: "", stderr: "forward-failed 41001 EADDRINUSE\n" }),
+    });
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    expect(logs.some((l) => l.includes(`${FWD} serves`))).toBe(false);
+    expect(logs.some((l) => l.includes(`no forward listens, so the forwarder ${FWD} was removed`))).toBe(true);
+    expect(state.forwarders.size).toBe(0);
+  });
+
+  it("refuses a forward on the preview app's own port", async () => {
+    const H = await loadHandover();
+    declarer("acme", "alpha", {
+      body: handing({ forwards: [
+        { port: 3000, network: "acme-net", target: "acme-svc:3000" },
+        { port: 41001, network: "acme-net", target: "acme-svc:8080" },
+      ] }),
+    });
+    const logs = [];
+    const out = await H.collectPreviewHostHandover({ checkoutDir, log: (l) => logs.push(l) });
+    expect(out.forwards.map((f) => f.port)).toEqual([41001]);
+    expect(logs.filter((l) => l.includes("skipped a forward") && l.includes("the preview app's own port"))).toHaveLength(1);
+    const { deps, calls } = makeDeps();
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    const run = previewRun(calls);
+    expect(run[run.indexOf("-p") + 1].endsWith(`:${H.PREVIEW_APP_CONTAINER_PORT}`)).toBe(true);
+  });
+});
+
+describe("cinatra-cli#287 — a stopped preview that starts again gets its forwards again", () => {
+  it("a plain start of a stopped preview re-attaches its forwards: the old forwarder removed first, the network joined, readiness read", async () => {
+    declarer("acme", "alpha", {
+      body: handing({ env: { [NAME_A]: SECRET_A }, forwards: [
+        { port: 3000, network: "acme-net", target: "acme-svc:3000" },
+        { port: 41001, network: "acme-net", target: "acme-svc:8080" },
+      ] }),
+    });
+    const { deps, calls, logs, state } = makeDeps();
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    await PV.runPreviewStop(["--slug", "s1"], deps);
+    calls.length = 0;
+    logs.length = 0;
+    const out = await PV.runPreviewStart(["--slug", "s1"], deps);
+    expect(out).toMatchObject({ container: "running", changed: true, rematerialized: false });
+    expect(previewRun(calls)).toBeUndefined();
+    const started = calls.findIndex((a) => a[0] === "start" && a[1] === "cinatra-preview-s1");
+    const runs = forwarderRuns(calls);
+    expect(runs).toHaveLength(1);
+    const run = calls.indexOf(runs[0]);
+    const removed = calls.findIndex((a) => a[0] === "rm" && a[2] === FWD);
+    expect(started).toBeGreaterThan(-1);
+    expect(removed).toBeGreaterThan(started);
+    expect(removed).toBeLessThan(run);
+    expect(calls.filter((a) => a[0] === "network")).toEqual([["network", "connect", "acme-net", "cinatra-preview-s1"]]);
+    expect(calls.findIndex((a) => a[0] === "logs" && a[1] === FWD)).toBeGreaterThan(run);
+    expect(runs[0].at(-1)).not.toContain('"port":3000');
+    expect(logs.some((l) => l.includes("port 3000 is the preview app's own port"))).toBe(true);
+    expect(logs.some((l) => l.includes(`${FWD} serves 127.0.0.1:41001 in cinatra-preview-s1`))).toBe(true);
+    expect(logs.some((l) => l.includes("keeps the env it was created with"))).toBe(true);
+    expect([...state.forwarders]).toEqual([FWD]);
+    for (const argv of calls) for (const a of argv) expect(String(a)).not.toContain(SECRET_A);
+    for (const line of logs) expect(line).not.toContain(SECRET_A);
+  });
+
+  it("a plain start with no forward left removes the forwarder from before, and one with no forwarder removes nothing", async () => {
+    const dir = declarer("acme", "alpha", { body: forwarding() });
+    const { deps, calls, state } = makeDeps();
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    await PV.runPreviewStop(["--slug", "s1"], deps);
+    rmSync(dir, { recursive: true, force: true });
+    calls.length = 0;
+    await PV.runPreviewStart(["--slug", "s1"], deps);
+    expect(forwarderRuns(calls)).toHaveLength(0);
+    expect(calls).toContainEqual(["rm", "-f", FWD]);
+    expect(state.forwarders.size).toBe(0);
+    await PV.runPreviewStop(["--slug", "s1"], deps);
+    calls.length = 0;
+    await PV.runPreviewStart(["--slug", "s1"], deps);
+    expect(calls.some((a) => a[0] === "rm")).toBe(false);
   });
 });
