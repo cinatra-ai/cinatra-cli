@@ -81,6 +81,13 @@ import { spawnSync } from "node:child_process";
 // dependency-free in the other direction (it never imports this module), so
 // there is no cycle and the light CLI core stays importable.
 import { assertEndpointOwnership, resolveEndpointOwnershipMode } from "./preview-endpoint-ownership.mjs";
+import {
+  attachPreviewHostForwards,
+  collectPreviewHostHandover,
+  reattachPreviewHostForwards,
+  removePreviewForwarder,
+  writeHandoverEnvFile,
+} from "./preview-host-handover.mjs";
 // cinatra-cli#295: one extension pinned at a given commit (node builtins only,
 // like this module; its `tar` reader is imported lazily by the real describer).
 import {
@@ -119,6 +126,12 @@ export const PROVENANCE_PREFIX = "local-image:";
 
 // A preview always runs production runtime semantics (AC2).
 export const PREVIEW_RUNTIME_MODE = "production";
+// What tells a preview from a production deployment inside the container
+// (cinatra-cli#287): the runtime mode stays `production`; the install profile
+// is the product's own separate axis, and an image that does not read it
+// ignores it.
+export const PREVIEW_INSTALL_PROFILE_ENV = "CINATRA_INSTALL_PROFILE";
+export const PREVIEW_INSTALL_PROFILE = "preview";
 
 // The durable local-data root. Matches prod's env-overridable
 // `CINATRA_EXTENSION_DATA_ROOT` / `resolveExtensionDataRoot` (default
@@ -872,6 +885,9 @@ function assertContainerDialedEndpointsOwned({ env, checkoutDir, deps }) {
  * Build the `-e KEY=VALUE` docker-run env args for a preview container.
  *
  *  - ALWAYS sets CINATRA_RUNTIME_MODE=production (AC2).
+ *  - ALWAYS sets CINATRA_INSTALL_PROFILE=preview (cinatra-cli#287): a preview,
+ *    never a production deployment, though its runtime mode is production. An
+ *    ambient value is never forwarded in its place (it is no passthrough key).
  *  - ALWAYS sets CINATRA_EXTENSION_DATA_ROOT to the durable-volume mount path (AC4).
  *  - Requires + forwards CINATRA_ENCRYPTION_KEY (AC6, validated by caller).
  *  - Forwards the known DB/auth/redis/registry passthrough keys when present in `env`.
@@ -899,6 +915,7 @@ export function buildPreviewRunEnvArgs({ encryptionKey, env = process.env, fleet
   const reachableOnly = new Set(REACHABLE_ONLY_ENV_KEYS);
   const pairs = [];
   pairs.push([ "CINATRA_RUNTIME_MODE", PREVIEW_RUNTIME_MODE ]);
+  pairs.push([ PREVIEW_INSTALL_PROFILE_ENV, PREVIEW_INSTALL_PROFILE ]);
   pairs.push([ EXTENSION_DATA_ROOT_ENV, EXTENSION_DATA_ROOT_IN_CONTAINER ]);
   pairs.push([ "CINATRA_ARTIFACT_DATA_ROOT", ARTIFACT_DATA_ROOT_IN_CONTAINER ]);
   pairs.push([ ENCRYPTION_KEY_ENV, encryptionKey ]);
@@ -2432,6 +2449,13 @@ export function removeContainer(name, deps) {
   deps.runDocker(["rm", "-f", name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
 }
 
+/** cinatra-cli#287: remove a preview's container AND the host-handover
+ *  forwarder in its network namespace (the forwarder first). Best-effort. */
+export function removePreviewContainer(name, deps) {
+  removePreviewForwarder(name, deps);
+  removeContainer(name, deps);
+}
+
 /** Remove an image tag (superseded-tag cleanup — AC4). Best-effort. */
 export function removeImage(tag, deps) {
   deps.runDocker(["image", "rm", "-f", tag], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
@@ -2484,7 +2508,7 @@ function resolveRuntimeEnv({ deps, env, hostPort }) {
  *
  * @returns {string} the container name
  */
-export function bootPreviewContainer({ slug, tag, hostPort, bind = null, encryptionKey, provenance, sha, fleet = PREVIEW_FLEET_DEFAULT, deps }) {
+export function bootPreviewContainer({ slug, tag, hostPort, bind = null, encryptionKey, provenance, sha, fleet = PREVIEW_FLEET_DEFAULT, envFile = null, deps }) {
   assertNotProductionImageTag(tag);
   const containerName = previewContainerName(slug);
   const volumeName = previewVolumeName(slug);
@@ -2500,6 +2524,8 @@ export function bootPreviewContainer({ slug, tag, hostPort, bind = null, encrypt
     // unset is the byte-identical pre-#248 argument (docker's own 0.0.0.0).
     "-p", bind ? `${bind}:${hostPort}:3000` : `${hostPort}:3000`,
     ...envArgs,
+    // cinatra-cli#287: the host handover's values travel in a 0600 file, never in this argv.
+    ...(envFile ? ["--env-file", envFile] : []),
   ];
   if (provenance) args.push("--label", `cinatra.preview.provenance=${provenance}`);
   if (sha) args.push("--label", `cinatra.preview.sha=${sha}`);
@@ -2512,6 +2538,35 @@ export function bootPreviewContainer({ slug, tag, hostPort, bind = null, encrypt
     );
   }
   return containerName;
+}
+
+/**
+ * cinatra-cli#287: boot the preview container with the HOST HANDOVER of the
+ * extensions present in the checkout (preview-host-handover.mjs): every
+ * declarer is called once before `docker run` (or the caller passes the
+ * `handover` it collected); the env it hands over travels in a 0600 env file
+ * removed as soon as `docker run` returns, and its forwards are served inside
+ * the container after the boot. A forwarder of an earlier boot is removed
+ * before this one, so it never outlives the container it served. With no
+ * declarer the boot is `bootPreviewContainer`.
+ */
+export async function bootPreviewContainerWithHandover({ checkoutDir, handover: collected = null, ...boot }) {
+  const { deps } = boot;
+  const log = deps.log ?? (() => {});
+  const handover = collected ?? await collectPreviewHostHandover({ checkoutDir, deps, log });
+  removePreviewForwarder(previewContainerName(boot.slug), deps);
+  let envFile = null;
+  let container;
+  try {
+    if (handover.env.length > 0) {
+      envFile = writeHandoverEnvFile(handover.env, deps.envFileTmpDir ? { tmpDir: deps.envFileTmpDir } : {});
+    }
+    container = bootPreviewContainer({ ...boot, envFile: envFile?.file ?? null });
+  } finally {
+    envFile?.cleanup();
+  }
+  await attachPreviewHostForwards({ containerName: container, tag: boot.tag, forwards: handover.forwards, deps, log });
+  return container;
 }
 
 // --- orchestration ---------------------------------------------------------
@@ -2851,7 +2906,7 @@ export async function runPreviewCreate(rest, injected = {}) {
   // impossible (#210).
   let imageBuiltHere = false;
   const abort = async (err) => {
-    removeContainer(previewContainerName(slug), deps);
+    removePreviewContainer(previewContainerName(slug), deps);
     if (imageBuiltHere) {
       await removeImageIfUnreferenced(tag, { registryPath: deps.registryPath, keepSlug: slug, deps });
     }
@@ -2892,7 +2947,8 @@ export async function runPreviewCreate(rest, injected = {}) {
     // Establish and verify the separate artifact volume BEFORE the first app
     // process. Never remove it on failure: even a failed boot may have written data.
     ensureArtifactVolume(slug, deps);
-    const container = bootPreviewContainer({
+    const container = await bootPreviewContainerWithHandover({
+      checkoutDir,
       slug,
       tag,
       hostPort,
@@ -3059,7 +3115,7 @@ export async function runPreviewRefresh(rest, injected = {}) {
   let replaced = false;
   let imageBuiltHere = false; // cinatra-cli#220 — see create's abort
   const abort = async (err) => {
-    if (replaced) removeContainer(previewContainerName(slug), deps);
+    if (replaced) removePreviewContainer(previewContainerName(slug), deps);
     if (newTag !== oldTag && imageBuiltHere) {
       await removeImageIfUnreferenced(newTag, { registryPath: deps.registryPath, keepSlug: slug, deps });
     }
@@ -3127,7 +3183,8 @@ export async function runPreviewRefresh(rest, injected = {}) {
     // no orphan accumulation), REUSING the durable volume (never dropped).
     replaced = true;
     removeContainer(previewContainerName(slug), deps);
-    const container = bootPreviewContainer({
+    const container = await bootPreviewContainerWithHandover({
+      checkoutDir,
       slug,
       tag: newTag,
       hostPort,
@@ -3425,10 +3482,14 @@ export async function runPreviewStart(rest, injected = {}) {
     }
 
     if (present === "stopped" && !recreate) {
+      // cinatra-cli#287: the declarers are read before the container comes back;
+      // once it runs, it gets their forwards again (its network namespace is new).
+      const handover = await collectPreviewHostHandover({ checkoutDir, deps, log: deps.log ?? (() => {}) });
       const r = deps.runDocker(["start", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
       if (r.error || r.status !== 0) {
         throw new Error(`docker start of preview ${name} failed` + (r.stderr ? `: ${r.stderr.trim()}` : "."));
       }
+      await reattachPreviewHostForwards({ containerName: name, tag, handover, deps, log: deps.log ?? (() => {}) });
       deps.log(`  started ${name}; health-gating http://${previewReachHost(row.bind ?? null)}:${hostPort}/api/health ...`);
       const result = await pollHealthGate({
         url: `http://${previewReachHost(row.bind ?? null)}:${hostPort}/api/health`,
@@ -3475,6 +3536,10 @@ export async function runPreviewStart(rest, injected = {}) {
     // cinatra-cli#219: a re-materialization boots a container that DIALS these
     // endpoints, so it is gated exactly like create and refresh.
     assertContainerDialedEndpointsOwned({ env: runtimeEnv, checkoutDir, deps });
+    // cinatra-cli#287: a re-materialized container gets the same host handover
+    // as a created one. It is collected BEFORE the old container is set aside,
+    // and a restored container gets its forwards back.
+    const handover = await collectPreviewHostHandover({ checkoutDir, deps, log: deps.log ?? (() => {}) });
 
     // AC6: keep the old container ASIDE (renamed + stopped) rather than
     // destroying it, so a failed re-materialize can put it back.
@@ -3497,13 +3562,16 @@ export async function runPreviewStart(rest, injected = {}) {
     // Put the parked container back. Every step is CHECKED: a restore that
     // silently failed would leave the canonical container absent while the
     // message claimed it was back, and the row would say `ready`.
-    const restore = () => {
+    const restore = async () => {
       if (!parked) return { outcome: "none", parked: null };
-      removeContainer(name, deps);
+      removePreviewContainer(name, deps);
       const back = deps.runDocker(["rename", parked, name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
       if (back.error || back.status !== 0) return { outcome: "failed", parked };
       const up = deps.runDocker(["start", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
       if (up.error || up.status !== 0) return { outcome: "failed", parked: name };
+      // cinatra-cli#287: the restored container's forwarder went with the boot
+      // that replaced it; it gets its declared forwards back.
+      await attachPreviewHostForwards({ containerName: name, tag, forwards: handover.forwards, deps, log: deps.log ?? (() => {}) });
       // Both steps SUCCEEDED. The confirming probe may still go unanswered — and
       // that is "could not confirm", not "it is gone": claiming the preview is
       // DOWN when the container is in fact back would be the same over-claim the
@@ -3542,7 +3610,9 @@ export async function runPreviewStart(rest, injected = {}) {
 
     let container;
     try {
-      container = bootPreviewContainer({
+      container = await bootPreviewContainerWithHandover({
+        checkoutDir,
+        handover,
         slug,
         tag,
         hostPort,
@@ -3554,7 +3624,7 @@ export async function runPreviewStart(rest, injected = {}) {
         deps: { ...deps, env: runtimeEnv },
       });
     } catch (err) {
-      const r = restore();
+      const r = await restore();
       await release(r.outcome === "failed" || r.outcome === "restored-not-running" ? "degraded" : row.state);
       throw new Error(`${err?.message ?? err}\n  ${restoreNote(r).trim()}`);
     }
@@ -3568,7 +3638,7 @@ export async function runPreviewStart(rest, injected = {}) {
     });
     if (result.state !== "healthy") {
       const diag = dumpContainerLogs(container, deps);
-      const r = restore();
+      const r = await restore();
       await release(r.outcome === "failed" || r.outcome === "restored-not-running" ? "degraded" : row.state);
       throw new Error(
         `preview "${slug}" did not reach healthy after re-materializing (terminal state: ${result.state}` +
