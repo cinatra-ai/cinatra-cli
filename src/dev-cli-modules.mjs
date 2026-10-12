@@ -88,12 +88,28 @@ function requireResolvedRepoRoot(key, repoRoot) {
  * the first sorted one is used).
  */
 export function discoverDevCliModulePath(key, repoRoot) {
-  const extRoot = path.join(requireResolvedRepoRoot(key, repoRoot), "extensions");
+  return discoverAllDevCliModulePaths(key, repoRoot)[0]?.modulePath ?? null;
+}
+
+/**
+ * EVERY declarer of `cinatra.devCliModules[key]`, for a key that several
+ * extensions may contribute to. Same scan as `discoverDevCliModulePath`: scopes
+ * and package dirs in sorted order, each declared path confined inside its own
+ * extension dir (a path that leaves it is skipped). Returns
+ * `[{ packageDir, modulePath }]` — `packageDir` relative to the root
+ * (`extensions/<scope>/<name>`), `modulePath` absolute — or `[]`.
+ *
+ * `repoRoot` is REQUIRED, exactly as above.
+ */
+export function discoverAllDevCliModulePaths(key, repoRoot) {
+  const root = requireResolvedRepoRoot(key, repoRoot);
+  const extRoot = path.join(root, "extensions");
+  const found = [];
   let scopes;
   try {
     scopes = readdirSync(extRoot).sort();
   } catch {
-    return null;
+    return found;
   }
   for (const scope of scopes) {
     let dirs;
@@ -120,10 +136,10 @@ export function discoverDevCliModulePath(key, repoRoot) {
       const base = path.join(extRoot, scope, dir);
       const resolved = path.resolve(base, rel);
       if (resolved !== base && !resolved.startsWith(base + path.sep)) continue;
-      return resolved;
+      found.push({ packageDir: path.join("extensions", scope, dir), modulePath: resolved });
     }
   }
-  return null;
+  return found;
 }
 
 /**

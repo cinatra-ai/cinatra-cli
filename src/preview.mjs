@@ -81,6 +81,7 @@ import { spawnSync } from "node:child_process";
 // dependency-free in the other direction (it never imports this module), so
 // there is no cycle and the light CLI core stays importable.
 import { assertEndpointOwnership, resolveEndpointOwnershipMode } from "./preview-endpoint-ownership.mjs";
+import { attachPreviewHostForwards, collectPreviewHostHandover, writeHandoverEnvFile } from "./preview-host-handover.mjs";
 // cinatra-cli#295: one extension pinned at a given commit (node builtins only,
 // like this module; its `tar` reader is imported lazily by the real describer).
 import {
@@ -119,6 +120,12 @@ export const PROVENANCE_PREFIX = "local-image:";
 
 // A preview always runs production runtime semantics (AC2).
 export const PREVIEW_RUNTIME_MODE = "production";
+// What tells a preview from a production deployment inside the container
+// (cinatra-cli#287): the runtime mode stays `production`; the install profile
+// is the product's own separate axis, and an image that does not read it
+// ignores it.
+export const PREVIEW_INSTALL_PROFILE_ENV = "CINATRA_INSTALL_PROFILE";
+export const PREVIEW_INSTALL_PROFILE = "preview";
 
 // The durable local-data root. Matches prod's env-overridable
 // `CINATRA_EXTENSION_DATA_ROOT` / `resolveExtensionDataRoot` (default
@@ -872,6 +879,9 @@ function assertContainerDialedEndpointsOwned({ env, checkoutDir, deps }) {
  * Build the `-e KEY=VALUE` docker-run env args for a preview container.
  *
  *  - ALWAYS sets CINATRA_RUNTIME_MODE=production (AC2).
+ *  - ALWAYS sets CINATRA_INSTALL_PROFILE=preview (cinatra-cli#287): a preview,
+ *    never a production deployment, though its runtime mode is production. An
+ *    ambient value is never forwarded in its place (it is no passthrough key).
  *  - ALWAYS sets CINATRA_EXTENSION_DATA_ROOT to the durable-volume mount path (AC4).
  *  - Requires + forwards CINATRA_ENCRYPTION_KEY (AC6, validated by caller).
  *  - Forwards the known DB/auth/redis/registry passthrough keys when present in `env`.
@@ -899,6 +909,7 @@ export function buildPreviewRunEnvArgs({ encryptionKey, env = process.env, fleet
   const reachableOnly = new Set(REACHABLE_ONLY_ENV_KEYS);
   const pairs = [];
   pairs.push([ "CINATRA_RUNTIME_MODE", PREVIEW_RUNTIME_MODE ]);
+  pairs.push([ PREVIEW_INSTALL_PROFILE_ENV, PREVIEW_INSTALL_PROFILE ]);
   pairs.push([ EXTENSION_DATA_ROOT_ENV, EXTENSION_DATA_ROOT_IN_CONTAINER ]);
   pairs.push([ "CINATRA_ARTIFACT_DATA_ROOT", ARTIFACT_DATA_ROOT_IN_CONTAINER ]);
   pairs.push([ ENCRYPTION_KEY_ENV, encryptionKey ]);
@@ -2484,7 +2495,7 @@ function resolveRuntimeEnv({ deps, env, hostPort }) {
  *
  * @returns {string} the container name
  */
-export function bootPreviewContainer({ slug, tag, hostPort, bind = null, encryptionKey, provenance, sha, fleet = PREVIEW_FLEET_DEFAULT, deps }) {
+export function bootPreviewContainer({ slug, tag, hostPort, bind = null, encryptionKey, provenance, sha, fleet = PREVIEW_FLEET_DEFAULT, envFile = null, deps }) {
   assertNotProductionImageTag(tag);
   const containerName = previewContainerName(slug);
   const volumeName = previewVolumeName(slug);
@@ -2500,6 +2511,8 @@ export function bootPreviewContainer({ slug, tag, hostPort, bind = null, encrypt
     // unset is the byte-identical pre-#248 argument (docker's own 0.0.0.0).
     "-p", bind ? `${bind}:${hostPort}:3000` : `${hostPort}:3000`,
     ...envArgs,
+    // cinatra-cli#287: the host handover's values travel in a 0600 file, never in this argv.
+    ...(envFile ? ["--env-file", envFile] : []),
   ];
   if (provenance) args.push("--label", `cinatra.preview.provenance=${provenance}`);
   if (sha) args.push("--label", `cinatra.preview.sha=${sha}`);
@@ -2512,6 +2525,32 @@ export function bootPreviewContainer({ slug, tag, hostPort, bind = null, encrypt
     );
   }
   return containerName;
+}
+
+/**
+ * cinatra-cli#287: boot the preview container with the HOST HANDOVER of the
+ * extensions present in the checkout (preview-host-handover.mjs): every
+ * declarer is called once before `docker run`; the env it hands over travels in
+ * a 0600 env file removed as soon as `docker run` returns, and its forwards are
+ * served inside the container after the boot. With no declarer the boot is
+ * exactly `bootPreviewContainer`.
+ */
+export async function bootPreviewContainerWithHandover({ checkoutDir, ...boot }) {
+  const { deps } = boot;
+  const log = deps.log ?? (() => {});
+  const handover = await collectPreviewHostHandover({ checkoutDir, deps, log });
+  let envFile = null;
+  let container;
+  try {
+    if (handover.env.length > 0) {
+      envFile = writeHandoverEnvFile(handover.env, deps.envFileTmpDir ? { tmpDir: deps.envFileTmpDir } : {});
+    }
+    container = bootPreviewContainer({ ...boot, envFile: envFile?.file ?? null });
+  } finally {
+    envFile?.cleanup();
+  }
+  attachPreviewHostForwards({ containerName: container, tag: boot.tag, forwards: handover.forwards, deps, log });
+  return container;
 }
 
 // --- orchestration ---------------------------------------------------------
@@ -2892,7 +2931,8 @@ export async function runPreviewCreate(rest, injected = {}) {
     // Establish and verify the separate artifact volume BEFORE the first app
     // process. Never remove it on failure: even a failed boot may have written data.
     ensureArtifactVolume(slug, deps);
-    const container = bootPreviewContainer({
+    const container = await bootPreviewContainerWithHandover({
+      checkoutDir,
       slug,
       tag,
       hostPort,
@@ -3127,7 +3167,8 @@ export async function runPreviewRefresh(rest, injected = {}) {
     // no orphan accumulation), REUSING the durable volume (never dropped).
     replaced = true;
     removeContainer(previewContainerName(slug), deps);
-    const container = bootPreviewContainer({
+    const container = await bootPreviewContainerWithHandover({
+      checkoutDir,
       slug,
       tag: newTag,
       hostPort,
