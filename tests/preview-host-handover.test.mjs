@@ -81,6 +81,9 @@ function makeDeps(state = {}) {
         };
       }
     }
+    if (verb === "container" && sub === "inspect" && args.includes("{{json .NetworkSettings.Networks}}")) {
+      return state.membershipAnswer?.(args) ?? { status: 0, stdout: '{"bridge":{}}\n', stderr: "" };
+    }
     if (verb === "container" && sub === "inspect" && args.includes("{{json .}}")) {
       const slug = args.at(-1).slice("cinatra-preview-".length);
       return {
@@ -164,6 +167,8 @@ function makeDeps(state = {}) {
   return { deps, calls, logs, state };
 }
 
+const membershipReads = (calls) =>
+  calls.filter((a) => a[0] === "container" && a[1] === "inspect" && a.includes("{{json .NetworkSettings.Networks}}"));
 const previewRun = (calls) =>
   calls.find((a) => a[0] === "run" && a[1] === "-d" && !a.some((x) => String(x).startsWith("container:")));
 const forwarderRuns = (calls) => calls.filter((a) => a[0] === "run" && a.some((x) => String(x).startsWith("container:")));
@@ -242,12 +247,17 @@ describe("cinatra-cli#287 — the declared forwards are served inside the contai
       networkAnswer: (args) => args[2] === "beta_net"
         ? { status: 1, stdout: "", stderr: "Error response from daemon: endpoint with name cinatra-preview-s1 already exists in network beta_net" }
         : { status: 0, stdout: "", stderr: "" },
+      membershipAnswer: () => ({ status: 0, stdout: '{"acme-net":{},"beta_net":{},"bridge":{}}\n', stderr: "" }),
     });
     const out = await PV.runPreviewCreate(["--slug", "s1"], deps);
     expect(calls.filter((a) => a[0] === "network")).toEqual([
       ["network", "connect", "acme-net", "cinatra-preview-s1"],
       ["network", "connect", "beta_net", "cinatra-preview-s1"],
     ]);
+    // The join that exited 1 is a join because the container's membership read lists beta_net, not by its text.
+    const reads = membershipReads(calls);
+    expect(reads).toEqual([["container", "inspect", "--format", "{{json .NetworkSettings.Networks}}", "cinatra-preview-s1"]]);
+    expect(calls.indexOf(reads[0])).toBe(calls.findIndex((a) => a[0] === "network" && a[2] === "beta_net") + 1);
     expect(calls).toContainEqual(["rm", "-f", "cinatra-preview-s1.forward"]);
     const runs = forwarderRuns(calls);
     expect(runs).toHaveLength(1);
@@ -826,5 +836,119 @@ describe("cinatra-cli#303 — a container whose stop failed is never left ready 
     logs.length = 0;
     await expect(PV.runPreviewStart(["--slug", "s1"], deps)).rejects.toThrow(JOIN_FAILED);
     expect(logs.some((l) => l.includes("is already running"))).toBe(false);
+  });
+});
+
+describe("cinatra-cli#305 — a network join is read by its exit status and the container's membership, never by its text", () => {
+  const ALREADY = "Error response from daemon: endpoint with name cinatra-preview-s1 already exists in network acme-net";
+  const JOIN_FAILED = "preview host handover: docker network connect acme-net failed for 127.0.0.1:41001 in cinatra-preview-s1";
+  const timedOut = Object.assign(new Error("spawnSync docker ETIMEDOUT"), { code: "ETIMEDOUT" });
+  const joinExits1 = (stderr) => () => ({ status: 1, stdout: "", stderr });
+
+  it("a join that exits 1 saying it already exists, whose membership read does not list the network, fails the preview", async () => {
+    declarer("acme", "alpha", { body: forwarding() });
+    const { deps, calls, logs, state } = makeDeps({ networkAnswer: joinExits1(ALREADY) });
+    await expect(PV.runPreviewCreate(["--slug", "s1"], deps)).rejects.toThrow(`${JOIN_FAILED} (exit 1)`);
+    expect(membershipReads(calls)).toHaveLength(1);
+    expect(forwarderRuns(calls)).toHaveLength(0);
+    expect(logs.some((l) => l.includes(`${FWD} serves`))).toBe(false);
+    expect(state.forwarders.size).toBe(0);
+  });
+
+  it("a join that exits 1 with any text is a join when the membership read exits 0 listing the network", async () => {
+    declarer("acme", "alpha", { body: forwarding() });
+    const { deps, calls, logs, state } = makeDeps({
+      networkAnswer: joinExits1("Error response from daemon: made-up join failure"),
+      membershipAnswer: () => ({ status: 0, stdout: '{"acme-net":{"NetworkID":"n1"},"bridge":{}}\n', stderr: "" }),
+    });
+    expect((await PV.runPreviewCreate(["--slug", "s1"], deps)).state).toBe("healthy");
+    const reads = membershipReads(calls);
+    expect(reads).toHaveLength(1);
+    expect(calls.indexOf(reads[0])).toBe(calls.findIndex((a) => a[0] === "network" && a[1] === "connect") + 1);
+    expect(forwarderRuns(calls)).toHaveLength(1);
+    expect(logs.some((l) => l.includes(`${FWD} serves 127.0.0.1:41001`))).toBe(true);
+    expect([...state.forwarders]).toEqual([FWD]);
+  });
+
+  const unread = [
+    ["the membership read exits 1 after printing the network", "its membership read failed: docker container inspect cinatra-preview-s1: exit 1",
+      () => ({ status: 1, stdout: '{"acme-net":{}}\n', stderr: "Error: made-up inspect failure" })],
+    ["the membership read times out after printing the network", "its membership read failed: docker container inspect cinatra-preview-s1: ETIMEDOUT",
+      () => ({ status: null, error: timedOut, stdout: '{"acme-net":{}}\n', stderr: "" })],
+    ["the membership read exits 0 with no map of networks", "its answer is not a map of networks",
+      () => ({ status: 0, stdout: "acme-net\n", stderr: "" })],
+  ];
+  for (const [label, why, membershipAnswer] of unread) {
+    it(`a join that exits 1 saying it already exists fails the preview when ${label}`, async () => {
+      declarer("acme", "alpha", { body: forwarding() });
+      const { deps, calls, logs, state } = makeDeps({ networkAnswer: joinExits1(ALREADY), membershipAnswer });
+      const first = PV.runPreviewCreate(["--slug", "s1"], deps);
+      await expect(first).rejects.toThrow(`${JOIN_FAILED} (exit 1; `);
+      await expect(first).rejects.toThrow(why);
+      expect(forwarderRuns(calls)).toHaveLength(0);
+      expect(logs.some((l) => l.includes(`${FWD} serves`))).toBe(false);
+      expect(state.forwarders.size).toBe(0);
+    });
+  }
+});
+
+describe("cinatra-cli#305 — the declarer is bounded from its spawn", () => {
+  it("a runner stopped before it reports that it started settles at the start bound, and its group is killed", async () => {
+    const pidsFile = path.join(tmp, "pids");
+    const stopper = path.join(tmp, "stop-before-start.cjs");
+    // Loaded before the runner's own code: it starts a child in its group, records both pids and stops itself.
+    writeFileSync(stopper,
+      'const { spawn } = require("node:child_process");\nconst { writeFileSync } = require("node:fs");\n' +
+      "const env = { ...process.env };\ndelete env.NODE_OPTIONS;\n" +
+      'const kid = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", env });\n' +
+      `writeFileSync(${JSON.stringify(pidsFile)}, \`\${process.pid} \${kid.pid}\`);\n` +
+      'process.kill(process.pid, "SIGSTOP");\n');
+    declarer("acme", "never-starts", { body: handing({ env: { [NAME_B]: SECRET_B } }) });
+    const cli = path.join(tmp, "cli.mjs");
+    writeFileSync(cli,
+      `import { collectPreviewHostHandover } from ${JSON.stringify(new URL("../src/preview-host-handover.mjs", import.meta.url).href)};\n` +
+      `process.env.NODE_OPTIONS = ${JSON.stringify(`--require ${stopper}`)};\n` +
+      `const out = await collectPreviewHostHandover({ checkoutDir: ${JSON.stringify(checkoutDir)}, ` +
+      "deps: { handoverStartTimeoutMs: 1000, handoverTimeoutMs: 60_000, handoverAbortGraceMs: 300 }, log: (l) => console.log(l) });\n" +
+      'console.log(`collected ${out.env.length}`);\n');
+    const child = spawn(process.execPath, [cli], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    child.stdout.on("data", (d) => { out += d; });
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    let pids = [];
+    let left = [];
+    let code;
+    try {
+      code = await new Promise((resolve) => {
+        const t = setTimeout(() => { child.kill("SIGKILL"); resolve("still running after 10 s"); }, 10_000);
+        child.on("exit", (c) => { clearTimeout(t); resolve(c); });
+      });
+      pids = existsSync(pidsFile) ? readFileSync(pidsFile, "utf8").split(" ").map(Number) : [];
+      for (let i = 0; i < 20 && pids.some(alive); i++) await new Promise((r) => setTimeout(r, 100));
+      left = pids.filter(alive);
+    } finally {
+      if (!pids.length && existsSync(pidsFile)) pids = readFileSync(pidsFile, "utf8").split(" ").map(Number);
+      for (const pid of pids) if (alive(pid)) process.kill(pid, "SIGKILL");
+    }
+    expect(code).toBe(0);
+    expect(pids).toHaveLength(2);
+    expect(out).toContain(`skipped "${KEY}" of ${path.join("extensions", "acme", "never-starts")}: it timed out before it started.`);
+    expect(out).toContain("collected 0");
+    expect(left).toEqual([]);
+  }, 20_000);
+
+  it("a declarer that answers after its abort is still timed out: the bound, once expired, is the outcome", async () => {
+    const H = await loadHandover();
+    declarer("acme", "late", {
+      body: "export function previewHostHandover({ signal }) {\n" +
+        `  return new Promise((resolve) => signal.addEventListener("abort", () => resolve(${JSON.stringify({ env: { [NAME_B]: SECRET_B } })})));\n}\n`,
+    });
+    const logs = [];
+    const out = await H.collectPreviewHostHandover({
+      checkoutDir, deps: { handoverTimeoutMs: 300, handoverAbortGraceMs: 2_000 }, log: (l) => logs.push(l),
+    });
+    expect(out.env).toEqual([]);
+    expect(logs.filter((l) => l.includes(`skipped "${KEY}" of`) && l.includes("it timed out."))).toHaveLength(1);
+    for (const line of logs) expect(line).not.toContain(SECRET_B);
   });
 });

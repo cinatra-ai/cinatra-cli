@@ -22,10 +22,13 @@
 //
 // A declarer that throws, times out or returns a bad shape is skipped with a
 // warning that names the key and its package dir, never a value. Each declarer
-// runs in its own process group: at the bound it gets an abort on its `signal`,
-// then the group is killed, so nothing it started keeps the CLI alive. Every
-// docker effect goes through the preview's `runDocker` seam, and a declared
-// forward that is not served fails the preview, naming its port and the step.
+// runs in its own process group, bounded from its spawn: a runner that does not
+// report that it started within the start bound, or a declarer that does not
+// answer within its bound, gets an abort on its `signal`, then the group is
+// killed, so nothing it started keeps the CLI alive. Every docker effect goes
+// through the preview's `runDocker` seam, and its success is read from its exit
+// status, never from its text. A declared forward that is not served fails the
+// preview, naming its port and the step.
 
 import { spawn } from "node:child_process";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -73,6 +76,9 @@ export function parseForwardTarget(target) {
 
 /** How long a declarer past its bound has, after its abort, before its group is killed. */
 export const PREVIEW_HOST_HANDOVER_ABORT_GRACE_MS = 1_000;
+/** How long the runner has, from its spawn, to report that it started; the
+ *  declarer's own bound starts when it does. */
+export const PREVIEW_HOST_HANDOVER_START_TIMEOUT_MS = 30_000;
 const DECLARER_RUNNER =
   `import { pathToFileURL } from "node:url";const ac=new AbortController();` +
   `process.on("message",(m)=>{if(m==="abort")ac.abort();});` +
@@ -83,33 +89,48 @@ const DECLARER_RUNNER =
   `else process.send({result:await fn({log:(l)=>process.send({log:String(l)}),signal:ac.signal})});}` +
   `catch{process.send({failed:true});}`;
 
-/** Run one declarer module in its own process group, bounded from its start:
- *  resolves `{ result }`, `{ noExport }`, `{ failed }` or `{ timedOut }`. The
- *  group also ends when the CLI ends first: the runner kills it when its channel
- *  to the CLI closes. */
-function runDeclarer(modulePath, { timeoutMs, graceMs, log }) {
+/** Run one declarer module in its own process group, bounded from its spawn:
+ *  the start bound is armed right after the spawn, and the declarer's own bound
+ *  replaces it when the runner reports that it started. Resolves `{ result }`,
+ *  `{ noExport }`, `{ failed }` or `{ timedOut, started }`. Once a bound expires
+ *  the outcome is `timedOut`, whatever the child sends or does after it: the
+ *  child gets its abort and, after the grace, its group is killed. The group
+ *  also ends when the CLI ends first: the runner kills it when its channel to
+ *  the CLI closes. */
+function runDeclarer(modulePath, { timeoutMs, startTimeoutMs, graceMs, log }) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, ["--input-type=module", "-e", DECLARER_RUNNER, modulePath],
       { detached: true, stdio: ["ignore", "inherit", "inherit", "ipc"] });
-    const timers = [];
     let settled = false;
+    let started = false;
+    let expired = null;
+    let bound = null;
+    let grace = null;
     const done = (outcome) => {
       if (settled) return;
       settled = true;
-      timers.forEach(clearTimeout);
+      clearTimeout(bound);
+      clearTimeout(grace);
       try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
-      resolve(outcome);
+      resolve(expired ?? outcome);
     };
+    const expire = () => {
+      expired = { timedOut: true, started };
+      try { child.send("abort"); } catch { /* it is going anyway */ }
+      grace = setTimeout(() => done(expired), graceMs);
+    };
+    bound = setTimeout(expire, startTimeoutMs);
     child.on("error", () => done({ failed: true }));
     child.on("exit", () => done({ failed: true }));
     child.on("message", (m) => {
-      if (m === "ready") {
-        timers.push(setTimeout(() => {
-          try { child.send("abort"); } catch { /* it is going anyway */ }
-          timers.push(setTimeout(() => done({ timedOut: true }), graceMs));
-        }, timeoutMs));
-      } else if (m && typeof m === "object" && "log" in m) log(m.log);
-      else done(m && typeof m === "object" ? m : { failed: true });
+      if (m && typeof m === "object" && "log" in m) log(m.log);
+      else if (expired) return;
+      else if (m === "ready") {
+        if (started) return;
+        started = true;
+        clearTimeout(bound);
+        bound = setTimeout(expire, timeoutMs);
+      } else done(m && typeof m === "object" ? m : { failed: true });
     });
   });
 }
@@ -124,6 +145,7 @@ export async function collectPreviewHostHandover({ checkoutDir, deps = {}, log =
   const discover = deps.discoverHandoverDeclarers ??
     ((root) => discoverAllDevCliModulePaths(PREVIEW_HOST_HANDOVER_KEY, root));
   const timeoutMs = deps.handoverTimeoutMs ?? PREVIEW_HOST_HANDOVER_TIMEOUT_MS;
+  const startTimeoutMs = deps.handoverStartTimeoutMs ?? PREVIEW_HOST_HANDOVER_START_TIMEOUT_MS;
   const graceMs = deps.handoverAbortGraceMs ?? PREVIEW_HOST_HANDOVER_ABORT_GRACE_MS;
   const env = [];
   const forwards = [];
@@ -138,13 +160,14 @@ export async function collectPreviewHostHandover({ checkoutDir, deps = {}, log =
   }
   for (const { packageDir, modulePath } of declarers) {
     const who = `"${PREVIEW_HOST_HANDOVER_KEY}" of ${packageDir}`;
-    const run = await runDeclarer(modulePath, { timeoutMs, graceMs, log });
+    const run = await runDeclarer(modulePath, { timeoutMs, startTimeoutMs, graceMs, log });
     if (run.noExport) {
       warn(`skipped ${who}: it exports no ${PREVIEW_HOST_HANDOVER_EXPORT} function.`);
       continue;
     }
     if (run.timedOut || run.failed) {
-      warn(`skipped ${who}: ${run.timedOut ? "it timed out" : "it failed"}.`);
+      const why = run.failed ? "it failed" : run.started ? "it timed out" : "it timed out before it started";
+      warn(`skipped ${who}: ${why}.`);
       continue;
     }
     const result = run.result;
@@ -281,16 +304,39 @@ export function previewForwarderRunArgs({ containerName, tag, forwards }) {
 
 /** Why a docker call failed: its error code, or its exit status. */
 function dockerFailure(r) {
-  return r.error ? String(r.error.code ?? "error") : `exit ${r.status}`;
+  return r.error ? String(r.error.code ?? "error") : r.timedOut ? "timed out" : `exit ${r.status}`;
 }
 
 /**
- * After the boot: join each declared network (an existing membership is fine),
- * then replace this preview's forwarder with one serving every forward, and read
- * that each listener reports that it listens. A declared forward that is not
- * served FAILS the preview: the forwarder is removed and the error names the
- * port and the step. An earlier forwarder of this container is removed with the
- * container (see removePreviewForwarder).
+ * The names of the networks `containerName` is a member of, from its own
+ * `docker container inspect`. Its output is read only after it exits 0 within
+ * its bound; an error, a timeout, a non-zero exit or an answer that is not a
+ * map of networks throws.
+ */
+export function readContainerNetworks(containerName, deps) {
+  const r = deps.runDocker(["container", "inspect", "--format", "{{json .NetworkSettings.Networks}}", containerName],
+    { timeoutMs: 15_000 });
+  if (r.error || r.timedOut || r.status !== 0) {
+    throw new Error(`docker container inspect ${containerName}: ${dockerFailure(r)}`);
+  }
+  let networks = null;
+  try {
+    networks = JSON.parse(String(r.stdout ?? ""));
+  } catch { /* not a map of networks */ }
+  if (!isPlainObject(networks)) throw new Error(`docker container inspect ${containerName}: its answer is not a map of networks`);
+  return new Set(Object.keys(networks));
+}
+
+/**
+ * After the boot: join each declared network, then replace this preview's
+ * forwarder with one serving every forward, and read that each listener reports
+ * that it listens. A join that exits 0 is a join. A join that exits non-zero is
+ * one only when the container's own membership read (readContainerNetworks)
+ * lists the network: an existing membership is fine, and the join's text is
+ * never read. A declared forward that is not served FAILS the preview: the
+ * forwarder is removed and the error names the port and the step. An earlier
+ * forwarder of this container is removed with the container (see
+ * removePreviewForwarder).
  */
 export async function attachPreviewHostForwards({ containerName, tag, forwards, deps, log = () => {} }) {
   if (!forwards.length) return { forwarder: null, forwards: [] };
@@ -301,9 +347,17 @@ export async function attachPreviewHostForwards({ containerName, tag, forwards, 
   };
   const ports = forwards.map((f) => f.port);
   for (const network of [...new Set(forwards.map((f) => f.network))].sort()) {
+    const joined = forwards.filter((f) => f.network === network).map((f) => f.port);
     const r = deps.runDocker(["network", "connect", network, containerName], { timeoutMs: 15_000 });
-    if (r.error || (r.status !== 0 && !/already exists/i.test(r.stderr ?? ""))) {
-      fail(`docker network connect ${network}`, forwards.filter((f) => f.network === network).map((f) => f.port), dockerFailure(r));
+    if (r.error || r.timedOut) fail(`docker network connect ${network}`, joined, dockerFailure(r));
+    if (r.status !== 0) {
+      let member;
+      try {
+        member = readContainerNetworks(containerName, deps).has(network);
+      } catch (err) {
+        fail(`docker network connect ${network}`, joined, `${dockerFailure(r)}; its membership read failed: ${err.message}`);
+      }
+      if (!member) fail(`docker network connect ${network}`, joined, dockerFailure(r));
     }
   }
   const name = previewForwarderName(containerName);
