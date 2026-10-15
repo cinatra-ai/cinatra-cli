@@ -111,6 +111,7 @@ function makeDeps(state = {}) {
     }
     if (verb === "rm") {
       state.forwarders.delete(args.at(-1));
+      if (args.at(-1) === "cinatra-preview-s1") state.containerRunning = state.containerStopped = false;
       return { status: 0, stdout: "", stderr: "" };
     }
     if (verb === "logs" && String(args.at(-1)).endsWith(".forward")) {
@@ -736,4 +737,53 @@ describe("cinatra-cli#303 — the declarer and what it started end when the CLI 
       expect(left).toEqual([]);
     }, 30_000);
   }
+});
+
+describe("cinatra-cli#303 — a start whose declared forward failed leaves no container running without it", () => {
+  const failingJoins = (extra = {}) => {
+    const state = { ...extra };
+    state.networkAnswer = () => state.joinFails
+      ? { status: 1, stdout: "", stderr: "Error response from daemon: network acme-net not found" }
+      : { status: 0, stdout: "", stderr: "" };
+    return state;
+  };
+  const JOIN_FAILED = "preview host handover: docker network connect acme-net failed for 127.0.0.1:41001";
+
+  it("a plain start of a stopped preview whose attach fails stops it again, and a second start does not succeed without the forward", async () => {
+    declarer("acme", "alpha", { body: forwarding() });
+    const state = failingJoins();
+    const { deps } = makeDeps(state);
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    await PV.runPreviewStop(["--slug", "s1"], deps);
+    state.joinFails = true;
+    await expect(PV.runPreviewStart(["--slug", "s1"], deps)).rejects.toThrow(JOIN_FAILED);
+    expect(state.containerRunning).toBe(false);
+    await expect(PV.runPreviewStart(["--slug", "s1"], deps)).rejects.toThrow(JOIN_FAILED);
+    expect(state.containerRunning).toBe(false);
+  });
+
+  it("a start that re-materializes an absent container whose attach fails removes it, and a second start does not succeed without the forward", async () => {
+    declarer("acme", "alpha", { body: forwarding() });
+    const state = failingJoins({ imagePresent: true });
+    const { deps } = makeDeps(state);
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    state.containerRunning = false;
+    state.joinFails = true;
+    await expect(PV.runPreviewStart(["--slug", "s1"], deps)).rejects.toThrow(JOIN_FAILED);
+    expect(state.containerRunning).toBe(false);
+    await expect(PV.runPreviewStart(["--slug", "s1"], deps)).rejects.toThrow(JOIN_FAILED);
+    expect(state.containerRunning).toBe(false);
+  });
+
+  it("a recreate whose attach fails, and whose restored container's attach fails too, leaves it stopped; a second start does not succeed without the forward", async () => {
+    declarer("acme", "alpha", { body: forwarding() });
+    const state = failingJoins({ imagePresent: true });
+    const { deps } = makeDeps(state);
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    state.joinFails = true;
+    await expect(PV.runPreviewStart(["--slug", "s1", "--recreate"], deps)).rejects.toThrow(JOIN_FAILED);
+    expect(state.containerRunning).toBe(false);
+    await expect(PV.runPreviewStart(["--slug", "s1"], deps)).rejects.toThrow(JOIN_FAILED);
+    expect(state.containerRunning).toBe(false);
+  });
 });
