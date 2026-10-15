@@ -122,6 +122,7 @@ function makeDeps(state = {}) {
       if (state.containerLsAnswer) return state.containerLsAnswer(args);
       return { status: 0, stdout: [...state.forwarders].map((name) => `${name}\n`).join(""), stderr: "" };
     }
+    if (verb === "stop" && state.stopFails) return { status: 1, stdout: "", stderr: "Error response from daemon: made-up stop failure" };
     if (verb === "stop" || verb === "start") {
       state.containerRunning = verb === "start";
       state.containerStopped = verb === "stop";
@@ -785,5 +786,45 @@ describe("cinatra-cli#303 — a start whose declared forward failed leaves no co
     expect(state.containerRunning).toBe(false);
     await expect(PV.runPreviewStart(["--slug", "s1"], deps)).rejects.toThrow(JOIN_FAILED);
     expect(state.containerRunning).toBe(false);
+  });
+});
+
+describe("cinatra-cli#303 — a container whose stop failed is never left ready without its forward", () => {
+  const JOIN_FAILED = "preview host handover: docker network connect acme-net failed for 127.0.0.1:41001";
+  const failingJoins = (extra = {}) => {
+    const state = { ...extra };
+    state.networkAnswer = () => state.joinFails
+      ? { status: 1, stdout: "", stderr: "Error response from daemon: network acme-net not found" }
+      : { status: 0, stdout: "", stderr: "" };
+    return state;
+  };
+
+  it("a recreate whose restored container's attach and stop both fail says it was NOT stopped, and a second start fails without the forward", async () => {
+    declarer("acme", "alpha", { body: forwarding() });
+    const state = failingJoins({ imagePresent: true });
+    const { deps, logs } = makeDeps(state);
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    state.joinFails = true;
+    state.stopFails = true;
+    const first = PV.runPreviewStart(["--slug", "s1", "--recreate"], deps);
+    await expect(first).rejects.toThrow("was NOT stopped again (docker stop failed); stop it before the next start");
+    await expect(first).rejects.not.toThrow("and STOPPED");
+    logs.length = 0;
+    await expect(PV.runPreviewStart(["--slug", "s1"], deps)).rejects.toThrow(JOIN_FAILED);
+    expect(logs.some((l) => l.includes("is already running"))).toBe(false);
+  });
+
+  it("a plain start whose attach and stop both fail leaves the row degraded, and a second start fails without the forward", async () => {
+    declarer("acme", "alpha", { body: forwarding() });
+    const state = failingJoins();
+    const { deps, logs } = makeDeps(state);
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    await PV.runPreviewStop(["--slug", "s1"], deps);
+    state.joinFails = true;
+    state.stopFails = true;
+    await expect(PV.runPreviewStart(["--slug", "s1"], deps)).rejects.toThrow("NOT stopped again (docker stop failed)");
+    logs.length = 0;
+    await expect(PV.runPreviewStart(["--slug", "s1"], deps)).rejects.toThrow(JOIN_FAILED);
+    expect(logs.some((l) => l.includes("is already running"))).toBe(false);
   });
 });
