@@ -3452,6 +3452,16 @@ export async function runPreviewStart(rest, injected = {}) {
       // says it is running" is not the same fact and must never clear it — the
       // container that failed the gate is typically still running. Re-probe, and
       // only a real healthy answer promotes the row.
+      // cinatra-cli#303: and never without its declared forwards served.
+      const handover = await collectPreviewHostHandover({ checkoutDir, deps, log: deps.log ?? (() => {}) });
+      if (handover.forwards.length > 0) {
+        try {
+          await attachPreviewHostForwards({ containerName: name, tag, forwards: handover.forwards, deps, log: deps.log ?? (() => {}) });
+        } catch (err) {
+          await release("degraded");
+          throw err;
+        }
+      }
       deps.log(`preview "${slug}" is running but its row is degraded; re-probing http://${previewReachHost(row.bind ?? null)}:${hostPort}/api/health ...`);
       const probe = await pollHealthGate({
         url: `http://${previewReachHost(row.bind ?? null)}:${hostPort}/api/health`,
@@ -3489,7 +3499,18 @@ export async function runPreviewStart(rest, injected = {}) {
       if (r.error || r.status !== 0) {
         throw new Error(`docker start of preview ${name} failed` + (r.stderr ? `: ${r.stderr.trim()}` : "."));
       }
-      await reattachPreviewHostForwards({ containerName: name, tag, handover, deps, log: deps.log ?? (() => {}) });
+      try {
+        await reattachPreviewHostForwards({ containerName: name, tag, handover, deps, log: deps.log ?? (() => {}) });
+      } catch (err) {
+        // cinatra-cli#303: a start whose declared forwards failed leaves the
+        // container stopped, as it found it, so no later start finds it running
+        // without them.
+        const down = deps.runDocker(["stop", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+        // Still running without its forwards: the row says degraded, never ready.
+        if (down.error || down.status !== 0) await release("degraded");
+        throw new Error(`${err?.message ?? err}\n  ${name} was ` +
+          (down.error || down.status !== 0 ? `NOT stopped again (docker stop failed); stop it before the next start.` : `stopped again.`));
+      }
       deps.log(`  started ${name}; health-gating http://${previewReachHost(row.bind ?? null)}:${hostPort}/api/health ...`);
       const result = await pollHealthGate({
         url: `http://${previewReachHost(row.bind ?? null)}:${hostPort}/api/health`,
@@ -3571,7 +3592,14 @@ export async function runPreviewStart(rest, injected = {}) {
       if (up.error || up.status !== 0) return { outcome: "failed", parked: name };
       // cinatra-cli#287: the restored container's forwarder went with the boot
       // that replaced it; it gets its declared forwards back.
-      await attachPreviewHostForwards({ containerName: name, tag, forwards: handover.forwards, deps, log: deps.log ?? (() => {}) });
+      try {
+        await attachPreviewHostForwards({ containerName: name, tag, forwards: handover.forwards, deps, log: deps.log ?? (() => {}) });
+      } catch (err) {
+        // cinatra-cli#303: without its declared forwards it is stopped again.
+        const down = deps.runDocker(["stop", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+        const stopped = !down.error && down.status === 0;
+        return { outcome: stopped ? "restored-stopped" : "restored-running", parked: null, why: err?.message ?? String(err) };
+      }
       // Both steps SUCCEEDED. The confirming probe may still go unanswered — and
       // that is "could not confirm", not "it is gone": claiming the preview is
       // DOWN when the container is in fact back would be the same over-claim the
@@ -3589,6 +3617,14 @@ export async function runPreviewStart(rest, injected = {}) {
     /** The tail of a failure message: what the restore actually achieved. */
     const restoreNote = (r) => {
       if (r.outcome === "none") return `There was no previous container to restore. `;
+      if (r.outcome === "restored-stopped") {
+        return `The previous container was put back as ${name} and STOPPED, because its declared forwards failed ` +
+          `too (${r.why}). \`cinatra instance preview start --slug ${slug}\` retries it. `;
+      }
+      if (r.outcome === "restored-running") {
+        return `The previous container was put back as ${name}, its declared forwards failed too (${r.why}), and it ` +
+          `was NOT stopped again (docker stop failed); stop it before the next start. Its row is degraded. `;
+      }
       if (r.outcome === "restored") {
         return `The PREVIOUS container was restored and restarted — this run left the preview as it found it. `;
       }
@@ -3624,8 +3660,11 @@ export async function runPreviewStart(rest, injected = {}) {
         deps: { ...deps, env: runtimeEnv },
       });
     } catch (err) {
+      // cinatra-cli#303: a container this run booted (its handover failed, say)
+      // never stays up when nothing was parked: it goes, as on create.
+      if (!parked) removePreviewContainer(name, deps);
       const r = await restore();
-      await release(r.outcome === "failed" || r.outcome === "restored-not-running" ? "degraded" : row.state);
+      await release(r.outcome === "failed" || r.outcome === "restored-not-running" || r.outcome === "restored-running" ? "degraded" : row.state);
       throw new Error(`${err?.message ?? err}\n  ${restoreNote(r).trim()}`);
     }
     deps.log(
@@ -3639,7 +3678,7 @@ export async function runPreviewStart(rest, injected = {}) {
     if (result.state !== "healthy") {
       const diag = dumpContainerLogs(container, deps);
       const r = await restore();
-      await release(r.outcome === "failed" || r.outcome === "restored-not-running" ? "degraded" : row.state);
+      await release(r.outcome === "failed" || r.outcome === "restored-not-running" || r.outcome === "restored-running" ? "degraded" : row.state);
       throw new Error(
         `preview "${slug}" did not reach healthy after re-materializing (terminal state: ${result.state}` +
           (result.status ? `, http ${result.status}` : "") + `). ` +
