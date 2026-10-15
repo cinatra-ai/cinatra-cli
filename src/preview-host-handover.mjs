@@ -21,13 +21,16 @@
 //     listens, and only a forward that reported so is said to be served.
 //
 // A declarer that throws, times out or returns a bad shape is skipped with a
-// warning that names the key and its package dir, never a value. Every docker
-// effect goes through the preview's `runDocker` seam.
+// warning that names the key and its package dir, never a value. Each declarer
+// runs in its own process group: at the bound it gets an abort on its `signal`,
+// then the group is killed, so nothing it started keeps the CLI alive. Every
+// docker effect goes through the preview's `runDocker` seam, and a declared
+// forward that is not served fails the preview, naming its port and the step.
 
+import { spawn } from "node:child_process";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 
 import { discoverAllDevCliModulePaths } from "./dev-cli-modules.mjs";
 
@@ -50,7 +53,6 @@ export const PREVIEW_FORWARDER_LABEL = "cinatra.preview.forwarder=true";
 const NETWORK_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const TARGET_HOST_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,252}$/;
 
-const NO_EXPORT = Symbol("no-export");
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
 function validPort(value, min) {
@@ -69,12 +71,47 @@ export function parseForwardTarget(target) {
   return validPort(port, 1) ? { host, port } : null;
 }
 
-function withTimeout(promise, ms) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error("timed out")), ms);
+/** How long a declarer past its bound has, after its abort, before its group is killed. */
+export const PREVIEW_HOST_HANDOVER_ABORT_GRACE_MS = 1_000;
+const DECLARER_RUNNER =
+  `import { pathToFileURL } from "node:url";const ac=new AbortController();` +
+  `process.on("message",(m)=>{if(m==="abort")ac.abort();});` +
+  // The CLI's end closes this channel, however it ends: the group ends with it.
+  `process.on("disconnect",()=>{try{process.kill(0,"SIGKILL");}catch{process.exit(1);}});process.send("ready");` +
+  `try{const mod=await import(pathToFileURL(process.argv[1]).href);const fn=mod?.${PREVIEW_HOST_HANDOVER_EXPORT};` +
+  `if(typeof fn!=="function")process.send({noExport:true});` +
+  `else process.send({result:await fn({log:(l)=>process.send({log:String(l)}),signal:ac.signal})});}` +
+  `catch{process.send({failed:true});}`;
+
+/** Run one declarer module in its own process group, bounded from its start:
+ *  resolves `{ result }`, `{ noExport }`, `{ failed }` or `{ timedOut }`. The
+ *  group also ends when the CLI ends first: the runner kills it when its channel
+ *  to the CLI closes. */
+function runDeclarer(modulePath, { timeoutMs, graceMs, log }) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", DECLARER_RUNNER, modulePath],
+      { detached: true, stdio: ["ignore", "inherit", "inherit", "ipc"] });
+    const timers = [];
+    let settled = false;
+    const done = (outcome) => {
+      if (settled) return;
+      settled = true;
+      timers.forEach(clearTimeout);
+      try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+      resolve(outcome);
+    };
+    child.on("error", () => done({ failed: true }));
+    child.on("exit", () => done({ failed: true }));
+    child.on("message", (m) => {
+      if (m === "ready") {
+        timers.push(setTimeout(() => {
+          try { child.send("abort"); } catch { /* it is going anyway */ }
+          timers.push(setTimeout(() => done({ timedOut: true }), graceMs));
+        }, timeoutMs));
+      } else if (m && typeof m === "object" && "log" in m) log(m.log);
+      else done(m && typeof m === "object" ? m : { failed: true });
+    });
   });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -86,8 +123,8 @@ export async function collectPreviewHostHandover({ checkoutDir, deps = {}, log =
   const warn = (line) => log(`  ⚠ preview host handover: ${line}`);
   const discover = deps.discoverHandoverDeclarers ??
     ((root) => discoverAllDevCliModulePaths(PREVIEW_HOST_HANDOVER_KEY, root));
-  const importModule = deps.importHandoverModule ?? ((file) => import(pathToFileURL(file).href));
   const timeoutMs = deps.handoverTimeoutMs ?? PREVIEW_HOST_HANDOVER_TIMEOUT_MS;
+  const graceMs = deps.handoverAbortGraceMs ?? PREVIEW_HOST_HANDOVER_ABORT_GRACE_MS;
   const env = [];
   const forwards = [];
   const names = new Set();
@@ -101,22 +138,16 @@ export async function collectPreviewHostHandover({ checkoutDir, deps = {}, log =
   }
   for (const { packageDir, modulePath } of declarers) {
     const who = `"${PREVIEW_HOST_HANDOVER_KEY}" of ${packageDir}`;
-    let result;
-    try {
-      result = await withTimeout((async () => {
-        const mod = await importModule(modulePath);
-        const fn = mod?.[PREVIEW_HOST_HANDOVER_EXPORT];
-        return typeof fn === "function" ? fn({ log }) : NO_EXPORT;
-      })(), timeoutMs);
-      if (result === NO_EXPORT) {
-        warn(`skipped ${who}: it exports no ${PREVIEW_HOST_HANDOVER_EXPORT} function.`);
-        continue;
-      }
-    } catch (err) {
-      const why = err instanceof Error && err.message === "timed out" ? "it timed out" : "it failed";
-      warn(`skipped ${who}: ${why}.`);
+    const run = await runDeclarer(modulePath, { timeoutMs, graceMs, log });
+    if (run.noExport) {
+      warn(`skipped ${who}: it exports no ${PREVIEW_HOST_HANDOVER_EXPORT} function.`);
       continue;
     }
+    if (run.timedOut || run.failed) {
+      warn(`skipped ${who}: ${run.timedOut ? "it timed out" : "it failed"}.`);
+      continue;
+    }
+    const result = run.result;
     if (!isPlainObject(result) ||
         (result.env !== undefined && !isPlainObject(result.env)) ||
         (result.forwards !== undefined && !Array.isArray(result.forwards))) {
@@ -207,7 +238,8 @@ export function removePreviewForwarder(containerName, deps) {
 /**
  * Read the forwarder's own report of each listener from its log, until every
  * port has reported or the attempts run out. Returns `{ ready: Set<port>,
- * failed: Map<port, code> }`; a port in neither did not report.
+ * failed: Map<port, code> }`; a port in neither did not report. A `docker logs`
+ * that errs, times out or exits non-zero throws: its output is never read.
  */
 export async function readForwarderReadiness({ name, ports, deps }) {
   const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -217,6 +249,7 @@ export async function readForwarderReadiness({ name, ports, deps }) {
   for (let i = 0; i < FORWARDER_READY_ATTEMPTS; i++) {
     if (i > 0) await sleep(FORWARDER_READY_INTERVAL_MS);
     const r = deps.runDocker(["logs", name], { timeoutMs: 15_000 });
+    if (r.error || r.status !== 0) throw new Error(`docker logs ${name}: ${dockerFailure(r)}`);
     for (const line of `${r.stdout ?? ""}\n${r.stderr ?? ""}`.split("\n")) {
       const m = FORWARDER_REPORT_RE.exec(line.trim());
       if (!m || !want.has(Number(m[2]))) continue;
@@ -246,46 +279,50 @@ export function previewForwarderRunArgs({ containerName, tag, forwards }) {
   ];
 }
 
+/** Why a docker call failed: its error code, or its exit status. */
+function dockerFailure(r) {
+  return r.error ? String(r.error.code ?? "error") : `exit ${r.status}`;
+}
+
 /**
  * After the boot: join each declared network (an existing membership is fine),
- * then replace this preview's forwarder with one serving every forward whose
- * network was joined, and read which listeners report that they listen. Only
- * those are said to be served; a forwarder that serves none is removed. A
- * failure is a named WARNING, never a failed preview. An earlier forwarder of
- * this container is removed with the container (see removePreviewForwarder).
+ * then replace this preview's forwarder with one serving every forward, and read
+ * that each listener reports that it listens. A declared forward that is not
+ * served FAILS the preview: the forwarder is removed and the error names the
+ * port and the step. An earlier forwarder of this container is removed with the
+ * container (see removePreviewForwarder).
  */
 export async function attachPreviewHostForwards({ containerName, tag, forwards, deps, log = () => {} }) {
-  const warn = (line) => log(`  ⚠ preview host handover: ${line}`);
   if (!forwards.length) return { forwarder: null, forwards: [] };
-  const joined = new Set();
+  const fail = (step, ports, why) => {
+    removePreviewForwarder(containerName, deps);
+    throw new Error(`preview host handover: ${step} failed for ${ports.map((p) => `127.0.0.1:${p}`).join(", ")} ` +
+      `in ${containerName} (${why}); a declared forward that is not served fails the preview.`);
+  };
+  const ports = forwards.map((f) => f.port);
   for (const network of [...new Set(forwards.map((f) => f.network))].sort()) {
     const r = deps.runDocker(["network", "connect", network, containerName], { timeoutMs: 15_000 });
-    if (!r.error && (r.status === 0 || /already exists/i.test(r.stderr ?? ""))) joined.add(network);
-    else warn(`could not join ${containerName} to the network ${network}; its forwards are skipped.`);
+    if (r.error || (r.status !== 0 && !/already exists/i.test(r.stderr ?? ""))) {
+      fail(`docker network connect ${network}`, forwards.filter((f) => f.network === network).map((f) => f.port), dockerFailure(r));
+    }
   }
-  const joinedForwards = forwards.filter((f) => joined.has(f.network));
-  if (!joinedForwards.length) return { forwarder: null, forwards: [] };
   const name = previewForwarderName(containerName);
   removePreviewForwarder(containerName, deps);
-  const r = deps.runDocker(previewForwarderRunArgs({ containerName, tag, forwards: joinedForwards }), { timeoutMs: 60_000 });
-  if (r.error || r.status !== 0) {
-    removePreviewForwarder(containerName, deps);
-    warn(`the forwarder ${name} did not start (exit ${r.status}).`);
-    return { forwarder: null, forwards: [] };
+  const r = deps.runDocker(previewForwarderRunArgs({ containerName, tag, forwards }), { timeoutMs: 60_000 });
+  if (r.error || r.status !== 0) fail(`docker run of the forwarder ${name}`, ports, dockerFailure(r));
+  let report;
+  try {
+    report = await readForwarderReadiness({ name, ports, deps });
+  } catch (err) {
+    fail("the readiness read", ports, err.message);
   }
-  const { ready, failed } = await readForwarderReadiness({ name, ports: joinedForwards.map((f) => f.port), deps });
-  for (const f of joinedForwards) {
-    if (failed.has(f.port)) warn(`127.0.0.1:${f.port} could not listen (${failed.get(f.port)}); that forward is not served.`);
-    else if (!ready.has(f.port)) warn(`127.0.0.1:${f.port} did not report that it listens; that forward is not served.`);
+  const unserved = forwards.filter((f) => !report.ready.has(f.port));
+  if (unserved.length) {
+    fail("the readiness read", unserved.map((f) => f.port), unserved.map((f) => report.failed.has(f.port)
+      ? `${f.port} could not listen: ${report.failed.get(f.port)}` : `${f.port} did not report that it listens`).join("; "));
   }
-  const served = joinedForwards.filter((f) => ready.has(f.port));
-  if (!served.length) {
-    removePreviewForwarder(containerName, deps);
-    warn(`no forward listens, so the forwarder ${name} was removed.`);
-    return { forwarder: null, forwards: [] };
-  }
-  log(`  preview host handover: ${name} serves ${served.map((f) => `127.0.0.1:${f.port}`).join(", ")} in ${containerName}.`);
-  return { forwarder: name, forwards: served };
+  log(`  preview host handover: ${name} serves ${ports.map((p) => `127.0.0.1:${p}`).join(", ")} in ${containerName}.`);
+  return { forwarder: name, forwards };
 }
 
 /**
@@ -304,10 +341,7 @@ export async function reattachPreviewHostForwards({ containerName, tag, handover
       "`instance preview start --recreate` hands the declared env over again.");
   }
   if (handover.forwards.length > 0) {
-    const attached = await attachPreviewHostForwards({ containerName, tag, forwards: handover.forwards, deps, log });
-    // No forwarder serves (every join refused, say): the one from before the stop is left over.
-    if (!attached.forwarder) removePreviewForwarder(containerName, deps);
-    return attached;
+    return attachPreviewHostForwards({ containerName, tag, forwards: handover.forwards, deps, log });
   }
   const r = deps.runDocker(
     ["container", "ls", "-a", "--filter", `label=${PREVIEW_FORWARDER_LABEL}`, "--format", "{{.Names}}"],

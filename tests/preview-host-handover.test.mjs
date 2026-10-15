@@ -103,6 +103,7 @@ function makeDeps(state = {}) {
       }
       if (!args.some((a) => String(a).startsWith("container:"))) state.containerRunning = true;
       else {
+        if (state.forwarderRunAnswer) return state.forwarderRunAnswer(args);
         state.forwarders.add(args[args.indexOf("--name") + 1]);
         state.forwarderPorts = [...String(args.at(-1)).matchAll(/"port":([0-9]+)/g)].map((m) => Number(m[1]));
       }
@@ -117,6 +118,7 @@ function makeDeps(state = {}) {
         { status: 0, stdout: state.forwarderPorts.map((port) => `forward-ready ${port}\n`).join(""), stderr: "" };
     }
     if (verb === "container" && sub === "ls") {
+      if (state.containerLsAnswer) return state.containerLsAnswer(args);
       return { status: 0, stdout: [...state.forwarders].map((name) => `${name}\n`).join(""), stderr: "" };
     }
     if (verb === "stop" || verb === "start") {
@@ -416,21 +418,21 @@ describe("cinatra-cli#287 — the forwarder never outlives the container it serv
     expect(state.forwarders.size).toBe(0);
   });
 
-  it("a refresh whose network joins all fail removes the old forwarder", async () => {
+  it("a refresh whose network join fails fails, naming the port and the step, and removes the old forwarder", async () => {
     declarer("acme", "alpha", { body: forwarding() });
     const state = {};
     state.networkAnswer = () => state.joinFails
       ? { status: 1, stdout: "", stderr: "Error response from daemon: network acme-net not found" }
       : { status: 0, stdout: "", stderr: "" };
-    const { deps, calls, logs } = makeDeps(state);
+    const { deps, calls } = makeDeps(state);
     await PV.runPreviewCreate(["--slug", "s1"], deps);
     expect([...state.forwarders]).toEqual([FWD]);
     state.joinFails = true;
     calls.length = 0;
-    await PV.runPreviewRefresh(["--slug", "s1"], deps);
+    await expect(PV.runPreviewRefresh(["--slug", "s1"], deps))
+      .rejects.toThrow("preview host handover: docker network connect acme-net failed for 127.0.0.1:41001");
     expect(forwarderRuns(calls)).toHaveLength(0);
     expect(state.forwarders.size).toBe(0);
-    expect(logs.some((l) => l.includes("could not join cinatra-preview-s1 to the network acme-net"))).toBe(true);
   });
 
   it("a failed health gate removes the forwarder with the container, on create and on refresh", async () => {
@@ -498,7 +500,7 @@ describe("cinatra-cli#287 — a forward is said to be served only when its liste
     }
   });
 
-  it("only the forwards whose listeners report ready are said to be served", async () => {
+  it("a declared forward whose listener does not listen fails the start, naming its port", async () => {
     declarer("acme", "alpha", {
       body: handing({ forwards: [
         { port: 41001, network: "acme-net", target: "acme-svc:8080" },
@@ -508,21 +510,20 @@ describe("cinatra-cli#287 — a forward is said to be served only when its liste
     const { deps, logs, state } = makeDeps({
       forwarderLog: () => ({ status: 0, stdout: "forward-ready 41001\n", stderr: "forward-failed 41002 EADDRINUSE\n" }),
     });
-    await PV.runPreviewCreate(["--slug", "s1"], deps);
-    const serves = logs.filter((l) => l.includes(`${FWD} serves`));
-    expect(serves).toEqual([`  preview host handover: ${FWD} serves 127.0.0.1:41001 in cinatra-preview-s1.`]);
-    expect(logs.some((l) => l.includes("127.0.0.1:41002 could not listen (EADDRINUSE)"))).toBe(true);
-    expect([...state.forwarders]).toEqual([FWD]);
+    await expect(PV.runPreviewCreate(["--slug", "s1"], deps))
+      .rejects.toThrow("the readiness read failed for 127.0.0.1:41002 in cinatra-preview-s1 (41002 could not listen: EADDRINUSE)");
+    expect(logs.some((l) => l.includes(`${FWD} serves`))).toBe(false);
+    expect(state.forwarders.size).toBe(0);
   });
 
-  it("a forwarder none of whose listeners listens is removed, and no forward is said to be served", async () => {
+  it("a forwarder none of whose listeners listens is removed, and the start fails", async () => {
     declarer("acme", "alpha", { body: forwarding() });
     const { deps, logs, state } = makeDeps({
       forwarderLog: () => ({ status: 0, stdout: "", stderr: "forward-failed 41001 EADDRINUSE\n" }),
     });
-    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    await expect(PV.runPreviewCreate(["--slug", "s1"], deps))
+      .rejects.toThrow("the readiness read failed for 127.0.0.1:41001 in cinatra-preview-s1 (41001 could not listen: EADDRINUSE)");
     expect(logs.some((l) => l.includes(`${FWD} serves`))).toBe(false);
-    expect(logs.some((l) => l.includes(`no forward listens, so the forwarder ${FWD} was removed`))).toBe(true);
     expect(state.forwarders.size).toBe(0);
   });
 
@@ -596,4 +597,143 @@ describe("cinatra-cli#287 — a stopped preview that starts again gets its forwa
     await PV.runPreviewStart(["--slug", "s1"], deps);
     expect(calls.some((a) => a[0] === "rm")).toBe(false);
   });
+});
+
+describe("cinatra-cli#303 — a declared forward whose handover failed fails the preview, naming the port and the step", () => {
+  const timedOut = Object.assign(new Error("spawnSync docker ETIMEDOUT"), { code: "ETIMEDOUT" });
+  const refused = [
+    ["network connect exits 1", "docker network connect acme-net",
+      { networkAnswer: () => ({ status: 1, stdout: "acme-net\n", stderr: "Error response from daemon: network acme-net not found" }) }],
+    ["the forwarder run exits 125 after printing an id", `docker run of the forwarder ${FWD}`,
+      { forwarderRunAnswer: () => ({ status: 125, stdout: "deadbeef\n", stderr: "" }) }],
+    ["docker logs exits 1 after a forward-ready line", "the readiness read",
+      { forwarderLog: () => ({ status: 1, stdout: "forward-ready 41001\n", stderr: "" }) }],
+    ["docker logs times out after a forward-ready line", "the readiness read",
+      { forwarderLog: () => ({ status: null, error: timedOut, stdout: "forward-ready 41001\n", stderr: "" }) }],
+  ];
+  for (const [label, step, answer] of refused) {
+    it(`refuses valid-looking output with a failed exit: ${label}`, async () => {
+      declarer("acme", "alpha", { body: forwarding() });
+      const { deps, logs, state } = makeDeps(answer);
+      await expect(PV.runPreviewCreate(["--slug", "s1"], deps))
+        .rejects.toThrow(`preview host handover: ${step} failed for 127.0.0.1:41001 in cinatra-preview-s1`);
+      expect(logs.some((l) => l.includes(`${FWD} serves`))).toBe(false);
+      expect(state.forwarders.size).toBe(0);
+    });
+  }
+
+  it("a failed docker network connect for a declared port fails a plain start of a stopped preview", async () => {
+    declarer("acme", "alpha", { body: forwarding() });
+    const state = {};
+    state.networkAnswer = () => state.joinFails
+      ? { status: 1, stdout: "", stderr: "Error response from daemon: network acme-net not found" }
+      : { status: 0, stdout: "", stderr: "" };
+    const { deps, calls } = makeDeps(state);
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    await PV.runPreviewStop(["--slug", "s1"], deps);
+    state.joinFails = true;
+    calls.length = 0;
+    await expect(PV.runPreviewStart(["--slug", "s1"], deps))
+      .rejects.toThrow("preview host handover: docker network connect acme-net failed for 127.0.0.1:41001 in cinatra-preview-s1 (exit 1)");
+    expect(forwarderRuns(calls)).toHaveLength(0);
+    expect(state.forwarders.size).toBe(0);
+  });
+
+  it("a pack that declares no forward: create, stop and start join no network, run no forwarder and read no forwarder log", async () => {
+    declarer("acme", "alpha", { body: handing({ env: { [NAME_A]: SECRET_A } }) });
+    const { deps, calls, state } = makeDeps();
+    expect((await PV.runPreviewCreate(["--slug", "s1"], deps)).state).toBe("healthy");
+    await PV.runPreviewStop(["--slug", "s1"], deps);
+    const created = calls.length;
+    state.containerLsAnswer = () => ({ status: 1, stdout: `${FWD}\n`, stderr: "" });
+    const out = await PV.runPreviewStart(["--slug", "s1"], deps);
+    expect(out).toMatchObject({ container: "running", changed: true, rematerialized: false });
+    expect(calls.slice(created).some((a) => a[0] === "rm")).toBe(false);
+    expect(calls.some((a) => a[0] === "network")).toBe(false);
+    expect(calls.some((a) => a[0] === "logs" && a[1] === FWD)).toBe(false);
+    expect(forwarderRuns(calls)).toHaveLength(0);
+  });
+});
+
+describe("cinatra-cli#303 — the declarer runs under a terminating bound", () => {
+  it("a declarer holding a handle gets its abort, is terminated with what it started at the bound, and the CLI exits", async () => {
+    const marks = path.join(tmp, "marks");
+    mkdirSync(marks);
+    const kidFile = path.join(marks, "kid");
+    const abortedFile = path.join(marks, "aborted");
+    declarer("acme", "holds", {
+      body: 'import { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\n' +
+        "export function previewHostHandover({ signal }) {\n" +
+        '  const kid = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });\n' +
+        `  writeFileSync(${JSON.stringify(kidFile)}, String(kid.pid));\n` +
+        `  signal?.addEventListener("abort", () => writeFileSync(${JSON.stringify(abortedFile)}, "1"));\n` +
+        "  setInterval(() => {}, 1000);\n  return new Promise(() => {});\n}\n",
+    });
+    const cli = path.join(tmp, "cli.mjs");
+    writeFileSync(cli,
+      `import { collectPreviewHostHandover } from ${JSON.stringify(new URL("../src/preview-host-handover.mjs", import.meta.url).href)};\n` +
+      `const out = await collectPreviewHostHandover({ checkoutDir: ${JSON.stringify(checkoutDir)}, ` +
+      "deps: { handoverTimeoutMs: 1000, handoverAbortGraceMs: 500 }, log: (l) => console.log(l) });\n" +
+      'console.log(`collected ${out.forwards.length}`);\n');
+    const child = spawn(process.execPath, [cli], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    child.stdout.on("data", (d) => { out += d; });
+    const code = await new Promise((resolve) => {
+      const t = setTimeout(() => { child.kill("SIGKILL"); resolve("still running after 10 s"); }, 10_000);
+      child.on("exit", (c) => { clearTimeout(t); resolve(c); });
+    });
+    const kid = Number(readFileSync(kidFile, "utf8"));
+    let kidAlive = true;
+    for (let i = 0; i < 20 && kidAlive; i++) {
+      try { process.kill(kid, 0); await new Promise((r) => setTimeout(r, 100)); } catch { kidAlive = false; }
+    }
+    if (kidAlive) process.kill(kid, "SIGKILL");
+    expect(code).toBe(0);
+    expect(out).toContain(`skipped "${KEY}" of`);
+    expect(out).toContain("it timed out");
+    expect(existsSync(abortedFile)).toBe(true);
+    expect(kidAlive).toBe(false);
+  }, 20_000);
+});
+
+describe("cinatra-cli#303 — the declarer and what it started end when the CLI ends", () => {
+  const endings = [
+    ["SIGINT", (cli) => cli.kill("SIGINT")],
+    ["SIGTERM", (cli) => cli.kill("SIGTERM")],
+    ["SIGHUP", (cli) => cli.kill("SIGHUP")],
+    ["a normal exit", (cli) => cli.stdin.write("exit\n")],
+    ["an uncaught error", (cli) => cli.stdin.write("throw\n")],
+  ];
+  for (const [ending, end] of endings) {
+    it(`a declarer still running when the CLI ends by ${ending} before the bound is ended with its child`, async () => {
+      const pidsFile = path.join(tmp, "pids");
+      declarer("acme", "holds", {
+        body: 'import { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\n' +
+          "export function previewHostHandover() {\n" +
+          '  const kid = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });\n' +
+          `  writeFileSync(${JSON.stringify(pidsFile)}, \`\${process.pid} \${kid.pid}\`);\n` +
+          "  setInterval(() => {}, 1000);\n  return new Promise(() => {});\n}\n",
+      });
+      const cli = path.join(tmp, "cli.mjs");
+      writeFileSync(cli,
+        `import { collectPreviewHostHandover } from ${JSON.stringify(new URL("../src/preview-host-handover.mjs", import.meta.url).href)};\n` +
+        'process.stdin.on("data", (d) => { if (String(d).startsWith("exit")) process.exit(0); throw new Error("made-up failure"); });\n' +
+        `await collectPreviewHostHandover({ checkoutDir: ${JSON.stringify(checkoutDir)}, deps: { handoverTimeoutMs: 60_000 } });\n`);
+      const child = spawn(process.execPath, [cli], { stdio: ["pipe", "ignore", "ignore"] });
+      const exited = new Promise((resolve) => child.on("exit", () => resolve(true)));
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      for (let i = 0; i < 100 && !existsSync(pidsFile); i++) await sleep(100);
+      await sleep(200);
+      const pids = readFileSync(pidsFile, "utf8").split(" ").map(Number);
+      end(child);
+      const ended = await Promise.race([exited, sleep(10_000).then(() => false)]);
+      const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+      for (let i = 0; i < 30 && pids.some(alive); i++) await sleep(100);
+      const left = pids.filter(alive);
+      for (const pid of left) process.kill(pid, "SIGKILL");
+      if (!ended) child.kill("SIGKILL");
+      expect(ended).toBe(true);
+      expect(left).toEqual([]);
+    }, 30_000);
+  }
 });
