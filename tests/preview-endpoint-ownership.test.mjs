@@ -289,14 +289,31 @@ describe("verifyEndpointOwnership — the #219 reproduction", () => {
     expect(report.violations).toHaveLength(1);
   });
 
-  it("reports UNKNOWN (and never a violation) when the probe itself cannot run", () => {
+  it("REFUSES under enforce when the probe itself cannot run: an unreadable endpoint set is no pass", () => {
+    const deps = { log: () => {}, runDocker: () => ({ status: 127, stdout: "", stderr: "docker: not found" }) };
+    expect(() => assertEndpointOwnership({
+      entries: [{ key: "REDIS_URL", value: "redis://127.0.0.1:6379" }],
+      checkoutDir: OURS,
+      deps,
+      env: {},
+    })).toThrow(/the ownership of REDIS_URL \(host port 6379\) could not be verified/);
+    // A listing that exits 0 but whose inspect times out is unreadable too.
+    const timedOut = { log: () => {}, runDocker: (a) => a[0] === "ps"
+      ? { status: 0, stdout: "abc\n", stderr: "" }
+      : { status: null, stdout: "[]", stderr: "", timedOut: true, error: Object.assign(new Error("ETIMEDOUT"), { code: "ETIMEDOUT" }) } };
+    expect(() => assertEndpointOwnership({
+      entries: [{ key: "REDIS_URL", value: "redis://127.0.0.1:6379" }], checkoutDir: OURS, deps: timedOut, env: {},
+    })).toThrow(/could not be verified/);
+  });
+
+  it("reports UNKNOWN (and never a violation) under warn when the probe itself cannot run", () => {
     const deps = { log: () => {}, runDocker: () => ({ status: 127, stdout: "", stderr: "docker: not found" }) };
     const logs = [];
     const report = assertEndpointOwnership({
       entries: [{ key: "REDIS_URL", value: "redis://127.0.0.1:6379" }],
       checkoutDir: OURS,
       deps: { ...deps, log: (m) => logs.push(m) },
-      env: {},
+      env: { CINATRA_PREVIEW_ENDPOINT_OWNERSHIP: "warn" },
     });
     expect(report.results[0].verdict).toBe("unknown");
     expect(report.violations).toEqual([]);

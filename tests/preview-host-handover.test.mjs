@@ -7,7 +7,7 @@
 // program on loopback ports picked by the system.
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -15,10 +15,15 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { answerComposeOwnership } from "./helpers/fake-compose-ownership.mjs";
+import { answerPreviewIdentity, liveContainerId, nextRunId } from "./helpers/fake-preview-identity.mjs";
 import * as DCM from "../src/dev-cli-modules.mjs";
 import * as PV from "../src/preview.mjs";
 
 const loadHandover = () => import("../src/preview-host-handover.mjs");
+const H_FORWARDER_OF = "cinatra.preview.forwarder-of";
+// The IDs the fake docker prints: the n-th preview run, and the n-th forwarder run.
+const RUN_ID = (n) => n.toString(16).padStart(64, "c");
+const FWD_ID = (n) => n.toString(16).padStart(64, "f");
 
 const KEY = "preview-host-handover";
 const SHA_A = "a".repeat(40);
@@ -44,12 +49,12 @@ afterEach(() => {
 });
 
 /** A made-up extension in the checkout: its manifest and, when given, the module it declares. */
-function declarer(scope, name, { rel = "./handover.mjs", body = null, key = KEY } = {}) {
+function declarer(scope, name, { rel = "./handover.mjs", body = null, key = KEY, optional = false } = {}) {
   const dir = path.join(checkoutDir, "extensions", scope, name);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     path.join(dir, "package.json"),
-    JSON.stringify({ name: `@${scope}/${name}`, cinatra: { devCliModules: { [key]: rel } } }),
+    JSON.stringify({ name: `@${scope}/${name}`, cinatra: { devCliModules: { [key]: rel }, ...(optional ? { previewHostHandoverOptional: true } : {}) } }),
   );
   if (body !== null) writeFileSync(path.join(dir, rel), body);
   return dir;
@@ -63,11 +68,15 @@ function makeDeps(state = {}) {
   state.envFiles = [];
   // The forwarders docker holds, by name, and the ports of the last one run.
   state.forwarders = new Set();
+  // The forwarders by the ID their run printed: their name and the container they serve.
+  state.forwarderIds = new Map();
   state.forwarderPorts = [];
   const runDocker = (args) => {
     calls.push(args);
     const ownership = answerComposeOwnership(args, state);
     if (ownership) return ownership;
+    const identity = answerPreviewIdentity(args, state, { containerExists: (s) => Boolean(s.containerRunning || s.containerStopped) });
+    if (identity) return identity;
     const [verb, sub] = args;
     if (verb === "volume" && String(args.at(-1)).startsWith("cinatra-preview-artifacts-")) {
       const name = args.at(-1);
@@ -104,28 +113,59 @@ function makeDeps(state = {}) {
         const file = args[i + 1];
         state.envFiles.push({ file, mode: statSync(file).mode & 0o777, text: readFileSync(file, "utf8") });
       }
-      if (!args.some((a) => String(a).startsWith("container:"))) state.containerRunning = true;
-      else {
-        if (state.forwarderRunAnswer) return state.forwarderRunAnswer(args);
-        state.forwarders.add(args[args.indexOf("--name") + 1]);
-        state.forwarderPorts = [...String(args.at(-1)).matchAll(/"port":([0-9]+)/g)].map((m) => Number(m[1]));
+      if (!args.some((a) => String(a).startsWith("container:"))) {
+        state.containerRunning = true;
+        return { status: 0, stdout: `${nextRunId(state)}\n`, stderr: "" };
       }
-      return { status: 0, stdout: "deadbeef\n", stderr: "" };
+      if (state.forwarderRunAnswer) return state.forwarderRunAnswer(args);
+      const name = args[args.indexOf("--name") + 1];
+      const of = String(args.find((a) => String(a).startsWith(`${H_FORWARDER_OF}=`)) ?? "").slice(H_FORWARDER_OF.length + 1);
+      state.forwarderRunCount = (state.forwarderRunCount ?? 0) + 1;
+      const id = state.forwarderRunCount.toString(16).padStart(64, "f");
+      state.forwarderIds.set(id, { name, of });
+      state.forwarders.add(name);
+      state.forwarderPorts = [...String(args.at(-1)).matchAll(/"port":([0-9]+)/g)].map((m) => Number(m[1]));
+      return { status: 0, stdout: `${id}\n`, stderr: "" };
     }
     if (verb === "rm") {
-      state.forwarders.delete(args.at(-1));
-      if (args.at(-1) === "cinatra-preview-s1") state.containerRunning = state.containerStopped = false;
+      const target = String(args.at(-1));
+      if (state.rmAnswer) {
+        const answer = state.rmAnswer(args);
+        if (answer) return answer;
+      }
+      const fwd = state.forwarderIds.get(target);
+      if (fwd) {
+        state.forwarders.delete(fwd.name);
+        state.forwarderIds.delete(target);
+      }
+      // A removal by name (as a CLI before the result line made it) removes that forwarder too.
+      if (state.forwarders.delete(target)) {
+        for (const [id, f] of state.forwarderIds) if (f.name === target) state.forwarderIds.delete(id);
+      }
+      if (target === liveContainerId(state) || target === "cinatra-preview-s1") state.containerRunning = state.containerStopped = false;
       return { status: 0, stdout: "", stderr: "" };
     }
-    if (verb === "logs" && String(args.at(-1)).endsWith(".forward")) {
+    if (verb === "logs" && (state.forwarderIds.has(String(args.at(-1))) || String(args.at(-1)).endsWith(".forward"))) {
       return state.forwarderLog?.(args) ??
         { status: 0, stdout: state.forwarderPorts.map((port) => `forward-ready ${port}\n`).join(""), stderr: "" };
     }
     if (verb === "container" && sub === "ls") {
       if (state.containerLsAnswer) return state.containerLsAnswer(args);
-      return { status: 0, stdout: [...state.forwarders].map((name) => `${name}\n`).join(""), stderr: "" };
+      const filter = String(args[args.indexOf("--filter") + 1] ?? "");
+      // The status-checked absence listing by name: no other container holds it.
+      if (filter.startsWith("name=")) return { status: 0, stdout: "", stderr: "" };
+      // The listing by the plain forwarder label names every forwarder (as a CLI before the result line read it).
+      if (filter === `label=${"cinatra.preview.forwarder=true"}`) {
+        return { status: 0, stdout: [...state.forwarders].map((name) => `${name}\n`).join(""), stderr: "" };
+      }
+      const of = filter.startsWith(`label=${H_FORWARDER_OF}=`) ? filter.slice(`label=${H_FORWARDER_OF}=`.length) : null;
+      const ids = [...state.forwarderIds].filter(([, f]) => f.of === of).map(([id]) => id);
+      return { status: 0, stdout: ids.map((id) => `${id}\n`).join(""), stderr: "" };
     }
-    if (verb === "stop" && state.stopFails) return { status: 1, stdout: "", stderr: "Error response from daemon: made-up stop failure" };
+    if (verb === "rename" && args[2] === "cinatra-preview-s1") state.liveContainerId = args[1];
+    if (verb === "stop" && state.stopFails && (state.stops = (state.stops ?? 0) + 1) > (state.stopFailsAfter ?? 0)) {
+      return { status: 1, stdout: "", stderr: "Error response from daemon: made-up stop failure" };
+    }
     if (verb === "stop" || verb === "start") {
       state.containerRunning = verb === "start";
       state.containerStopped = verb === "stop";
@@ -189,7 +229,7 @@ describe("cinatra-cli#287 — the preview container tells itself from a producti
 });
 
 describe("cinatra-cli#287 — every declarer of a dev-CLI key", () => {
-  it("lists every declarer in sorted order, confined to its own dir, and skips a path that leaves it", () => {
+  it("lists every declarer in sorted order, confined to its own dir, and names a path that leaves it as that declarer's failure", () => {
     declarer("zeta", "one");
     declarer("acme", "beta");
     declarer("acme", "alpha");
@@ -199,8 +239,10 @@ describe("cinatra-cli#287 — every declarer of a dev-CLI key", () => {
     expect(found.map((d) => d.packageDir)).toEqual([
       path.join("extensions", "acme", "alpha"),
       path.join("extensions", "acme", "beta"),
+      path.join("extensions", "acme", "escape"),
       path.join("extensions", "zeta", "one"),
     ]);
+    expect(found[2]).toMatchObject({ modulePath: null, invalid: "its declared module path leaves its package" });
     expect(found[0].modulePath).toBe(path.join(checkoutDir, "extensions", "acme", "alpha", "handover.mjs"));
     expect(DCM.discoverDevCliModulePath(KEY, checkoutDir)).toBe(found[0].modulePath);
     expect(DCM.discoverAllDevCliModulePaths("no-such-key", checkoutDir)).toEqual([]);
@@ -209,7 +251,7 @@ describe("cinatra-cli#287 — every declarer of a dev-CLI key", () => {
 
 describe("cinatra-cli#287 — the handed-over env reaches the container in a 0600 env file only", () => {
   it("boots with --env-file holding the namespaced entries; no value in any argv or log; the file is gone after the run", async () => {
-    declarer("acme", "alpha", { body: handing({ env: { [NAME_A]: SECRET_A, PATH_LIKE_NAME: SECRET_B } }) });
+    declarer("acme", "alpha", { body: handing({ env: { [NAME_A]: SECRET_A } }) });
     declarer("acme", "beta", { body: handing({ env: { [NAME_B]: SECRET_B } }) });
     const { deps, calls, logs, state } = makeDeps();
     const out = await PV.runPreviewCreate(["--slug", "s1"], deps);
@@ -220,7 +262,6 @@ describe("cinatra-cli#287 — the handed-over env reaches the container in a 060
     expect(state.envFiles[0].mode).toBe(0o600);
     expect(state.envFiles[0].text).toBe(`${NAME_A}=${SECRET_A}\n${NAME_B}=${SECRET_B}\n`);
     expect(existsSync(state.envFiles[0].file)).toBe(false);
-    expect(logs.some((l) => l.includes("PATH_LIKE_NAME") && l.includes("not an extension override name"))).toBe(true);
     for (const argv of calls) for (const a of argv) for (const v of [SECRET_A, SECRET_B]) expect(String(a)).not.toContain(v);
     for (const line of logs) for (const v of [SECRET_A, SECRET_B]) expect(line).not.toContain(v);
   });
@@ -251,18 +292,21 @@ describe("cinatra-cli#287 — the declared forwards are served inside the contai
     });
     const out = await PV.runPreviewCreate(["--slug", "s1"], deps);
     expect(calls.filter((a) => a[0] === "network")).toEqual([
-      ["network", "connect", "acme-net", "cinatra-preview-s1"],
-      ["network", "connect", "beta_net", "cinatra-preview-s1"],
+      ["network", "connect", "acme-net", RUN_ID(1)],
+      ["network", "connect", "beta_net", RUN_ID(1)],
     ]);
     // The join that exited 1 is a join because the container's membership read lists beta_net, not by its text.
     const reads = membershipReads(calls);
-    expect(reads).toEqual([["container", "inspect", "--format", "{{json .NetworkSettings.Networks}}", "cinatra-preview-s1"]]);
+    expect(reads).toEqual([["container", "inspect", "--format", "{{json .NetworkSettings.Networks}}", RUN_ID(1)]]);
     expect(calls.indexOf(reads[0])).toBe(calls.findIndex((a) => a[0] === "network" && a[2] === "beta_net") + 1);
-    expect(calls).toContainEqual(["rm", "-f", "cinatra-preview-s1.forward"]);
+    // An earlier forwarder of THIS container is looked up by the label naming its ID before the run.
+    const lookup = ["container", "ls", "-a", "--no-trunc", "--filter", `label=${H_FORWARDER_OF}=${RUN_ID(1)}`, "--format", "{{.ID}}"];
     const runs = forwarderRuns(calls);
     expect(runs).toHaveLength(1);
     const fwd = runs[0];
-    expect(fwd.slice(0, 6)).toEqual(["run", "-d", "--name", "cinatra-preview-s1.forward", "--network", "container:cinatra-preview-s1"]);
+    expect(calls.findIndex((a) => JSON.stringify(a) === JSON.stringify(lookup))).toBeLessThan(calls.indexOf(fwd));
+    expect(fwd.slice(0, 6)).toEqual(["run", "-d", "--name", "cinatra-preview-s1.forward", "--network", `container:${RUN_ID(1)}`]);
+    expect(fwd).toContain(`${H_FORWARDER_OF}=${RUN_ID(1)}`);
     expect(fwd[fwd.indexOf("--entrypoint") + 1]).toBe("node");
     expect(fwd).toContain(out.tag);
     const script = fwd.at(-1);
@@ -314,46 +358,87 @@ describe("cinatra-cli#287 — the declared forwards are served inside the contai
 });
 
 describe("cinatra-cli#287 — what a declarer hands over is validated, and a failing declarer is skipped", () => {
-  it("skips each invalid entry with a warning and keeps the valid ones", async () => {
-    const H = await loadHandover();
-    declarer("acme", "alpha", {
-      body: handing({
-        env: { [NAME_A]: "one\nline", lower_case_name: "x", [NAME_B]: SECRET_B },
-        forwards: [
-          { port: 80, network: "acme-net", target: "svc:1" },
-          { port: 41001, network: "bad net", target: "svc:1" },
-          { port: 41002, network: "acme-net", target: "no-port" },
-          { port: 41003, network: "acme-net", target: "svc:99999" },
-          { port: 41004.5, network: "acme-net", target: "svc:1" },
-          { port: 41005, network: "acme-net", target: "svc:8080" },
-          { port: 41005, network: "acme-net", target: "svc:8081" },
-        ],
-      }),
+  const invalidEntries = [
+    ["an env value of two lines", { env: { [NAME_A]: "one\nline" } }, "is not one line of text"],
+    ["an env name outside the extension namespace", { env: { lower_case_name: "x" } }, "is not an extension override name"],
+    ["a forward below port 1024", { forwards: [{ port: 80, network: "acme-net", target: "svc:1" }] }, "a forward needs"],
+    ["a forward on a bad network name", { forwards: [{ port: 41001, network: "bad net", target: "svc:1" }] }, "a forward needs"],
+    ["a forward with no target port", { forwards: [{ port: 41002, network: "acme-net", target: "no-port" }] }, "a forward needs"],
+    ["a forward to a port past 65535", { forwards: [{ port: 41003, network: "acme-net", target: "svc:99999" }] }, "a forward needs"],
+    ["a forward on a fractional port", { forwards: [{ port: 41004.5, network: "acme-net", target: "svc:1" }] }, "a forward needs"],
+    ["two forwards on one port", { forwards: [{ port: 41005, network: "acme-net", target: "svc:8080" }, { port: 41005, network: "acme-net", target: "svc:8081" }] }, "a forward needs"],
+    ["a forward on the preview app's own port", { forwards: [{ port: 3000, network: "acme-net", target: "svc:3000" }] }, "the preview app's own port"],
+  ];
+  for (const [label, handed, why] of invalidEntries) {
+    it(`a required declarer that hands over ${label} refuses the preview; marked optional, it is skipped whole and named`, async () => {
+      const H = await loadHandover();
+      const good = { env: { [NAME_B]: SECRET_B }, forwards: [{ port: 41009, network: "acme-net", target: "svc:9" }] };
+      const merged = { env: { ...good.env, ...(handed.env ?? {}) }, forwards: [...good.forwards, ...(handed.forwards ?? [])] };
+      const dir = declarer("acme", "alpha", { body: handing(merged) });
+      await expect(H.collectPreviewHostHandover({ checkoutDir })).rejects.toThrow(
+        `the required declarer "${KEY}" of ${path.join("extensions", "acme", "alpha")} failed: `);
+      await expect(H.collectPreviewHostHandover({ checkoutDir })).rejects.toThrow(why);
+      rmSync(dir, { recursive: true, force: true });
+      declarer("acme", "alpha", { body: handing(merged), optional: true });
+      const logs = [];
+      const out = await H.collectPreviewHostHandover({ checkoutDir, log: (l) => logs.push(l) });
+      expect(out.env).toEqual([]);
+      expect(out.forwards).toEqual([]);
+      expect(out.skipped).toHaveLength(1);
+      expect(out.skipped[0].packageDir).toBe(path.join("extensions", "acme", "alpha"));
+      expect(out.skipped[0].why).toContain(why);
+      expect(logs.filter((l) => l.includes(`skipped "${KEY}" of ${path.join("extensions", "acme", "alpha")}: `))).toHaveLength(1);
+      for (const line of logs) expect(line).not.toContain(SECRET_B);
     });
-    const logs = [];
-    const out = await H.collectPreviewHostHandover({ checkoutDir, log: (l) => logs.push(l) });
-    expect(out.env).toEqual([[NAME_B, SECRET_B]]);
-    expect(out.forwards).toEqual([{ port: 41005, network: "acme-net", host: "svc", targetPort: 8080 }]);
-    expect(logs.filter((l) => l.includes("skipped a forward"))).toHaveLength(6);
-    expect(logs.filter((l) => l.includes("dropped the env key"))).toHaveLength(2);
-    for (const line of logs) expect(line).not.toContain(SECRET_B);
-  });
+  }
 
-  it("skips a declarer that throws, times out, returns a bad shape or exports nothing, and keeps the others", async () => {
+  const failingDeclarers = [
+    ["throws", `export async function previewHostHandover() { throw new Error("${SECRET_A}"); }\n`, "it failed"],
+    ["hangs past its bound", "export function previewHostHandover() { return new Promise(() => {}); }\n", "it timed out"],
+    ["returns a bad shape", 'export async function previewHostHandover() { return "nope"; }\n', "it returned no { env, forwards } object"],
+    ["exports nothing", "export const other = 1;\n", "it exports no previewHostHandover function"],
+  ];
+  for (const [label, body, why] of failingDeclarers) {
+    it(`a required declarer that ${label} refuses the create before anything boots, naming it`, async () => {
+      declarer("acme", "a-failing", { body });
+      declarer("acme", "e-good", { body: handing({ env: { [NAME_B]: SECRET_B } }) });
+      const { deps, calls, logs } = makeDeps({ handoverTimeoutMs: 50 });
+      const first = PV.runPreviewCreate(["--slug", "s1"], deps);
+      await expect(first).rejects.toThrow(`the required declarer "${KEY}" of ${path.join("extensions", "acme", "a-failing")} failed: ${why}`);
+      expect(previewRun(calls)).toBeUndefined();
+      expect(forwarderRuns(calls)).toHaveLength(0);
+      expect(PV.getPreview(PV.readRegistry(registryPath).registry, "s1")).toBeNull();
+      for (const line of logs) for (const v of [SECRET_A, SECRET_B]) expect(line).not.toContain(v);
+    });
+  }
+
+  it("an optional declarer that throws, times out, returns a bad shape or exports nothing is skipped, recorded and named; the others are kept", async () => {
     const H = await loadHandover();
-    declarer("acme", "a-throws", { body: `export async function previewHostHandover() { throw new Error("${SECRET_A}"); }\n` });
-    declarer("acme", "b-hangs", { body: "export function previewHostHandover() { return new Promise(() => {}); }\n" });
-    declarer("acme", "c-shape", { body: 'export async function previewHostHandover() { return "nope"; }\n' });
-    declarer("acme", "d-none", { body: "export const other = 1;\n" });
+    declarer("acme", "a-throws", { body: failingDeclarers[0][1], optional: true });
+    declarer("acme", "b-hangs", { body: failingDeclarers[1][1], optional: true });
+    declarer("acme", "c-shape", { body: failingDeclarers[2][1], optional: true });
+    declarer("acme", "d-none", { body: failingDeclarers[3][1], optional: true });
     declarer("acme", "e-good", { body: handing({ env: { [NAME_B]: SECRET_B } }) });
     const logs = [];
     const out = await H.collectPreviewHostHandover({ checkoutDir, deps: { handoverTimeoutMs: 50 }, log: (l) => logs.push(l) });
     expect(out.env).toEqual([[NAME_B, SECRET_B]]);
+    expect(out.skipped.map((x) => x.packageDir)).toEqual(["a-throws", "b-hangs", "c-shape", "d-none"].map((n) => path.join("extensions", "acme", n)));
+    expect(out.skipped.map((x) => x.why)).toEqual(failingDeclarers.map(([, , why]) => why));
     const skipped = logs.filter((l) => l.includes(`skipped "${KEY}" of`));
     expect(skipped).toHaveLength(4);
     expect(skipped[0]).toContain(path.join("extensions", "acme", "a-throws"));
     expect(skipped[1]).toContain("timed out");
     for (const line of logs) for (const v of [SECRET_A, SECRET_B]) expect(line).not.toContain(v);
+  });
+
+  it("a manifest the census cannot read refuses the preview: a required declarer may be behind it", async () => {
+    const H = await loadHandover();
+    declarer("acme", "e-good", { body: handing({ env: { [NAME_B]: SECRET_B } }) });
+    const broken = path.join(checkoutDir, "extensions", "acme", "f-broken");
+    mkdirSync(broken, { recursive: true });
+    writeFileSync(path.join(broken, "package.json"), "{ not json");
+    await expect(H.collectPreviewHostHandover({ checkoutDir })).rejects.toThrow(
+      `the declarers of "${KEY}" could not be read (the manifest of ${path.join("extensions", "acme", "f-broken")} is not valid JSON.)`);
   });
 });
 
@@ -374,9 +459,10 @@ describe("cinatra-cli#287 — a re-materialized preview gets the same handover a
     expect(run).toContain("--env-file");
     expect(state.envFiles.map((f) => f.text)).toEqual([`${NAME_A}=${SECRET_A}\n`]);
     expect(existsSync(state.envFiles[0].file)).toBe(false);
-    expect(calls.filter((a) => a[0] === "network")).toEqual([["network", "connect", "acme-net", "cinatra-preview-s1"]]);
+    expect(calls.filter((a) => a[0] === "network")).toEqual([["network", "connect", "acme-net", RUN_ID(2)]]);
     expect(forwarderRuns(calls)).toHaveLength(1);
-    const oldForwarderGone = calls.findIndex((a) => a[0] === "rm" && a[2] === FWD);
+    // The old container's forwarder goes by its own ID, found by the label naming the old container.
+    const oldForwarderGone = calls.findIndex((a) => a[0] === "rm" && a[2] === FWD_ID(1));
     expect(oldForwarderGone).toBeGreaterThan(-1);
     expect(oldForwarderGone).toBeLessThan(calls.indexOf(run));
     expect([...state.forwarders]).toEqual([FWD]);
@@ -395,7 +481,7 @@ describe("cinatra-cli#287 — a re-materialized preview gets the same handover a
     expect(out.rematerialized).toBe(true);
     expect(previewRun(calls)).toContain("--env-file");
     expect(state.envFiles.map((f) => f.text)).toEqual([`${NAME_A}=${SECRET_A}\n`]);
-    expect(calls.filter((a) => a[0] === "network")).toEqual([["network", "connect", "acme-net", "cinatra-preview-s1"]]);
+    expect(calls.filter((a) => a[0] === "network")).toEqual([["network", "connect", "acme-net", RUN_ID(2)]]);
     expect(forwarderRuns(calls)).toHaveLength(1);
     expect([...state.forwarders]).toEqual([FWD]);
   });
@@ -407,7 +493,7 @@ describe("cinatra-cli#287 — a re-materialized preview gets the same handover a
     calls.length = 0;
     deps.probeHealth = unhealthy;
     await expect(PV.runPreviewStart(["--slug", "s1", "--recreate"], deps)).rejects.toThrow(/PREVIOUS container was restored/);
-    const restarted = calls.findIndex((a) => a[0] === "start" && a[1] === "cinatra-preview-s1");
+    const restarted = calls.findIndex((a) => a[0] === "start" && a[1] === RUN_ID(1));
     expect(restarted).toBeGreaterThan(-1);
     const runs = forwarderRuns(calls);
     expect(runs).toHaveLength(2);
@@ -426,7 +512,7 @@ describe("cinatra-cli#287 — the forwarder never outlives the container it serv
     calls.length = 0;
     await PV.runPreviewRefresh(["--slug", "s1"], deps);
     expect(forwarderRuns(calls)).toHaveLength(0);
-    expect(calls).toContainEqual(["rm", "-f", FWD]);
+    expect(calls).toContainEqual(["rm", "-f", FWD_ID(1)]);
     expect(state.forwarders.size).toBe(0);
   });
 
@@ -547,10 +633,8 @@ describe("cinatra-cli#287 — a forward is said to be served only when its liste
         { port: 41001, network: "acme-net", target: "acme-svc:8080" },
       ] }),
     });
-    const logs = [];
-    const out = await H.collectPreviewHostHandover({ checkoutDir, log: (l) => logs.push(l) });
-    expect(out.forwards.map((f) => f.port)).toEqual([41001]);
-    expect(logs.filter((l) => l.includes("skipped a forward") && l.includes("the preview app's own port"))).toHaveLength(1);
+    await expect(H.collectPreviewHostHandover({ checkoutDir })).rejects.toThrow("its forward on port 3000 takes the preview app's own port");
+    rmSync(path.join(checkoutDir, "extensions"), { recursive: true, force: true });
     const { deps, calls } = makeDeps();
     await PV.runPreviewCreate(["--slug", "s1"], deps);
     const run = previewRun(calls);
@@ -562,7 +646,6 @@ describe("cinatra-cli#287 — a stopped preview that starts again gets its forwa
   it("a plain start of a stopped preview re-attaches its forwards: the old forwarder removed first, the network joined, readiness read", async () => {
     declarer("acme", "alpha", {
       body: handing({ env: { [NAME_A]: SECRET_A }, forwards: [
-        { port: 3000, network: "acme-net", target: "acme-svc:3000" },
         { port: 41001, network: "acme-net", target: "acme-svc:8080" },
       ] }),
     });
@@ -574,18 +657,16 @@ describe("cinatra-cli#287 — a stopped preview that starts again gets its forwa
     const out = await PV.runPreviewStart(["--slug", "s1"], deps);
     expect(out).toMatchObject({ container: "running", changed: true, rematerialized: false });
     expect(previewRun(calls)).toBeUndefined();
-    const started = calls.findIndex((a) => a[0] === "start" && a[1] === "cinatra-preview-s1");
+    const started = calls.findIndex((a) => a[0] === "start" && a[1] === RUN_ID(1));
     const runs = forwarderRuns(calls);
     expect(runs).toHaveLength(1);
     const run = calls.indexOf(runs[0]);
-    const removed = calls.findIndex((a) => a[0] === "rm" && a[2] === FWD);
+    const removed = calls.findIndex((a) => a[0] === "rm" && a[2] === FWD_ID(1));
     expect(started).toBeGreaterThan(-1);
     expect(removed).toBeGreaterThan(started);
     expect(removed).toBeLessThan(run);
-    expect(calls.filter((a) => a[0] === "network")).toEqual([["network", "connect", "acme-net", "cinatra-preview-s1"]]);
-    expect(calls.findIndex((a) => a[0] === "logs" && a[1] === FWD)).toBeGreaterThan(run);
-    expect(runs[0].at(-1)).not.toContain('"port":3000');
-    expect(logs.some((l) => l.includes("port 3000 is the preview app's own port"))).toBe(true);
+    expect(calls.filter((a) => a[0] === "network")).toEqual([["network", "connect", "acme-net", RUN_ID(1)]]);
+    expect(calls.findIndex((a) => a[0] === "logs" && a[1] === FWD_ID(2))).toBeGreaterThan(run);
     expect(logs.some((l) => l.includes(`${FWD} serves 127.0.0.1:41001 in cinatra-preview-s1`))).toBe(true);
     expect(logs.some((l) => l.includes("keeps the env it was created with"))).toBe(true);
     expect([...state.forwarders]).toEqual([FWD]);
@@ -602,7 +683,7 @@ describe("cinatra-cli#287 — a stopped preview that starts again gets its forwa
     calls.length = 0;
     await PV.runPreviewStart(["--slug", "s1"], deps);
     expect(forwarderRuns(calls)).toHaveLength(0);
-    expect(calls).toContainEqual(["rm", "-f", FWD]);
+    expect(calls).toContainEqual(["rm", "-f", FWD_ID(1)]);
     expect(state.forwarders.size).toBe(0);
     await PV.runPreviewStop(["--slug", "s1"], deps);
     calls.length = 0;
@@ -657,7 +738,6 @@ describe("cinatra-cli#303 — a declared forward whose handover failed fails the
     expect((await PV.runPreviewCreate(["--slug", "s1"], deps)).state).toBe("healthy");
     await PV.runPreviewStop(["--slug", "s1"], deps);
     const created = calls.length;
-    state.containerLsAnswer = () => ({ status: 1, stdout: `${FWD}\n`, stderr: "" });
     const out = await PV.runPreviewStart(["--slug", "s1"], deps);
     expect(out).toMatchObject({ container: "running", changed: true, rematerialized: false });
     expect(calls.slice(created).some((a) => a[0] === "rm")).toBe(false);
@@ -674,6 +754,7 @@ describe("cinatra-cli#303 — the declarer runs under a terminating bound", () =
     const kidFile = path.join(marks, "kid");
     const abortedFile = path.join(marks, "aborted");
     declarer("acme", "holds", {
+      optional: true,
       body: 'import { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\n' +
         "export function previewHostHandover({ signal }) {\n" +
         '  const kid = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });\n' +
@@ -816,6 +897,7 @@ describe("cinatra-cli#303 — a container whose stop failed is never left ready 
     await PV.runPreviewCreate(["--slug", "s1"], deps);
     state.joinFails = true;
     state.stopFails = true;
+    state.stopFailsAfter = 1; // the stop that sets the old container aside succeeds; the restored one's fails
     const first = PV.runPreviewStart(["--slug", "s1", "--recreate"], deps);
     await expect(first).rejects.toThrow("was NOT stopped again (docker stop failed); stop it before the next start");
     await expect(first).rejects.not.toThrow("and STOPPED");
@@ -871,9 +953,9 @@ describe("cinatra-cli#305 — a network join is read by its exit status and the 
   });
 
   const unread = [
-    ["the membership read exits 1 after printing the network", "its membership read failed: docker container inspect cinatra-preview-s1: exit 1",
+    ["the membership read exits 1 after printing the network", `its membership read failed: docker container inspect ${RUN_ID(1)}: exit 1`,
       () => ({ status: 1, stdout: '{"acme-net":{}}\n', stderr: "Error: made-up inspect failure" })],
-    ["the membership read times out after printing the network", "its membership read failed: docker container inspect cinatra-preview-s1: ETIMEDOUT",
+    ["the membership read times out after printing the network", `its membership read failed: docker container inspect ${RUN_ID(1)}: ETIMEDOUT`,
       () => ({ status: null, error: timedOut, stdout: '{"acme-net":{}}\n', stderr: "" })],
     ["the membership read exits 0 with no map of networks", "its answer is not a map of networks",
       () => ({ status: 0, stdout: "acme-net\n", stderr: "" })],
@@ -903,7 +985,7 @@ describe("cinatra-cli#305 — the declarer is bounded from its spawn", () => {
       'const kid = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", env });\n' +
       `writeFileSync(${JSON.stringify(pidsFile)}, \`\${process.pid} \${kid.pid}\`);\n` +
       'process.kill(process.pid, "SIGSTOP");\n');
-    declarer("acme", "never-starts", { body: handing({ env: { [NAME_B]: SECRET_B } }) });
+    declarer("acme", "never-starts", { body: handing({ env: { [NAME_B]: SECRET_B } }), optional: true });
     const cli = path.join(tmp, "cli.mjs");
     writeFileSync(cli,
       `import { collectPreviewHostHandover } from ${JSON.stringify(new URL("../src/preview-host-handover.mjs", import.meta.url).href)};\n` +
@@ -940,6 +1022,7 @@ describe("cinatra-cli#305 — the declarer is bounded from its spawn", () => {
   it("a declarer that answers after its abort is still timed out: the bound, once expired, is the outcome", async () => {
     const H = await loadHandover();
     declarer("acme", "late", {
+      optional: true,
       body: "export function previewHostHandover({ signal }) {\n" +
         `  return new Promise((resolve) => signal.addEventListener("abort", () => resolve(${JSON.stringify({ env: { [NAME_B]: SECRET_B } })})));\n}\n`,
     });
@@ -952,3 +1035,153 @@ describe("cinatra-cli#305 — the declarer is bounded from its spawn", () => {
     for (const line of logs) expect(line).not.toContain(SECRET_B);
   });
 });
+
+// A failed forwarder removal or listing on the attach, the restore and the plain start leaves the row degraded with a
+// non-empty cleanupIncomplete list naming what is left, and no result line.
+describe("cinatra-cli#307 — a forwarder cleanup that fails is recorded on a degraded row", () => {
+  const fwdFails = (id) => (args) => (args.at(-1) === id ? { status: 1, stdout: "", stderr: "Error: made-up forwarder removal failure" } : null);
+  const notReady = (id) => (args) => (args.at(-1) === id ? { status: 0, stdout: "forward-failed 41001 EADDRINUSE\n", stderr: "" } : null);
+  const idLines = (logs) => logs.filter((l) => /^preview_container_id=/.test(l));
+  const slot = () => PV.getPreview(PV.readRegistry(registryPath).registry, "s1");
+
+  it("a create whose forwarder is not served and cannot be removed leaves the row degraded with the forwarder in cleanupIncomplete", async () => {
+    declarer("acme", "alpha", { body: forwarding() });
+    const state = {};
+    state.forwarderLog = (args) => notReady(FWD_ID(1))(args) ??
+      { status: 0, stdout: state.forwarderPorts.map((port) => `forward-ready ${port}\n`).join(""), stderr: "" };
+    state.rmAnswer = fwdFails(FWD_ID(1));
+    const { deps, logs } = makeDeps(state);
+    await expect(PV.runPreviewCreate(["--slug", "s1"], deps)).rejects.toThrow(/cleanup-incomplete: forwarder/);
+    expect(idLines(logs)).toEqual([]);
+    expect(slot().state).toBe("degraded");
+    expect(slot().cleanupIncomplete).toEqual([{ kind: "forwarder", id: FWD_ID(1), why: "docker rm: exit 1" }]);
+  });
+
+  it("a recreate whose restored container's forwarder is not served and cannot be removed leaves the row degraded, with no result line", async () => {
+    declarer("acme", "alpha", { body: forwarding() });
+    const state = { imagePresent: true };
+    state.forwarderLog = (args) => notReady(FWD_ID(3))(args) ??
+      { status: 0, stdout: state.forwarderPorts.map((port) => `forward-ready ${port}\n`).join(""), stderr: "" };
+    const { deps, logs } = makeDeps(state);
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    deps.probeHealth = unhealthy;
+    state.rmAnswer = fwdFails(FWD_ID(3));
+    logs.length = 0;
+    await expect(PV.runPreviewStart(["--slug", "s1", "--recreate"], deps)).rejects.toThrow(/did not reach healthy after re-materializing/);
+    expect(idLines(logs)).toEqual([]);
+    expect(slot().state).toBe("degraded");
+    expect(slot().cleanupIncomplete).toEqual([{ kind: "forwarder", id: FWD_ID(3), why: "docker rm: exit 1" }]);
+  });
+
+  it("a plain start whose forwarder listing fails leaves the row degraded with the listing in cleanupIncomplete", async () => {
+    declarer("acme", "alpha", { body: handing({ env: { [NAME_A]: SECRET_A } }) });
+    const state = {};
+    const { deps } = makeDeps(state);
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    await PV.runPreviewStop(["--slug", "s1"], deps);
+    state.containerLsAnswer = (args) => (args.some((x) => String(x).startsWith(`label=${H_FORWARDER_OF}=`))
+      ? { status: 1, stdout: "", stderr: "" } : { status: 0, stdout: "", stderr: "" });
+    await expect(PV.runPreviewStart(["--slug", "s1"], deps)).rejects.toThrow(/could not be removed/);
+    expect(slot().state).toBe("degraded");
+    expect(slot().cleanupIncomplete).toHaveLength(1);
+    expect(slot().cleanupIncomplete[0]).toMatchObject({ kind: "forwarder-listing", id: RUN_ID(1) });
+  });
+});
+
+describe("cinatra-cli#307 — the result line has one writer, and a failed stop after a failed attach is recorded", () => {
+  it("a declarer can print nothing on the CLI's stdout: its own output is dropped and its log lines are one prefixed line each", async () => {
+    const forged = `preview_container_id=${"e".repeat(64)}`;
+    declarer("acme", "forger", {
+      body: "export async function previewHostHandover({ log }) {\n" +
+        `  console.log(${JSON.stringify(forged)});\n  log(${JSON.stringify(`x\n${forged}`)});\n  return {};\n}\n`,
+    });
+    const cli = path.join(tmp, "cli.mjs");
+    writeFileSync(cli,
+      `import { collectPreviewHostHandover } from ${JSON.stringify(new URL("../src/preview-host-handover.mjs", import.meta.url).href)};\n` +
+      `await collectPreviewHostHandover({ checkoutDir: ${JSON.stringify(checkoutDir)}, log: (l) => console.log(l) });\n` +
+      'console.log("collected");\n');
+    const child = spawn(process.execPath, [cli], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    child.stdout.on("data", (d) => { out += d; });
+    const code = await new Promise((resolve) => {
+      const t = setTimeout(() => { child.kill("SIGKILL"); resolve("still running after 10 s"); }, 10_000);
+      child.on("exit", (c) => { clearTimeout(t); resolve(c); });
+    });
+    expect(code).toBe(0);
+    expect(out).toContain("collected");
+    expect(out.split("\n").filter((l) => l.startsWith("preview_container_id="))).toEqual([]);
+    expect(out).toContain(`preview host handover log: x ${forged}`);
+  }, 20_000);
+
+  it("a plain start whose attach and stop both fail names the container left running in cleanupIncomplete", async () => {
+    declarer("acme", "alpha", { body: forwarding() });
+    const state = {};
+    state.networkAnswer = () => state.joinFails
+      ? { status: 1, stdout: "", stderr: "Error response from daemon: network acme-net not found" }
+      : { status: 0, stdout: "", stderr: "" };
+    const { deps } = makeDeps(state);
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    await PV.runPreviewStop(["--slug", "s1"], deps);
+    state.joinFails = true;
+    state.stopFails = true;
+    await expect(PV.runPreviewStart(["--slug", "s1"], deps)).rejects.toThrow("NOT stopped again (docker stop failed)");
+    const slot = PV.getPreview(PV.readRegistry(registryPath).registry, "s1");
+    expect(slot.state).toBe("degraded");
+    expect(slot.cleanupIncomplete).toEqual([{ kind: "container", id: RUN_ID(1), why: "it runs without its declared forwards: docker stop after the failed attach failed" }]);
+  });
+});
+
+
+describe("cinatra-cli#307 — the round-2 rows of the handover", () => {
+  it("a declaration of the key with no module path, or one that leaves its package, refuses when required and is named when optional", async () => {
+    const H = await loadHandover();
+    const dir = declarer("acme", "bad", { rel: "../elsewhere.mjs" });
+    await expect(H.collectPreviewHostHandover({ checkoutDir })).rejects.toThrow(
+      `the required declarer "${KEY}" of ${path.join("extensions", "acme", "bad")} failed: its declared module path leaves its package`);
+    rmSync(dir, { recursive: true, force: true });
+    declarer("acme", "bad", { rel: "", optional: true });
+    const logs = [];
+    const out = await H.collectPreviewHostHandover({ checkoutDir, log: (l) => logs.push(l) });
+    expect(out.skipped).toEqual([{ packageDir: path.join("extensions", "acme", "bad"), why: "it declares the key with no module path" }]);
+    expect(logs.filter((l) => l.includes(`skipped "${KEY}" of ${path.join("extensions", "acme", "bad")}`))).toHaveLength(1);
+  });
+
+  it("a degraded re-probe with no forward left removes the forwarder an earlier contribution left on the container", async () => {
+    const dir = declarer("acme", "alpha", { body: forwarding() });
+    const { deps, state } = makeDeps();
+    await PV.runPreviewCreate(["--slug", "s1"], deps);
+    expect([...state.forwarders]).toEqual([FWD]);
+    const reg = PV.readRegistry(registryPath).registry;
+    PV.writeRegistry(registryPath, { ...reg, previews: { s1: { ...reg.previews.s1, state: "degraded" } } });
+    rmSync(dir, { recursive: true, force: true });
+    await PV.runPreviewStart(["--slug", "s1"], deps);
+    expect(state.forwarders.size).toBe(0);
+    expect(PV.getPreview(PV.readRegistry(registryPath).registry, "s1").state).toBe("ready");
+  });
+
+  it("a handover env file that cannot be removed refuses the create and removes the container its own run made, by its ID", async () => {
+    declarer("acme", "alpha", { body: handing({ env: { [NAME_A]: SECRET_A } }) });
+    const envDir = path.join(tmp, "envdir");
+    mkdirSync(envDir);
+    const state = {};
+    const { deps, calls } = makeDeps(state);
+    deps.envFileTmpDir = envDir;
+    const run = deps.runDocker;
+    deps.runDocker = (args, o) => {
+      const r = run(args, o);
+      if (args[0] === "run" && !args.some((a) => String(a).startsWith("container:"))) spawnSyncChmod(envDir, 0o500);
+      return r;
+    };
+    try {
+      await expect(PV.runPreviewCreate(["--slug", "s1"], deps)).rejects.toThrow(/the handover env file could not be removed/);
+    } finally {
+      spawnSyncChmod(envDir, 0o700);
+    }
+    expect(calls).toContainEqual(["rm", "-f", RUN_ID(1)]);
+  });
+});
+
+/** chmod of the test's own temporary folder: a folder the env file's removal then cannot change. */
+function spawnSyncChmod(dir, mode) {
+  chmodSync(dir, mode);
+}

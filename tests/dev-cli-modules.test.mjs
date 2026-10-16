@@ -8,6 +8,7 @@
 // tailscale keys when the connector is present.
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import * as DCM from "../src/dev-cli-modules.mjs";
 import {
   mkdtempSync,
   mkdirSync,
@@ -18,6 +19,8 @@ import {
 } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
+import { spawn, spawnSync } from "node:child_process";
+import { symlinkSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   discoverDevCliModulePath,
@@ -274,5 +277,84 @@ describe("real-tree resolution (the tailscale connector's declaration)", () => {
     }
     expect(existsSync(api)).toBe(true);
     expect(existsSync(hostname)).toBe(true);
+  });
+});
+
+
+// The single loader keeps its short-circuit, and the multi-declarer census is
+// bounded by regular file, size and count: a manifest that would block or that
+// cannot be read within the bounds is never a silent skip of a declarer.
+describe("dev-cli module discovery is bounded (cinatra-cli#307)", () => {
+  const moduleUrl = new URL("../src/dev-cli-modules.mjs", import.meta.url).href;
+  /** Run `call` (an expression over `M`, the module) in a separate node process bounded at 5 s. */
+  async function inChild(call) {
+    const script = `const M = await import(${JSON.stringify(moduleUrl)});\n` +
+      `try { console.log("ok " + JSON.stringify(${call})); } catch (err) { console.log("threw " + (err.code ?? "") + " " + err.message); }\n`;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    child.stdout.on("data", (d) => { out += d; });
+    const code = await new Promise((resolve) => {
+      const t = setTimeout(() => { child.kill("SIGKILL"); resolve("still running after 5 s"); }, 5_000);
+      child.on("exit", (c) => { clearTimeout(t); resolve(c); });
+    });
+    return { code, out: out.trim() };
+  }
+  function fifoManifest(scope, name) {
+    const dir = path.join(fixtureRoot, "extensions", scope, name);
+    mkdirSync(dir, { recursive: true });
+    const made = spawnSync("mkfifo", [path.join(dir, "package.json")]);
+    expect(made.status).toBe(0);
+  }
+
+  it("the single loader stops at the first declarer: a later manifest that would block is never opened", async () => {
+    writePkg("a-scope", "first", { cinatra: { devCliModules: { "my-key": "./m.mjs" } } }, { "m.mjs": "export const x = 1;\n" });
+    fifoManifest("b-scope", "blocking");
+    const r = await inChild(`M.discoverDevCliModulePath("my-key", ${JSON.stringify(fixtureRoot)})`);
+    expect(r.code).toBe(0);
+    expect(r.out).toBe(`ok ${JSON.stringify(path.join(fixtureRoot, "extensions", "a-scope", "first", "m.mjs"))}`);
+  }, 15_000);
+
+  it("the multi-declarer census refuses a manifest that is not a regular file, without blocking on it", async () => {
+    writePkg("a-scope", "first", { cinatra: { devCliModules: { "my-key": "./m.mjs" } } });
+    fifoManifest("b-scope", "blocking");
+    const r = await inChild(`M.discoverAllDevCliModulePaths("my-key", ${JSON.stringify(fixtureRoot)})`);
+    expect(r.code).toBe(0);
+    expect(r.out).toBe(`threw ${DCM.ERR_DEV_CLI_DECLARER_CENSUS} the manifest of ${path.join("extensions", "b-scope", "blocking")} is not a regular file.`);
+  }, 15_000);
+
+  it("the census refuses an oversized manifest, a symlinked package dir and more packages than its bound", () => {
+    writePkg("a-scope", "big", { cinatra: { devCliModules: { "my-key": "./m.mjs" } }, pad: "x".repeat(DCM.DECLARER_CENSUS_MAX_MANIFEST_BYTES) });
+    expect(() => DCM.discoverAllDevCliModulePaths("my-key", fixtureRoot)).toThrow(`the manifest of ${path.join("extensions", "a-scope", "big")} is larger than`);
+    rmSync(path.join(fixtureRoot, "extensions"), { recursive: true, force: true });
+    writePkg("a-scope", "real", { cinatra: { devCliModules: { "my-key": "./m.mjs" } } });
+    symlinkSync(path.join(fixtureRoot, "extensions", "a-scope", "real"), path.join(fixtureRoot, "extensions", "a-scope", "linked"));
+    expect(() => DCM.discoverAllDevCliModulePaths("my-key", fixtureRoot)).toThrow(`${path.join("extensions", "a-scope", "linked")} is a symbolic link`);
+    rmSync(path.join(fixtureRoot, "extensions"), { recursive: true, force: true });
+    for (let i = 0; i <= DCM.DECLARER_CENSUS_MAX_PACKAGES; i++) writePkg("many", `p${String(i).padStart(4, "0")}`, { name: `p${i}` });
+    expect(() => DCM.discoverAllDevCliModulePaths("my-key", fixtureRoot)).toThrow(`more than ${DCM.DECLARER_CENSUS_MAX_PACKAGES} packages`);
+  });
+
+  it("the census reads a malformed manifest as a failure, an absent one as no package, and names an optional declarer", () => {
+    writePkg("a-scope", "opt", { cinatra: { devCliModules: { "my-key": "./m.mjs" }, myOptional: true } });
+    writePkg("a-scope", "req", { cinatra: { devCliModules: { "my-key": "./m.mjs" }, myOptional: "true" } });
+    mkdirSync(path.join(fixtureRoot, "extensions", "a-scope", "no-manifest"), { recursive: true });
+    expect(DCM.discoverAllDevCliModulePaths("my-key", fixtureRoot, { optionalFlag: "myOptional" }).map((d) => [d.packageDir, d.optional]))
+      .toEqual([[path.join("extensions", "a-scope", "opt"), true], [path.join("extensions", "a-scope", "req"), false]]);
+    writeFileSync(path.join(fixtureRoot, "extensions", "a-scope", "no-manifest", "package.json"), "{ not json");
+    expect(() => DCM.discoverAllDevCliModulePaths("my-key", fixtureRoot)).toThrow(`the manifest of ${path.join("extensions", "a-scope", "no-manifest")} is not valid JSON.`);
+  });
+});
+
+describe("the declarer census never follows a symlinked extensions root (cinatra-cli#307)", () => {
+  it("throws when extensions/ itself is a symbolic link", () => {
+    const real = mkdtempSync(path.join(tmpdir(), "devcli-real-"));
+    mkdirSync(path.join(real, "a-scope", "pkg"), { recursive: true });
+    writeFileSync(path.join(real, "a-scope", "pkg", "package.json"), JSON.stringify({ cinatra: { devCliModules: { "my-key": "./m.mjs" } } }));
+    symlinkSync(real, path.join(fixtureRoot, "extensions"));
+    try {
+      expect(() => DCM.discoverAllDevCliModulePaths("my-key", fixtureRoot)).toThrow("extensions is a symbolic link; the census does not follow it.");
+    } finally {
+      rmSync(real, { recursive: true, force: true });
+    }
   });
 });

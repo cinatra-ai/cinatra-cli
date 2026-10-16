@@ -67,6 +67,7 @@ import {
   readFileSync,
   writeFileSync,
   renameSync,
+  rmSync,
   unlinkSync,
   statSync,
   fstatSync,
@@ -76,6 +77,7 @@ import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 
 // cinatra-cli#219 — the endpoint-ownership proof. Node-builtins-only and
 // dependency-free in the other direction (it never imports this module), so
@@ -85,7 +87,9 @@ import {
   attachPreviewHostForwards,
   collectPreviewHostHandover,
   reattachPreviewHostForwards,
-  removePreviewForwarder,
+  removePreviewForwardersOf,
+  listPreviewForwardersOf,
+  CONTAINER_ID_RE,
   writeHandoverEnvFile,
 } from "./preview-host-handover.mjs";
 // cinatra-cli#295: one extension pinned at a given commit (node builtins only,
@@ -345,6 +349,26 @@ export const PREVIEW_STOP_TIMEOUT_MS = 60_000;
 // `foo--superseded` is itself a valid slug, and parking `foo` would then target a
 // real preview's container. Docker accepts `.` in a container name.
 export const SUPERSEDED_CONTAINER_SUFFIX = ".superseded";
+
+/**
+ * THE RESULT LINE: a successful `instance preview create`, `start --recreate`
+ * or `refresh` prints exactly one stdout line `preview_container_id=<id>`,
+ * where <id> is the full 64-hex ID its OWN `docker run -d` returned in that
+ * invocation (never read back by name), only after that container's checks
+ * pass, and never on a failure path. The registry row records the same value as
+ * `containerId`. A plain start that makes no container prints no such line.
+ */
+export const PREVIEW_CONTAINER_ID_KEY = "preview_container_id";
+export function previewContainerIdLine(id) {
+  if (!CONTAINER_ID_RE.test(String(id))) throw new Error("preview: a result line needs a 64-hex container ID.");
+  return `${PREVIEW_CONTAINER_ID_KEY}=${id}`;
+}
+/** The label `create` puts on the data volume it creates: a fresh nonce of that
+ *  invocation, the one proof that the volume was made by it (docker hands an
+ *  existing volume back unchanged, labels included). */
+export const PREVIEW_VOLUME_CREATOR_LABEL = "cinatra.preview.volume-created-by";
+/** The durable degraded state a cleanup that did not finish leaves on the row. */
+export const CLEANUP_INCOMPLETE_FIELD = "cleanupIncomplete";
 
 // Preview containers publish their app port (container 3000) to a host port in a
 // DEDICATED pool, disjoint from every port the install/clone systems hand out:
@@ -1071,9 +1095,27 @@ function isValidPreviewSlot(slug, slot) {
   // ownership is explicitly recovered. A present, malformed declaration is corruption.
   if (Object.hasOwn(slot, "artifactVolumeName") && slot.artifactVolumeName !== previewArtifactVolumeName(slug)) return false;
   if (!PREVIEW_STATES.has(slot.state)) return false;
+  // THE RESULT LINE's record: absent on a row written before it (valid, but no
+  // proof of which container the row's run made); present, it is a full ID.
+  if (Object.hasOwn(slot, "containerId") && !CONTAINER_ID_RE.test(String(slot.containerId))) return false;
+  // The durable degraded state of a cleanup that did not finish: when present,
+  // a NON-EMPTY list whose every entry names its kind, the ID or the name of what
+  // is left, and why (isCleanupEntry).
+  if (Object.hasOwn(slot, CLEANUP_INCOMPLETE_FIELD) &&
+      !(Array.isArray(slot[CLEANUP_INCOMPLETE_FIELD]) && slot[CLEANUP_INCOMPLETE_FIELD].length > 0 &&
+        slot[CLEANUP_INCOMPLETE_FIELD].every(isCleanupEntry))) return false;
   if (typeof slot.createdAt !== "string" || slot.createdAt.length === 0) return false;
   if (!Array.isArray(slot.history)) return false;
   return true;
+}
+
+/** One entry of `cleanupIncomplete`: { kind, id | name, why }, each a non-empty
+ *  string (an id a full container ID). */
+function isCleanupEntry(e) {
+  if (!e || typeof e !== "object" || Array.isArray(e)) return false;
+  const text = (v) => typeof v === "string" && v.length > 0;
+  if (!text(e.kind) || !text(e.why)) return false;
+  return (Object.hasOwn(e, "id") && CONTAINER_ID_RE.test(String(e.id))) || text(e.name);
 }
 
 function areRegistryEntriesValid(previews) {
@@ -1264,8 +1306,9 @@ export function listPreviews(registry) {
  * the recorded value for "docker's default", which is also what a row written
  * before #248 reads as.
  */
-export function makePreviewSlot({ slug, ref, sha, hostPort, bind = null, fleet = PREVIEW_FLEET_DEFAULT, pin = null, state = "ready", now }) {
+export function makePreviewSlot({ slug, ref, sha, hostPort, bind = null, fleet = PREVIEW_FLEET_DEFAULT, pin = null, state = "ready", now, containerId = null }) {
   if (!isValidSlug(slug)) throw new Error(`Invalid preview slug "${slug}".`);
+  if (containerId != null && !CONTAINER_ID_RE.test(String(containerId))) throw new Error("makePreviewSlot requires a 64-hex container ID.");
   if (!isImmutableSha(sha)) throw new Error(`makePreviewSlot requires a 40-hex SHA (got ${JSON.stringify(sha)}).`);
   const at = (now ?? (() => new Date().toISOString()))();
   // engineering#666: normalise the fleet FIRST — the image tag is derived from it.
@@ -1291,6 +1334,8 @@ export function makePreviewSlot({ slug, ref, sha, hostPort, bind = null, fleet =
     // cinatra-cli#295: the pinned extension, recorded only when there is one so
     // an unpinned row is byte-unchanged.
     ...(pin == null ? {} : { pin }),
+    // THE RESULT LINE's record: the ID this row's own run returned.
+    ...(containerId == null ? {} : { containerId }),
     state,
     createdAt: at,
     refreshedAt: at,
@@ -1304,7 +1349,7 @@ export function makePreviewSlot({ slug, ref, sha, hostPort, bind = null, fleet =
  * logs old→new. The volumeName/containerName are stable (the durable volume is
  * REUSED, AC4). Pure — returns a new slot.
  */
-export function refreshPreviewSlot(slot, { ref, sha, hostPort, bind, fleet, pin, state = "ready", now }) {
+export function refreshPreviewSlot(slot, { ref, sha, hostPort, bind, fleet, pin, state = "ready", now, containerId }) {
   if (!isImmutableSha(sha)) throw new Error(`refreshPreviewSlot requires a 40-hex SHA (got ${JSON.stringify(sha)}).`);
   const at = (now ?? (() => new Date().toISOString()))();
   // engineering#666, the same reading as `bind`: UNDEFINED carries the row's own
@@ -1315,10 +1360,15 @@ export function refreshPreviewSlot(slot, { ref, sha, hostPort, bind, fleet, pin,
   // cinatra-cli#295, the same reading: UNDEFINED carries the row's pin forward.
   const pinValue = pin !== undefined ? (pin ?? null) : (slot.pin ?? null);
   const imageTag = previewImageTag(sha, fleetValue, pinValue);
-  const { pin: _priorPin, ...rest } = slot;
+  const { pin: _priorPin, containerId: _priorId, ...rest } = slot;
+  // A refresh boots a new container: the row records the ID that run returned
+  // (UNDEFINED keeps the row's own; the row never names another run's container).
+  const idValue = containerId !== undefined ? containerId : (_priorId ?? null);
+  if (idValue != null && !CONTAINER_ID_RE.test(String(idValue))) throw new Error("refreshPreviewSlot requires a 64-hex container ID.");
   return {
     ...rest,
     ...(pinValue == null ? {} : { pin: pinValue }),
+    ...(idValue == null ? {} : { containerId: idValue }),
     ref: ref !== undefined ? String(ref) : slot.ref,
     sha,
     imageTag,
@@ -1413,10 +1463,14 @@ function defaultPrepareContext({ sha, checkoutDir }) {
  * cinatra-cli#295: one file of the checkout at an immutable SHA (`git show`), or
  * null when the file does not exist at that commit. Any other failure throws.
  */
-function defaultReadFileAtSha({ sha, file, checkoutDir }) {
-  const r = runSpawn("git", ["-C", checkoutDir, "show", `${sha}:${file}`], { timeoutMs: 60_000 });
-  if (r.status === 0) return r.stdout;
-  if (/does not exist|exists on disk, but not in/i.test(r.stderr ?? "")) return null;
+function defaultReadFileAtSha({ sha, file, checkoutDir, run = runSpawn }) {
+  const r = run("git", ["-C", checkoutDir, "show", `${sha}:${file}`], { timeoutMs: 60_000 });
+  if (!r.error && !r.timedOut && r.status === 0) return r.stdout;
+  // Absence is read from a status-checked listing of that commit's tree, never
+  // from git's error text: exit 0 naming no entry is "not there"; an entry (the
+  // file is there, yet it could not be shown), an error or a non-zero exit throws.
+  const ls = run("git", ["-C", checkoutDir, "ls-tree", "-z", "--name-only", sha, "--", file], { timeoutMs: 60_000 });
+  if (!ls.error && !ls.timedOut && ls.status === 0 && String(ls.stdout ?? "").split("\0").every((entry) => entry === "")) return null;
   throw new Error(`Could not read ${file} at ${sha} in ${checkoutDir}` + (r.stderr ? `: ${r.stderr.trim()}` : "."));
 }
 
@@ -2115,7 +2169,8 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha, flee
   try {
     r = deps.runDocker(args, {
       timeoutMs,
-      stdio: ["ignore", "inherit", "inherit"],
+      // The build's own output goes to stderr: stdout carries the result line only.
+      stdio: ["ignore", 2, "inherit"],
     });
   } finally {
     releaseBuildCacheLock(cacheLock);
@@ -2180,17 +2235,81 @@ export function buildPreviewImage({ tag, contextDir, deps, provenance, sha, flee
   return tag;
 }
 
+const dockerFailed = (r) => Boolean(r.error || r.timedOut || r.status !== 0);
+
 /**
- * "absent" only when docker SAID the volume does not exist; "present" when it
- * inspected successfully; "unknown" when the probe was not answered. Callers
- * that would DESTROY on absence must treat unknown as presence.
+ * Absence from a STATUS-CHECKED listing, never from an error text: the listing
+ * must exit 0, and then "absent" means no line of it is exactly `name`.
+ * Returns "absent", "listed" (it exists), or "unknown" (the listing erred,
+ * timed out or exited non-zero).
+ */
+export function listedByName({ args, name, deps }) {
+  const r = deps.runDocker(args, { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+  if (dockerFailed(r)) return "unknown";
+  return String(r.stdout ?? "").split("\n").some((line) => line.trim() === name) ? "listed" : "absent";
+}
+
+const volumeListArgs = (name) => ["volume", "ls", "--format", "{{.Name}}", "--filter", `name=${name}`];
+
+/**
+ * "present" when the volume inspects successfully; "absent" only when the
+ * inspect exits non-zero AND a status-checked `docker volume ls` names no such
+ * volume; "unknown" otherwise. No error text is read. Callers that would
+ * DESTROY on absence must treat unknown as presence, and `create` deletes only
+ * a volume it made itself (ensurePreviewDataVolume), whatever this says.
  */
 export function volumeAbsence({ ref, deps }) {
   const r = deps.runDocker(["volume", "inspect", ref], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
-  if (r.status === 0) return "present";
-  const said = `${r.stderr ?? ""}`;
-  if (!r.timedOut && !r.error && /no such volume/i.test(said)) return "absent";
-  return "unknown";
+  if (!dockerFailed(r)) return "present";
+  if (r.error || r.timedOut) return "unknown";
+  const listed = listedByName({ args: volumeListArgs(ref), name: ref, deps });
+  return listed === "absent" ? "absent" : "unknown";
+}
+
+/**
+ * Make the preview's data volume for THIS create, and prove whether this
+ * invocation made it: `docker volume create` with a label holding a fresh
+ * nonce, then a status-checked read of the volume's labels. Docker hands an
+ * existing volume back unchanged, so only a volume whose label holds THIS nonce
+ * was created here. Returns `{ createdHere }`; a failed create or a read that is
+ * not a status-0 JSON map throws (and nothing is deleted on that account).
+ */
+export function ensurePreviewDataVolume(name, deps) {
+  const nonce = (deps.volumeNonce ?? (() => randomBytes(16).toString("hex")))();
+  const made = deps.runDocker(["volume", "create", "--label", `${PREVIEW_VOLUME_CREATOR_LABEL}=${nonce}`, name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+  if (dockerFailed(made)) throw new Error(`docker volume create ${name} failed or is uncertain; nothing was removed.`);
+  const r = deps.runDocker(["volume", "inspect", "--format", "{{json .Labels}}", name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+  if (dockerFailed(r)) throw new Error(`docker volume inspect ${name} failed after its create; nothing was removed.`);
+  let labels;
+  try {
+    labels = JSON.parse(String(r.stdout ?? "").trim());
+  } catch {
+    labels = undefined;
+  }
+  if (labels === null) labels = {};
+  if (!labels || typeof labels !== "object" || Array.isArray(labels)) {
+    throw new Error(`docker volume inspect ${name} answered no map of labels; nothing was removed.`);
+  }
+  return { createdHere: labels[PREVIEW_VOLUME_CREATOR_LABEL] === nonce, nonce };
+}
+
+/** True only when a status-checked read of `name`'s labels still carries
+ *  `nonce` (this invocation's own creation record): the binding a volume has,
+ *  since docker addresses a volume by its name alone. */
+export function volumeStillCreatedBy(name, nonce, deps) {
+  // "ours", "not-ours" (a status-0 map of labels without the nonce: a volume
+  // replaced since), or "unknown" (the read failed or answered no map).
+  const r = deps.runDocker(["volume", "inspect", "--format", "{{json .Labels}}", name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+  if (dockerFailed(r)) return "unknown";
+  let labels;
+  try {
+    labels = JSON.parse(String(r.stdout ?? "").trim());
+  } catch {
+    return "unknown";
+  }
+  if (labels === null) return "not-ours";
+  if (!labels || typeof labels !== "object" || Array.isArray(labels)) return "unknown";
+  return labels[PREVIEW_VOLUME_CREATOR_LABEL] === nonce ? "ours" : "not-ours";
 }
 
 /** Separate stable user-data volume; never nested in the extension volume. */
@@ -2212,7 +2331,9 @@ function artifactVolumePresence(slug, deps) {
     } catch { /* malformed successful reads are unknown ownership */ }
     throw new Error(`Artifact volume ${name} has unknown ownership or storage options; nothing was adopted or removed.`);
   }
-  if (r.status === 1 && !r.signal && !r.error && !r.timedOut && /no such volume/i.test(r.stderr ?? "")) return "absent";
+  // Absence from a status-checked listing, never from the inspect's text.
+  if (r.status === 1 && !r.signal && !r.error && !r.timedOut &&
+      listedByName({ args: volumeListArgs(name), name, deps }) === "absent") return "absent";
   throw new Error(`Could not verify artifact volume ${name}; nothing was adopted or removed.`);
 }
 
@@ -2289,9 +2410,10 @@ export function previewImagePresence({ tag, sha, pin = null, deps }) {
       ? { state: "present", sha: stamped, pin: stampedPin }
       : { state: "mismatch", sha: stamped, pin: stampedPin };
   }
-  const said = `${r.stderr ?? ""}`;
-  if (!r.timedOut && !r.error && /no such (image|object)/i.test(said)) return { state: "absent" };
-  return { state: "unknown" };
+  // Absence from a status-checked listing of the tag, never from the inspect's text.
+  if (r.error || r.timedOut) return { state: "unknown" };
+  const listed = listedByName({ args: ["image", "ls", "--format", "{{.Repository}}:{{.Tag}}", tag], name: tag, deps });
+  return listed === "absent" ? { state: "absent" } : { state: "unknown" };
 }
 
 /**
@@ -2307,17 +2429,91 @@ export function containerState(name, deps) {
   const r = deps.runDocker(["container", "inspect", "-f", "{{.State.Running}}", name], {
     timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS,
   });
-  if (r.status === 0) return (r.stdout ?? "").trim() === "true" ? "running" : "stopped";
-  // A NON-ZERO exit is not proof of absence. Docker says a missing container in
-  // so many words ("No such object/container"); a probe that TIMED OUT or hit a
-  // busy/erroring daemon says nothing at all — and this was observed for real:
-  // right after an aborted image build the daemon was slow enough that the probe
-  // timed out, and reporting "absent" then would have (a) told the operator their
-  // running preview was gone and (b) let `start` re-materialize ON TOP of a live
-  // container. An unobserved fact is "unknown", never a claim.
-  const said = `${r.stderr ?? ""}`;
-  if (!r.timedOut && !r.error && /no such (object|container|image)/i.test(said)) return "absent";
-  return "unknown";
+  if (!dockerFailed(r)) {
+    const said = String(r.stdout ?? "").trim();
+    return said === "true" ? "running" : said === "false" ? "stopped" : "unknown";
+  }
+  // A NON-ZERO exit is not proof of absence, and neither is its error text: a
+  // probe that TIMED OUT or hit a busy/erroring daemon says nothing at all — and
+  // this was observed for real: right after an aborted image build the daemon
+  // was slow enough that the probe timed out, and reporting "absent" then would
+  // have (a) told the operator their running preview was gone and (b) let
+  // `start` re-materialize ON TOP of a live container. "absent" is read only
+  // from a status-checked listing that names no such container; an unobserved
+  // fact is "unknown", never a claim. Given a container ID (the liveness of a
+  // verified ID), the listing is by that ID (`--filter id=`), never by a name;
+  // given a name, by the exact name. A caller addresses a container it found
+  // by name through the ID it reads (readContainerId), never by this answer.
+  if (r.error || r.timedOut) return "unknown";
+  const byId = CONTAINER_ID_RE.test(String(name));
+  const listed = listedByName({
+    args: byId
+      ? ["container", "ls", "-a", "--no-trunc", "--filter", `id=${name}`, "--format", "{{.ID}}"]
+      : ["container", "ls", "-a", "--no-trunc", "--filter", `name=^/${name}$`, "--format", "{{.Names}}"],
+    name,
+    deps,
+  });
+  return listed === "absent" ? "absent" : "unknown";
+}
+
+/**
+ * The ID of the container `name` from a status-checked `docker container
+ * inspect --format {{.Id}}`: exit 0 and one full 64-hex ID, else null. Every
+ * reuse compares it with the ID the row recorded; it is never itself the
+ * authority for a delete.
+ */
+export function readContainerId(name, deps) {
+  const r = deps.runDocker(["container", "inspect", "--format", "{{.Id}}", name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+  if (dockerFailed(r)) return null;
+  const id = String(r.stdout ?? "").trim();
+  return CONTAINER_ID_RE.test(id) ? id : null;
+}
+
+/** The one refusal for a row written before the result line: it records no
+ *  container ID, so it is no authority to delete or reuse any container. */
+export function legacyRowRefusal(slug) {
+  return new Error(`preview "${slug}": this preview's registry row predates recorded container IDs; run ` +
+    `\`cinatra instance preview start --slug ${slug} --recreate\` once. Nothing was removed or reused.`);
+}
+
+/**
+ * The container a delete or a reuse may act on: the live container of `name`,
+ * by the ID a status-checked inspect reads, and only when it is the one the row
+ * recorded. No recorded ID is no authority, for a delete and a reuse alike: a
+ * row written before the result line REFUSES (legacyRowRefusal), and nothing
+ * is removed or reused. Throws on a failed read or a mismatch too: neither is
+ * ever authority for a delete or a ready. The one named exception is a
+ * recreate's park step (parkTargetId).
+ */
+export function requireRecordedContainer(row, name, deps) {
+  if (row.containerId == null) throw legacyRowRefusal(row.slug);
+  const id = readContainerId(name, deps);
+  if (!id) {
+    throw new Error(`Could not read the ID of ${name} (docker inspect failed or answered no container ID). Nothing was changed.`);
+  }
+  if (row.containerId != null && row.containerId !== id) {
+    throw new Error(`The container named ${name} (${id.slice(0, 12)}) is not the one preview "${row.slug}" recorded ` +
+      `(${row.containerId.slice(0, 12)}): it was made by another run. Nothing was changed; ` +
+      `\`cinatra instance preview status --slug ${row.slug}\` shows the row.`);
+  }
+  return id;
+}
+
+/**
+ * The container `start --recreate` sets aside. On a row that recorded an ID it
+ * is that container (requireRecordedContainer). On a row written before the
+ * result line it is the live container by the ID a status-checked inspect
+ * reads NOW: the authority for removing it later is THIS invocation's own park
+ * action (it renames and stops that ID itself and removes exactly that ID once
+ * the new container is healthy), never the row and never the name.
+ */
+export function parkTargetId(row, name, deps) {
+  if (row.containerId != null) return requireRecordedContainer(row, name, deps);
+  const id = readContainerId(name, deps);
+  if (!id) {
+    throw new Error(`Could not read the ID of ${name} (docker inspect failed or answered no container ID). Nothing was changed.`);
+  }
+  return id;
 }
 
 /**
@@ -2439,26 +2635,82 @@ export async function removeImageIfUnreferenced(tag, { registryPath, keepSlug, d
         return false;
       }
     }
-    removeImage(tag, deps);
+    const removed = removeImage(tag, deps);
+    if (!removed) deps.log?.(`  kept image ${tag} — its removal did not succeed (an image is rebuildable cache, not data).`);
+    return removed;
+  });
+}
+
+/** "healthy" holds only when the verified ID itself reads running by a
+ *  status-checked inspect: an app answer on the port is no proof of WHICH
+ *  container serves it, and an unknown state is never ready. */
+export function confirmedHealthy(result, id, deps) {
+  if (result.state !== "healthy") return result;
+  return containerState(id, deps) === "running" ? result : { ...result, state: "unconfirmed" };
+}
+
+/**
+ * The entries of `cleanupIncomplete` that are still there, each re-read by a
+ * status-checked listing of its own ID (a container or a forwarder), of the
+ * forwarders labelled with its container ID (a forwarder listing), or of its
+ * exact name (a volume). An entry whose read fails, or that names nothing this
+ * can re-read, stays. A row is promoted to "ready" only when none stays.
+ */
+export function remainingLeftovers(list, deps) {
+  return (Array.isArray(list) ? list : []).filter((e) => {
+    try {
+      if ((e.kind === "container" || e.kind === "forwarder") && CONTAINER_ID_RE.test(String(e.id))) {
+        return listedByName({ args: ["container", "ls", "-a", "--no-trunc", "--filter", `id=${e.id}`, "--format", "{{.ID}}"], name: e.id, deps }) !== "absent";
+      }
+      if (e.kind === "forwarder-listing" && CONTAINER_ID_RE.test(String(e.id))) {
+        return listPreviewForwardersOf(e.id, deps).length > 0;
+      }
+      if (e.kind === "volume" && typeof e.name === "string") {
+        return listedByName({ args: volumeListArgs(e.name), name: e.name, deps }) !== "absent";
+      }
+    } catch {
+      return true;
+    }
     return true;
   });
 }
 
-/** Remove a container (best-effort, forced). */
-export function removeContainer(name, deps) {
-  deps.runDocker(["rm", "-f", name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+/** The error of a run that would have promoted a row whose earlier leftovers are still there. */
+function leftoversError(slug, left) {
+  return new Error(`preview "${slug}" serves, but cleanup-incomplete: ${left.map((l) => `${l.kind} ${l.id?.slice(0, 12) ?? l.name ?? ""}`.trim()).join(", ")} ` +
+    `from an earlier run is still there; the row stays degraded with ${CLEANUP_INCOMPLETE_FIELD} naming it, and no result line was printed. ` +
+    "Remove what it names, then run the command again.");
 }
 
-/** cinatra-cli#287: remove a preview's container AND the host-handover
- *  forwarder in its network namespace (the forwarder first). Best-effort. */
-export function removePreviewContainer(name, deps) {
-  removePreviewForwarder(name, deps);
-  removeContainer(name, deps);
+/**
+ * Remove the preview container `id` — the ID this invocation's own run
+ * returned, or one it recorded — with the host-handover forwarders labelled
+ * with that ID (the forwarders first). Never by name. Every removal is
+ * status-checked; what could not be removed THROWS with `cleanupIncomplete`.
+ */
+export function removePreviewContainerById(id, deps) {
+  if (!CONTAINER_ID_RE.test(String(id))) throw new Error("preview: a container is removed only by its full ID.");
+  const left = [];
+  try {
+    removePreviewForwardersOf(id, deps);
+  } catch (err) {
+    left.push(...(err.cleanupIncomplete ?? [{ kind: "forwarder-listing", id, why: err.message }]));
+  }
+  const r = deps.runDocker(["rm", "-f", id], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+  if (dockerFailed(r)) left.push({ kind: "container", id, why: `docker rm: ${r.error ? String(r.error.code ?? "error") : r.timedOut ? "timed out" : `exit ${r.status}`}` });
+  if (left.length) {
+    const err = new Error(`container ${id.slice(0, 12)} or its forwarder could not be removed (${left.map((l) => l.why).join("; ")})`);
+    err.cleanupIncomplete = left;
+    throw err;
+  }
 }
 
 /** Remove an image tag (superseded-tag cleanup — AC4). Best-effort. */
 export function removeImage(tag, deps) {
-  deps.runDocker(["image", "rm", "-f", tag], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+  // The argv is the one the preview road's wrapper allows and turns into a
+  // non-forced removal; its result is read, never assumed.
+  const r = deps.runDocker(["image", "rm", "-f", tag], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+  return !dockerFailed(r);
 }
 
 /** Dump the container's recent logs for failure diagnostics (mirrors dump_logs). */
@@ -2508,7 +2760,33 @@ function resolveRuntimeEnv({ deps, env, hostPort }) {
  *
  * @returns {string} the container name
  */
-export function bootPreviewContainer({ slug, tag, hostPort, bind = null, encryptionKey, provenance, sha, fleet = PREVIEW_FLEET_DEFAULT, envFile = null, deps }) {
+export function bootPreviewContainer(boot) {
+  return runPreviewContainer(boot).name;
+}
+
+/** The container ID docker wrote to a run's `--cidfile`, or null: a regular
+ *  file of at most 256 bytes holding one full ID (the folder is this run's own). */
+function readCidFile(file) {
+  try {
+    const st = statSync(file);
+    if (!st.isFile() || st.size > 256) return null;
+    const id = readFileSync(file, "utf8").trim();
+    return CONTAINER_ID_RE.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `bootPreviewContainer` with THE RESULT LINE's identity: returns
+ * `{ name, id }`, where `id` is the full ID this run's own `docker run -d`
+ * printed after it exited 0. The run also writes docker's `--cidfile` in a
+ * fresh 0700 folder, so a run that exits non-zero AFTER docker created the
+ * container still names the ID it created: the thrown error carries it as
+ * `previewContainerId`, and only that ID is ever removed. A run that exits 0
+ * without one full ID throws, carrying the cidfile's ID when there is one.
+ */
+export function runPreviewContainer({ slug, tag, hostPort, bind = null, encryptionKey, provenance, sha, fleet = PREVIEW_FLEET_DEFAULT, envFile = null, deps }) {
   assertNotProductionImageTag(tag);
   const containerName = previewContainerName(slug);
   const volumeName = previewVolumeName(slug);
@@ -2529,15 +2807,38 @@ export function bootPreviewContainer({ slug, tag, hostPort, bind = null, encrypt
   ];
   if (provenance) args.push("--label", `cinatra.preview.provenance=${provenance}`);
   if (sha) args.push("--label", `cinatra.preview.sha=${sha}`);
+  const cidDir = mkdtempSync(path.join(deps.envFileTmpDir ?? os.tmpdir(), "cinatra-preview-cid-"));
+  const cidFile = path.join(cidDir, "container.id");
+  args.push("--cidfile", cidFile);
   args.push(tag);
-  const r = deps.runDocker(args, { timeoutMs: 60_000 });
+  let r;
+  let created;
+  try {
+    r = deps.runDocker(args, { timeoutMs: 60_000 });
+    created = readCidFile(cidFile);
+  } finally {
+    try {
+      rmSync(cidDir, { recursive: true, force: true });
+    } catch {
+      /* the cidfile holds only the ID: a leftover temp folder never masks it */
+    }
+  }
+  const printed = String(r.stdout ?? "").trim();
   if (r.error || r.status !== 0) {
-    throw new Error(
+    const err = new Error(
       `docker run of preview ${containerName} (${tag}) failed` +
         (r.stderr ? `: ${r.stderr.trim()}` : "."),
     );
+    if (created) err.previewContainerId = created;
+    throw err;
   }
-  return containerName;
+  if (!CONTAINER_ID_RE.test(printed) || (created && created !== printed)) {
+    const err = new Error(`docker run of preview ${containerName} (${tag}) exited 0 but answered no single container ID; ` +
+      `no container is taken as this run's by its name.`);
+    if (created) err.previewContainerId = created;
+    throw err;
+  }
+  return { name: containerName, id: printed };
 }
 
 /**
@@ -2554,18 +2855,32 @@ export async function bootPreviewContainerWithHandover({ checkoutDir, handover: 
   const { deps } = boot;
   const log = deps.log ?? (() => {});
   const handover = collected ?? await collectPreviewHostHandover({ checkoutDir, deps, log });
-  removePreviewForwarder(previewContainerName(boot.slug), deps);
   let envFile = null;
   let container;
   try {
     if (handover.env.length > 0) {
       envFile = writeHandoverEnvFile(handover.env, deps.envFileTmpDir ? { tmpDir: deps.envFileTmpDir } : {});
     }
-    container = bootPreviewContainer({ ...boot, envFile: envFile?.file ?? null });
+    container = runPreviewContainer({ ...boot, envFile: envFile?.file ?? null });
   } finally {
-    envFile?.cleanup();
+    // The env file holds handed-over values: a failed removal fails the boot,
+    // and the error still names the container this run made (removed by ID).
+    try {
+      envFile?.cleanup();
+    } catch (cleanupErr) {
+      const e = new Error(`preview: the handover env file could not be removed (${cleanupErr?.code ?? "error"}); the preview is refused.`);
+      if (container?.id) e.previewContainerId = container.id;
+      throw e;
+    }
   }
-  await attachPreviewHostForwards({ containerName: container, tag: boot.tag, forwards: handover.forwards, deps, log });
+  try {
+    await attachPreviewHostForwards({ containerName: container.name, containerId: container.id, tag: boot.tag, forwards: handover.forwards, deps, log });
+  } catch (err) {
+    // The container this run made, by the ID its own run returned: the caller
+    // removes exactly it, never whatever holds the name.
+    err.previewContainerId = container.id;
+    throw err;
+  }
   return container;
 }
 
@@ -2883,14 +3198,16 @@ export async function runPreviewCreate(rest, injected = {}) {
     writeRegistry(deps.registryPath, next);
   });
 
-  // Whether the durable volume already existed BEFORE this create — so a FAILED
-  // create only removes a volume IT created, never a pre-existing/recovered one
-  // holding data.
-  // FAIL-SAFE: only a probe that positively said "no such volume" licenses the
-  // abort path to delete it. An unanswered probe (a timeout, a busy daemon) must
-  // read as "it was already there" — deleting a durable volume this run did not
-  // create is unrecoverable data loss, and there is no cost to keeping one.
-  const volumePreexisted = volumeAbsence({ ref: volumeName, deps }) !== "absent";
+  // A FAILED create removes only what THIS invocation made, each by the record
+  // its own call returned: the container by the ID its run returned, the data
+  // volume only when its label holds this invocation's nonce
+  // (ensurePreviewDataVolume) — never on a reading of current state or of an
+  // error text. Deleting a durable volume this run did not create is
+  // unrecoverable data loss, and there is no cost to keeping one.
+  let volumeCreatedHere = false;
+  let volumeNonce = null;
+  let containerIdHere = null;
+  let abortRan = false;
 
   deps.log(`preview create: slug=${slug} ref=${ref} -> sha=${sha}`);
   deps.log(`  image tag: ${tag}   provenance: ${provenance}   runtime: CINATRA_RUNTIME_MODE=production`);
@@ -2906,12 +3223,34 @@ export async function runPreviewCreate(rest, injected = {}) {
   // impossible (#210).
   let imageBuiltHere = false;
   const abort = async (err) => {
-    removePreviewContainer(previewContainerName(slug), deps);
+    abortRan = true;
+    // Every cleanup outcome is status-checked. What could not be removed is the
+    // durable degraded state "cleanup-incomplete": the row is KEPT, degraded,
+    // naming what is left — never released as if the removal were clean.
+    const left = [];
+    const ownId = containerIdHere ?? err?.previewContainerId ?? null;
+    if (ownId) {
+      try {
+        removePreviewContainerById(ownId, deps);
+      } catch (e) {
+        left.push(...(e.cleanupIncomplete ?? [{ kind: "container", id: ownId, why: e.message }]));
+      }
+    } else if (err?.cleanupIncomplete) {
+      left.push(...err.cleanupIncomplete);
+    }
     if (imageBuiltHere) {
       await removeImageIfUnreferenced(tag, { registryPath: deps.registryPath, keepSlug: slug, deps });
     }
-    if (!volumePreexisted) {
-      deps.runDocker(["volume", "rm", "-f", volumeName], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+    // The volume goes only while its label still holds this invocation's nonce,
+    // re-read right before the removal (a volume replaced under the name since
+    // is not this run's and is kept); `volume rm` without force refuses one in use.
+    const owned = volumeCreatedHere ? volumeStillCreatedBy(volumeName, volumeNonce, deps) : "not-ours";
+    if (owned === "unknown") {
+      left.push({ kind: "volume", name: volumeName, why: "its label could not be read again, so the volume this run made is kept" });
+    }
+    if (owned === "ours") {
+      const rm = deps.runDocker(["volume", "rm", volumeName], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+      if (dockerFailed(rm)) left.push({ kind: "volume", name: volumeName, why: rm.timedOut ? "docker volume rm: timed out" : `docker volume rm: ${rm.error ? String(rm.error.code ?? "error") : `exit ${rm.status}`}` });
     }
     await withRegistryLock(deps.registryPath, () => {
       const reg = requireUsableRegistry(deps.registryPath);
@@ -2919,11 +3258,14 @@ export async function runPreviewCreate(rest, injected = {}) {
       // Only release OUR provisioning claim (never a row a racing op finalized).
       if (cur && cur.state === "provisioning" && cur.sha === sha) {
         const next2 = cloneRegistry(reg);
-        delete next2.previews[slug];
+        if (left.length === 0) delete next2.previews[slug];
+        else next2.previews[slug] = { ...cur, state: "degraded", [CLEANUP_INCOMPLETE_FIELD]: left };
         writeRegistry(deps.registryPath, next2);
       }
     });
-    throw err;
+    if (left.length === 0) throw err;
+    throw new Error(`${err?.message ?? err}\n  cleanup-incomplete: ${left.map((l) => `${l.kind} ${l.id?.slice(0, 12) ?? l.name ?? l.of?.slice(0, 12) ?? ""}`.trim()).join(", ")} ` +
+      `could not be removed; the row of "${slug}" is kept as degraded with ${CLEANUP_INCOMPLETE_FIELD} naming them.`);
   };
 
   try {
@@ -2947,7 +3289,9 @@ export async function runPreviewCreate(rest, injected = {}) {
     // Establish and verify the separate artifact volume BEFORE the first app
     // process. Never remove it on failure: even a failed boot may have written data.
     ensureArtifactVolume(slug, deps);
-    const container = await bootPreviewContainerWithHandover({
+    // The data volume, made by this create with its own nonce (or found).
+    ({ createdHere: volumeCreatedHere, nonce: volumeNonce } = ensurePreviewDataVolume(volumeName, deps));
+    const booted = await bootPreviewContainerWithHandover({
       checkoutDir,
       slug,
       tag,
@@ -2959,13 +3303,15 @@ export async function runPreviewCreate(rest, injected = {}) {
       fleet,
       deps: { ...deps, env: runtimeEnv },
     });
+    containerIdHere = booted.id;
+    const container = booted.name;
     deps.log(`  booted ${container}; health-gating http://${previewReachHost(bind)}:${hostPort}/api/health ...`);
     const result = await pollHealthGate({
       url: `http://${previewReachHost(bind)}:${hostPort}/api/health`,
-      deps: { ...deps, isRunning: () => containerRunning(container, deps) },
-    });
+      deps: { ...deps, isRunning: () => containerRunning(booted.id, deps) },
+    }).then((p) => confirmedHealthy(p, booted.id, deps));
     if (result.state !== "healthy") {
-      const diag = dumpContainerLogs(container, deps);
+      const diag = dumpContainerLogs(booted.id, deps);
       await abort(
         new Error(
           `preview create for "${slug}" did not reach healthy (terminal state: ${result.state}` +
@@ -2976,22 +3322,24 @@ export async function runPreviewCreate(rest, injected = {}) {
       );
     }
   } catch (err) {
-    // `abort` re-throws; if it already ran (the message carries our marker) do
-    // not double-clean. Any OTHER throw (build/run) still needs teardown.
-    if (/did not reach healthy/.test(String(err?.message))) throw err;
+    // `abort` re-throws; if it already ran (its own flag, never a message
+    // text) do not double-clean. Any OTHER throw (build/run) still needs teardown.
+    if (abortRan) throw err;
     await abort(err);
   }
 
-  // Success: flip the claim to a ready row (AC3 — sha/tag/volume/provenance).
+  // Success: flip the claim to a ready row (AC3 — sha/tag/volume/provenance),
+  // recording the ID this run's own container run returned.
   await withRegistryLock(deps.registryPath, () => {
     const reg = requireUsableRegistry(deps.registryPath);
     const cur = getPreview(reg, slug);
     const next = cloneRegistry(reg);
-    next.previews[slug] = makePreviewSlot({ slug, ref, sha, hostPort, bind, fleet, pin: pin?.id ?? null, state: "ready", now: () => cur?.createdAt ?? new Date().toISOString() });
+    next.previews[slug] = makePreviewSlot({ slug, ref, sha, hostPort, bind, fleet, pin: pin?.id ?? null, state: "ready", now: () => cur?.createdAt ?? new Date().toISOString(), containerId: containerIdHere });
     writeRegistry(deps.registryPath, next);
   });
   deps.log(`preview "${slug}" is healthy: ${tag} (sha ${sha}) on http://${previewReachHost(bind)}:${hostPort}`);
-  return { slug, sha, tag, hostPort, state: "healthy" };
+  deps.log(previewContainerIdLine(containerIdHere));
+  return { slug, sha, tag, hostPort, state: "healthy", containerId: containerIdHere };
 }
 
 /**
@@ -3043,7 +3391,7 @@ export async function runPreviewRefresh(rest, injected = {}) {
   // CLAIM the slug under the lock: require an existing (non-in-flight) row,
   // capture the prior sha/tag + reuse the durable host port, and flip the row to
   // `provisioning` so a concurrent op can't race the container replacement.
-  let oldSha, oldTag, hostPort, bind, oldBind, volumeName, fleet, pinId;
+  let oldSha, oldTag, hostPort, bind, oldBind, volumeName, fleet, pinId, rowForId;
   await withRegistryLock(deps.registryPath, async () => {
     const reg = requireUsableRegistry(deps.registryPath);
     const existing = getPreview(reg, slug);
@@ -3056,11 +3404,17 @@ export async function runPreviewRefresh(rest, injected = {}) {
     if (existing.state === "provisioning") {
       throw new Error(`An operation is already in-flight for preview "${slug}" (state=provisioning). Wait for it to finish.`);
     }
+    // Contract (2): a row with no recorded container ID refuses a refresh
+    // UNCONDITIONALLY (R3), before any other read: the one named refusal.
+    if (existing.containerId == null) throw legacyRowRefusal(slug);
     requireRecordedArtifactVolume(existing, deps);
     const currentContainer = previewContainerName(slug);
     const currentState = containerState(currentContainer, deps);
     if (currentState === "unknown") throw new Error(`Could not verify existing preview ${currentContainer}; refresh left it untouched.`);
+    // A row with no recorded container ID is no authority to remove the
+    // container under its name: refused here, before any build or change.
     if (currentState !== "absent") requireArtifactContainerMount(slug, currentContainer, deps);
+    rowForId = existing;
     oldSha = existing.sha;
     oldTag = existing.imageTag;
     // Reuse the preview's durable host port; allocate only if an older row never
@@ -3114,8 +3468,22 @@ export async function runPreviewRefresh(rest, injected = {}) {
   // image is removed SHA-global-safe (only if no other slug references it).
   let replaced = false;
   let imageBuiltHere = false; // cinatra-cli#220 — see create's abort
+  let bootedId = null;
+  let abortRan = false;
   const abort = async (err) => {
-    if (replaced) removePreviewContainer(previewContainerName(slug), deps);
+    abortRan = true;
+    // Only the container THIS refresh's own run made, by the ID it returned.
+    const ownId = bootedId ?? err?.previewContainerId ?? null;
+    let left = [];
+    if (ownId) {
+      try {
+        removePreviewContainerById(ownId, deps);
+      } catch (e) {
+        left = e.cleanupIncomplete ?? [{ kind: "container", id: ownId, why: e.message }];
+      }
+    } else if (err?.cleanupIncomplete) {
+      left = err.cleanupIncomplete;
+    }
     if (newTag !== oldTag && imageBuiltHere) {
       await removeImageIfUnreferenced(newTag, { registryPath: deps.registryPath, keepSlug: slug, deps });
     }
@@ -3138,12 +3506,16 @@ export async function runPreviewRefresh(rest, injected = {}) {
           // exists to prevent. After replacement nothing is running, so the
           // requested bind stands as the intent a later `start --recreate` boots.
           bind: replaced ? (cur.bind ?? null) : oldBind,
-          state: replaced ? "degraded" : "ready",
+          state: replaced || left.length || (cur[CLEANUP_INCOMPLETE_FIELD]?.length ?? 0) > 0 ? "degraded" : "ready",
+          ...(left.length || cur[CLEANUP_INCOMPLETE_FIELD]?.length
+            ? { [CLEANUP_INCOMPLETE_FIELD]: [...(cur[CLEANUP_INCOMPLETE_FIELD] ?? []), ...left] } : {}),
         };
         writeRegistry(deps.registryPath, next);
       }
     });
-    throw err;
+    if (left.length === 0) throw err;
+    throw new Error(`${err?.message ?? err}\n  cleanup-incomplete: a container or forwarder could not be removed; ` +
+      `the row of "${slug}" is degraded with ${CLEANUP_INCOMPLETE_FIELD} naming it.`);
   };
 
   try {
@@ -3181,9 +3553,25 @@ export async function runPreviewRefresh(rest, injected = {}) {
 
     // Replace the running container (AC4: the replaced container is removed —
     // no orphan accumulation), REUSING the durable volume (never dropped).
+    // The old container goes by the ID a status-checked inspect reads, and only
+    // when it is the one the row recorded; an unreadable state replaces nothing.
+    const oldName = previewContainerName(slug);
+    const oldState = containerState(oldName, deps);
+    if (oldState === "unknown") {
+      throw new Error(`Could not determine the state of ${oldName}; nothing was replaced.`);
+    }
+    if (oldState !== "absent") {
+      const oldId = requireRecordedContainer(rowForId, oldName, deps);
+      try {
+        removePreviewContainerById(oldId, deps);
+      } catch (err) {
+        // What is left of the old container is recorded; nothing new is booted.
+        replaced = true;
+        throw err;
+      }
+    }
     replaced = true;
-    removeContainer(previewContainerName(slug), deps);
-    const container = await bootPreviewContainerWithHandover({
+    const booted = await bootPreviewContainerWithHandover({
       checkoutDir,
       slug,
       tag: newTag,
@@ -3195,13 +3583,15 @@ export async function runPreviewRefresh(rest, injected = {}) {
       fleet,
       deps: { ...deps, env: runtimeEnv },
     });
+    bootedId = booted.id;
+    const container = booted.name;
     deps.log(`  booted ${container}; health-gating http://${previewReachHost(bind)}:${hostPort}/api/health ...`);
     const result = await pollHealthGate({
       url: `http://${previewReachHost(bind)}:${hostPort}/api/health`,
-      deps: { ...deps, isRunning: () => containerRunning(container, deps) },
-    });
+      deps: { ...deps, isRunning: () => containerRunning(booted.id, deps) },
+    }).then((p) => confirmedHealthy(p, booted.id, deps));
     if (result.state !== "healthy") {
-      const diag = dumpContainerLogs(container, deps);
+      const diag = dumpContainerLogs(booted.id, deps);
       await abort(
         new Error(
           `preview refresh for "${slug}" did not reach healthy (terminal state: ${result.state}` +
@@ -3212,29 +3602,40 @@ export async function runPreviewRefresh(rest, injected = {}) {
       );
     }
   } catch (err) {
-    if (/did not reach healthy/.test(String(err?.message))) throw err;
+    if (abortRan) throw err;
     await abort(err);
   }
 
   // Success: flip the claim to a ready row at the NEW sha/tag with old->new
   // history (AC3), then clean up the superseded OLD image — SHA-global-safe.
+  let refreshLeft = [];
   await withRegistryLock(deps.registryPath, () => {
     const reg = requireUsableRegistry(deps.registryPath);
     const cur = getPreview(reg, slug);
     if (!cur) throw new Error(`preview "${slug}" vanished from the registry mid-refresh.`);
     // Restore the pre-claim sha into `cur` so refreshPreviewSlot appends a
     // correct old->new history entry (the claim had flipped state, not sha).
-    const base = { ...cur, sha: oldSha, imageTag: oldTag, provenance: previewProvenance(oldSha) };
+    const { [CLEANUP_INCOMPLETE_FIELD]: earlier = [], ...kept } = cur;
+    const base = { ...kept, sha: oldSha, imageTag: oldTag, provenance: previewProvenance(oldSha) };
+    // A ready promotion first re-reads every earlier leftover; while any is
+    // still there the refreshed row stays degraded, naming it (R1).
+    refreshLeft = remainingLeftovers(earlier, deps);
     const next = cloneRegistry(reg);
-    next.previews[slug] = refreshPreviewSlot(base, { ref, sha: newSha, hostPort, bind, fleet, pin: pinId, state: "ready", now: () => new Date().toISOString() });
+    next.previews[slug] = {
+      ...refreshPreviewSlot(base, { ref, sha: newSha, hostPort, bind, fleet, pin: pinId, state: refreshLeft.length ? "degraded" : "ready", now: () => new Date().toISOString(), containerId: bootedId }),
+      ...(refreshLeft.length ? { [CLEANUP_INCOMPLETE_FIELD]: refreshLeft } : {}),
+    };
     writeRegistry(deps.registryPath, next);
   });
+  if (refreshLeft.length) throw leftoversError(slug, refreshLeft);
   if (oldTag !== newTag) {
-    await removeImageIfUnreferenced(oldTag, { registryPath: deps.registryPath, keepSlug: slug, deps });
-    deps.log(`  cleaned up superseded image ${oldTag} (${oldSha}) now that ${newTag} is healthy.`);
+    if (await removeImageIfUnreferenced(oldTag, { registryPath: deps.registryPath, keepSlug: slug, deps })) {
+      deps.log(`  cleaned up superseded image ${oldTag} (${oldSha}) now that ${newTag} is healthy.`);
+    }
   }
   deps.log(`preview "${slug}" refreshed and healthy: ${newTag} (sha ${newSha}) on http://${previewReachHost(bind)}:${hostPort}`);
-  return { slug, sha: newSha, tag: newTag, previousSha: oldSha, hostPort, state: "healthy" };
+  deps.log(previewContainerIdLine(bootedId));
+  return { slug, sha: newSha, tag: newTag, previousSha: oldSha, hostPort, state: "healthy", containerId: bootedId };
 }
 
 /**
@@ -3309,7 +3710,12 @@ export async function runPreviewStop(rest, injected = {}) {
       deps.log(`preview "${slug}": ${name} is already stopped.`);
       return { slug, container: "stopped", changed: false };
     }
-    const r = deps.runDocker(["stop", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+    // The running container is stopped by the ID a status-checked inspect reads,
+    // and only when it is the one the row recorded. A stop removes and reuses
+    // nothing, so a row without a recorded ID still stops by the ID read now.
+    const id = row.containerId != null ? requireRecordedContainer(row, name, deps) : readContainerId(name, deps);
+    if (!id) throw new Error(`Could not read the ID of ${name} (docker inspect failed or answered no container ID). Nothing was changed.`);
+    const r = deps.runDocker(["stop", id], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
     if (r.error || r.status !== 0) {
       throw new Error(`docker stop of preview ${name} failed` + (r.stderr ? `: ${r.stderr.trim()}` : "."));
     }
@@ -3377,6 +3783,9 @@ export async function runPreviewStart(rest, injected = {}) {
     if (existing.state === "provisioning") {
       throw new Error(`An operation is already in-flight for preview "${slug}" (state=provisioning). Wait for it to finish.`);
     }
+    // Contract (2): a row with no recorded container ID refuses a plain start,
+    // whether a container is under its name or not; only `--recreate` clears it.
+    if (!recreate && existing.containerId == null) throw legacyRowRefusal(slug);
     requireRecordedArtifactVolume(existing, deps);
     row = existing;
     const next = cloneRegistry(reg);
@@ -3428,22 +3837,55 @@ export async function runPreviewStart(rest, injected = {}) {
   // `extra` carries the fields a SUCCESSFUL path commits with the release (the
   // re-materialized bind); a failure path passes none, so the row keeps what it
   // already truthfully recorded.
+  // A failed cleanup's list is ADDED to what the row already names; a "ready"
+  // promotion first re-reads every earlier leftover (remainingLeftovers): while
+  // any is still there the row stays degraded, naming it, and the caller fails
+  // without a result line. Resolves to the state written.
   const release = async (state, extra = null) => {
+    let written = null;
     await withRegistryLock(deps.registryPath, () => {
       const reg = requireUsableRegistry(deps.registryPath);
       const cur = getPreview(reg, slug);
       if (cur && cur.state === "provisioning") {
         const next = cloneRegistry(reg);
-        next.previews[slug] = { ...cur, ...(extra ?? {}), state };
+        const { [CLEANUP_INCOMPLETE_FIELD]: earlier = [], ...base } = cur;
+        const added = extra?.[CLEANUP_INCOMPLETE_FIELD] ?? [];
+        const { [CLEANUP_INCOMPLETE_FIELD]: _drop, ...rest } = extra ?? {};
+        let left = [...earlier, ...added];
+        let final = state;
+        if (state === "ready" && left.length) {
+          left = remainingLeftovers(left, deps);
+          if (left.length) final = "degraded";
+        }
+        next.previews[slug] = { ...base, ...rest, ...(left.length ? { [CLEANUP_INCOMPLETE_FIELD]: left } : {}), state: final };
         writeRegistry(deps.registryPath, next);
+        written = { state: final, left };
       }
     });
+    return written;
+  };
+  /** Promote to ready, or fail without a result line while earlier leftovers remain. */
+  const promote = async (extra = null) => {
+    const w = await release("ready", extra);
+    if (w && w.state !== "ready") throw leftoversError(slug, w.left);
   };
 
   try {
     if (present !== "absent") requireArtifactContainerMount(slug, name, deps);
+    // Every reuse below acts on the live container by the ID a status-checked
+    // inspect reads, and only when it is the one the row recorded: a mismatch,
+    // a failed read or a row with no recorded ID changes nothing and never
+    // reads as ready. A recreate's park step is the one exception (parkTargetId):
+    // on a row with no recorded ID its authority is this invocation's own park.
+    const liveId = present === "absent" ? null
+      : recreate ? parkTargetId(row, name, deps) : requireRecordedContainer(row, name, deps);
     if (present === "running" && !recreate) {
       if (row.state !== "degraded") {
+        // "ready" rests on the verified ID's own liveness, never on the name's.
+        const own = containerState(liveId, deps);
+        if (own !== "running") {
+          throw new Error(`The container ${liveId.slice(0, 12)} preview "${slug}" recorded is ${own} by its own ID; nothing was changed.`);
+        }
         deps.log(`preview "${slug}" is already running: ${tag} on http://${previewReachHost(row.bind ?? null)}:${hostPort}`);
         await release(row.state);
         return { slug, container: "running", changed: false, rematerialized: false, hostPort };
@@ -3454,19 +3896,20 @@ export async function runPreviewStart(rest, injected = {}) {
       // only a real healthy answer promotes the row.
       // cinatra-cli#303: and never without its declared forwards served.
       const handover = await collectPreviewHostHandover({ checkoutDir, deps, log: deps.log ?? (() => {}) });
-      if (handover.forwards.length > 0) {
-        try {
-          await attachPreviewHostForwards({ containerName: name, tag, forwards: handover.forwards, deps, log: deps.log ?? (() => {}) });
-        } catch (err) {
-          await release("degraded");
-          throw err;
-        }
+      // The forwarders follow the declarers' answer NOW: with forwards they are
+      // attached; with none, the forwarders labelled with this ID are removed
+      // (an earlier contribution never stays on after an optional skip).
+      try {
+        await reattachPreviewHostForwards({ containerName: name, containerId: liveId, tag, handover, deps, log: deps.log ?? (() => {}) });
+      } catch (err) {
+        await release("degraded", err.cleanupIncomplete ? { [CLEANUP_INCOMPLETE_FIELD]: err.cleanupIncomplete } : null);
+        throw err;
       }
       deps.log(`preview "${slug}" is running but its row is degraded; re-probing http://${previewReachHost(row.bind ?? null)}:${hostPort}/api/health ...`);
       const probe = await pollHealthGate({
         url: `http://${previewReachHost(row.bind ?? null)}:${hostPort}/api/health`,
-        deps: { ...deps, isRunning: () => containerRunning(name, deps) },
-      });
+        deps: { ...deps, isRunning: () => containerRunning(liveId, deps) },
+      }).then((p) => confirmedHealthy(p, liveId, deps));
       if (probe.state !== "healthy") {
         await release("degraded");
         throw new Error(
@@ -3481,12 +3924,12 @@ export async function runPreviewStart(rest, injected = {}) {
                 : s === "unknown"
                   ? `Nothing here touched the container; docker did not answer a state probe, so whether it is ` +
                     `still up is UNKNOWN. `
-                  : `Nothing here touched the container, and it is now ${s}. `)(containerState(name, deps)) +
+                  : `Nothing here touched the container, and it is now ${s}. `)(containerState(liveId, deps)) +
             `\`cinatra instance preview start --slug ${slug} --recreate\` re-materializes it with freshly ` +
             `composed environment (no build), which is the fix when the configuration is what changed.`,
         );
       }
-      await release("ready");
+      await promote();
       deps.log(`preview "${slug}" is healthy again: ${tag} on http://${previewReachHost(row.bind ?? null)}:${hostPort}`);
       return { slug, container: "running", changed: false, rematerialized: false, hostPort };
     }
@@ -3495,29 +3938,34 @@ export async function runPreviewStart(rest, injected = {}) {
       // cinatra-cli#287: the declarers are read before the container comes back;
       // once it runs, it gets their forwards again (its network namespace is new).
       const handover = await collectPreviewHostHandover({ checkoutDir, deps, log: deps.log ?? (() => {}) });
-      const r = deps.runDocker(["start", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+      const r = deps.runDocker(["start", liveId], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
       if (r.error || r.status !== 0) {
         throw new Error(`docker start of preview ${name} failed` + (r.stderr ? `: ${r.stderr.trim()}` : "."));
       }
       try {
-        await reattachPreviewHostForwards({ containerName: name, tag, handover, deps, log: deps.log ?? (() => {}) });
+        await reattachPreviewHostForwards({ containerName: name, containerId: liveId, tag, handover, deps, log: deps.log ?? (() => {}) });
       } catch (err) {
         // cinatra-cli#303: a start whose declared forwards failed leaves the
         // container stopped, as it found it, so no later start finds it running
         // without them.
-        const down = deps.runDocker(["stop", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+        const down = deps.runDocker(["stop", liveId], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
         // Still running without its forwards: the row says degraded, never ready.
-        if (down.error || down.status !== 0) await release("degraded");
+        if (down.error || down.status !== 0 || err.cleanupIncomplete) {
+          const left = [...(err.cleanupIncomplete ?? []),
+            ...(down.error || down.status !== 0
+              ? [{ kind: "container", id: liveId, why: "it runs without its declared forwards: docker stop after the failed attach failed" }] : [])];
+          await release("degraded", { [CLEANUP_INCOMPLETE_FIELD]: left });
+        }
         throw new Error(`${err?.message ?? err}\n  ${name} was ` +
           (down.error || down.status !== 0 ? `NOT stopped again (docker stop failed); stop it before the next start.` : `stopped again.`));
       }
       deps.log(`  started ${name}; health-gating http://${previewReachHost(row.bind ?? null)}:${hostPort}/api/health ...`);
       const result = await pollHealthGate({
         url: `http://${previewReachHost(row.bind ?? null)}:${hostPort}/api/health`,
-        deps: { ...deps, isRunning: () => containerRunning(name, deps) },
-      });
+        deps: { ...deps, isRunning: () => containerRunning(liveId, deps) },
+      }).then((p) => confirmedHealthy(p, liveId, deps));
       if (result.state !== "healthy") {
-        const diag = dumpContainerLogs(name, deps);
+        const diag = dumpContainerLogs(liveId, deps);
         await release("degraded");
         throw new Error(
           `preview "${slug}" started but did not reach healthy (terminal state: ${result.state}` +
@@ -3525,7 +3973,7 @@ export async function runPreviewStart(rest, injected = {}) {
             `durable volume is intact.\n--- container logs (tail) ---\n${diag.slice(-4000)}`,
         );
       }
-      await release("ready");
+      await promote();
       deps.log(`preview "${slug}" is healthy: ${tag} (sha ${row.sha}) on http://${previewReachHost(row.bind ?? null)}:${hostPort}`);
       return { slug, container: "running", changed: true, rematerialized: false, hostPort };
     }
@@ -3564,11 +4012,15 @@ export async function runPreviewStart(rest, injected = {}) {
 
     // AC6: keep the old container ASIDE (renamed + stopped) rather than
     // destroying it, so a failed re-materialize can put it back.
+    // The container set aside is the live one by the ID read above (the one the
+    // row recorded): it is renamed, stopped and, after a healthy boot, removed
+    // by that ID. A leftover of an earlier attempt under the aside name is never
+    // removed here (it is not this run's): the rename then fails and nothing changes.
     let parked = null;
+    let bootedId = null;
     if (present !== "absent") {
       parked = `${name}${SUPERSEDED_CONTAINER_SUFFIX}`;
-      removeContainer(parked, deps); // clear any debris from an earlier attempt
-      const rename = deps.runDocker(["rename", name, parked], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+      const rename = deps.runDocker(["rename", liveId, parked], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
       if (rename.error || rename.status !== 0) {
         await release(row.state);
         throw new Error(
@@ -3576,43 +4028,87 @@ export async function runPreviewStart(rest, injected = {}) {
             (rename.stderr ? `: ${rename.stderr.trim()}` : ".") + ` Nothing was changed.`,
         );
       }
-      // It still holds the published host port until it is stopped.
-      deps.runDocker(["stop", parked], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+      // It still holds the published host port until it is stopped, and its
+      // forwarder holds the forwarder's name: both are checked.
+      const down = deps.runDocker(["stop", liveId], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+      let asideFailed = down.error || down.status !== 0 ? `docker stop ${parked} failed` : null;
+      let asideLeft = [];
+      if (!asideFailed) {
+        try {
+          removePreviewForwardersOf(liveId, deps);
+        } catch (err) {
+          asideFailed = err.message;
+          asideLeft = err.cleanupIncomplete?.length ? err.cleanupIncomplete : [{ kind: "forwarder-listing", id: liveId, why: err.message }];
+        }
+      }
+      if (asideFailed) {
+        const back = deps.runDocker(["rename", liveId, name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+        if (back.error || back.status !== 0) {
+          asideLeft = [...asideLeft, { kind: "container", id: liveId, name: parked, why: "the rename back to its own name failed" }];
+        }
+        // A failed cleanup (a forwarder left, a container left under the aside
+        // name) leaves the row degraded, naming what is left (R1).
+        await release(asideLeft.length ? "degraded" : row.state, asideLeft.length ? { [CLEANUP_INCOMPLETE_FIELD]: asideLeft } : null);
+        throw new Error(`Could not set the existing preview container aside (${asideFailed}); ` +
+          (back.error || back.status !== 0 ? `it is left as ${parked}.` : `it keeps its name ${name}; start it with \`cinatra instance preview start --slug ${slug}\`.`));
+      }
     }
 
     // Put the parked container back. Every step is CHECKED: a restore that
     // silently failed would leave the canonical container absent while the
-    // message claimed it was back, and the row would say `ready`.
+    // message claimed it was back, and the row would say `ready`. Only the
+    // container THIS run made (bootedId) is removed for it, never by name.
     const restore = async () => {
-      if (!parked) return { outcome: "none", parked: null };
-      removePreviewContainer(name, deps);
-      const back = deps.runDocker(["rename", parked, name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
-      if (back.error || back.status !== 0) return { outcome: "failed", parked };
-      const up = deps.runDocker(["start", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
-      if (up.error || up.status !== 0) return { outcome: "failed", parked: name };
+      let newLeft = [];
+      if (bootedId) {
+        try {
+          removePreviewContainerById(bootedId, deps);
+        } catch (err) {
+          newLeft = err.cleanupIncomplete?.length ? err.cleanupIncomplete : [{ kind: "container", id: bootedId, why: err.message }];
+          // The new container itself still holds the name: the parked one cannot
+          // be put back, and both are named.
+          if (newLeft.some((l) => l.kind === "container")) {
+            return { outcome: "failed", parked, left: [...newLeft, ...(parked ? [{ kind: "container", id: liveId, name: parked, why: "set aside; not put back, since the new container could not be removed" }] : [])] };
+          }
+        }
+      }
+      // Only a forwarder of the new container is left (named): the parked one is put back.
+      const withNew = (r) => (newLeft.length ? { ...r, left: [...newLeft, ...(r.left ?? [])] } : r);
+      if (!parked) return withNew({ outcome: "none", parked: null });
+      const back = deps.runDocker(["rename", liveId, name], { timeoutMs: DOCKER_CLI_PROBE_TIMEOUT_MS });
+      if (back.error || back.status !== 0) {
+        return withNew({ outcome: "failed", parked, left: [{ kind: "container", id: liveId, name: parked, why: "the rename back to its own name failed" }] });
+      }
+      const up = deps.runDocker(["start", liveId], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+      if (up.error || up.status !== 0) {
+        return withNew({ outcome: "failed", parked: name, left: [{ kind: "container", id: liveId, name, why: "docker start of the restored container failed; it is left stopped" }] });
+      }
       // cinatra-cli#287: the restored container's forwarder went with the boot
       // that replaced it; it gets its declared forwards back.
       try {
-        await attachPreviewHostForwards({ containerName: name, tag, forwards: handover.forwards, deps, log: deps.log ?? (() => {}) });
+        await attachPreviewHostForwards({ containerName: name, containerId: liveId, tag, forwards: handover.forwards, deps, log: deps.log ?? (() => {}) });
       } catch (err) {
         // cinatra-cli#303: without its declared forwards it is stopped again.
-        const down = deps.runDocker(["stop", name], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
+        const down = deps.runDocker(["stop", liveId], { timeoutMs: PREVIEW_STOP_TIMEOUT_MS });
         const stopped = !down.error && down.status === 0;
-        return { outcome: stopped ? "restored-stopped" : "restored-running", parked: null, why: err?.message ?? String(err) };
+        const left = [...(err?.cleanupIncomplete ?? []),
+          ...(stopped ? [] : [{ kind: "container", id: liveId, why: "it runs without its declared forwards: docker stop failed" }])];
+        return withNew({ outcome: stopped ? "restored-stopped" : "restored-running", parked: null, why: err?.message ?? String(err),
+          ...(left.length ? { left } : {}) });
       }
       // Both steps SUCCEEDED. The confirming probe may still go unanswered — and
       // that is "could not confirm", not "it is gone": claiming the preview is
       // DOWN when the container is in fact back would be the same over-claim the
       // absent/unknown split exists to prevent.
-      const state = containerState(name, deps);
+      const state = containerState(liveId, deps);
       // Four distinguishable outcomes, because three of them are true in
       // different ways: it is back and running; it is back under its own name
       // but NOT running (started, then exited); its state could not be read; or
       // it never came back at all.
-      if (state === "running") return { outcome: "restored", parked: null };
-      if (state === "unknown") return { outcome: "unconfirmed", parked: null };
-      if (state === "stopped") return { outcome: "restored-not-running", parked: null };
-      return { outcome: "failed", parked: null };
+      if (state === "running") return withNew({ outcome: "restored", parked: null });
+      if (state === "unknown") return withNew({ outcome: "unconfirmed", parked: null });
+      if (state === "stopped") return withNew({ outcome: "restored-not-running", parked: null });
+      return withNew({ outcome: "failed", parked: null });
     };
     /** The tail of a failure message: what the restore actually achieved. */
     const restoreNote = (r) => {
@@ -3646,7 +4142,7 @@ export async function runPreviewStart(rest, injected = {}) {
 
     let container;
     try {
-      container = await bootPreviewContainerWithHandover({
+      const booted = await bootPreviewContainerWithHandover({
         checkoutDir,
         handover,
         slug,
@@ -3659,12 +4155,18 @@ export async function runPreviewStart(rest, injected = {}) {
         fleet: row.fleet ?? PREVIEW_FLEET_DEFAULT,
         deps: { ...deps, env: runtimeEnv },
       });
+      bootedId = booted.id;
+      container = booted.name;
     } catch (err) {
       // cinatra-cli#303: a container this run booted (its handover failed, say)
-      // never stays up when nothing was parked: it goes, as on create.
-      if (!parked) removePreviewContainer(name, deps);
+      // never stays up: it goes by the ID its own run returned (restore removes
+      // exactly it), never by its name — so a container this run did not make
+      // is never removed on this path.
+      bootedId = err?.previewContainerId ?? null;
       const r = await restore();
-      await release(r.outcome === "failed" || r.outcome === "restored-not-running" || r.outcome === "restored-running" ? "degraded" : row.state);
+      const left = r.left ?? (bootedId ? null : err?.cleanupIncomplete) ?? null;
+      await release(r.outcome === "failed" || r.outcome === "restored-not-running" || r.outcome === "restored-running" || r.outcome === "unconfirmed" || left ? "degraded" : row.state,
+        left ? { [CLEANUP_INCOMPLETE_FIELD]: left } : null);
       throw new Error(`${err?.message ?? err}\n  ${restoreNote(r).trim()}`);
     }
     deps.log(
@@ -3673,12 +4175,13 @@ export async function runPreviewStart(rest, injected = {}) {
     );
     const result = await pollHealthGate({
       url: `http://${previewReachHost(bind)}:${hostPort}/api/health`,
-      deps: { ...deps, isRunning: () => containerRunning(container, deps) },
-    });
+      deps: { ...deps, isRunning: () => containerRunning(bootedId, deps) },
+    }).then((p) => confirmedHealthy(p, bootedId, deps));
     if (result.state !== "healthy") {
-      const diag = dumpContainerLogs(container, deps);
+      const diag = dumpContainerLogs(bootedId, deps);
       const r = await restore();
-      await release(r.outcome === "failed" || r.outcome === "restored-not-running" || r.outcome === "restored-running" ? "degraded" : row.state);
+      await release(r.outcome === "failed" || r.outcome === "restored-not-running" || r.outcome === "restored-running" || r.outcome === "unconfirmed" || r.left ? "degraded" : row.state,
+        r.left ? { [CLEANUP_INCOMPLETE_FIELD]: r.left } : null);
       throw new Error(
         `preview "${slug}" did not reach healthy after re-materializing (terminal state: ${result.state}` +
           (result.status ? `, http ${result.status}` : "") + `). ` +
@@ -3687,14 +4190,35 @@ export async function runPreviewStart(rest, injected = {}) {
           `\n--- container logs (tail) ---\n${diag.slice(-4000)}`,
       );
     }
-    if (parked) removeContainer(parked, deps);
-    // The container IS published on `bind` now — that is when the row may say so.
-    await release("ready", { bind });
+    // The container set aside goes by the ID this run read when it parked it: the
+    // authority is THIS invocation's own park action (it renamed and stopped
+    // exactly that ID), on a row without a recorded ID too (parkTargetId);
+    // a removal that fails is recorded on the row, never taken as done.
+    let left = null;
+    if (parked) {
+      try {
+        removePreviewContainerById(liveId, deps);
+      } catch (err) {
+        left = err.cleanupIncomplete?.length ? err.cleanupIncomplete : [{ kind: "container", id: liveId, why: err.message }];
+      }
+    }
+    // A failed cleanup is never a ready row and never a result line (R1): the new
+    // container serves, but what is left is recorded and the command fails.
+    if (left?.length) {
+      await release("degraded", { bind, containerId: bootedId, [CLEANUP_INCOMPLETE_FIELD]: left });
+      throw new Error(`preview "${slug}" re-materialized and healthy as ${bootedId.slice(0, 12)}, but cleanup-incomplete: ${parked} ` +
+        `(${liveId.slice(0, 12)}) could not be removed; the row of "${slug}" is degraded with ${CLEANUP_INCOMPLETE_FIELD} naming it, ` +
+        `and no result line was printed.`);
+    }
+    // The container IS published on `bind` now — that is when the row may say so,
+    // with the ID this run's own container run returned.
+    await promote({ bind, containerId: bootedId });
     deps.log(
       `preview "${slug}" re-materialized and healthy: ${tag} (sha ${row.sha}) on http://${previewReachHost(bind)}:${hostPort} ` +
         `— container env recomposed, image untouched.`,
     );
-    return { slug, container: "running", changed: true, rematerialized: true, hostPort };
+    deps.log(previewContainerIdLine(bootedId));
+    return { slug, container: "running", changed: true, rematerialized: true, hostPort, containerId: bootedId };
   } catch (err) {
     await release(row.state);
     throw err;
@@ -3768,6 +4292,7 @@ export function runPreviewList(rest, injected = {}) {
 // --- test surface ----------------------------------------------------------
 
 export const __test = {
+  defaultReadFileAtSha,
   // constants
   PREVIEW_IMAGE_TAG_PREFIX,
   PREVIEW_CONTAINER_PREFIX,
@@ -3884,7 +4409,11 @@ export const __test = {
   ensurePreviewImage,
   containerRunning,
   containerState,
-  removeContainer,
+  readContainerId,
+  requireRecordedContainer,
+  parkTargetId,
+  removePreviewContainerById,
+  ensurePreviewDataVolume,
   removeImage,
   removeImageIfUnreferenced,
   dumpContainerLogs,

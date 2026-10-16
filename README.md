@@ -220,6 +220,47 @@ The memory and graph endpoints (`GRAPHITI_URL`, `NEO4J_URI`) stay on the host as
 well: they belong to subsystems outside extension installs, connections and the
 agent runtime bridge, so forwarding them is a separate decision.
 
+### What a preview command prints for a host to read
+
+A successful `cinatra instance preview create`, `instance preview start --recreate`
+or `instance preview refresh` prints exactly one line of this form to standard
+output:
+
+    preview_container_id=<id>
+
+`<id>` is the full 64-character lowercase hexadecimal ID that the command's own
+`docker run -d` returned in that run. It is never read back from `docker ps`,
+`docker inspect` or the container's name, it is printed only after that
+container's checks pass, and no failure prints it. A plain `instance preview
+start` that makes no new container prints no such line. The preview's registry
+row (`~/.cinatra/previews.json`) records the same value as `containerId`; a row
+written by an older CLI has no `containerId` and proves nothing about which run
+made its container.
+
+Every later step binds to that ID. `start`, `start --recreate` and `refresh`
+read the live container's ID with a status-checked `docker container inspect`
+and act only when it equals the recorded one; a mismatch or a failed read
+changes nothing. A row an older CLI wrote records no ID: `refresh` and a plain
+`start` refuse it, and `start --recreate` is the one step that clears it, removing
+only the container its own run set aside, by the ID it read when it did so. A failed command removes only what it made itself: the
+container by the ID its own run returned (or docker's `--cidfile` when the run
+failed after creating it), and the data volume only when the volume carries the
+label `cinatra.preview.volume-created-by` with that run's own random value. When
+a removal fails, the row is kept as `degraded` with a `cleanupIncomplete` list
+naming what is left, never released as if the removal were clean.
+
+### Extensions that hand a preview its host settings
+
+An extension declares a host handover in its `package.json` as
+`cinatra.devCliModules["preview-host-handover"]`. Such a declarer is
+**required**: if its manifest cannot be read, or its module fails, times out,
+exports no `previewHostHandover` function, returns no `{ env, forwards }` object
+or hands over any entry the CLI does not take, the preview is refused. A
+declarer whose handover may be left out says so in the same manifest with
+`"cinatra": { "previewHostHandoverOptional": true }` (the boolean `true`); its
+failure then skips its whole contribution, and the command names the package in
+a warning.
+
 ### Where a preview publishes its port
 
 A preview container publishes its app port to a host port, and by default that
