@@ -279,7 +279,7 @@ export function holdersFromInspect(inspectRows, port) {
 
 function inspectIds(ids, deps) {
   const r = deps.runDocker(["inspect", ...ids], { timeoutMs: OWNERSHIP_PROBE_TIMEOUT_MS });
-  if (r.status !== 0) return null;
+  if (r.error || r.timedOut || r.status !== 0) return null;
   try {
     const rows = JSON.parse(r.stdout ?? "");
     return Array.isArray(rows) ? rows : null;
@@ -289,7 +289,7 @@ function inspectIds(ids, deps) {
 }
 
 function idList(result) {
-  if (!result || result.status !== 0) return null;
+  if (!result || result.error || result.timedOut || result.status !== 0) return null;
   return (result.stdout ?? "").split("\n").map((s) => s.trim()).filter(Boolean);
 }
 
@@ -561,6 +561,18 @@ export function assertEndpointOwnership({ entries = [], checkoutDir, deps, env =
         ? `  NOTE: ${w.key} names no port this check can derive, so its ownership was NOT verified.`
         : `  NOTE: could not inspect this checkout's own containers, so ${w.key} (host port ${w.port}) ` +
           `ownership was NOT verified — docker metadata was unavailable.`,
+    );
+  }
+  // An endpoint set docker could not be read for is no pass under enforce: the
+  // probe's failure (an inspect or a listing that did not exit 0) refuses, and
+  // only warn proceeds on it.
+  const unread = report.results.filter((r) => r.verdict === "unknown");
+  if (unread.length > 0 && mode !== "warn") {
+    throw new Error(
+      `preview: the ownership of ${unread.map((r) => `${r.key} (host port ${r.port})`).join(", ")} could not be verified — ` +
+        `docker's container metadata could not be read, so nothing proves these endpoints are this instance's. ` +
+        `Nothing was built or booted. Check the docker daemon and retry, or set ${ENDPOINT_OWNERSHIP_ENV}=warn to proceed ` +
+        `without the proof.`,
     );
   }
   if (report.violations.length === 0 && !report.projectConflict) {
