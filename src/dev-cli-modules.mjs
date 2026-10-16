@@ -15,7 +15,7 @@
 // `import()` of a missing path produced — so every caller's existing
 // graceful-degradation guard keeps working.
 
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -88,28 +88,12 @@ function requireResolvedRepoRoot(key, repoRoot) {
  * the first sorted one is used).
  */
 export function discoverDevCliModulePath(key, repoRoot) {
-  return discoverAllDevCliModulePaths(key, repoRoot)[0]?.modulePath ?? null;
-}
-
-/**
- * EVERY declarer of `cinatra.devCliModules[key]`, for a key that several
- * extensions may contribute to. Same scan as `discoverDevCliModulePath`: scopes
- * and package dirs in sorted order, each declared path confined inside its own
- * extension dir (a path that leaves it is skipped). Returns
- * `[{ packageDir, modulePath }]` — `packageDir` relative to the root
- * (`extensions/<scope>/<name>`), `modulePath` absolute — or `[]`.
- *
- * `repoRoot` is REQUIRED, exactly as above.
- */
-export function discoverAllDevCliModulePaths(key, repoRoot) {
-  const root = requireResolvedRepoRoot(key, repoRoot);
-  const extRoot = path.join(root, "extensions");
-  const found = [];
+  const extRoot = path.join(requireResolvedRepoRoot(key, repoRoot), "extensions");
   let scopes;
   try {
     scopes = readdirSync(extRoot).sort();
   } catch {
-    return found;
+    return null;
   }
   for (const scope of scopes) {
     let dirs;
@@ -136,7 +120,130 @@ export function discoverAllDevCliModulePaths(key, repoRoot) {
       const base = path.join(extRoot, scope, dir);
       const resolved = path.resolve(base, rel);
       if (resolved !== base && !resolved.startsWith(base + path.sep)) continue;
-      found.push({ packageDir: path.join("extensions", scope, dir), modulePath: resolved });
+      // The first declarer wins, and nothing after it is read.
+      return resolved;
+    }
+  }
+  return null;
+}
+
+/** The bounds of the multi-declarer census below. */
+export const DECLARER_CENSUS_MAX_PACKAGES = 1000;
+export const DECLARER_CENSUS_MAX_MANIFEST_BYTES = 1024 * 1024;
+/** The code of the error the census throws when a manifest cannot be read within its bounds. */
+export const ERR_DEV_CLI_DECLARER_CENSUS = "ERR_CINATRA_DEV_CLI_DECLARER_CENSUS";
+
+function censusFailure(message) {
+  const err = new Error(message);
+  err.code = ERR_DEV_CLI_DECLARER_CENSUS;
+  return err;
+}
+
+/** The real sub-directories of `dir`, sorted. A missing extensions root is
+ *  null (nothing is present); any other listing failure, and a symbolic link
+ *  where a scope or a package dir would be, THROWS: the census never follows a
+ *  link and never reads an unlisted tree as empty. Plain files are no package. */
+function censusDirectories(dir, shown) {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    if (err?.code === "ENOENT" && shown === "extensions") return null;
+    throw censusFailure(`${shown} could not be listed (${err?.code ?? "error"}).`);
+  }
+  const names = [];
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) throw censusFailure(`${path.join(shown, entry.name)} is a symbolic link; the census does not follow it.`);
+    if (entry.isDirectory()) names.push(entry.name);
+  }
+  return names.sort();
+}
+
+/** One manifest, read within the census bounds: never through a symlink, never
+ *  a FIFO or a device (the open does not block, and the open file must be a
+ *  regular file), never more than the size bound. Returns the parsed manifest,
+ *  null when the dir holds no package.json, and throws on anything else. */
+function readBoundedManifest(file, packageDir) {
+  let fd;
+  try {
+    fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
+  } catch (err) {
+    if (err?.code === "ENOENT") return null;
+    throw censusFailure(`the manifest of ${packageDir} could not be opened (${err?.code ?? "error"}).`);
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw censusFailure(`the manifest of ${packageDir} is not a regular file.`);
+    if (stat.size > DECLARER_CENSUS_MAX_MANIFEST_BYTES) {
+      throw censusFailure(`the manifest of ${packageDir} is larger than ${DECLARER_CENSUS_MAX_MANIFEST_BYTES} bytes.`);
+    }
+    const buf = Buffer.alloc(stat.size + 1);
+    let size = 0;
+    for (;;) {
+      const n = readSync(fd, buf, size, buf.length - size, null);
+      if (n === 0) break;
+      size += n;
+      if (size > stat.size) throw censusFailure(`the manifest of ${packageDir} grew while it was read.`);
+    }
+    try {
+      return JSON.parse(buf.subarray(0, size).toString("utf8"));
+    } catch {
+      throw censusFailure(`the manifest of ${packageDir} is not valid JSON.`);
+    }
+  } catch (err) {
+    if (err?.code === ERR_DEV_CLI_DECLARER_CENSUS) throw err;
+    throw censusFailure(`the manifest of ${packageDir} could not be read (${err?.code ?? "error"}).`);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * EVERY declarer of `cinatra.devCliModules[key]`, for a key that several
+ * extensions may contribute to, from a BOUNDED census: scopes and package dirs
+ * in sorted order, real directories only (a symlinked scope or package dir is
+ * not followed), each package.json a regular file of at most
+ * DECLARER_CENSUS_MAX_MANIFEST_BYTES read without blocking, and at most
+ * DECLARER_CENSUS_MAX_PACKAGES packages. Each declared path is confined inside
+ * its own extension dir (a path that leaves it is skipped). Returns
+ * `[{ packageDir, modulePath, optional }]` — `packageDir` relative to the root
+ * (`extensions/<scope>/<name>`), `modulePath` absolute, `optional` true only
+ * when the same manifest sets `cinatra.<optionalFlag>` to the boolean true —
+ * or `[]`. A dir with no package.json is not a package. A manifest that cannot
+ * be read or parsed within the bounds, or a census past the package bound,
+ * THROWS (code ERR_CINATRA_DEV_CLI_DECLARER_CENSUS) naming the package dir: a
+ * caller that must not miss a declarer never reads such a census as empty.
+ *
+ * `repoRoot` is REQUIRED, exactly as above.
+ */
+export function discoverAllDevCliModulePaths(key, repoRoot, { optionalFlag = null } = {}) {
+  const root = requireResolvedRepoRoot(key, repoRoot);
+  const extRoot = path.join(root, "extensions");
+  const found = [];
+  const scopes = censusDirectories(extRoot, "extensions");
+  if (scopes === null) return found;
+  let packages = 0;
+  for (const scope of scopes) {
+    const dirs = censusDirectories(path.join(extRoot, scope), path.join("extensions", scope));
+    for (const dir of dirs) {
+      const packageDir = path.join("extensions", scope, dir);
+      const pkg = readBoundedManifest(path.join(extRoot, scope, dir, "package.json"), packageDir);
+      if (pkg === null) continue; // not a package dir
+      packages += 1;
+      if (packages > DECLARER_CENSUS_MAX_PACKAGES) {
+        throw censusFailure(`more than ${DECLARER_CENSUS_MAX_PACKAGES} packages under extensions/.`);
+      }
+      const declared = pkg?.cinatra?.devCliModules;
+      if (!declared || typeof declared !== "object") continue;
+      const rel = declared[key];
+      if (typeof rel !== "string" || rel.length === 0) continue;
+      // Confine the declared path inside the declaring extension dir
+      // (a manifest is repo-external data; never let it traverse out).
+      const base = path.join(extRoot, scope, dir);
+      const resolved = path.resolve(base, rel);
+      if (resolved !== base && !resolved.startsWith(base + path.sep)) continue;
+      const optional = optionalFlag !== null && pkg.cinatra[optionalFlag] === true;
+      found.push({ packageDir, modulePath: resolved, optional });
     }
   }
   return found;
