@@ -17,6 +17,7 @@ import * as tar from "tar";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { answerComposeOwnership } from "./helpers/fake-compose-ownership.mjs";
+import { answerPreviewIdentity, nextRunId } from "./helpers/fake-preview-identity.mjs";
 import { __test as P } from "../src/preview.mjs";
 import { __test as F } from "../src/install-preview.mjs";
 import { parseInstallArgs } from "../src/install.mjs";
@@ -67,6 +68,8 @@ function makeDeps(state = {}) {
     calls.push(args);
     const ownership = answerComposeOwnership(args, state);
     if (ownership) return ownership;
+    const identity = answerPreviewIdentity(args, state, { containerExists: (s) => Boolean(s.containerRunning) });
+    if (identity) return identity;
     const [verb, sub] = args;
     if (verb === "volume" && String(args.at(-1)).startsWith("cinatra-preview-artifacts-")) {
       const name = args.at(-1);
@@ -100,7 +103,7 @@ function makeDeps(state = {}) {
     }
     if (verb === "run" && sub === "-d") {
       state.containerRunning = true;
-      return { status: 0, stdout: "deadbeef\n", stderr: "" };
+      return { status: 0, stdout: `${nextRunId(state)}\n`, stderr: "" };
     }
     if (verb === "container" && sub === "inspect") {
       const running = Boolean(state.containerRunning);

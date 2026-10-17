@@ -220,6 +220,84 @@ The memory and graph endpoints (`GRAPHITI_URL`, `NEO4J_URI`) stay on the host as
 well: they belong to subsystems outside extension installs, connections and the
 agent runtime bridge, so forwarding them is a separate decision.
 
+### What a preview command prints for a host to read
+
+A successful `cinatra instance preview create`, `instance preview start --recreate`
+or `instance preview refresh` prints exactly one line of this form to standard
+output:
+
+    preview_container_id=<id>
+
+`<id>` is the full 64-character lowercase hexadecimal ID that the command's own
+`docker run -d` returned in that run. It is never read back from `docker ps`,
+`docker inspect` or the container's name, it is printed only after that
+container's checks pass, and no failure prints it. A plain `instance preview
+start` that makes no new container prints no such line. The preview's registry
+row (`~/.cinatra/previews.json`) records the same value as `containerId`; a row
+written by an older CLI has no `containerId` and proves nothing about which run
+made its container.
+
+Every later step binds to that ID. `start`, `start --recreate` and `refresh`
+read the live container's ID with a status-checked `docker container inspect`
+and act only when it equals the recorded one; a mismatch or a failed read
+changes nothing. A row an older CLI wrote records no ID: `refresh` and a plain
+`start` refuse it, and `start --recreate` is the one step that clears it, removing
+only the container its own run set aside, by the ID it read when it did so. The cleanup of a failed command removes only what that command made itself: the
+container by the ID its own run returned (or docker's `--cidfile` when the run
+failed after creating it), and the data volume only when the volume carries the
+label `cinatra.preview.volume-created-by` with that run's own random value. When
+a removal fails, the row is kept as `degraded`, never released as if the removal
+were clean: what is left is named in `cleanupIncomplete`, or, when it is the
+preview's own container that could not be replaced, in `containerConditions`.
+
+A degraded row keeps two separate lists. `cleanupIncomplete` names things to
+remove (another container, a forwarder, a volume, or the preview's previous
+container left under its `.superseded` name); a later command marks the row
+ready only after a status-checked listing shows each of them gone.
+`containerConditions` names a condition of the preview's own container, such as
+`not-running` (it was left stopped) or `without-forwards` (it runs without its
+declared forwards), which the next `instance preview start` checks again and
+clears when the container is running and healthy, or `state-unsettled`. A call
+that docker answers with no success, a timeout included, may still take effect
+after it answered and after any read, in the same command or a later one, so no
+read clears it. A stop or start of the preview's own container answered that way
+is the condition `state-unsettled`, a removal of it answered that way is the
+condition `not-replaced`, and a rename of it answered that way names it under
+its `.superseded` name. Each of these is kept: a plain `instance preview start`
+refuses that row and changes nothing, and `start --recreate` is the step that
+clears it, since it replaces the container and removes the old one by its ID.
+Only `not-running` and `without-forwards`, which are written from an answered
+read, are checked again by a plain start. A rename or removal of another
+container answered that way names it as a leftover. Every `docker run`
+that makes a preview's container or its forwarder goes through one call: a run
+that answers no success before docker's `--cidfile` names an ID is named as a
+leftover by the container name it ran under, and no read clears it, even one
+that finds no such container. Only a later run under that name that succeeds
+clears it (docker refuses a second container of the same name). A data volume
+create that answers no success is named the same way and stays named, and so
+does a volume whose create succeeded when its labels cannot be read. A forwarder
+an older CLI made carries no label naming its container: `start --recreate` also
+removes the forwarder of the preview's own name that carries none, and a
+forwarder name that another container still holds is named in the error. One module of
+the CLI, `src/preview-authority.mjs`, makes every removal of a preview's
+container, forwarder or data volume and every promotion of its row to ready. A
+test reads the source and fails when any source file outside that module holds a
+removal the test does not list for it, when a preview source file writes the
+ready state outside that module, and when any other source file's ready states
+differ from the list that test keeps of them.
+
+### Extensions that hand a preview its host settings
+
+An extension declares a host handover in its `package.json` as
+`cinatra.devCliModules["preview-host-handover"]`. Such a declarer is
+**required**: if its manifest cannot be read, or its module fails, times out,
+exports no `previewHostHandover` function, returns no `{ env, forwards }` object
+or hands over any entry the CLI does not take, the preview is refused. A
+declarer whose handover may be left out says so in the same manifest with
+`"cinatra": { "previewHostHandoverOptional": true }` (the boolean `true`); its
+failure then skips its whole contribution, and the command names the package in
+a warning.
+
 ### Where a preview publishes its port
 
 A preview container publishes its app port to a host port, and by default that
