@@ -20,6 +20,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { answerComposeOwnership } from "./helpers/fake-compose-ownership.mjs";
+import { answerPreviewIdentity, nextRunId, SEED_CONTAINER_ID } from "./helpers/fake-preview-identity.mjs";
 
 import { __test as F } from "../src/install-preview.mjs";
 import { __test as P } from "../src/preview.mjs";
@@ -98,6 +99,8 @@ function makeFakeDocker(state) {
     calls.push(args);
     const ownership = answerComposeOwnership(args, state); // cinatra-cli#219
     if (ownership) return ownership;
+    const identity = answerPreviewIdentity(args, state, { containerExists: (s) => Boolean(s.containerRunning) });
+    if (identity) return identity;
     const [verb, sub] = args;
     if (verb === "volume" && args.at(-1).startsWith("cinatra-preview-artifacts-")) {
       const name=args.at(-1), slug=name.slice("cinatra-preview-artifacts-".length);
@@ -109,7 +112,7 @@ function makeFakeDocker(state) {
     if (verb === "build") return { status: 0, stdout: "", stderr: "" };
     if (verb === "run" && sub === "-d") {
       state.containerRunning = true;
-      return { status: 0, stdout: "deadbeef\n", stderr: "" };
+      return { status: 0, stdout: `${nextRunId(state)}\n`, stderr: "" };
     }
     if (verb === "container" && sub === "inspect" && args.includes("{{json .}}")) {
       const slug=args.at(-1).slice("cinatra-preview-".length);
@@ -144,6 +147,10 @@ function makeBootstrapDeps(state = {}) {
     probeHealth: async () => state.health ?? { status: 200, body: '{"status":"ok"}' },
     probePort: async () => true,
     runDocker: fake.runDocker,
+    // This suite does not model docker's container metadata. Under enforce an
+    // endpoint set docker could not be read for refuses (cinatra-cli#307), so the
+    // gate runs in warn here, which is what these cases measured before.
+    ownershipControlEnv: { CINATRA_PREVIEW_ENDPOINT_OWNERSHIP: "warn" },
   };
   return { deps, fake, logs };
 }
@@ -395,7 +402,7 @@ describe("preview refresh — the continuation invents nothing (#197 AC6)", () =
     writeRegistry(registryPath, {
       version: 1,
       previews: {
-        plain: makePreviewSlot({ slug: "plain", ref: "main", sha: SHA_A, hostPort: 3410, now: () => "T0" }),
+        plain: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID, slug: "plain", ref: "main", sha: SHA_A, hostPort: 3410, now: () => "T0" }),
       },
     });
     const refreshed = makeBootstrapDeps({ sha: SHA_B });

@@ -11,9 +11,10 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { answerComposeOwnership } from "./helpers/fake-compose-ownership.mjs";
+import { answerPreviewIdentity, nextRunId, SEED_CONTAINER_ID } from "./helpers/fake-preview-identity.mjs";
 
 // engineering#660: the two DELEGATED env writers own their key sets in
 // their own modules; the coverage guard below reads them from there rather than
@@ -22,6 +23,21 @@ import { buildCoUseEnv } from "../src/install-couse.mjs";
 import { CLI_MANAGED_EXECUTION_ENV_KEYS } from "../src/execution-mode.mjs";
 
 import { __test as P } from "../src/preview.mjs";
+
+// One seam for the leftover ledger's proof: the authority module's reader
+// THROWS on a result that carries `madeUpReaderCrash`, so a case can throw
+// between a recreate's boot and its restore. Every other result is read
+// exactly as the module reads it.
+vi.mock("../src/preview-authority.mjs", async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    outputText: (r, stream) => {
+      if (r !== null && typeof r === "object" && Object.hasOwn(r, "madeUpReaderCrash")) throw new Error("made-up reader crash");
+      return actual.outputText(r, stream);
+    },
+  };
+});
 
 const {
   isValidSlug,
@@ -121,6 +137,8 @@ const {
 
 const SHA_A = "a".repeat(40);
 const SHA_B = "b".repeat(40);
+// The ID the fake docker prints for its n-th preview run.
+const RUN_ID = (n) => n.toString(16).padStart(64, "c");
 const KEY_64 = "00000000000000000000000000000000000000000000000000000000000000e2"; // 64 hex chars
 
 let tmp;
@@ -155,6 +173,26 @@ function makeFakeDocker(state) {
     // claim), so a case about something else is unaffected by the gate.
     const ownership = answerComposeOwnership(args, state);
     if (ownership) return ownership;
+    const identity = answerPreviewIdentity(args, state, {
+      containerExists: (s) => !s.containerAbsent && Boolean(s.containerRunning || s.containerPresentStopped),
+    });
+    if (identity) return identity;
+    // Per-case answers for the status-checked listings, the removals and the run.
+    if (args[1] === "ls" && state.lsAnswer) {
+      const answer = state.lsAnswer(args);
+      if (answer) return answer;
+    }
+    if (args[0] === "rm" && state.rmAnswer) {
+      const answer = state.rmAnswer(args);
+      if (answer) return answer;
+    }
+    if (args[0] === "volume" && args[1] === "rm" && state.volumeRmAnswer) return state.volumeRmAnswer(args);
+    if (args[0] === "run" && state.runAnswer) return state.runAnswer(args);
+    if (args[0] === "container" && args[1] === "inspect" && args.includes("{{.State.Running}}") && state.stateInspectAnswer) {
+      return state.stateInspectAnswer(args);
+    }
+    if (args[0] === "volume" && args[1] === "inspect" && args.length === 3 && state.volumePlainInspect &&
+        !String(args[2]).startsWith("cinatra-preview-artifacts-")) return state.volumePlainInspect;
     const [verb, sub] = args;
     // Separate user-data volume and real container mount inspection. Existing
     // unrelated fixtures start with an owned seeded volume; new lifecycle cases
@@ -196,7 +234,7 @@ function makeFakeDocker(state) {
     if (verb === "run" && sub === "-d") {
       state.containerRunning = true;
       state.containerAbsent = false; // it exists now (cinatra-cli#220)
-      return { status: 0, stdout: "deadbeef\n", stderr: "" };
+      return { status: 0, stdout: `${nextRunId(state)}\n`, stderr: "" };
     }
     // `docker container inspect -f {{.State.Running}} <name>` — liveness via the
     // running state (a bare inspect would succeed for a STOPPED container).
@@ -259,6 +297,7 @@ function makeFakeDocker(state) {
     }
     if (verb === "rename") {
       state.renames = [...(state.renames ?? []), args.slice(1)];
+      if (!String(args[2]).endsWith(P.SUPERSEDED_CONTAINER_SUFFIX) && /^[0-9a-f]{64}$/.test(String(args[1]))) state.liveContainerId = args[1];
       // `renameFailsAfter: n` lets a test fail the n-th rename (the RESTORE) while
       // letting the park succeed.
       const n = state.renames.length;
@@ -439,8 +478,11 @@ describe("preview — development-boot parity keys (cinatra-cli#300)", () => {
       containerRunning: true,
       health: healthy,
       images: new Set([slot.imageTag]),
+      liveContainerId: slot.containerId,
       compose: { containers: [{ id: "own-redis", name: "cinatra-redis-1", service: "redis", project: "cinatra", workingDir: tmp, ports: [["127.0.0.1", 6379, 6379]] }] },
     };
+    // The fake's next run ID differs from the recorded one, as docker's always does.
+    state.runIds = 9;
     const { deps: sdeps, fake: sfake } = makeDeps(state, { env });
     await runPreviewStart(["--slug", "main", "--recreate"], sdeps);
     expect(sfake.calls.find((c) => c[0] === "run").join(" ")).not.toContain("GRAPHITI_URL=");
@@ -539,7 +581,8 @@ describe("preview — agent-registry env forwarding (cinatra-cli#190)", () => {
   it("the boot maps the gateway host so the rewritten value resolves on a Linux engine too", async () => {
     const { deps, fake } = makeDeps(
       { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' } },
-      { env: { [ENCRYPTION_KEY_ENV]: KEY_64, CINATRA_AGENT_REGISTRY_URL: "http://127.0.0.1:4973" } },
+      // This case is about the gateway mapping; docker's container metadata is not modelled, so the ownership gate runs in warn.
+      { env: { [ENCRYPTION_KEY_ENV]: KEY_64, CINATRA_AGENT_REGISTRY_URL: "http://127.0.0.1:4973", CINATRA_PREVIEW_ENDPOINT_OWNERSHIP: "warn" } },
     );
     await runPreviewCreate(["--slug", "main"], deps);
     const run = fake.calls.find((c) => c[0] === "run");
@@ -695,7 +738,7 @@ describe("preview — real-prod-checkout guard (AC9)", () => {
 
 describe("preview — registry slot bookkeeping (AC3)", () => {
   it("makePreviewSlot records sha/tag/provenance/volume and seeds history", () => {
-    const slot = makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3010, now: () => "T0" });
+    const slot = makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3010, now: () => "T0" });
     expect(slot.sha).toBe(SHA_A);
     expect(slot.imageTag).toBe(previewImageTag(SHA_A));
     expect(slot.provenance).toBe(previewProvenance(SHA_A));
@@ -704,7 +747,7 @@ describe("preview — registry slot bookkeeping (AC3)", () => {
     expect(slot.history).toEqual([{ sha: SHA_A, imageTag: previewImageTag(SHA_A), at: "T0" }]);
   });
   it("refreshPreviewSlot records the NEW sha/tag and APPENDS old->new history (never silent overwrite)", () => {
-    const first = makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3010, now: () => "T0" });
+    const first = makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3010, now: () => "T0" });
     const second = refreshPreviewSlot(first, { ref: "main", sha: SHA_B, now: () => "T1" });
     expect(second.sha).toBe(SHA_B);
     expect(second.imageTag).toBe(previewImageTag(SHA_B));
@@ -712,7 +755,7 @@ describe("preview — registry slot bookkeeping (AC3)", () => {
     expect(second.history.map((h) => h.sha)).toEqual([SHA_A, SHA_B]);
   });
   it("round-trips through write/read and validates the shape", () => {
-    const slot = makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3010, now: () => "T0" });
+    const slot = makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3010, now: () => "T0" });
     writeRegistry(registryPath, { version: 1, previews: { main: slot } });
     const { status, registry } = readRegistry(registryPath);
     expect(status).toBe("ok");
@@ -768,7 +811,7 @@ describe("preview create — build + boot + health-gate (AC1, AC2, AC5)", () => 
   });
 
   it("AC1: create fails if a preview already exists for the slug (points to refresh)", async () => {
-    writeRegistry(registryPath, { version: 1, previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3010, now: () => "T0" }) } });
+    writeRegistry(registryPath, { version: 1, previews: { main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3010, now: () => "T0" }) } });
     const { deps } = makeDeps({ sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' } });
     await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/already exists.*refresh/s);
   });
@@ -789,8 +832,8 @@ describe("preview create — build + boot + health-gate (AC1, AC2, AC5)", () => 
     const state = { sha: SHA_A, health: { status: 503, body: '{"status":"degraded"}' } };
     const { deps, fake } = makeDeps(state);
     await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/did not reach healthy.*degraded/s);
-    // The failed container + freshly-built image + empty volume were removed.
-    expect(state.removedContainers).toContain("cinatra-preview-main");
+    // The failed container (by the ID its own run returned) + freshly-built image + the volume this create made were removed.
+    expect(state.removedContainers).toContain(RUN_ID(1));
     expect(state.removedImages).toContain(previewImageTag(SHA_A));
     expect(state.removedVolumes).toContain("cinatra-preview-data-main");
     // Diagnostics were dumped.
@@ -823,13 +866,13 @@ describe("preview refresh — rebuild at a new SHA (AC1, AC3, AC4, AC5, AC10)", 
   function seedReady() {
     writeRegistry(registryPath, {
       version: 1,
-      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3010, now: () => "T0" }) },
+      previews: { main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3010, now: () => "T0" }) },
     });
   }
 
   it("rebuilds at the NEW sha, reboots, REUSES the volume, health-gates, cleans up the superseded image", async () => {
     seedReady();
-    const state = { sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' } };
+    const state = { sha: SHA_B, containerRunning: true, health: { status: 200, body: '{"status":"ok"}' } };
     const { deps, fake } = makeDeps(state);
     const out = await runPreviewRefresh(["--ref", "main", "--slug", "main"], deps);
     expect(out.sha).toBe(SHA_B);
@@ -844,9 +887,9 @@ describe("preview refresh — rebuild at a new SHA (AC1, AC3, AC4, AC5, AC10)", 
     expect(run.join(" ")).toContain(`cinatra-preview-data-main:${EXTENSION_DATA_ROOT_IN_CONTAINER}`);
     expect(state.removedVolumes ?? []).not.toContain("cinatra-preview-data-main");
 
-    // AC4: the replaced container was removed AND the superseded OLD image was
+    // AC4: the replaced container was removed (by the ID a status-checked inspect read) AND the superseded OLD image was
     // cleaned up once the new one was healthy.
-    expect(state.removedContainers).toContain("cinatra-preview-main");
+    expect(state.removedContainers).toContain(SEED_CONTAINER_ID);
     expect(state.removedImages).toContain(previewImageTag(SHA_A));
     // ...but NOT the new image.
     expect(state.removedImages).not.toContain(previewImageTag(SHA_B));
@@ -916,7 +959,7 @@ describe("preview status/list (AC3)", () => {
   it("surfaces sha, tag, provenance, volume, and state", () => {
     writeRegistry(registryPath, {
       version: 1,
-      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3010, now: () => "T0" }) },
+      previews: { main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3010, now: () => "T0" }) },
     });
     const logs = [];
     runPreviewStatus(["--slug", "main"], { registryPath, checkoutDir: tmp, log: (...m) => logs.push(m.join(" ")) });
@@ -949,8 +992,8 @@ describe("preview — shared-SHA image tags are never dropped from under a sibli
     writeRegistry(registryPath, {
       version: 1,
       previews: {
-        one: makePreviewSlot({ slug: "one", ref: "main", sha: SHA_A, hostPort: 3010, now: () => "T0" }),
-        two: makePreviewSlot({ slug: "two", ref: "main", sha: SHA_A, hostPort: 3011, now: () => "T0" }),
+        one: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "one", ref: "main", sha: SHA_A, hostPort: 3010, now: () => "T0" }),
+        two: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "two", ref: "main", sha: SHA_A, hostPort: 3011, now: () => "T0" }),
       },
     });
     const state = { sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' } };
@@ -982,8 +1025,8 @@ describe("preview — container liveness uses .State.Running, not mere existence
     expect(P.containerRunning("x", stopped)).toBe(false);
     const running = { runDocker: () => ({ status: 0, stdout: "true\n", stderr: "" }) };
     expect(P.containerRunning("x", running)).toBe(true);
-    // cinatra-cli#220: docker NAMES a missing container; that is absence.
-    const absent = { runDocker: () => ({ status: 1, stdout: "", stderr: "Error: No such object: x" }) };
+    // cinatra-cli#307: absence is a status-checked listing that names no such container, never the inspect's text.
+    const absent = { runDocker: (a) => a[1] === "ls" ? { status: 0, stdout: "", stderr: "" } : { status: 1, stdout: "", stderr: "Error: No such object: x" } };
     expect(P.containerRunning("x", absent)).toBe(false);
     expect(P.containerState("x", absent)).toBe("absent");
   });
@@ -1005,7 +1048,7 @@ describe("preview — container liveness uses .State.Running, not mere existence
   it("cinatra-cli#220: stop and start REFUSE on an unknown container state", async () => {
     writeRegistry(registryPath, {
       version: 1,
-      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+      previews: { main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
     });
     const unanswered = (extra = {}) => ({
       registryPath,
@@ -1056,7 +1099,7 @@ describe("preview — host-port allocation (no default-stack / sibling collision
   it("skips a port already claimed by another preview row (siblings never collide)", async () => {
     const registry = {
       previews: {
-        a: makePreviewSlot({ slug: "a", ref: "main", sha: SHA_A, hostPort: PREVIEW_HOST_PORT_MIN, now: () => "T0" }),
+        a: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "a", ref: "main", sha: SHA_A, hostPort: PREVIEW_HOST_PORT_MIN, now: () => "T0" }),
       },
     };
     expect([...usedPreviewHostPorts(registry)]).toContain(PREVIEW_HOST_PORT_MIN);
@@ -1088,7 +1131,7 @@ describe("preview — host-port allocation (no default-stack / sibling collision
     // Legacy row: created before per-preview ports (hostPort null).
     writeRegistry(registryPath, {
       version: 1,
-      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, now: () => "T0" }) },
+      previews: { main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, now: () => "T0" }) },
     });
     expect(getPreview(readRegistry(registryPath).registry, "main").hostPort).toBeNull();
     // Build fails AFTER the claim is written — abort restores from the persisted
@@ -1126,7 +1169,7 @@ describe("preview — host-port allocation (no default-stack / sibling collision
   it("refresh REUSES the durable recorded host port (does not re-allocate)", async () => {
     writeRegistry(registryPath, {
       version: 1,
-      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 4444, now: () => "T0" }) },
+      previews: { main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 4444, now: () => "T0" }) },
     });
     const { deps, fake } = makeDeps({ sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' } });
     const out = await runPreviewRefresh(["--slug", "main"], deps);
@@ -1325,7 +1368,7 @@ describe("preview build budget — default + bounded override (#194)", () => {
   it("refresh honours the override and FAILS FAST on a malformed one — the running preview is untouched", async () => {
     writeRegistry(registryPath, {
       version: 1,
-      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+      previews: { main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
     });
     const { deps: bad, fake: badFake } = makeDeps(
       { sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' } },
@@ -1660,7 +1703,7 @@ describe("preview build levers — memory ceiling + CI forward (#210)", () => {
   it("refresh FAILS FAST on a malformed ceiling — the running preview is untouched", async () => {
     writeRegistry(registryPath, {
       version: 1,
-      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+      previews: { main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
     });
     const { deps: bad, fake: badFake } = makeDeps(
       { sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' } },
@@ -2025,7 +2068,7 @@ describe("preview build levers: worker count + bundler selection", () => {
 
     writeRegistry(registryPath, {
       version: 1,
-      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+      previews: { main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
     });
     const { deps: badRefresh, fake: badRefreshFake } = makeDeps(
       { sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' } },
@@ -2157,7 +2200,7 @@ describe("preview — container-dialed endpoint ownership (cinatra-cli#219)", ()
   it("refresh REFUSES before the running preview is touched", async () => {
     writeRegistry(registryPath, {
       version: 1,
-      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+      previews: { main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
     });
     const { deps, fake } = makeDeps(
       { sha: SHA_B, health: { status: 200, body: '{"status":"ok"}' }, compose: reproWorld() },
@@ -2207,7 +2250,7 @@ describe("preview — an image already present for the SHA is reused (cinatra-cl
   function seedReady(sha = SHA_A, hostPort = 3400) {
     writeRegistry(registryPath, {
       version: 1,
-      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha, hostPort, now: () => "T0" }) },
+      previews: { main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha, hostPort, now: () => "T0" }) },
     });
   }
 
@@ -2272,7 +2315,7 @@ describe("preview stop / start (cinatra-cli#220 AC3, AC4, AC5, AC6)", () => {
   function seedReady({ sha = SHA_A, hostPort = 3400 } = {}) {
     writeRegistry(registryPath, {
       version: 1,
-      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha, hostPort, now: () => "T0" }) },
+      previews: { main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha, hostPort, now: () => "T0" }) },
     });
   }
 
@@ -2281,7 +2324,7 @@ describe("preview stop / start (cinatra-cli#220 AC3, AC4, AC5, AC6)", () => {
     const { deps, fake } = makeDeps({ containerRunning: true });
     const out = await runPreviewStop(["--slug", "main"], deps);
     expect(out.container).toBe("stopped");
-    expect(fake.calls.find((c) => c[0] === "stop")).toEqual(["stop", "cinatra-preview-main"]);
+    expect(fake.calls.find((c) => c[0] === "stop")).toEqual(["stop", SEED_CONTAINER_ID]);
     // NEVER a volume/image removal, and the row is untouched.
     expect(fake.calls.some((c) => c[0] === "volume" && c[1] === "rm")).toBe(false);
     expect(fake.calls.some((c) => c[0] === "rm")).toBe(false);
@@ -2307,7 +2350,8 @@ describe("preview stop / start (cinatra-cli#220 AC3, AC4, AC5, AC6)", () => {
     const { deps, fake } = makeDeps(state);
     const out = await runPreviewStart(["--slug", "main"], deps);
     expect(out).toMatchObject({ container: "running", rematerialized: false });
-    expect(fake.calls.find((c) => c[0] === "start")).toEqual(["start", "cinatra-preview-main"]);
+    // Started by the ID a status-checked inspect read (the seeded row records none, so it proves nothing either way).
+    expect(fake.calls.find((c) => c[0] === "start")).toEqual(["start", SEED_CONTAINER_ID]);
     // No build, no run, no removal — the container was never destroyed.
     expect(fake.calls.some((c) => c[0] === "build")).toBe(false);
     expect(fake.calls.some((c) => c[0] === "run")).toBe(false);
@@ -2320,6 +2364,38 @@ describe("preview stop / start (cinatra-cli#220 AC3, AC4, AC5, AC6)", () => {
     const out = await runPreviewStart(["--slug", "main"], deps);
     expect(out.changed).toBe(false);
     expect(fake.calls.some((c) => c[0] === "run" || c[0] === "build" || c[0] === "start")).toBe(false);
+  });
+
+  it("a plain start that re-materializes an absent container prints no preview_container_id line; it records the new ID", async () => {
+    seedReady();
+    const state = { containerAbsent: true, health: { status: 200, body: '{"status":"ok"}' }, images: new Set([previewImageTag(SHA_A)]), compose: OWNED() };
+    const { deps, logs } = makeDeps(state, { env: { [ENCRYPTION_KEY_ENV]: KEY_64, REDIS_URL: "redis://127.0.0.1:6379" } });
+    const out = await runPreviewStart(["--slug", "main"], deps);
+    expect(out.rematerialized).toBe(true);
+    expect(logs.filter((l) => /^preview_container_id=/.test(l))).toEqual([]);
+    expect(getPreview(readRegistry(registryPath).registry, "main").containerId).toBe(out.containerId);
+  });
+
+  it("a logger that throws never changes a verb's path: a create keeps its ready row and the container its run made", async () => {
+    const state = { sha: SHA_A, health: { status: 200, body: '{"status":"ok"}' } };
+    const { deps, fake } = makeDeps(state);
+    deps.log = () => { throw new Error("made-up broken stdout"); };
+    await runPreviewCreate(["--slug", "main"], deps);
+    expect(getPreview(readRegistry(registryPath).registry, "main").state).toBe("ready");
+    expect(fake.calls.filter((c) => c[0] === "rm")).toEqual([]);
+  });
+
+  it("a verb whose docker seam throws still settles its claim: the row is never left in flight", async () => {
+    seedReady();
+    const { deps } = makeDeps({ health: { status: 200, body: '{"status":"ok"}' } });
+    const run = deps.runDocker;
+    // the claim's own reads answer; every container read after the claim throws
+    deps.runDocker = (args, o) => {
+      if (args[0] === "container") throw new Error("made-up seam crash");
+      return run(args, o);
+    };
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(/Could not determine the state/);
+    expect(getPreview(readRegistry(registryPath).registry, "main").state).toBe("ready");
   });
 
   it("AC3: start RE-MATERIALIZES an absent container from the recorded image — no build", async () => {
@@ -2361,8 +2437,8 @@ describe("preview stop / start (cinatra-cli#220 AC3, AC4, AC5, AC6)", () => {
     expect(fake.calls.some((c) => c[0] === "build")).toBe(false);
     // AC6: the OLD container was PARKED (renamed + stopped), not destroyed, and
     // only dropped once the new one was healthy.
-    expect(state.renames[0]).toEqual(["cinatra-preview-main", `cinatra-preview-main${P.SUPERSEDED_CONTAINER_SUFFIX}`]);
-    expect(state.removedContainers).toContain(`cinatra-preview-main${P.SUPERSEDED_CONTAINER_SUFFIX}`);
+    expect(state.renames[0]).toEqual([SEED_CONTAINER_ID, `cinatra-preview-main${P.SUPERSEDED_CONTAINER_SUFFIX}`]);
+    expect(state.removedContainers).toContain(SEED_CONTAINER_ID);
   });
 
   it("AC6: a re-materialization that fails its health gate RESTORES the previous container", async () => {
@@ -2378,10 +2454,61 @@ describe("preview stop / start (cinatra-cli#220 AC3, AC4, AC5, AC6)", () => {
       /PREVIOUS container was restored and restarted/,
     );
     // Renamed aside, then renamed BACK and started again.
-    expect(state.renames[1]).toEqual([`cinatra-preview-main${P.SUPERSEDED_CONTAINER_SUFFIX}`, "cinatra-preview-main"]);
-    expect(state.started).toContain("cinatra-preview-main");
+    expect(state.renames[1]).toEqual([SEED_CONTAINER_ID, "cinatra-preview-main"]);
+    expect(state.started).toContain(SEED_CONTAINER_ID);
     // The row is NOT left degraded — the preview is as it was found.
     expect(getPreview(readRegistry(registryPath).registry, "main").state).toBe("ready");
+  });
+
+  it("a logs answer that is not text never skips the settle: a stopped start that fails its gate leaves the row degraded", async () => {
+    seedReady();
+    const state = { containerRunning: false, containerPresentStopped: true, health: { status: 503, body: '{"status":"degraded"}' }, compose: OWNED() };
+    const { deps } = makeDeps(state);
+    const run = deps.runDocker;
+    deps.runDocker = (args, o) => (args[0] === "logs" ? { status: 0, stdout: Symbol("made-up logs"), stderr: "" } : run(args, o));
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(/started but did not reach healthy/);
+    expect(getPreview(readRegistry(registryPath).registry, "main").state).toBe("degraded");
+  });
+
+  it("a logs answer that is not text never skips the restore: a recreate that fails its gate puts the previous container back", async () => {
+    seedReady();
+    const state = { containerRunning: true, health: { status: 503, body: '{"status":"degraded"}' }, images: new Set([previewImageTag(SHA_A)]), compose: OWNED() };
+    const { deps } = makeDeps(state, { env: { [ENCRYPTION_KEY_ENV]: KEY_64, REDIS_URL: "redis://127.0.0.1:6379" } });
+    const run = deps.runDocker;
+    deps.runDocker = (args, o) => (args[0] === "logs" ? { status: 0, stdout: Symbol("made-up logs"), stderr: "" } : run(args, o));
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(/PREVIOUS container was restored and restarted/);
+    expect(state.renames[1]).toEqual([SEED_CONTAINER_ID, "cinatra-preview-main"]);
+    expect(getPreview(readRegistry(registryPath).registry, "main")).toMatchObject({ state: "ready", containerId: SEED_CONTAINER_ID });
+  });
+
+  it("a recreate that throws between its boot and its restore leaves no ready row with the old ID: it names what it created and set aside", async () => {
+    seedReady();
+    const state = { containerRunning: true, health: { status: 503, body: '{"status":"degraded"}' }, images: new Set([previewImageTag(SHA_A)]), compose: OWNED() };
+    const { deps } = makeDeps(state, { env: { [ENCRYPTION_KEY_ENV]: KEY_64, REDIS_URL: "redis://127.0.0.1:6379" } });
+    const run = deps.runDocker;
+    // the throw: the logs read after the failed gate, before the restore
+    deps.runDocker = (args, o) => (args[0] === "logs" ? { status: 0, stdout: "", stderr: "", madeUpReaderCrash: true } : run(args, o));
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(/made-up reader crash/);
+    expect(state.renames).toHaveLength(1);
+    const row = getPreview(readRegistry(registryPath).registry, "main");
+    expect(row).toMatchObject({ state: "degraded", containerId: SEED_CONTAINER_ID });
+    expect(row.cleanupIncomplete).toEqual([
+      { kind: "container", id: state.liveContainerId, why: "this run created it and did not remove it" },
+      { kind: "container", id: SEED_CONTAINER_ID, name: `cinatra-preview-main${P.SUPERSEDED_CONTAINER_SUFFIX}`, why: "this run set it aside and did not put it back" },
+    ]);
+    expect(state.liveContainerId).not.toBe(SEED_CONTAINER_ID);
+  });
+
+  it("a mount answer that is not text proves no mount: a stopped start refuses before docker start", async () => {
+    seedReady();
+    const state = { containerRunning: false, containerPresentStopped: true, health: { status: 200, body: '{"status":"ok"}' }, compose: OWNED() };
+    const { deps, fake } = makeDeps(state);
+    const run = deps.runDocker;
+    const mount = JSON.stringify({ Mounts: [{ Type: "volume", Name: previewArtifactVolumeName("main"), Destination: "/data/artifacts", RW: true }],
+      Config: { Env: ["CINATRA_ARTIFACT_DATA_ROOT=/data/artifacts"] } });
+    deps.runDocker = (args, o) => (args.includes("{{json .}}") ? { status: 0, stdout: { toString: () => mount }, stderr: "" } : run(args, o));
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(/does not prove its recorded artifact mount/);
+    expect(fake.calls.some((c) => c[0] === "start")).toBe(false);
   });
 
   it("start refuses (and never builds) when the recorded image is gone", async () => {
@@ -2440,7 +2567,7 @@ describe("preview lifecycle — soundness of the reuse + park/restore paths (cin
     ],
   });
   function seedReady({ sha = SHA_A, hostPort = 3400, state } = {}) {
-    const slot = makePreviewSlot({ slug: "main", ref: "main", sha, hostPort, now: () => "T0" });
+    const slot = makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha, hostPort, now: () => "T0" });
     writeRegistry(registryPath, { version: 1, previews: { main: state ? { ...slot, state } : slot } });
   }
 
@@ -2536,7 +2663,7 @@ describe("preview lifecycle — soundness of the reuse + park/restore paths (cin
     writeRegistry(registryPath, {
       version: 1,
       previews: {
-        main: { ...makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }), state: "provisioning" },
+        main: { ...makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }), state: "provisioning" },
       },
     });
     await expect(runPreviewStop(["--slug", "main"], deps)).rejects.toThrow(/already in-flight/);
@@ -2547,21 +2674,29 @@ describe("preview lifecycle — soundness of the reuse + park/restore paths (cin
 });
 
 describe("preview — a durable volume is never destroyed on an unanswered probe (cinatra-cli#220)", () => {
-  it("an unanswered `volume inspect` reads as PRE-EXISTING, so abort keeps it", async () => {
+  it("an unanswered read of the data volume's labels refuses the create before the boot, and abort keeps the volume", async () => {
     const state = {
       sha: SHA_A,
       health: { status: 503, body: '{"status":"degraded"}' },
       volumeProbeUnanswered: true,
       compose: { containers: [] },
     };
-    const { deps } = makeDeps(state);
-    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/did not reach healthy/);
+    const { deps, fake } = makeDeps(state);
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/docker volume inspect cinatra-preview-data-main failed after its create/);
+    expect(fake.calls.some((c) => c[0] === "run")).toBe(false);
     // Unrecoverable if wrong: the volume holds the preview's encrypted data.
     expect(state.removedVolumes ?? []).not.toContain("cinatra-preview-data-main");
+    // The volume exists (its create exited 0) and whether this run made it is unknown: the fresh row is
+    // never deleted, and it names the volume as a leftover by its exact name.
+    const kept = getPreview(readRegistry(registryPath).registry, "main");
+    expect(kept.state).toBe("degraded");
+    expect(kept.cleanupIncomplete).toContainEqual({ kind: "volume", name: "cinatra-preview-data-main",
+      why: "docker volume inspect answered no map of labels after its create exited 0; whether this run made cinatra-preview-data-main is unknown" });
   });
 
   it("volumeAbsence separates docker's \"no such volume\" from a silent probe", () => {
-    const absent = { runDocker: () => ({ status: 1, stdout: "", stderr: "Error: No such volume: v" }) };
+    // cinatra-cli#307: absence is a status-checked listing that names no such volume, never the inspect's text.
+    const absent = { runDocker: (a) => a[1] === "ls" ? { status: 0, stdout: "other\n", stderr: "" } : { status: 1, stdout: "", stderr: "Error: No such volume: v" } };
     const present = { runDocker: () => ({ status: 0, stdout: "[]", stderr: "" }) };
     const quiet = { runDocker: () => ({ status: null, stdout: "", stderr: "", timedOut: true, error: new Error("ETIMEDOUT") }) };
     expect(P.volumeAbsence({ ref: "v", deps: absent })).toBe("absent");
@@ -2574,7 +2709,7 @@ describe("preview start — the re-materialize image check is the STAMPED one (c
   function seedReady() {
     writeRegistry(registryPath, {
       version: 1,
-      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+      previews: { main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
     });
   }
   const OWNED = () => ({
@@ -2616,7 +2751,7 @@ describe("preview start — the re-materialize image check is the STAMPED one (c
 
 describe("preview — the restore/degraded messages say only what was OBSERVED (cinatra-cli#220)", () => {
   function seedReady(state) {
-    const slot = makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" });
+    const slot = makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" });
     writeRegistry(registryPath, { version: 1, previews: { main: state ? { ...slot, state } : slot } });
   }
   const OWNED = () => ({
@@ -2668,7 +2803,7 @@ describe("preview — the publish bind address (cinatra-cli#248 AC1)", () => {
     writeRegistry(registryPath, {
       version: 1,
       previews: {
-        main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort, bind, now: () => "T0" }),
+        main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort, bind, now: () => "T0" }),
       },
     });
   }
@@ -2787,7 +2922,7 @@ describe("preview — the publish bind address (cinatra-cli#248 AC1)", () => {
   it("a row written before #248 (no `bind`) still publishes the unchanged default", async () => {
     writeRegistry(registryPath, {
       version: 1,
-      previews: { main: { ...makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) } },
+      previews: { main: { ...makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) } },
     });
     const reg = readRegistry(registryPath).registry;
     delete reg.previews.main.bind; // exactly the legacy row shape
@@ -3100,7 +3235,7 @@ describe("preview — bind: the row never claims an interface the container is n
     writeRegistry(registryPath, {
       version: 1,
       previews: {
-        main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, bind: null, now: () => "T0" }),
+        main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, bind: null, now: () => "T0" }),
       },
     });
     const { deps, fake, logs } = makeDeps({
@@ -3121,7 +3256,7 @@ describe("preview — bind: the row never claims an interface the container is n
     writeRegistry(registryPath, {
       version: 1,
       previews: {
-        main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, bind: null, now: () => "T0" }),
+        main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, bind: null, now: () => "T0" }),
       },
     });
     const { deps, fake } = makeDeps({
@@ -3758,7 +3893,7 @@ describe("preview extension fleet — --fleet required|dev (engineering#666)", (
     const row = getPreview(readRegistry(registryPath).registry, "main");
     expect(row.fleet).toBe("dev");
     // A row written before this lever reads as the required fleet, never undefined.
-    expect(makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }).fleet).toBe(
+    expect(makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }).fleet).toBe(
       "required",
     );
 
@@ -3812,7 +3947,7 @@ describe("preview extension fleet — --fleet required|dev (engineering#666)", (
     // valid, `status` prints a fleet no build produced, and a plain `refresh`
     // carries it past the claim into the build assembly, which refuses it only
     // after the row has been flipped to `provisioning`.
-    const corrupt = makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" });
+    const corrupt = makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" });
     corrupt.fleet = "devel"; // not one of PREVIEW_FLEETS; tag stays the required one
     writeFileSync(registryPath, JSON.stringify({ version: 1, previews: { main: corrupt } }));
     expect(readRegistry(registryPath).status).toBe("malformed");
@@ -3823,7 +3958,7 @@ describe("preview extension fleet — --fleet required|dev (engineering#666)", (
 
     // An ABSENT field is not corruption: that is every row written before this
     // lever, and it reads as the required set it was built with.
-    const legacy = makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" });
+    const legacy = makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" });
     delete legacy.fleet;
     writeFileSync(registryPath, JSON.stringify({ version: 1, previews: { main: legacy } }));
     expect(readRegistry(registryPath).status).toBe("ok");
@@ -3837,7 +3972,7 @@ describe("preview extension fleet — --fleet required|dev (engineering#666)", (
 
     writeRegistry(registryPath, {
       version: 1,
-      previews: { main: makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+      previews: { main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
     });
     const { deps: badRefresh, fake: badRefreshFake } = makeDeps({ sha: SHA_B, health: healthy });
     await expect(runPreviewRefresh(["--slug", "main", "--fleet", "devel"], badRefresh)).rejects.toThrow(/--fleet/);
@@ -3932,7 +4067,7 @@ describe("preview extension fleet — --fleet required|dev (engineering#666)", (
   it("a row written BEFORE this lever (no `fleet` field at all) stays valid and reads as the required fleet", async () => {
     // Not `makePreviewSlot(...)` without the option — that writes the field.
     // This is the shape a registry file on disk actually has today.
-    const legacy = makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" });
+    const legacy = makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" });
     delete legacy.fleet;
     expect(legacy.fleet).toBeUndefined();
     writeRegistry(registryPath, { version: 1, previews: { main: legacy } });
@@ -4020,7 +4155,7 @@ describe("preview extension fleet — --fleet required|dev (engineering#666)", (
       ],
     });
     for (const [fleet, expected] of [["dev", true], ["required", false], [undefined, false]]) {
-      const slot = makePreviewSlot({ slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, ...(fleet ? { fleet } : {}), now: () => "T0" });
+      const slot = makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID,  slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, ...(fleet ? { fleet } : {}), now: () => "T0" });
       if (fleet === undefined) delete slot.fleet;
       writeRegistry(registryPath, { version: 1, previews: { main: slot } });
       const state = { containerRunning: true, health: healthy, images: new Set([slot.imageTag]), compose: owned() };
@@ -4097,17 +4232,17 @@ describe("preview — separately owned durable artifact storage", () => {
     expect(state.artifactExists).toBe(true);expect(state.artifactDeleted).not.toBe(true);
   });
   it.each(["start","refresh"])("legacy %s refuses without a storage declaration and leaves row/container unchanged",async verb=>{
-    const row=makePreviewSlot({slug:"artifact",ref:"main",sha:SHA_A,hostPort:3400});delete row.artifactVolumeName;
+    const row=makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID, slug:"artifact",ref:"main",sha:SHA_A,hostPort:3400});delete row.artifactVolumeName;
     writeRegistry(registryPath,{version:1,previews:{artifact:row}});const original=readFileSync(registryPath,"utf8");
     const {deps,fake}=makeDeps({containerRunning:true});
     await expect((verb==="start"?runPreviewStart:runPreviewRefresh)(["--slug","artifact"],deps)).rejects.toThrow(/predates separate artifact storage/);
     expect(readFileSync(registryPath,"utf8")).toBe(original);expect(fake.calls).toEqual([]);
   });
   it.each(["start","refresh"])("missing recorded artifact volume refuses %s before touching serving container",async verb=>{
-    const row=makePreviewSlot({slug:"artifact",ref:"main",sha:SHA_A,hostPort:3400});writeRegistry(registryPath,{version:1,previews:{artifact:row}});
+    const row=makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID, slug:"artifact",ref:"main",sha:SHA_A,hostPort:3400});writeRegistry(registryPath,{version:1,previews:{artifact:row}});
     const state={artifactExists:false,containerRunning:true};const {deps,fake}=makeDeps(state);
     await expect((verb==="start"?runPreviewStart:runPreviewRefresh)(["--slug","artifact"],deps)).rejects.toThrow(/missing/);
-    expect(fake.calls.every(a=>a[0]==="volume"&&a[1]==="inspect")).toBe(true);expect(state.containerRunning).toBe(true);
+    expect(fake.calls.every(a=>a[0]==="volume"&&["inspect","ls"].includes(a[1]))).toBe(true);expect(state.containerRunning).toBe(true);
   });
   it("refresh and start recreate reuse the same artifact bytes and exact volume",async()=>{
     const state={health:{status:200,body:'{"status":"ok"}'},artifactBytes:"snapshot"};const {deps,fake}=makeDeps(state);
@@ -4127,7 +4262,7 @@ describe("preview — separately owned durable artifact storage", () => {
     expect(state.containerRunning).toBe(true);expect(state.artifactBytes).toBe("snapshot");expect(state.artifactDeleted).not.toBe(true);
   });
   it.each([{artifactMounts:[]},{artifactEnv:["CINATRA_ARTIFACT_DATA_ROOT=/wrong"]}])("start refuses existing container with incorrect artifact mount/root: %j",async extra=>{
-    writeRegistry(registryPath,{version:1,previews:{artifact:makePreviewSlot({slug:"artifact",ref:"main",sha:SHA_A,hostPort:3400})}});
+    writeRegistry(registryPath,{version:1,previews:{artifact:makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID, slug:"artifact",ref:"main",sha:SHA_A,hostPort:3400})}});
     const {deps,fake}=makeDeps({containerPresentStopped:true,...extra});
     await expect(runPreviewStart(["--slug","artifact"],deps)).rejects.toThrow(/artifact mount\/root/);
     expect(fake.calls.some(a=>["start","run","rm","rename"].includes(a[0]))).toBe(false);
@@ -4138,7 +4273,7 @@ describe("preview — separately owned durable artifact storage", () => {
 describe("preview — refresh storage read races and absence evidence",()=>{
   it.each([{artifactMounts:[]},{artifactEnv:["CINATRA_ARTIFACT_DATA_ROOT=/wrong"]},
       {artifactMounts:[{Type:"volume",Name:"foreign",Destination:"/data/artifacts",RW:true}]}])("refuses refresh of incorrectly bound serving container: %j",async extra=>{
-    const row=makePreviewSlot({slug:"artifact",ref:"main",sha:SHA_A,hostPort:3400});
+    const row=makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID, slug:"artifact",ref:"main",sha:SHA_A,hostPort:3400});
     writeRegistry(registryPath,{version:1,previews:{artifact:row}});const original=readFileSync(registryPath,"utf8");
     const state={containerRunning:true,artifactBytes:"preserved",...extra};const {deps,fake}=makeDeps(state);
     await expect(runPreviewRefresh(["--slug","artifact"],deps)).rejects.toThrow(/artifact mount\/root/);
@@ -4149,5 +4284,798 @@ describe("preview — refresh storage read races and absence evidence",()=>{
     const {deps,fake}=makeDeps({artifactProbeOverride:{stdout:"",stderr:"no such volume",...failure}});
     await expect(runPreviewCreate(["--slug","artifact"],deps)).rejects.toThrow(/Could not verify artifact volume/);
     expect(existsSync(registryPath)).toBe(false);expect(fake.calls.every(a=>a[1]==="inspect")).toBe(true);
+  });
+});
+
+
+// cinatra-cli#307 and the result line: every delete and every reuse is bound to a record this invocation made.
+describe("preview — deletes and reuse are bound to this run's own records (cinatra-cli#307)", () => {
+  const healthy = { status: 200, body: '{"status":"ok"}' };
+  const idLines = (logs) => logs.filter((l) => /^preview_container_id=/.test(l));
+  const created = () => getPreview(readRegistry(registryPath).registry, "main");
+
+  it("create prints exactly one preview_container_id line, the ID its own run returned, and the row records it", async () => {
+    const { deps, logs } = makeDeps({ sha: SHA_A, health: healthy });
+    const out = await runPreviewCreate(["--slug", "main"], deps);
+    expect(idLines(logs)).toEqual([`preview_container_id=${RUN_ID(1)}`]);
+    expect(out.containerId).toBe(RUN_ID(1));
+    expect(created().containerId).toBe(RUN_ID(1));
+  });
+
+  it("a create that fails prints no preview_container_id line", async () => {
+    const { deps, logs } = makeDeps({ sha: SHA_A, health: { status: 503, body: '{"status":"degraded"}' } });
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/did not reach healthy/);
+    expect(idLines(logs)).toEqual([]);
+    expect(created()).toBeNull();
+  });
+
+  it("a run that exits 0 without one full container ID fails the create, removes nothing by name and prints no line", async () => {
+    const state = { sha: SHA_A, health: healthy, runAnswer: () => ({ status: 0, stdout: "deadbeef\n", stderr: "" }) };
+    const { deps, fake, logs } = makeDeps(state);
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/exited 0 but answered no single container ID/);
+    expect(fake.calls.some((c) => c[0] === "rm")).toBe(false);
+    expect(idLines(logs)).toEqual([]);
+  });
+
+  it("start --recreate prints exactly one line with the NEW run's ID and records it; a plain start that changes nothing prints none", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps, logs } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.images = new Set([previewImageTag(SHA_A)]);
+    logs.length = 0;
+    await runPreviewStart(["--slug", "main", "--recreate"], deps);
+    expect(idLines(logs)).toEqual([`preview_container_id=${RUN_ID(2)}`]);
+    expect(created().containerId).toBe(RUN_ID(2));
+    // The container set aside (the one the row recorded) went by its own ID.
+    expect(state.removedContainers).toEqual([RUN_ID(1)]);
+    state.containerRunning = true; // the fake's removal of the old container stopped "the" container; the new one runs
+    logs.length = 0;
+    await runPreviewStart(["--slug", "main"], deps);
+    expect(idLines(logs)).toEqual([]);
+  });
+
+  it("a container under the preview's name that is not the one its row recorded is never reused, parked or removed", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps, fake } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.images = new Set([previewImageTag(SHA_A)]);
+    state.liveContainerId = "d".repeat(64); // another run's container now holds the name
+    const n = fake.calls.length;
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(/is not the one preview "main" recorded/);
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(/is not the one preview "main" recorded/);
+    expect(fake.calls.slice(n).some((c) => ["rm", "rename", "stop", "start", "run"].includes(c[0]))).toBe(false);
+    expect(created().state).toBe("ready");
+  });
+
+  it("a container whose inspect says 'No such container' while a status-checked listing names it is never absent, and nothing is removed", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps, fake } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.images = new Set([previewImageTag(SHA_A)]);
+    state.stateInspectAnswer = () => ({ status: 1, stdout: "", stderr: "Error: No such container: cinatra-preview-main" });
+    state.lsAnswer = (a) => a[0] === "container" && a.includes("{{.Names}}") ? { status: 0, stdout: "cinatra-preview-main\n", stderr: "" } : null;
+    const n = fake.calls.length;
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(/Could not determine the state of cinatra-preview-main/);
+    expect(fake.calls.slice(n).some((c) => ["rm", "rename", "stop", "run"].includes(c[0]))).toBe(false);
+    expect(P.containerState("cinatra-preview-main", deps)).toBe("unknown");
+  });
+
+  it("a recreate removes no leftover under the aside name, and a failed boot removes only the container its own run made", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps, fake } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.images = new Set([previewImageTag(SHA_A)]);
+    state.health = { status: 503, body: '{"status":"degraded"}' };
+    const n = fake.calls.length;
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(/PREVIOUS container was restored/);
+    const rms = fake.calls.slice(n).filter((c) => c[0] === "rm");
+    expect(rms).toEqual([["rm", "-f", RUN_ID(2)]]);
+    expect(created().containerId).toBe(RUN_ID(1));
+  });
+
+  it("a data volume that existed before the create is never removed, even when its inspect said 'no such volume'", async () => {
+    const state = {
+      sha: SHA_A,
+      health: { status: 503, body: '{"status":"degraded"}' },
+      volumeExists: true,
+      volumeLabels: { "some.other.label": "x" },
+      volumePlainInspect: { status: 1, stdout: "", stderr: "Error response from daemon: get cinatra-preview-data-main: no such volume" },
+    };
+    const { deps, fake } = makeDeps(state);
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/did not reach healthy/);
+    expect(fake.calls.some((c) => c[0] === "volume" && c[1] === "rm")).toBe(false);
+  });
+
+  it("the data volume this create made carries its nonce and is removed on failure; a removal that fails keeps the row as cleanup-incomplete", async () => {
+    const state = {
+      sha: SHA_A,
+      health: { status: 503, body: '{"status":"degraded"}' },
+      volumeRmAnswer: () => ({ status: 1, stdout: "", stderr: "Error: volume is in use" }),
+    };
+    const { deps, fake } = makeDeps(state);
+    deps.volumeNonce = () => "0123456789abcdef0123456789abcdef";
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/cleanup-incomplete: volume cinatra-preview-data-main/);
+    expect(fake.calls).toContainEqual(["volume", "create", "--label", "cinatra.preview.volume-created-by=0123456789abcdef0123456789abcdef", "cinatra-preview-data-main"]);
+    expect(fake.calls).toContainEqual(["volume", "rm", "cinatra-preview-data-main"]);
+    const row = created();
+    expect(row.state).toBe("degraded");
+    expect(row.cleanupIncomplete).toEqual([{ kind: "volume", name: "cinatra-preview-data-main", why: "docker volume rm: exit 1" }]);
+  });
+
+  it("a container removal that fails keeps the row as cleanup-incomplete, never released as clean", async () => {
+    const state = {
+      sha: SHA_A,
+      health: { status: 503, body: '{"status":"degraded"}' },
+      rmAnswer: () => ({ status: 1, stdout: "", stderr: "Error: made-up removal failure" }),
+    };
+    const { deps } = makeDeps(state);
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/cleanup-incomplete: container /);
+    const row = created();
+    expect(row.state).toBe("degraded");
+    expect(row.cleanupIncomplete).toEqual([{ kind: "container", id: RUN_ID(1), why: "docker rm: exit 1" }]);
+    expect(row.containerId).toBeUndefined();
+  });
+
+  it("a run that fails after docker created the container removes exactly the ID docker wrote to its cidfile", async () => {
+    const state = {
+      sha: SHA_A,
+      health: healthy,
+      runAnswer: (a) => {
+        // Docker writes the cidfile when it creates the container, before the start that fails.
+        const i = a.indexOf("--cidfile");
+        if (i !== -1) writeFileSync(a[i + 1], `${"e".repeat(64)}\n`);
+        return { status: 125, stdout: "", stderr: "Error: driver failed programming external connectivity" };
+      },
+    };
+    const { deps, fake } = makeDeps(state);
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/docker run of preview cinatra-preview-main/);
+    expect(fake.calls.filter((c) => c[0] === "rm")).toEqual([["rm", "-f", "e".repeat(64)]]);
+    expect(created()).toBeNull();
+  });
+
+  it("an artifact volume whose inspect says 'no such volume' while a listing names it is never read as absent", async () => {
+    const state = {
+      sha: SHA_A,
+      health: healthy,
+      artifactExists: false,
+      lsAnswer: (a) => a[0] === "volume" ? { status: 0, stdout: "cinatra-preview-artifacts-main\n", stderr: "" } : null,
+    };
+    const { deps, fake } = makeDeps(state);
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/Could not verify artifact volume cinatra-preview-artifacts-main/);
+    expect(fake.calls.some((c) => c[0] === "volume" && c[1] === "create")).toBe(false);
+  });
+
+  it("an image whose inspect says 'No such image' while a listing names the tag is unknown, never absent", () => {
+    const tag = previewImageTag(SHA_A);
+    const deps = { runDocker: (a) => a[1] === "ls" ? { status: 0, stdout: `${tag}\n`, stderr: "" } : { status: 1, stdout: "", stderr: `Error: No such image: ${tag}` } };
+    expect(P.previewImagePresence({ tag, sha: SHA_A, deps }).state).toBe("unknown");
+    const listed = { runDocker: (a) => a[1] === "ls" ? { status: 0, stdout: "", stderr: "" } : { status: 1, stdout: "", stderr: "" } };
+    expect(P.previewImagePresence({ tag, sha: SHA_A, deps: listed }).state).toBe("absent");
+    const failing = { runDocker: () => ({ status: 1, stdout: "", stderr: `Error: No such image: ${tag}` }) };
+    expect(P.previewImagePresence({ tag, sha: SHA_A, deps: failing }).state).toBe("unknown");
+  });
+
+  it("an answer that is not text proves nothing: a forged image stamp is unknown and a forged artifact volume is refused, never parsed", async () => {
+    const tag = previewImageTag(SHA_A);
+    const forged = (text) => ({ toString: () => text, trim: () => text, valueOf: () => text });
+    for (const stdout of [forged(`${SHA_A} `), Symbol("made-up")]) {
+      expect(P.previewImagePresence({ tag, sha: SHA_A, deps: { runDocker: () => ({ status: 0, stdout, stderr: "" }) } }).state).toBe("unknown");
+    }
+    const owned = JSON.stringify([{ Name: previewArtifactVolumeName("main"), Driver: "local", Options: null, Labels: { [ARTIFACT_VOLUME_OWNER_LABEL]: "main" } }]);
+    const { deps, fake } = makeDeps({ sha: SHA_A, health: healthy, artifactProbeOverride: { status: 0, stdout: forged(owned), stderr: "" } });
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/unknown ownership/);
+    expect(fake.calls.some((c) => c[0] === "run")).toBe(false);
+    expect(created()).toBeNull();
+  });
+
+  it("a file's absence at a commit is read from a status-checked tree listing, never from git's error text", () => {
+    const read = P.defaultReadFileAtSha;
+    const shown = (show, ls) => (cmd, args) => (args.includes("show") ? show : ls);
+    const missing = { status: 128, stdout: "", stderr: "fatal: path 'pnpm-lock.yaml' does not exist in 'abc'" };
+    expect(read({ sha: SHA_A, file: "x", checkoutDir: tmp, run: shown(missing, { status: 0, stdout: "", stderr: "" }) })).toBeNull();
+    expect(() => read({ sha: SHA_A, file: "x", checkoutDir: tmp, run: shown(missing, { status: 0, stdout: "x\0", stderr: "" }) })).toThrow(/Could not read x/);
+    expect(() => read({ sha: SHA_A, file: "x", checkoutDir: tmp, run: shown(missing, { status: 128, stdout: "", stderr: "" }) })).toThrow(/Could not read x/);
+    expect(read({ sha: SHA_A, file: "x", checkoutDir: tmp, run: shown({ status: 0, stdout: "body", stderr: "" }, null) })).toBe("body");
+  });
+
+  it("create's own failure path runs once, by its own flag: an error whose text names the health marker still releases the claim", async () => {
+    const { deps } = makeDeps({ sha: SHA_A, health: healthy });
+    deps.composeRuntimeEnv = () => { throw new Error("made-up hook failure: did not reach healthy"); };
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/made-up hook failure/);
+    expect(created()).toBeNull();
+  });
+
+  it("a status-checked inspect is the only liveness read the health poll makes, by the run's own ID", async () => {
+    const { deps, fake } = makeDeps({ sha: SHA_A, health: healthy });
+    await runPreviewCreate(["--slug", "main"], deps);
+    const live = fake.calls.filter((c) => c[0] === "container" && c[1] === "inspect" && c.includes("{{.State.Running}}"));
+    expect(live.every((c) => c.at(-1) === RUN_ID(1))).toBe(true);
+  });
+});
+
+// A row written before the result line records no container ID: no authority to remove or reuse the container under its name.
+describe("preview — a registry row without a recorded container ID (cinatra-cli#307)", () => {
+  const healthy = { status: 200, body: '{"status":"ok"}' };
+  const LEGACY = /this preview's registry row predates recorded container IDs; run `cinatra instance preview start --slug main --recreate` once/;
+  function seedLegacy() {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: makePreviewSlot({ state: "ready", slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+    });
+    return readFileSync(registryPath, "utf8");
+  }
+
+  it("refresh on a row without a recorded ID refuses and removes nothing", async () => {
+    const original = seedLegacy();
+    const state = { sha: SHA_B, containerRunning: true, health: healthy };
+    const { deps, fake } = makeDeps(state);
+    await expect(runPreviewRefresh(["--ref", "main", "--slug", "main"], deps)).rejects.toThrow(LEGACY);
+    expect(fake.calls.some((c) => ["rm", "build", "run", "stop", "rename"].includes(c[0]))).toBe(false);
+    expect(state.removedContainers ?? []).toEqual([]);
+    expect(readFileSync(registryPath, "utf8")).toBe(original);
+  });
+
+  it("a plain start on a row without a recorded ID refuses and reuses nothing, running or stopped", async () => {
+    const original = seedLegacy();
+    const running = { containerRunning: true, health: healthy, images: new Set([previewImageTag(SHA_A)]) };
+    const { deps: up, fake: upFake, logs } = makeDeps(running);
+    await expect(runPreviewStart(["--slug", "main"], up)).rejects.toThrow(LEGACY);
+    expect(upFake.calls.some((c) => ["rm", "run", "stop", "start", "rename"].includes(c[0]))).toBe(false);
+    expect(logs.some((l) => l.includes("is already running"))).toBe(false);
+    const stopped = { containerRunning: false, containerPresentStopped: true, health: healthy, images: new Set([previewImageTag(SHA_A)]) };
+    const { deps: down, fake: downFake } = makeDeps(stopped);
+    await expect(runPreviewStart(["--slug", "main"], down)).rejects.toThrow(LEGACY);
+    expect(downFake.calls.some((c) => ["rm", "run", "stop", "start", "rename"].includes(c[0]))).toBe(false);
+    expect(readFileSync(registryPath, "utf8")).toBe(original);
+  });
+
+  it("start --recreate on a row without a recorded ID removes only the container its own park step set aside, and records the new ID", async () => {
+    seedLegacy();
+    const state = { containerRunning: true, health: healthy, images: new Set([previewImageTag(SHA_A)]) };
+    const { deps, fake, logs } = makeDeps(state);
+    await runPreviewStart(["--slug", "main", "--recreate"], deps);
+    // The park step read the live ID, renamed and stopped exactly it, and removed exactly it once the new one was healthy.
+    expect(state.renames[0]).toEqual([SEED_CONTAINER_ID, `cinatra-preview-main${P.SUPERSEDED_CONTAINER_SUFFIX}`]);
+    expect(fake.calls.filter((c) => c[0] === "rm")).toEqual([["rm", "-f", SEED_CONTAINER_ID]]);
+    expect(getPreview(readRegistry(registryPath).registry, "main").containerId).toBe(RUN_ID(1));
+    expect(logs.filter((l) => /^preview_container_id=/.test(l))).toEqual([`preview_container_id=${RUN_ID(1)}`]);
+  });
+
+  it("start --recreate on a row without a recorded ID whose restore's start fails keeps the restored container's condition: the row records that container, degraded, its start not settled", async () => {
+    seedLegacy();
+    const state = { containerRunning: true, health: { status: 503, body: '{"status":"degraded"}' }, images: new Set([previewImageTag(SHA_A)]) };
+    const { deps, logs } = makeDeps(state);
+    const run = deps.runDocker;
+    deps.runDocker = (args, o) => (args[0] === "start" ? { status: 1, stdout: "", stderr: "made-up start failure" } : run(args, o));
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(
+      "but docker start answered exit 1: whether it took effect is not settled, so it may or may not be running",
+    );
+    const after = getPreview(readRegistry(registryPath).registry, "main");
+    expect(after.state).toBe("degraded");
+    expect(after.containerId).toBe(SEED_CONTAINER_ID);
+    expect(after.cleanupIncomplete).toBeUndefined();
+    expect(after.containerConditions).toEqual([{ id: SEED_CONTAINER_ID, condition: "state-unsettled", why: "docker start answered exit 1; whether it took effect is not settled" }]);
+    expect(logs.filter((l) => /^preview_container_id=/.test(l))).toEqual([]);
+  });
+
+  it("start --recreate on a row without a recorded ID whose aside step stops the container but cannot remove its forwarders puts it back stopped: the row records it, not running, and the next plain start takes it", async () => {
+    seedLegacy();
+    const state = { containerRunning: true, health: healthy, images: new Set([previewImageTag(SHA_A)]) };
+    state.lsAnswer = (a) => (a.some((x) => String(x).startsWith("label=cinatra.preview.forwarder-of=")) ? { status: 1, stdout: "", stderr: "" } : null);
+    const { deps } = makeDeps(state);
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(
+      "it keeps its name cinatra-preview-main, stopped; start it with `cinatra instance preview start --slug main`.",
+    );
+    const after = getPreview(readRegistry(registryPath).registry, "main");
+    expect(after.state).toBe("degraded");
+    expect(after.containerId).toBe(SEED_CONTAINER_ID);
+    expect(after.containerConditions).toEqual([{ id: SEED_CONTAINER_ID, condition: "not-running", why: "set aside and stopped, then put back stopped: the removal of its forwarders failed" }]);
+    expect(after.cleanupIncomplete).toHaveLength(1);
+    expect(after.cleanupIncomplete[0]).toMatchObject({ kind: "forwarder-listing", id: SEED_CONTAINER_ID });
+    // the instructed plain start is not refused: it starts the recorded container and promotes it
+    state.lsAnswer = null;
+    state.containerPresentStopped = true;
+    await runPreviewStart(["--slug", "main"], deps);
+    const ready = getPreview(readRegistry(registryPath).registry, "main");
+    expect(ready.state).toBe("ready");
+    expect(ready.containerId).toBe(SEED_CONTAINER_ID);
+    expect(ready.containerConditions).toBeUndefined();
+  });
+
+  it("start --recreate on a row without a recorded ID whose aside stop fails puts the container back with its stop not settled, never as found: the row records it, degraded, a plain start is refused and start --recreate replaces it", async () => {
+    seedLegacy();
+    const state = { containerRunning: true, health: healthy, images: new Set([previewImageTag(SHA_A)]) };
+    const { deps } = makeDeps(state);
+    const run = deps.runDocker;
+    deps.runDocker = (args, o) => (args[0] === "stop" && state.stopFails !== false ? { status: 1, stdout: "", stderr: "made-up stop failure" } : run(args, o));
+    const failed = runPreviewStart(["--slug", "main", "--recreate"], deps);
+    await expect(failed).rejects.toThrow(
+      "it keeps its name cinatra-preview-main, and whether it is stopped is not settled; its row is degraded, and " +
+        "a plain start refuses it until `cinatra instance preview start --slug main --recreate` replaces its container.",
+    );
+    const after = getPreview(readRegistry(registryPath).registry, "main");
+    expect(after.state).toBe("degraded");
+    expect(after.containerId).toBe(SEED_CONTAINER_ID);
+    expect(after.containerConditions).toEqual([{ id: SEED_CONTAINER_ID, condition: "state-unsettled", why: "docker stop answered exit 1; whether it took effect is not settled" }]);
+    expect(after.cleanupIncomplete).toBeUndefined();
+    // no read clears it (the stop may still land): a plain start is refused, changing nothing
+    state.stopFails = false;
+    const kept = readFileSync(registryPath, "utf8");
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(
+      "a plain start refuses it until `cinatra instance preview start --slug main --recreate` replaces its container. Nothing was changed.");
+    expect(readFileSync(registryPath, "utf8")).toBe(kept);
+    // start --recreate replaces the container
+    await runPreviewStart(["--slug", "main", "--recreate"], deps);
+    const ready = getPreview(readRegistry(registryPath).registry, "main");
+    expect(ready.state).toBe("ready");
+    expect(ready.containerId).not.toBe(SEED_CONTAINER_ID);
+    expect(ready.containerConditions).toBeUndefined();
+  });
+
+  it("start --recreate on a row without a recorded ID whose restored container starts and then exits records it on the row, not running", async () => {
+    seedLegacy();
+    const state = { containerRunning: true, health: { status: 503, body: '{"status":"degraded"}' }, images: new Set([previewImageTag(SHA_A)]), restoreExits: true };
+    const { deps } = makeDeps(state);
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(/was put back as cinatra-preview-main but is NOT running/);
+    const after = getPreview(readRegistry(registryPath).registry, "main");
+    expect(after.state).toBe("degraded");
+    expect(after.containerId).toBe(SEED_CONTAINER_ID);
+    expect(after.containerConditions).toEqual([{ id: SEED_CONTAINER_ID, condition: "not-running", why: "the restored container started and then exited" }]);
+  });
+
+  it("start --recreate on a row without a recorded ID whose restored container's state goes unread leaves the row degraded with no condition made up, and names status, never a plain start", async () => {
+    seedLegacy();
+    const state = { containerRunning: true, health: { status: 503, body: '{"status":"degraded"}' }, images: new Set([previewImageTag(SHA_A)]) };
+    const { deps } = makeDeps(state);
+    const run = deps.runDocker;
+    let restarted = false;
+    deps.runDocker = (args, o) => {
+      if (args[0] === "start" && args[1] === SEED_CONTAINER_ID) restarted = true;
+      if (restarted && args.includes("{{.State.Running}}") && args.at(-1) === SEED_CONTAINER_ID) {
+        return { status: null, stdout: "", stderr: "", error: Object.assign(new Error("spawnSync docker ETIMEDOUT"), { code: "ETIMEDOUT" }), timedOut: true };
+      }
+      return run(args, o);
+    };
+    const failed = runPreviewStart(["--slug", "main", "--recreate"], deps);
+    await expect(failed).rejects.toThrow(/its state is UNKNOWN, not known to be down. Check `cinatra instance preview status --slug main`/);
+    await expect(failed).rejects.not.toThrow("`cinatra instance preview start --slug main`");
+    const after = getPreview(readRegistry(registryPath).registry, "main");
+    expect(after.state).toBe("degraded");
+    expect(after.containerId).toBeUndefined();
+    expect(after.containerConditions).toBeUndefined();
+  });
+
+  it("stop on a row without a recorded ID names the recreate as the way back, never a plain start", async () => {
+    seedLegacy();
+    const state = { containerRunning: true, health: healthy };
+    const { deps, logs } = makeDeps(state);
+    await runPreviewStop(["--slug", "main"], deps);
+    expect(logs.some((l) => l.includes("a plain start refuses it: `cinatra instance preview start --slug main --recreate` brings it back."))).toBe(true);
+    expect(logs.some((l) => l.includes("`cinatra instance preview start --slug main` brings it back"))).toBe(false);
+    const after = getPreview(readRegistry(registryPath).registry, "main");
+    expect(after.state).toBe("ready");
+    expect(after.containerId).toBeUndefined();
+  });
+
+  it("a recorded container is verified only from the authority's own claim read; no recorded ID is no authority, and the park target is the one named exception", async () => {
+    const A = await import("../src/preview-authority.mjs");
+    const row = makePreviewSlot({ state: "ready", slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" });
+    const deps = { runDocker: () => ({ status: 0, stdout: `${SEED_CONTAINER_ID}\n`, stderr: "" }) };
+    P.writeRegistry(registryPath, { version: 1, previews: { main: row } });
+    let inv = A.beginInvocation();
+    let claim = await A.claimRow(inv, { registryPath, slug: "main", take: (existing) => ({ ...existing }) });
+    expect(() => A.verifyRecorded(inv, claim, "cinatra-preview-main", deps)).toThrow(LEGACY);
+    const target = A.parkTarget(inv, claim, "cinatra-preview-main", deps);
+    expect(target.id).toBe(SEED_CONTAINER_ID);
+    // A park target is no authority to remove anything: only this invocation's own park of it is.
+    expect(() => A.removeContainer(inv, target, deps)).toThrow(/takes a container-created or container-parked or container-recorded token/);
+    await A.settleRow(inv, claim);
+    P.writeRegistry(registryPath, { version: 1, previews: { main: { ...row, containerId: SEED_CONTAINER_ID } } });
+    inv = A.beginInvocation();
+    claim = await A.claimRow(inv, { registryPath, slug: "main", take: (existing) => ({ ...existing }) });
+    expect(A.verifyRecorded(inv, claim, "cinatra-preview-main", deps).id).toBe(SEED_CONTAINER_ID);
+    // A row object handed in by a caller is never the claim: the recorded ID is the authority's own read.
+    expect(() => A.verifyRecorded(inv, { ...claim }, "cinatra-preview-main", deps)).toThrow(/takes a claim token of this invocation/);
+  });
+});
+
+
+// The census rows of the create, recreate, refresh and start paths: a failed cleanup is a degraded row with a non-empty
+// cleanupIncomplete list and no result line; liveness and ready by the verified ID only; the legacy refusals unconditional.
+describe("preview — every census row of the cleanup, liveness and release paths (cinatra-cli#307)", () => {
+  const healthy = { status: 200, body: '{"status":"ok"}' };
+  const unhealthy = { status: 503, body: '{"status":"degraded"}' };
+  const idLines = (logs) => logs.filter((l) => /^preview_container_id=/.test(l));
+  const row = () => getPreview(readRegistry(registryPath).registry, "main");
+  const LEGACY = /this preview's registry row predates recorded container IDs/;
+
+  it("refresh prints exactly one preview_container_id line equal to the registry's containerId on success, and none on failure", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps, logs } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.sha = SHA_B;
+    logs.length = 0;
+    await runPreviewRefresh(["--ref", "main", "--slug", "main"], deps);
+    expect(idLines(logs)).toEqual([`preview_container_id=${RUN_ID(2)}`]);
+    expect(row().containerId).toBe(RUN_ID(2));
+    state.liveContainerId = RUN_ID(2);
+    state.containerRunning = true;
+    state.health = unhealthy;
+    logs.length = 0;
+    await expect(runPreviewRefresh(["--ref", "main", "--slug", "main"], deps)).rejects.toThrow(/did not reach healthy/);
+    expect(idLines(logs)).toEqual([]);
+  });
+
+  it("a recreate whose new container fails its health gate prints no line, and the restored container's state is read by its own ID", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps, fake, logs } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.images = new Set([previewImageTag(SHA_A)]);
+    state.health = unhealthy;
+    logs.length = 0;
+    const n = fake.calls.length;
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(/PREVIOUS container was restored/);
+    expect(idLines(logs)).toEqual([]);
+    const states = fake.calls.slice(n).filter((c) => c[0] === "container" && c[1] === "inspect" && c.includes("{{.State.Running}}"));
+    // The first read is the presence read by name (then the ID is verified); every liveness read after it is by an ID.
+    expect(states[0].at(-1)).toBe("cinatra-preview-main");
+    expect(states.length).toBeGreaterThan(2);
+    expect(states.slice(1).every((c) => /^[0-9a-f]{64}$/.test(String(c.at(-1))))).toBe(true);
+  });
+
+  it("a healthy recreate whose parked container cannot be removed leaves the row degraded with cleanupIncomplete, prints no line and fails", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps, logs } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.images = new Set([previewImageTag(SHA_A)]);
+    state.rmAnswer = (a) => (a.at(-1) === RUN_ID(1) ? { status: 1, stdout: "", stderr: "Error: made-up removal failure" } : null);
+    logs.length = 0;
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(/cleanup-incomplete: cinatra-preview-main\.superseded/);
+    expect(idLines(logs)).toEqual([]);
+    expect(row().state).toBe("degraded");
+    expect(row().containerId).toBe(RUN_ID(2));
+    expect(row().cleanupIncomplete).toEqual([{ kind: "container", id: RUN_ID(1), why: "docker rm: exit 1" }]);
+  });
+
+  it("a recreate whose park step cannot list the forwarders of the parked container leaves the row degraded with cleanupIncomplete", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps, fake } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.images = new Set([previewImageTag(SHA_A)]);
+    state.lsAnswer = (a) => (a.some((x) => String(x).startsWith("label=cinatra.preview.forwarder-of=")) ? { status: 1, stdout: "", stderr: "" } : null);
+    const n = fake.calls.length;
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(/Could not set the existing preview container aside/);
+    expect(fake.calls.slice(n).some((c) => c[0] === "run")).toBe(false);
+    expect(row().state).toBe("degraded");
+    expect(row().cleanupIncomplete).toHaveLength(1);
+    expect(row().cleanupIncomplete[0]).toMatchObject({ kind: "forwarder-listing", id: RUN_ID(1) });
+    expect(row().cleanupIncomplete[0].why).toMatch(/exit 1/);
+  });
+
+  it("the liveness of a container ID whose inspect fails non-zero is read by an ID listing: unknown while it is listed, never absent by a name", () => {
+    const id = SEED_CONTAINER_ID;
+    const listed = { runDocker: (a) => (a[1] === "ls" ? { status: 0, stdout: `${id}\n`, stderr: "" } : { status: 1, stdout: "", stderr: "Error: No such object" }) };
+    expect(P.containerState(id, listed)).toBe("unknown");
+    expect(P.containerRunning(id, listed)).toBe(true);
+    const calls = [];
+    const gone = { runDocker: (a) => { calls.push(a); return a[1] === "ls" ? { status: 0, stdout: "", stderr: "" } : { status: 1, stdout: "", stderr: "" }; } };
+    expect(P.containerState(id, gone)).toBe("absent");
+    expect(calls.find((a) => a[1] === "ls")).toEqual(["container", "ls", "-a", "--no-trunc", "--filter", `id=${id}`, "--format", "{{.ID}}"]);
+  });
+
+  it("the degraded re-probe reads liveness by the verified ID, never by the name", async () => {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: { ...makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID, slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }), state: "degraded" } },
+    });
+    const state = { containerRunning: true, health: healthy };
+    const { deps, fake } = makeDeps(state);
+    await runPreviewStart(["--slug", "main"], deps);
+    const live = fake.calls.filter((c) => c[0] === "container" && c[1] === "inspect" && c.includes("{{.State.Running}}"));
+    expect(live.slice(1).length).toBeGreaterThan(0);
+    expect(live.slice(1).every((c) => c.at(-1) === SEED_CONTAINER_ID)).toBe(true);
+    expect(row().state).toBe("ready");
+  });
+
+  it("an already-running ready row is ready only when its recorded ID itself reads running", async () => {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID, slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+    });
+    const state = {
+      containerRunning: true,
+      stateInspectAnswer: (a) => (a.at(-1) === SEED_CONTAINER_ID ? { status: 0, stdout: "false\n", stderr: "" } : { status: 0, stdout: "true\n", stderr: "" }),
+    };
+    const { deps, logs } = makeDeps(state);
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(/is stopped by its own ID; nothing was changed/);
+    expect(logs.some((l) => l.includes("is already running"))).toBe(false);
+    expect(row().state).toBe("ready");
+  });
+
+  it("a registry row whose cleanupIncomplete is empty, or names no ID or name, or no reason, is malformed", () => {
+    const base = { ...makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID, slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }), state: "degraded" };
+    for (const bad of [[], [{ kind: "container" }], [{ kind: "container", id: SEED_CONTAINER_ID }], [{ kind: "container", why: "x" }], [{ id: SEED_CONTAINER_ID, why: "x" }]]) {
+      writeRegistry(registryPath, { version: 1, previews: { main: { ...base, cleanupIncomplete: bad } } });
+      expect(readRegistry(registryPath).status).toBe("malformed");
+    }
+    writeRegistry(registryPath, { version: 1, previews: { main: { ...base, cleanupIncomplete: [{ kind: "volume", name: "cinatra-preview-data-main", why: "docker volume rm: exit 1" }] } } });
+    expect(readRegistry(registryPath).status).toBe("ok");
+  });
+
+  it("refresh and a plain start refuse a row without a recorded ID even when no container is under its name", async () => {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: makePreviewSlot({ state: "ready", slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) },
+    });
+    const original = readFileSync(registryPath, "utf8");
+    const state = { sha: SHA_B, containerAbsent: true, health: healthy, images: new Set([previewImageTag(SHA_A)]) };
+    const { deps, fake } = makeDeps(state);
+    await expect(runPreviewRefresh(["--ref", "main", "--slug", "main"], deps)).rejects.toThrow(LEGACY);
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(LEGACY);
+    expect(fake.calls.some((c) => ["build", "run", "rm"].includes(c[0]))).toBe(false);
+    expect(readFileSync(registryPath, "utf8")).toBe(original);
+  });
+});
+
+// Abort, restore, image-cleanup and liveness rows (each an instance of R1-R5).
+describe("preview — abort, restore and cleanup rows (cinatra-cli#307)", () => {
+  const healthy = { status: 200, body: '{"status":"ok"}' };
+  const unhealthy = { status: 503, body: '{"status":"degraded"}' };
+  const idLines = (logs) => logs.filter((l) => /^preview_container_id=/.test(l));
+  const row = () => getPreview(readRegistry(registryPath).registry, "main");
+  const timedOutAnswer = () => ({ status: null, stdout: "", stderr: "", timedOut: true, error: Object.assign(new Error("ETIMEDOUT"), { code: "ETIMEDOUT" }) });
+
+  it("a data volume replaced under its name after this create's label read is never removed by the abort", async () => {
+    const state = { sha: SHA_A, health: unhealthy, volumeLabelsOnReread: { "cinatra.preview.volume-created-by": "another-run" } };
+    const { deps, fake } = makeDeps(state);
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/did not reach healthy/);
+    expect(fake.calls.some((c) => c[0] === "volume" && c[1] === "rm")).toBe(false);
+  });
+
+  it("a superseded image whose removal fails is kept and said so, never logged as cleaned up", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps, logs } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.sha = SHA_B;
+    const run = deps.runDocker;
+    deps.runDocker = (args, o) => (args[0] === "image" && args[1] === "rm" ? { status: 1, stdout: "", stderr: "Error: conflict" } : run(args, o));
+    logs.length = 0;
+    await runPreviewRefresh(["--ref", "main", "--slug", "main"], deps);
+    expect(logs.some((l) => l.includes("cleaned up superseded image"))).toBe(false);
+    expect(logs.some((l) => l.includes(`kept image ${previewImageTag(SHA_A)}`))).toBe(true);
+  });
+
+  it("a superseded image cleanup that throws never fails a refresh after its result line: the image is kept and said so", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps, logs } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.sha = SHA_B;
+    const run = deps.runDocker;
+    deps.runDocker = (args, o) => {
+      if (args[0] === "image" && args[1] === "rm") throw new Error("made-up docker client crash");
+      return run(args, o);
+    };
+    logs.length = 0;
+    await runPreviewRefresh(["--ref", "main", "--slug", "main"], deps);
+    expect(logs.filter((l) => /^preview_container_id=/.test(l))).toEqual([`preview_container_id=${RUN_ID(2)}`]);
+    expect(logs.some((l) => l.includes(`kept image ${previewImageTag(SHA_A)}`))).toBe(true);
+    expect(row().state).toBe("ready");
+  });
+
+  it("a failed refresh's image cleanup that throws never keeps the row from its settle: the claim is released, degraded", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.sha = SHA_B;
+    state.health = unhealthy;
+    const run = deps.runDocker;
+    deps.runDocker = (args, o) => {
+      if (args[0] === "image" && args[1] === "rm") throw new Error("made-up docker client crash");
+      return run(args, o);
+    };
+    await expect(runPreviewRefresh(["--ref", "main", "--slug", "main"], deps)).rejects.toThrow(/did not reach healthy/);
+    expect(row().state).toBe("degraded");
+    expect(row().sha).toBe(SHA_A);
+  });
+
+  it("a create whose promotion throws removes the container its own run made, by its ID, and prints no line", async () => {
+    const state = { sha: SHA_A };
+    const { deps, logs, fake } = makeDeps(state);
+    // the registry turns unreadable after the health gate passed, so the promotion's own registry write throws
+    deps.probeHealth = async () => {
+      writeFileSync(registryPath, "{ not json");
+      return healthy;
+    };
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/malformed/);
+    expect(fake.calls.filter((c) => c[0] === "rm")).toEqual([["rm", "-f", RUN_ID(1)]]);
+    expect(logs.filter((l) => /^preview_container_id=/.test(l))).toEqual([]);
+  });
+
+  it("a restore whose rename back fails leaves the row degraded, naming the container left under the aside name", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.images = new Set([previewImageTag(SHA_A)]);
+    state.health = unhealthy;
+    state.renameFailsAfter = 1;
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(/could NOT be brought back/);
+    expect(row().state).toBe("degraded");
+    expect(row().cleanupIncomplete).toEqual([{ kind: "container", id: RUN_ID(1), name: `cinatra-preview-main${P.SUPERSEDED_CONTAINER_SUFFIX}`, why: "the rename back to its own name answered exit 1; whether it took effect is not settled" }]);
+  });
+
+  it("a rename of the preview's own container that answers no success names it under its aside name, and no read clears it: a plain start is refused and start --recreate replaces it", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.images = new Set([previewImageTag(SHA_A)]);
+    state.health = unhealthy;
+    state.renameFailsAfter = 1;
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(/could NOT be brought back/);
+    const aside = { kind: "container", id: RUN_ID(1), name: `cinatra-preview-main${P.SUPERSEDED_CONTAINER_SUFFIX}`, why: "the rename back to its own name answered exit 1; whether it took effect is not settled" };
+    expect(row()).toMatchObject({ state: "degraded", containerId: RUN_ID(1), cleanupIncomplete: [aside] });
+    // the rename may still land after any read: a plain start is refused, changing nothing
+    state.renameFailsAfter = undefined;
+    state.health = healthy;
+    const kept = readFileSync(registryPath, "utf8");
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(
+      "a plain start refuses it until `cinatra instance preview start --slug main --recreate` replaces its container. Nothing was changed.");
+    expect(readFileSync(registryPath, "utf8")).toBe(kept);
+    await runPreviewStart(["--slug", "main", "--recreate"], deps);
+    expect(row().state).toBe("ready");
+    expect(row().containerId).not.toBe(RUN_ID(1));
+    expect(row().cleanupIncomplete).toBeUndefined();
+  });
+
+  it("a refresh whose removal of the old container answers a timeout leaves it not-replaced, and no read clears it: a plain start is refused and start --recreate replaces it", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.sha = SHA_B;
+    state.rmAnswer = (a) => (a.at(-1) === RUN_ID(1) ? timedOutAnswer() : null);
+    await expect(runPreviewRefresh(["--ref", "main", "--slug", "main"], deps)).rejects.toThrow(/could not be removed; nothing new was booted/);
+    const pending = [{ id: RUN_ID(1), condition: "not-replaced", why: "docker rm: timed out" }];
+    expect(row()).toMatchObject({ state: "degraded", containerId: RUN_ID(1), containerConditions: pending });
+    // the old container still reads running; the removal may still land after that read: a plain start is refused, changing nothing
+    state.containerRunning = true;
+    const kept = readFileSync(registryPath, "utf8");
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(
+      "a plain start refuses it until `cinatra instance preview start --slug main --recreate` replaces its container. Nothing was changed.");
+    expect(readFileSync(registryPath, "utf8")).toBe(kept);
+    state.rmAnswer = null;
+    state.images = new Set([previewImageTag(SHA_A)]);
+    await runPreviewStart(["--slug", "main", "--recreate"], deps);
+    expect(row().state).toBe("ready");
+    expect(row().containerId).not.toBe(RUN_ID(1));
+    expect(row().containerConditions).toBeUndefined();
+  });
+
+  it("a restore whose start fails records the restored container's start as not settled, never a leftover; no read clears it: a plain start is refused and start --recreate replaces it", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.images = new Set([previewImageTag(SHA_A)]);
+    state.health = unhealthy;
+    const run = deps.runDocker;
+    deps.runDocker = (args, o) => (args[0] === "start" && state.startFails ? { status: 1, stdout: "", stderr: "made-up start failure" } : run(args, o));
+    state.startFails = true;
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(/docker start answered exit 1: whether it took effect is not settled/);
+    expect(row().state).toBe("degraded");
+    expect(row().containerId).toBe(RUN_ID(1));
+    expect(row().cleanupIncomplete).toBeUndefined();
+    expect(row().containerConditions).toEqual([{ id: RUN_ID(1), condition: "state-unsettled", why: "docker start answered exit 1; whether it took effect is not settled" }]);
+    state.startFails = false;
+    state.health = healthy;
+    const kept = readFileSync(registryPath, "utf8");
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(
+      "a plain start refuses it until `cinatra instance preview start --slug main --recreate` replaces its container. Nothing was changed.");
+    expect(readFileSync(registryPath, "utf8")).toBe(kept);
+    await runPreviewStart(["--slug", "main", "--recreate"], deps);
+    expect(row().state).toBe("ready");
+    expect(row().containerId).not.toBe(RUN_ID(1));
+    expect(row().containerConditions).toBeUndefined();
+  });
+
+  it("a degraded row whose earlier leftover is still there stays degraded on a healthy re-probe; once it is gone the row is ready and the list cleared", async () => {
+    const leftover = { kind: "container", id: "d".repeat(64), why: "docker rm: exit 1" };
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: { ...makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID, slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }), state: "degraded", cleanupIncomplete: [leftover] } },
+    });
+    const state = { containerRunning: true, health: healthy };
+    state.lsAnswer = (a) => (a.includes(`id=${leftover.id}`) ? { status: 0, stdout: state.leftoverGone ? "" : `${leftover.id}\n`, stderr: "" } : null);
+    const { deps, logs } = makeDeps(state);
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(/cleanup-incomplete: container dddddddddddd from an earlier run is still there/);
+    expect(row().state).toBe("degraded");
+    expect(row().cleanupIncomplete).toEqual([leftover]);
+    expect(logs.some((l) => l.includes("is healthy again"))).toBe(false);
+    state.leftoverGone = true;
+    await runPreviewStart(["--slug", "main"], deps);
+    expect(row().state).toBe("ready");
+    expect(Object.hasOwn(row(), "cleanupIncomplete")).toBe(false);
+  });
+
+  it("an app answer of healthy is no ready while the run's own ID reads unknown: the create fails unconfirmed and prints no line", async () => {
+    const state = { sha: SHA_A, health: healthy, stateInspectAnswer: (a) => (a.at(-1) === RUN_ID(1) ? timedOutAnswer() : { status: 0, stdout: "true\n", stderr: "" }) };
+    const { deps, logs } = makeDeps(state);
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/did not reach healthy \(terminal state: unconfirmed/);
+    expect(idLines(logs)).toEqual([]);
+    expect(row()).toBeNull();
+  });
+
+  it("an inspect that exits 0 answering neither true nor false is an unknown state, never stopped", () => {
+    expect(P.containerState("x", { runDocker: () => ({ status: 0, stdout: "\n", stderr: "" }) })).toBe("unknown");
+    expect(P.containerState("x", { runDocker: () => ({ status: 0, stdout: "maybe\n", stderr: "" }) })).toBe("unknown");
+    expect(P.containerState("x", { runDocker: () => ({ status: 0, stdout: "false\n", stderr: "" }) })).toBe("stopped");
+  });
+
+  it("refresh gives a row without a recorded ID the one legacy refusal before any storage or state read", async () => {
+    writeRegistry(registryPath, { version: 1, previews: { main: makePreviewSlot({ state: "ready", slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }) } });
+    const state = { sha: SHA_B, artifactExists: false, containerRunning: true };
+    const { deps, fake } = makeDeps(state);
+    await expect(runPreviewRefresh(["--ref", "main", "--slug", "main"], deps)).rejects.toThrow(/this preview's registry row predates recorded container IDs/);
+    expect(fake.calls).toEqual([]);
+  });
+});
+
+describe("preview — output, data volume and refresh-failure rows (cinatra-cli#307)", () => {
+  const healthy = { status: 200, body: '{"status":"ok"}' };
+  const unhealthy = { status: 503, body: '{"status":"degraded"}' };
+  const row = () => getPreview(readRegistry(registryPath).registry, "main");
+
+  it("the image build's own output never reaches stdout: stdout carries the result line only", async () => {
+    const { deps, fake } = makeDeps({ sha: SHA_A, health: healthy });
+    await runPreviewCreate(["--slug", "main"], deps);
+    expect(fake.buildOpts().stdio).toEqual(["ignore", 2, "inherit"]);
+  });
+
+  it("a data volume whose label cannot be read again is kept and named, never read as another run's", async () => {
+    const state = { sha: SHA_A, health: unhealthy, labelRereadFails: true };
+    const { deps, fake } = makeDeps(state);
+    await expect(runPreviewCreate(["--slug", "main"], deps)).rejects.toThrow(/cleanup-incomplete: volume cinatra-preview-data-main/);
+    expect(fake.calls.some((c) => c[0] === "volume" && c[1] === "rm")).toBe(false);
+    expect(row().state).toBe("degraded");
+    expect(row().cleanupIncomplete).toEqual([{ kind: "volume", name: "cinatra-preview-data-main", why: "its label could not be read again, so the volume this run made is kept" }]);
+  });
+
+  it("a refresh that fails before the replacement keeps a degraded row's earlier list, never ready", async () => {
+    const leftover = { kind: "container", id: "d".repeat(64), why: "docker rm: exit 1" };
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: { ...makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID, slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }), state: "degraded", cleanupIncomplete: [leftover] } },
+    });
+    const state = { sha: SHA_B, containerRunning: true, buildFails: true, health: healthy };
+    const { deps } = makeDeps(state);
+    await expect(runPreviewRefresh(["--ref", "main", "--slug", "main"], deps)).rejects.toThrow(/docker build/);
+    expect(row().state).toBe("degraded");
+    expect(row().cleanupIncomplete).toEqual([leftover]);
+  });
+
+  it("a refresh that fails before the replacement on a degraded row with no list returns it to degraded, never ready", async () => {
+    writeRegistry(registryPath, {
+      version: 1,
+      previews: { main: { ...makePreviewSlot({ state: "ready", containerId: SEED_CONTAINER_ID, slug: "main", ref: "main", sha: SHA_A, hostPort: 3400, now: () => "T0" }), state: "degraded" } },
+    });
+    const state = { sha: SHA_B, containerRunning: true, buildFails: true, health: healthy };
+    const { deps, fake } = makeDeps(state);
+    await expect(runPreviewRefresh(["--ref", "main", "--slug", "main"], deps)).rejects.toThrow(/docker build/);
+    expect(row().state).toBe("degraded");
+    expect(row().sha).toBe(SHA_A);
+    expect(row().cleanupIncomplete).toBeUndefined();
+    // nothing was replaced: no removal and no run
+    expect(fake.calls.filter((c) => c[0] === "rm" || c[0] === "run")).toEqual([]);
+  });
+
+  it("a restore whose removal of the new container leaves only its forwarder listing still puts the parked container back and names the listing", async () => {
+    const state = { sha: SHA_A, health: healthy };
+    const { deps } = makeDeps(state);
+    await runPreviewCreate(["--slug", "main"], deps);
+    state.images = new Set([previewImageTag(SHA_A)]);
+    state.health = unhealthy;
+    state.lsAnswer = (a) => (a.includes(`label=cinatra.preview.forwarder-of=${RUN_ID(2)}`) ? { status: 1, stdout: "", stderr: "" } : null);
+    await expect(runPreviewStart(["--slug", "main", "--recreate"], deps)).rejects.toThrow(/PREVIOUS container was restored/);
+    expect(state.renames.at(-1)).toEqual([RUN_ID(1), "cinatra-preview-main"]);
+    expect(row().state).toBe("degraded");
+    expect(row().cleanupIncomplete).toHaveLength(1);
+    expect(row().cleanupIncomplete[0]).toMatchObject({ kind: "forwarder-listing", id: RUN_ID(2) });
   });
 });
