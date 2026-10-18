@@ -190,7 +190,7 @@ function allFiles(dir = SRC, rel = "") {
 }
 const sourceFiles = () => allFiles().filter((rel) => rel.endsWith(".mjs"));
 
-const REGEX_BEFORE = new Set(["(", ",", "=", ":", "[", "!", "&", "|", "?", "{", "}", ";", "+", "-", "*", "%", "<", ">", "~", "^"]);
+const REGEX_BEFORE = new Set(["(", ",", "=", ":", "[", "!", "&", "|", "?", "{", ";", "+", "-", "*", "%", "<", ">", "~", "^"]);
 const REGEX_AFTER_WORD = new Set(["return", "typeof", "case", "do", "else", "in", "of", "new", "delete", "void", "throw", "instanceof", "yield", "await"]);
 
 /**
@@ -222,6 +222,11 @@ export function stringLiterals(src) {
   return lex(src).literals;
 }
 
+/** The line numbers of a source's ambiguous slashes (a slash after `}`, after a postfix `++` or `--`, or after a bare `of`), each read as division. */
+export function ambiguousSlashes(src) {
+  return lex(src).ambiguous;
+}
+
 /** The source with every comment, string literal and regex blanked (its newlines kept): its code only. */
 export function codeOnly(src) {
   const chars = src.split("");
@@ -234,8 +239,14 @@ export function codeOnly(src) {
 function lex(src) {
   const out = [];
   const spans = [];
+  const ambiguous = [];
   let code = "";
   let i = 0;
+  const lineOf = (at) => {
+    let line = 1;
+    for (let k = 0; k < at; k++) if (src[k] === "\n") line++;
+    return line;
+  };
   const lastSignificant = () => {
     const m = /(\S+)\s*$/.exec(code);
     return m ? m[1] : "";
@@ -244,9 +255,30 @@ function lex(src) {
     const last = lastSignificant();
     if (last === "") return true;
     const ch = last.at(-1);
+    // After `}` (a block or an object literal) or a postfix `++`/`--` a slash may
+    // be division or a regex; without a parser it is read as division and its
+    // line is recorded, so the census can refuse it.
+    if (ch === "}" || /(?:\+\+|--)$/.test(last)) {
+      ambiguous.push(lineOf(i));
+      return false;
+    }
     if (REGEX_BEFORE.has(ch)) return true;
     const word = /([A-Za-z_$][\w$]*)$/.exec(last);
-    return Boolean(word && REGEX_AFTER_WORD.has(word[1]));
+    if (!word || !REGEX_AFTER_WORD.has(word[1])) return false;
+    // A word after a property dot (`obj.of`, `obj?.in`, `obj. return`; a spread
+    // `...` is no property dot) or a private `#` is a property name, never a
+    // keyword: a slash after it is division.
+    const head = word.index > 0 ? last.slice(0, word.index) : code.trimEnd().slice(0, -last.length).trimEnd();
+    if (head.endsWith("#") || (head.endsWith(".") && !head.endsWith("..."))) return false;
+    // `of` is a keyword only in a for-of head; anywhere else it may be a name
+    // (`const of = 2; of / n`), so a slash after it is ambiguous: it is read as
+    // division and its line is recorded. Every other word of the set is
+    // reserved in a module, so after it a slash opens a regex.
+    if (word[1] === "of") {
+      ambiguous.push(lineOf(i));
+      return false;
+    }
+    return true;
   };
   const readQuoted = (q) => {
     let j = i + 1;
@@ -302,13 +334,17 @@ function lex(src) {
     if (c === "/" && regexAllowed()) {
       let j = i + 1;
       let inClass = false;
+      let closed = false;
       while (j < src.length && src[j] !== "\n") {
-        if (src[j] === "\\") { j += 2; continue; }
+        if (src[j] === "\\") { if (src[j + 1] === "\n") break; j += 2; continue; }
         if (src[j] === "[") inClass = true;
         else if (src[j] === "]") inClass = false;
-        else if (src[j] === "/" && !inClass) break;
+        else if (src[j] === "/" && !inClass) { closed = true; break; }
         j++;
       }
+      // A regex closes on its own line: a slash with no closing slash before the
+      // line end or the source end is code (division).
+      if (!closed) return false;
       j++;
       while (j < src.length && /[a-z]/i.test(src[j])) j++;
       code += " __re ";
@@ -321,7 +357,7 @@ function lex(src) {
   while (i < src.length) {
     if (!step()) { code += src[i]; i++; }
   }
-  return { literals: out, spans };
+  return { literals: out, spans, ambiguous };
 }
 
 const isPreviewFile = (rel) => path.basename(rel).includes("preview") && path.basename(rel) !== AUTHORITY;
@@ -708,5 +744,93 @@ describe("the preview authority census (cinatra-cli#307)", () => {
       const pinned = EXCEPTION_WRITERS.find(([r, w]) => r === rel && w.at(-1) === lines[i])[1];
       expect(lines.slice(i - pinned.length + 1, i + 1)).toEqual(pinned);
     }
+  });
+
+  it("F3-a: a division after an object literal is no regex: the removal literals after it are read", () => {
+    const values = stringLiterals('const ignored = {} / 1; deps.runDocker(["rm", "-f", id]);').map((l) => l.value);
+    expect(values).toContain("rm");
+    expect(values).toContain("-f");
+  });
+
+  it("F3-b: a division after a postfix increment is no regex: the removal literals after it are read", () => {
+    const values = stringLiterals('let n = 0; n++ / 1; deps.runDocker(["rm", "-f", id]);').map((l) => l.value);
+    expect(values).toContain("rm");
+    expect(values).toContain("-f");
+  });
+
+  it("F3-c: a slash with no closing slash before the line end is no regex: the literal after it is read", () => {
+    // the slash follows `(`, which admits a regex, so the scan runs and meets no closing slash on its line
+    const src = 'const half = ( / 2); const label = "rm";';
+    expect(stringLiterals(src).map((l) => l.value)).toContain("rm");
+    expect(codeOnly(src)).toContain("const label");
+  });
+
+  it("F3-d: ambiguousSlashes names the line of every slash after an object literal or a postfix increment", () => {
+    const src = [
+      'const ignored = {} / 1; deps.runDocker(["rm", "-f", id]);',
+      'let n = 0; n++ / 1; deps.runDocker(["rm", "-f", id]);',
+      'const half = {} / 2; const label = "rm";',
+    ].join("\n");
+    // read by name, so a lexer without the helper fails this assertion, never the file
+    expect(typeof ambiguousSlashes === "function" ? ambiguousSlashes(src) : null).toEqual([1, 2, 3]);
+  });
+
+  it("F3-e: a real regex still reads as a regex (the control)", () => {
+    const values = stringLiterals('const hit = /rm/.test(s); const word = "x";').map((l) => l.value);
+    expect(values).toContain("x");
+    expect(values).not.toContain("rm");
+  });
+
+  it("F3-f: no source file under src/ holds an ambiguous slash", () => {
+    expect(authorityLiterals()).toContain("rm");
+    const sites = sourceFiles().flatMap((rel) =>
+      (typeof ambiguousSlashes === "function" ? ambiguousSlashes(read(rel)) : ["unread"]).map((line) => `${rel}:${line}`));
+    expect(sites).toEqual([]);
+  });
+
+  it("F3-g: a backslash before a line end does not carry a would-be regex onto the next line: the literal there is read", () => {
+    // the slash follows `=`; a backslash stands before the newline, and the next line holds a literal and a division
+    const src = 'const r = / a \\\nconst label = "rm"; const half = n / 2;';
+    expect(stringLiterals(src).map((l) => l.value)).toContain("rm");
+    expect(codeOnly(src)).toContain("const label");
+  });
+
+  it("F3-h: a division after a postfix decrement is no regex: the removal literals after it are read, and its line is recorded", () => {
+    const src = 'let n = 2; n-- / 1; deps.runDocker(["rm", "-f", id]);';
+    const values = stringLiterals(src).map((l) => l.value);
+    expect(values).toContain("rm");
+    expect(values).toContain("-f");
+    expect(typeof ambiguousSlashes === "function" ? ambiguousSlashes(src) : null).toEqual([1]);
+  });
+
+  it("F3-i: a division after a property named like a keyword is no regex: the removal literals after it are read, and no line is recorded", () => {
+    const src = [
+      'const a = obj.of / (deps.runDocker(["rm", "-f", id]), 2) / 1;',
+      'const b = obj?.in / (["rmi"], 2) / 1;',
+      'const c = obj. return / (["prune"], 2) / 1;',
+      'const d = this.#await / (["down"], 2) / 1;',
+    ].join("\n");
+    const values = stringLiterals(src).map((l) => l.value);
+    for (const v of ["rm", "-f", "rmi", "prune", "down"]) expect(values).toContain(v);
+    expect(typeof ambiguousSlashes === "function" ? ambiguousSlashes(src) : null).toEqual([]);
+  });
+
+  it("F3-j: a slash after a bare `of` (a name outside a for-of head) is read as division, and its line is recorded", () => {
+    const src = 'const of = 4;\nconst q = of / (deps.runDocker(["rm", "-f", id]), 2) / 1;';
+    const values = stringLiterals(src).map((l) => l.value);
+    expect(values).toContain("rm");
+    expect(values).toContain("-f");
+    expect(typeof ambiguousSlashes === "function" ? ambiguousSlashes(src) : null).toEqual([2]);
+  });
+
+  it("F3-k: a keyword that is no property still opens a regex, after a spread too (the control)", () => {
+    const src = [
+      'function f(s) { return /"rm"/.test(s); }',
+      'const t = typeof /"rmi"/;',
+      'const parts = [...await /"prune"/.exec(s)];',
+    ].join("\n");
+    const values = stringLiterals(src).map((l) => l.value);
+    for (const v of ["rm", "rmi", "prune"]) expect(values).not.toContain(v);
+    expect(typeof ambiguousSlashes === "function" ? ambiguousSlashes(src) : []).toEqual([]);
   });
 });

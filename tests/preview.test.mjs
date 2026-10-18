@@ -2366,6 +2366,105 @@ describe("preview stop / start (cinatra-cli#220 AC3, AC4, AC5, AC6)", () => {
     expect(fake.calls.some((c) => c[0] === "run" || c[0] === "build" || c[0] === "start")).toBe(false);
   });
 
+  it("F2-a: a plain start of a running ready preview whose required declarer throws is refused and changes nothing", async () => {
+    seedReady();
+    const packageDir = path.join(tmp, "made-up-required-declarer");
+    mkdirSync(packageDir, { recursive: true });
+    const modulePath = path.join(packageDir, "handover.mjs");
+    writeFileSync(modulePath, 'export async function previewHostHandover() { throw new Error("made-up declarer failure"); }\n');
+    const { deps, fake, logs } = makeDeps({ containerRunning: true, health: { status: 200, body: '{"status":"ok"}' }, compose: OWNED() });
+    deps.discoverHandoverDeclarers = () => [{ packageDir, modulePath, optional: false }];
+    const before = getPreview(readRegistry(registryPath).registry, "main");
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(`the required declarer "preview-host-handover" of ${packageDir} failed`);
+    expect(logs.some((l) => l.includes("is already running"))).toBe(false);
+    // every field as it was (the settle rewrites the row, so only its key order may differ)
+    expect(getPreview(readRegistry(registryPath).registry, "main")).toEqual(before);
+    expect(fake.calls.filter((c) => /^(run|create|start|stop|restart|kill|pause|unpause|rename|rm|update)$/.test(c[0] === "container" ? c[1] : c[0]) ||
+      (["network", "volume", "image"].includes(c[0]) && /^(create|rm|remove|prune|connect|disconnect)$/.test(c[1])))).toEqual([]);
+  });
+
+  it("F2-b: a plain start of a running ready preview whose declarer discovery fails is refused and changes nothing", async () => {
+    seedReady();
+    const { deps, fake, logs } = makeDeps({ containerRunning: true, health: { status: 200, body: '{"status":"ok"}' }, compose: OWNED() });
+    deps.discoverHandoverDeclarers = () => { throw new Error("made-up unreadable manifest"); };
+    const before = getPreview(readRegistry(registryPath).registry, "main");
+    await expect(runPreviewStart(["--slug", "main"], deps)).rejects.toThrow(/could not be read \(made-up unreadable manifest\)/);
+    expect(logs.some((l) => l.includes("is already running"))).toBe(false);
+    // every field as it was (the settle rewrites the row, so only its key order may differ)
+    expect(getPreview(readRegistry(registryPath).registry, "main")).toEqual(before);
+    expect(fake.calls.filter((c) => /^(run|create|start|stop|restart|kill|pause|unpause|rename|rm|update)$/.test(c[0] === "container" ? c[1] : c[0]) ||
+      (["network", "volume", "image"].includes(c[0]) && /^(create|rm|remove|prune|connect|disconnect)$/.test(c[1])))).toEqual([]);
+  });
+
+  it("F2-c: a plain start of a running ready preview whose only declarer is optional and fails stays a no-op and warns once by name", async () => {
+    seedReady();
+    const packageDir = path.join(tmp, "made-up-optional-declarer");
+    mkdirSync(packageDir, { recursive: true });
+    const modulePath = path.join(packageDir, "handover.mjs");
+    writeFileSync(modulePath, 'export async function previewHostHandover() { throw new Error("made-up declarer failure"); }\n');
+    const { deps, fake, logs } = makeDeps({ containerRunning: true, health: { status: 200, body: '{"status":"ok"}' }, compose: OWNED() });
+    deps.discoverHandoverDeclarers = () => [{ packageDir, modulePath, optional: true }];
+    const out = await runPreviewStart(["--slug", "main"], deps);
+    expect(out.changed).toBe(false);
+    expect(logs.filter((l) => l.includes("is already running"))).toHaveLength(1);
+    const warnings = logs.filter((l) => l.includes("preview host handover: skipped"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(packageDir);
+    expect(fake.calls.filter((c) => /^(run|create|start|stop|restart|kill|pause|unpause|rename|rm|update)$/.test(c[0] === "container" ? c[1] : c[0]) ||
+      (["network", "volume", "image"].includes(c[0]) && /^(create|rm|remove|prune|connect|disconnect)$/.test(c[1])))).toEqual([]);
+  });
+
+  it("F2-d: a plain start of a running ready preview whose failing optional declarers' dir names hold line breaks prints no forged line: each name is escaped on its one warning line", async () => {
+    seedReady();
+    const moduleDir = path.join(tmp, "made-up-optional-declarer");
+    mkdirSync(moduleDir, { recursive: true });
+    const modulePath = path.join(moduleDir, "handover.mjs");
+    writeFileSync(modulePath, 'export async function previewHostHandover() { throw new Error("made-up declarer failure"); }\n');
+    // the census keeps a directory's raw name: one that holds a result line between CR LF breaks, one with U+2028, U+0085 and U+2029
+    const forging = path.join("extensions", "acme", `made-up\r\npreview_container_id=${"b".repeat(64)}\r\n`);
+    const breaking = path.join("extensions", "acme", "made-up\u2028line\u0085break\u2029para");
+    const { deps, logs } = makeDeps({ containerRunning: true, health: { status: 200, body: '{"status":"ok"}' }, compose: OWNED() });
+    deps.discoverHandoverDeclarers = () => [{ packageDir: forging, modulePath, optional: true }, { packageDir: breaking, modulePath, optional: true }];
+    const out = await runPreviewStart(["--slug", "main"], deps);
+    expect(out.changed).toBe(false);
+    const warnings = logs.filter((l) => l.includes("preview host handover: skipped"));
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toContain(`of ${JSON.stringify(forging)}: `);
+    expect(warnings[1]).toContain(`of ${JSON.stringify(breaking).replace("\u2028", "\\u2028").replace("\u0085", "\\u0085").replace("\u2029", "\\u2029")}: `);
+    // each warning is one physical line, so no line printed is a result line
+    expect(warnings.filter((l) => /[\r\n\u0085\u2028\u2029]/.test(l))).toEqual([]);
+    expect(logs.join("\n").split("\n").filter((l) => l.startsWith("preview_container_id="))).toEqual([]);
+  });
+
+  it("F2-e: a plain start of a running ready preview whose failing required declarer's dir name holds a line break is refused on one line that escapes the name", async () => {
+    seedReady();
+    const moduleDir = path.join(tmp, "made-up-required-declarer");
+    mkdirSync(moduleDir, { recursive: true });
+    const modulePath = path.join(moduleDir, "handover.mjs");
+    writeFileSync(modulePath, 'export async function previewHostHandover() { throw new Error("made-up declarer failure"); }\n');
+    const packageDir = path.join("extensions", "acme", `made-up\r\npreview_container_id=${"c".repeat(64)}\u2029\n`);
+    const { deps, logs } = makeDeps({ containerRunning: true, health: { status: 200, body: '{"status":"ok"}' }, compose: OWNED() });
+    deps.discoverHandoverDeclarers = () => [{ packageDir, modulePath, optional: false }];
+    const err = await runPreviewStart(["--slug", "main"], deps).then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toContain(`the required declarer "preview-host-handover" of ${JSON.stringify(packageDir).replace("\u2029", "\\u2029")} failed`);
+    expect(err.message).not.toMatch(/[\r\n\u0085\u2028\u2029]/);
+    expect(logs.some((l) => l.includes("is already running"))).toBe(false);
+  });
+
+  it("F2-f: a plain start of a running ready preview whose declarer census fails on a dir name that holds a line break is refused on one line that escapes the census text", async () => {
+    seedReady();
+    const dir = path.join("extensions", "acme", `made-up\r\npreview_container_id=${"d".repeat(64)}\u2029\n`);
+    const failure = `the manifest of ${dir} is not valid JSON.`;
+    const { deps, logs } = makeDeps({ containerRunning: true, health: { status: 200, body: '{"status":"ok"}' }, compose: OWNED() });
+    deps.discoverHandoverDeclarers = () => { throw new Error(failure); };
+    const err = await runPreviewStart(["--slug", "main"], deps).then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toContain(`could not be read (${JSON.stringify(failure).replace("\u2029", "\\u2029")})`);
+    expect(err.message).not.toMatch(/[\r\n\u0085\u2028\u2029]/);
+    expect(logs.some((l) => l.includes("is already running"))).toBe(false);
+  });
+
   it("a plain start that re-materializes an absent container prints no preview_container_id line; it records the new ID", async () => {
     seedReady();
     const state = { containerAbsent: true, health: { status: 200, body: '{"status":"ok"}' }, images: new Set([previewImageTag(SHA_A)]), compose: OWNED() };

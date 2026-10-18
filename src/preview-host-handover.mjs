@@ -167,13 +167,31 @@ function runFailure(run) {
   return null;
 }
 
+/** A character that can end, break or forge a line: a C0 or C1 control, DEL, U+2028 or U+2029. */
+// eslint-disable-next-line no-control-regex
+const CONTROL_OR_BREAK_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
+/**
+ * Text read from the disk (a declarer's package dir, a census failure that
+ * names one) as one line: as it is when it holds no control or line-break
+ * character, else JSON-quoted with every such character escaped. So a directory
+ * name can never start a line of its own (a result line, say) on the CLI's
+ * stdout or in an error.
+ */
+function oneLineText(text) {
+  const s = String(text);
+  if (!CONTROL_OR_BREAK_RE.test(s)) return s;
+  return JSON.stringify(s).replace(/[\u007f-\u009f\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
 /**
  * Call every declarer once and merge what they hand over, validated:
  * `{ env: [[name, value], ...], forwards: [{ port, network, host, targetPort }, ...],
  *    skipped: [{ packageDir, why }, ...] }`.
  * A REQUIRED declarer's failure THROWS (the preview is refused); an OPTIONAL
  * declarer's failure skips its whole contribution and is recorded in `skipped`
- * and in one warning line. No line names a value.
+ * and in one warning line. No line names a value, and a package dir is shown
+ * through oneLineText, so no name can break the line it is printed on.
  */
 export async function collectPreviewHostHandover({ checkoutDir, deps = {}, log = () => {} }) {
   const warn = (line) => log(`  ⚠ preview host handover: ${line}`);
@@ -194,10 +212,10 @@ export async function collectPreviewHostHandover({ checkoutDir, deps = {}, log =
     // The census could not read every manifest, so a required declarer may be
     // among the unread: nothing is assumed absent.
     throw new Error(`preview host handover: the declarers of "${PREVIEW_HOST_HANDOVER_KEY}" could not be read ` +
-      `(${String(err?.message ?? err).slice(0, 300)}); the preview is refused, since a required handover may be among them.`);
+      `(${oneLineText(String(err?.message ?? err).slice(0, 300))}); the preview is refused, since a required handover may be among them.`);
   }
   for (const { packageDir, modulePath, optional = false, invalid = null } of declarers) {
-    const who = `"${PREVIEW_HOST_HANDOVER_KEY}" of ${packageDir}`;
+    const who = `"${PREVIEW_HOST_HANDOVER_KEY}" of ${oneLineText(packageDir)}`;
     const run = invalid ? { invalid } : await runDeclarer(modulePath, { timeoutMs, startTimeoutMs, graceMs, log });
     // The whole contribution is checked before any of it is taken: a declarer
     // is either taken in full or it failed.

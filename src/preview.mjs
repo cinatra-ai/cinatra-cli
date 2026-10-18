@@ -3704,6 +3704,16 @@ export async function runPreviewStart(rest, injected = {}) {
         if (own !== "running") {
           throw new Error(`The container ${target.id.slice(0, 12)} preview "${slug}" recorded is ${own} by its own ID; nothing was changed.`);
         }
+        // A running preview is only "already running" while its required
+        // declarers still answer: a required declarer's or the discovery's
+        // failure refuses the start, and the row returns to the state the claim
+        // read. An optional declarer's skip prints its own warning line.
+        try {
+          await collectPreviewHostHandover({ checkoutDir, deps, log });
+        } catch (err) {
+          await settleRow(inv, claim);
+          throw err;
+        }
         deps.log(`preview "${slug}" is already running: ${tag} on http://${previewReachHost(row.bind ?? null)}:${hostPort}`);
         await settleRow(inv, claim);
         return { slug, container: "running", changed: false, rematerialized: false, hostPort };
