@@ -47,6 +47,7 @@
 // ---------------------------------------------------------------------------
 
 import path from "node:path";
+import { answerOk, outputText } from "./preview-authority.mjs";
 
 // --- the compose label contract (identical to the install path's) ----------
 
@@ -279,9 +280,10 @@ export function holdersFromInspect(inspectRows, port) {
 
 function inspectIds(ids, deps) {
   const r = deps.runDocker(["inspect", ...ids], { timeoutMs: OWNERSHIP_PROBE_TIMEOUT_MS });
-  if (r.status !== 0) return null;
+  const said = answerOk(r) ? outputText(r, "stdout") : null;
+  if (said === null) return null;
   try {
-    const rows = JSON.parse(r.stdout ?? "");
+    const rows = JSON.parse(said);
     return Array.isArray(rows) ? rows : null;
   } catch {
     return null;
@@ -289,8 +291,9 @@ function inspectIds(ids, deps) {
 }
 
 function idList(result) {
-  if (!result || result.status !== 0) return null;
-  return (result.stdout ?? "").split("\n").map((s) => s.trim()).filter(Boolean);
+  const said = answerOk(result) ? outputText(result, "stdout") : null;
+  if (said === null) return null;
+  return said.split("\n").map((s) => s.trim()).filter(Boolean);
 }
 
 /**
@@ -309,9 +312,10 @@ function idList(result) {
  * this guard into a false refusal on the isolated path (#219 AC5).
  *
  * `status: "unavailable"` means the probe itself could not run (no docker CLI,
- * an inspect failure). That is an UNKNOWN, never a mismatch — the caller
- * degrades to a warning rather than claiming an ownership violation it did not
- * observe.
+ * an inspect failure). That is an UNKNOWN, never a mismatch: the caller never
+ * claims an ownership violation it did not observe, and never reads the unknown
+ * as a pass either — under enforce it REFUSES (assertEndpointOwnership), and
+ * only warn proceeds on it with a warning.
  */
 export function inspectContainerWorld({ checkoutDir, deps }) {
   const empty = { status: "unavailable", rows: [], ports: new Set(), projects: new Set(), containers: [] };
@@ -360,9 +364,11 @@ export function liveProjects(own) {
  *   - "unverifiable" — no port could be derived from the value (never guessed).
  *   - "unknown"      — the ownership probe could not run at all.
  *
- * "foreign" / "contested" / "unowned" are VIOLATIONS. "unverifiable" /
- * "unknown" are reported as warnings and never block: refusing on evidence we
- * do not have would be a fabricated verdict.
+ * "foreign" / "contested" / "unowned" are VIOLATIONS. "unverifiable" is reported
+ * as a warning and never blocks: refusing on evidence we do not have would be a
+ * fabricated verdict. "unknown" (the probe could not read docker) is no pass
+ * either: under enforce it REFUSES (assertEndpointOwnership), and only warn
+ * proceeds on it with the warning.
  *
  * ONE MORE REFUSAL, not per-endpoint: when the checkout's own RUNNING containers
  * span MORE THAN ONE compose project, "rooted at this checkout" no longer picks
@@ -541,8 +547,9 @@ export function ownershipFailureMessage({ report, checkoutDir, mode, gatewayHost
 /**
  * The call site: verify, then REFUSE (enforce) or WARN LOUDLY (warn).
  *
- * Warnings that are not violations (an unverifiable value, an unavailable
- * probe) are always printed and never block.
+ * Warnings that are not violations are always printed. An unverifiable value
+ * never blocks; an unavailable probe (an "unknown" verdict) REFUSES under
+ * enforce, and only warn proceeds on it.
  */
 export function assertEndpointOwnership({ entries = [], checkoutDir, deps, env = {}, gatewayHost }) {
   const mode = resolveEndpointOwnershipMode(env);
@@ -561,6 +568,18 @@ export function assertEndpointOwnership({ entries = [], checkoutDir, deps, env =
         ? `  NOTE: ${w.key} names no port this check can derive, so its ownership was NOT verified.`
         : `  NOTE: could not inspect this checkout's own containers, so ${w.key} (host port ${w.port}) ` +
           `ownership was NOT verified — docker metadata was unavailable.`,
+    );
+  }
+  // An endpoint set docker could not be read for is no pass under enforce: the
+  // probe's failure (an inspect or a listing that did not exit 0) refuses, and
+  // only warn proceeds on it.
+  const unread = report.results.filter((r) => r.verdict === "unknown");
+  if (unread.length > 0 && mode !== "warn") {
+    throw new Error(
+      `preview: the ownership of ${unread.map((r) => `${r.key} (host port ${r.port})`).join(", ")} could not be verified — ` +
+        `docker's container metadata could not be read, so nothing proves these endpoints are this instance's. ` +
+        `Nothing was built or booted. Check the docker daemon and retry, or set ${ENDPOINT_OWNERSHIP_ENV}=warn to proceed ` +
+        `without the proof.`,
     );
   }
   if (report.violations.length === 0 && !report.projectConflict) {
