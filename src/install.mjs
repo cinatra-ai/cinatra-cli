@@ -10583,6 +10583,27 @@ async function bootstrapPreviewFrontDoor({
   });
 }
 
+/** True when a repository or ref would reach git as an option instead of the
+ *  value it names: not a string, empty, or "-"-led (`--upload-pack=<command>`
+ *  is such a value, and git runs the command it names). Every helper that
+ *  hands a caller's repository or ref to git refuses such a value first. */
+function isFlagShapedGitValue(value) {
+  return typeof value !== "string" || value === "" || value.startsWith("-");
+}
+
+/** Throw a named refusal for a repository or ref that `isFlagShapedGitValue`
+ *  marks, before any git child starts. `what` is "ref" or "repository". */
+function refuseFlagShapedGitValue(what, value) {
+  if (!isFlagShapedGitValue(value)) return;
+  throw Object.assign(
+    new Error(
+      `Refusing the ${what} "${value}": it is empty or starts with "-", so it is not passed to git. ` +
+        `Name a ${what === "ref" ? "branch, tag or commit" : "repository URL or path"} instead.`,
+    ),
+    { code: "GIT_VALUE_FLAG_SHAPED" },
+  );
+}
+
 /** The dry run's read-only `git ls-remote <repo> <ref>`: the sha it names, or
  *  "<resolved at clone>" when it cannot resolve (offline, a bad ref) or its
  *  advisory read outlives its bound, which it names in one warning line. A
@@ -10590,11 +10611,11 @@ async function bootstrapPreviewFrontDoor({
  *  empty or "-"-led repository or ref is named and not read, and "--" ends
  *  git's options before the two. */
 export function dryRunResolvedSha({ cap = capture, repoUrl, ref, log = console.log }) {
-  if (typeof repoUrl !== "string" || repoUrl === "" || repoUrl.startsWith("-")) {
+  if (isFlagShapedGitValue(repoUrl)) {
     log(`  ⚠ The repository "${repoUrl}" is empty or starts with "-", so it is not passed to \`git ls-remote\`. The ref is resolved at clone.`);
     return "<resolved at clone>";
   }
-  if (typeof ref !== "string" || ref === "" || ref.startsWith("-")) {
+  if (isFlagShapedGitValue(ref)) {
     log(`  ⚠ The ref "${ref}" is empty or starts with "-", so it is not passed to \`git ls-remote\`. The ref is resolved at clone.`);
     return "<resolved at clone>";
   }
@@ -10611,7 +10632,9 @@ export function dryRunResolvedSha({ cap = capture, repoUrl, ref, log = console.l
 
 /** Clone a fresh host repo or update an existing checkout to `ref`; return the
  *  resolved commit SHA. Refuses a dirty checkout unless --force (stash-then-
- *  reset), and refuses to update a checkout whose origin is a different repo. */
+ *  reset), and refuses to update a checkout whose origin is a different repo.
+ *  An empty or "-"-led ref (and, for a clone, repository) is refused by name
+ *  before any git child starts, so it never reaches git as an option. */
 export async function cloneOrUpdateHost({
   targetDir,
   repoUrl,
@@ -10623,6 +10646,7 @@ export async function cloneOrUpdateHost({
   log,
   deps = {},
 }) {
+  refuseFlagShapedGitValue("ref", ref);
   if (alreadyCheckout) {
     log(`- Existing cinatra checkout at ${targetDir} — updating to ref "${ref}"…`);
     // A log line only: an expired bound is named and the update goes on to the
@@ -10676,6 +10700,7 @@ export async function cloneOrUpdateHost({
         `commit you want), or drop --no-fetch.`,
     );
   }
+  refuseFlagShapedGitValue("repository", repoUrl);
 
   if (existsSync(targetDir) && !isEmptyDir(targetDir)) {
     // Non-empty + --force was confirmed above; clone into it is unsafe, so
@@ -10696,12 +10721,13 @@ export async function cloneOrUpdateHost({
 
   // Fresh clone: check out the requested ref (the clone default is the remote
   // HEAD branch). Resolve `ref` to a commit and check it out detached-then-by-
-  // name so both a branch and a raw sha work.
+  // name so both a branch and a raw sha work. The ref was refused above when
+  // "-"-led; `checkout` takes no "--" here, as "--" would make it a path.
   const checkout = git(["-C", targetDir, "checkout", ref]);
   if (checkout.status !== 0) {
     // Fetch the ref explicitly (covers a tag/sha not in the default clone) then
     // check out the fetched commit.
-    const fetched = git(["-C", targetDir, "fetch", "origin", ref, "--tags"]);
+    const fetched = git(["-C", targetDir, "fetch", "--tags", "origin", "--", ref]);
     const fh = fetched.status === 0 ? git(["-C", targetDir, "checkout", "FETCH_HEAD"]) : fetched;
     if (fh.status !== 0) {
       throw new Error(
@@ -10840,6 +10866,9 @@ export async function resolveLatestReleaseTag({ targetDir, log = console.log, de
  *                 resolved commit. Used by `install`/`cloneOrUpdateHost` so
  *                 `--ref main` keeps tracking `main`.
  *
+ *  An empty or "-"-led `ref` is refused by name before any git child starts,
+ *  and "--" ends `git fetch`'s options before the ref it fetches.
+ *
  *  `fetch: false` skips the fetch step (the caller already fetched the ref).
  *  `deps` injects `runGit(args)` + `workingTreeIsDirty` + `capture` for tests. */
 export function moveExistingCheckoutToRef({
@@ -10851,6 +10880,9 @@ export function moveExistingCheckoutToRef({
   log = console.log,
   deps = {},
 } = {}) {
+  // 0. A "-"-led or empty ref would reach `git fetch` / `git checkout` as an
+  //    option; refuse it by name before any git child (the dirt read included).
+  refuseFlagShapedGitValue("ref", ref);
   const runGit = deps.runGit ?? ((args) => git(["-C", targetDir, ...args]));
   const cap = deps.capture ?? capture;
   // cinatra-cli#198: the guard now classifies the dirt instead of only counting
@@ -10920,8 +10952,8 @@ export function moveExistingCheckoutToRef({
   const isTag = kind === "tag";
   if (fetch) {
     const fetchArgs = isTag
-      ? ["fetch", "origin", "--force", `refs/tags/${ref}:refs/tags/${ref}`]
-      : ["fetch", "origin", ref, "--tags", "--force"];
+      ? ["fetch", "--force", "origin", "--", `refs/tags/${ref}:refs/tags/${ref}`]
+      : ["fetch", "--tags", "--force", "origin", "--", ref];
     const fetched = runGit(fetchArgs);
     if (fetched.status !== 0) {
       throw new Error(`git fetch origin ${ref} failed: ${(fetched.stderr ?? "").trim()}`);

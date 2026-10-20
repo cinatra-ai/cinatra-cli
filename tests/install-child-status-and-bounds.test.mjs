@@ -1007,3 +1007,193 @@ describe("the companion sync's git children", () => {
     });
   });
 });
+
+describe("the host checkout's git moves: a ref (or a clone's repository) never reaches git as an option", () => {
+  const FLAG_SHAPED = ["--upload-pack=touch /tmp/x", "", "-x"];
+  const REPO = "https://github.com/example/example.git";
+
+  const G = (args, cwd) =>
+    execFileSync("git", args, {
+      cwd,
+      env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" },
+      encoding: "utf8",
+    }).trim();
+
+  function sourceRepo(name) {
+    const dir = path.join(sandbox, name);
+    mkdirSync(dir, { recursive: true });
+    G(["init", "-q", "-b", "main"], dir);
+    writeFileSync(path.join(dir, "a.txt"), "a\n");
+    G(["add", "-A"], dir);
+    G(["commit", "-q", "-m", "one"], dir);
+    return dir;
+  }
+
+  /** A recording `git` stand-in first on PATH of THIS process while `fn` runs
+   *  (awaited): every git child the helper starts appends one line to the
+   *  returned record file, so "no line" means no git child started. */
+  async function withRecordingGit(fn) {
+    const record = path.join(mkdtempSync(path.join(sandbox, "git-record-")), "calls.txt");
+    const env = standInEnv("git", `echo "$*" >> "${record}"\nexit 1`);
+    const before = process.env.PATH;
+    process.env.PATH = env.PATH;
+    try {
+      await fn();
+    } finally {
+      if (before === undefined) delete process.env.PATH;
+      else process.env.PATH = before;
+    }
+    return existsSync(record) ? readFileSync(record, "utf8").split("\n").filter(Boolean) : [];
+  }
+
+  async function refusal(promiseOrFn) {
+    try {
+      await (typeof promiseOrFn === "function" ? promiseOrFn() : promiseOrFn);
+    } catch (err) {
+      return err;
+    }
+    return null;
+  }
+
+  const refusedRef = (value) =>
+    `Refusing the ref "${value}": it is empty or starts with "-", so it is not passed to git. Name a branch, tag or commit instead.`;
+
+  it("a fresh clone: a '--upload-pack=' ref runs no command through the real git, and nothing is cloned", async () => {
+    const source = sourceRepo("flag-ref-source");
+    const marker = path.join(sandbox, "clone-ref-upload-pack-ran");
+    const targetDir = path.join(sandbox, "flag-ref-clone");
+    const ref = `--upload-pack=touch ${marker}; :`;
+    const err = await refusal(
+      install.cloneOrUpdateHost({ targetDir, repoUrl: source, ref, alreadyCheckout: false, force: false, yes: true, log: () => {} }),
+    );
+    expect(existsSync(marker)).toBe(false);
+    expect(err?.code).toBe("GIT_VALUE_FLAG_SHAPED");
+    expect(err?.message).toBe(refusedRef(ref));
+    expect(existsSync(targetDir)).toBe(false);
+  });
+
+  it("cloneOrUpdateHost refuses an empty or '-'-led ref by name, for a clone and for an existing checkout, and starts no git child", async () => {
+    for (const ref of FLAG_SHAPED) {
+      for (const alreadyCheckout of [false, true]) {
+        const targetDir = path.join(mkdtempSync(path.join(sandbox, "flag-ref-host-")), "checkout");
+        if (alreadyCheckout) mkdirSync(targetDir);
+        let err;
+        const calls = await withRecordingGit(async () => {
+          err = await refusal(
+            install.cloneOrUpdateHost({ targetDir, repoUrl: REPO, ref, alreadyCheckout, force: false, yes: true, log: () => {} }),
+          );
+        });
+        expect(calls, `ref ${JSON.stringify(ref)}, alreadyCheckout ${alreadyCheckout}`).toEqual([]);
+        expect(err?.code).toBe("GIT_VALUE_FLAG_SHAPED");
+        expect(err?.message).toBe(refusedRef(ref));
+        if (!alreadyCheckout) expect(existsSync(targetDir)).toBe(false);
+      }
+    }
+  });
+
+  it("cloneOrUpdateHost refuses an empty or '-'-led repository for a clone by name, and starts no git child", async () => {
+    for (const repoUrl of FLAG_SHAPED) {
+      const targetDir = path.join(mkdtempSync(path.join(sandbox, "flag-repo-host-")), "checkout");
+      let err;
+      const calls = await withRecordingGit(async () => {
+        err = await refusal(
+          install.cloneOrUpdateHost({ targetDir, repoUrl, ref: "main", alreadyCheckout: false, force: false, yes: true, log: () => {} }),
+        );
+      });
+      expect(calls, `repository ${JSON.stringify(repoUrl)}`).toEqual([]);
+      expect(err?.code).toBe("GIT_VALUE_FLAG_SHAPED");
+      expect(err?.message).toBe(
+        `Refusing the repository "${repoUrl}": it is empty or starts with "-", so it is not passed to git. Name a repository URL or path instead.`,
+      );
+      expect(existsSync(targetDir)).toBe(false);
+    }
+  });
+
+  it("moveExistingCheckoutToRef refuses an empty or '-'-led ref by name, for either kind, before any git child (the dirt read included)", async () => {
+    const dir = path.join(sandbox, "flag-ref-move");
+    mkdirSync(dir, { recursive: true });
+    for (const ref of FLAG_SHAPED) {
+      for (const kind of ["ref", "tag"]) {
+        let err;
+        const calls = await withRecordingGit(async () => {
+          err = await refusal(() => install.moveExistingCheckoutToRef({ targetDir: dir, ref, kind, log: () => {} }));
+        });
+        expect(calls, `ref ${JSON.stringify(ref)}, kind ${kind}`).toEqual([]);
+        expect(err?.code).toBe("GIT_VALUE_FLAG_SHAPED");
+        expect(err?.message).toBe(refusedRef(ref));
+
+        const seams = [];
+        const injected = await refusal(() =>
+          install.moveExistingCheckoutToRef({
+            targetDir: dir,
+            ref,
+            kind,
+            log: () => {},
+            deps: {
+              captureRaw: (...args) => {
+                seams.push(["captureRaw", args]);
+                return "";
+              },
+              runGit: (args) => {
+                seams.push(["runGit", args]);
+                return { status: 0, stdout: "", stderr: "" };
+              },
+            },
+          }),
+        );
+        expect(seams).toEqual([]);
+        expect(injected?.message).toBe(refusedRef(ref));
+      }
+    }
+  });
+
+  it("moveExistingCheckoutToRef: '--' ends git fetch's options before the ref it fetches, for either kind", () => {
+    for (const [kind, ref, refspec] of [
+      ["ref", "main", "main"],
+      ["tag", "v1.2.3", "refs/tags/v1.2.3:refs/tags/v1.2.3"],
+    ]) {
+      const fetches = [];
+      expect(() =>
+        install.moveExistingCheckoutToRef({
+          targetDir: path.join(sandbox, "no-such-checkout"),
+          ref,
+          kind,
+          log: () => {},
+          deps: {
+            classifyTargetDirt: () => ({ entries: [], byproducts: [], operator: [], clean: true, resettable: [] }),
+            runGit: (args) => {
+              if (args[0] === "fetch") fetches.push(args);
+              return { status: 1, stdout: "", stderr: "stop here" };
+            },
+          },
+        }),
+      ).toThrow(/git fetch origin .* failed: stop here/);
+      const opts = kind === "tag" ? ["--force"] : ["--tags", "--force"];
+      expect(fetches).toEqual([["fetch", ...opts, "origin", "--", refspec]]);
+    }
+  });
+
+  it("a fresh clone still resolves a ref only its explicit fetch brings, through the real git with '--'", async () => {
+    const source = sourceRepo("dashdash-fetch-source");
+    G(["checkout", "-q", "-b", "side"], source);
+    writeFileSync(path.join(source, "b.txt"), "b\n");
+    G(["add", "-A"], source);
+    G(["commit", "-q", "-m", "two"], source);
+    const side = G(["rev-parse", "HEAD"], source);
+    G(["update-ref", "refs/custom/only", side], source);
+    G(["checkout", "-q", "main"], source);
+    G(["branch", "-q", "-D", "side"], source);
+    const targetDir = path.join(sandbox, "dashdash-fetch-clone");
+    await expect(
+      install.cloneOrUpdateHost({
+        targetDir,
+        repoUrl: source,
+        ref: "refs/custom/only",
+        alreadyCheckout: false,
+        force: false,
+        yes: true,
+        log: () => {},
+      }),
+    ).resolves.toBe(side);
+  });
+});
