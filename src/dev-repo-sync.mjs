@@ -100,7 +100,9 @@ export function isAllowedGitRemote(url) {
  * `sha`, and is its worktree STILL free of local work?
  *
  * Fail-closed: a missing/invalid argument, a non-git or unreadable directory,
- * or any git error answers `false`. Stray published-marker debris is not local
+ * or any git error answers `false`; a git read that outlives its bound throws
+ * its named failure (code CHILD_TIMEOUT) instead, so a hung read is never
+ * taken for a checkout that moved. Stray published-marker debris is not local
  * work (see PUBLISHED_MARKER_BASENAME) and does not withdraw an attestation,
  * consistent with the dirty computation everywhere else in this module.
  *
@@ -126,7 +128,10 @@ export function attestationStillHolds({ dest, sha, deps } = {}) {
       .map((l) => l.replace(/\r$/, ""))
       .filter((l) => l.trim() !== "");
     return lines.every((l) => l === STRAY_MARKER_STATUS_LINE);
-  } catch {
+  } catch (err) {
+    // An unreadable state attests nothing; a git child that outlived its bound
+    // is its own named failure, never a quiet "does not hold".
+    if (err?.code === "CHILD_TIMEOUT") throw err;
     return false;
   }
 }
@@ -159,7 +164,8 @@ export function attestationStillHolds({ dest, sha, deps } = {}) {
  * is a real tree divergence, exactly as elsewhere in this module.
  *
  * Fail-closed: an empty/absent file list, an unreadable index, or any git error
- * answers `false`. ONE git call, made only when a skew actually needs deciding.
+ * answers `false`; a git read that outlives its bound throws its named failure
+ * (code CHILD_TIMEOUT) instead. ONE git call, made only when a skew actually needs deciding.
  */
 export function packedPathsAreTrackedAndUnhidden({ dir, files, deps } = {}) {
   if (typeof dir !== "string" || !dir) return false;
@@ -180,19 +186,62 @@ export function packedPathsAreTrackedAndUnhidden({ dir, files, deps } = {}) {
       // Untracked-only allowance for the marker debris (see above).
       return file === PUBLISHED_MARKER_BASENAME && flag === undefined;
     });
-  } catch {
+  } catch (err) {
+    if (err?.code === "CHILD_TIMEOUT") throw err;
     return false;
+  }
+}
+
+/** The bound of one git child of the companion sync (a clone or fetch
+ *  included), counted from its spawn. */
+export const REPO_SYNC_GIT_TIMEOUT_MS = 15 * 60_000;
+
+/** The word that names a git child in a timeout message: the first argument
+ *  that is neither a flag nor the value of git's `-C` / `-c` option, so
+ *  `git -C <dir> status` is named `git status`. */
+function gitSubcommand(args) {
+  const list = Array.isArray(args) ? args : [];
+  for (let i = 0; i < list.length; i += 1) {
+    const a = list[i];
+    if (typeof a !== "string") continue;
+    if (a === "-C" || a === "-c") {
+      i += 1;
+      continue;
+    }
+    if (a.startsWith("-")) continue;
+    return a;
+  }
+  return null;
+}
+
+/** Run one git child of the sync: its stdout after exit 0, the child's own
+ *  error (with its `status`) on a non-zero exit, and a named error (code
+ *  CHILD_TIMEOUT) when it outlives its bound; SIGKILL, so a child that ignores
+ *  SIGTERM cannot hold the wait open. */
+export function runRepoSyncGit(args, cwd, { timeoutMs = REPO_SYNC_GIT_TIMEOUT_MS } = {}) {
+  try {
+    return execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: timeoutMs,
+      killSignal: "SIGKILL",
+    }).toString();
+  } catch (err) {
+    if (err?.code === "ETIMEDOUT") {
+      const word = gitSubcommand(args);
+      const sub = word ? ` ${word}` : "";
+      const named = new Error(`\`git${sub}\` did not finish within ${Math.round(timeoutMs / 1000)} s; it was stopped.`);
+      named.code = "CHILD_TIMEOUT";
+      throw named;
+    }
+    throw err;
   }
 }
 
 export function defaultRepoSyncDeps() {
   return {
-    git: (args, cwd) =>
-      execFileSync("git", args, {
-        cwd,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-      }).toString(),
+    git: (args, cwd) => runRepoSyncGit(args, cwd),
     exists: (p) => existsSync(p),
     readdir: (p) => readdirSync(p),
     mkdirp: (p) => mkdirSync(p, { recursive: true }),
@@ -320,12 +369,30 @@ export function syncOneRepo({
   // this avoids a per-repo network round-trip). GitHub serves reachable-sha
   // fetches; an unreachable pin (force-pushed companion history) fails loud
   // here — that is the bump-the-lock signal, never a silent fallback to tip.
+  // Presence is read by exit status: `cat-file -e <sha>` exits 0 when the
+  // object is in the repository and 1, silently, only when it is not; any
+  // other failure (another status, a signal, a timeout) is an unread state and
+  // throws, never "absent". An object that is there but is no readable commit
+  // reads present here, and the checkout and the HEAD check below fail on it.
   const ensurePinnedCommitTo = (pin) => {
     let present = true;
     try {
-      git(["cat-file", "-e", `${pin}^{commit}`], dest);
-    } catch {
-      present = false;
+      git(["cat-file", "-e", pin], dest);
+    } catch (err) {
+      if (err?.code !== "CHILD_TIMEOUT" && err?.status === 1 && !err?.signal) {
+        present = false;
+      } else {
+        // The wrapper keeps the named failure's identity: a read that outlived
+        // its bound still carries code CHILD_TIMEOUT for every caller.
+        const timedOut = err?.code === "CHILD_TIMEOUT";
+        const unread = new Error(
+          `${pkgName}: could not read whether the pinned commit ${pin} is present in ${dest} ` +
+            `(${timedOut ? err.message : `git exited ${err?.status ?? "without a status"}`}).`,
+          { cause: err },
+        );
+        if (timedOut) unread.code = "CHILD_TIMEOUT";
+        throw unread;
+      }
     }
     if (!present) git(["fetch", "origin", pin], dest);
     git(["checkout", "--detach", pin], dest);
@@ -361,7 +428,8 @@ export function syncOneRepo({
   // It is deliberately NOT "the sync just ran": an in-place update syncs the
   // extensions twice (install phase, then setup phase) and only the second
   // run's results are read downstream, so the attestation must re-verify the
-  // state rather than report an action. Fail-closed: an unreadable ref, a HEAD
+  // state rather than report an action. A read that outlives its bound throws
+  // its named failure (code CHILD_TIMEOUT). Fail-closed: an unreadable ref, a HEAD
   // that is not the tip (e.g. local commits ahead of upstream), or a dirty tree
   // yields `undefined` — an unverifiable state is never attested. Untracked
   // published-marker debris is tool output, not local work (see
@@ -373,7 +441,8 @@ export function syncOneRepo({
       const tip = git(["rev-parse", `refs/remotes/origin/${branch}`], dest).trim();
       if (!COMMIT_SHA_RE.test(head) || head !== tip) return undefined;
       return readTreeState().dirty ? undefined : head;
-    } catch {
+    } catch (err) {
+      if (err?.code === "CHILD_TIMEOUT") throw err;
       return undefined;
     }
   };
@@ -474,7 +543,8 @@ export function syncOneRepo({
           ["rev-list", "-n", "1", "HEAD", "--not", "--branches", "--remotes", "--tags"],
           dest,
         ).trim();
-      } catch {
+      } catch (err) {
+        if (err?.code === "CHILD_TIMEOUT") throw err;
         unreachableTip = "unverifiable";
       }
       if (unreachableTip !== "") {

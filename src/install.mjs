@@ -36,6 +36,7 @@ import {
   constants as fsConstants,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -278,60 +279,144 @@ const GIT_ALLOW_PROTOCOL = ALLOWED_GIT_PROTOCOLS.join(":");
 // ---------------------------------------------------------------------------
 // Small process helpers (self-contained — index.mjs equivalents are not
 // exported, and install.mjs must stay import-light).
+//
+// These helpers and the setup child (`runSetupInTarget`) bound each child wait
+// from its spawn: spawnSync's own `timeout`, with SIGKILL so a child that
+// ignores SIGTERM cannot hold the wait open. An expired bound is a named failure
+// (`childTimeoutError`), never "false", "null" or empty. Success is the exit
+// status alone; output is parsed only after a zero status. The other direct
+// child waits of this file (the compose start among them) keep their own handling.
 // ---------------------------------------------------------------------------
 
-/** Run a command inheriting stdio; throw `message` on non-zero exit. */
-function runOrThrow(command, args, message, { cwd, env } = {}) {
-  const result = spawnSync(command, args, {
-    stdio: "inherit",
-    env: env ?? process.env,
-    ...(cwd ? { cwd } : {}),
-  });
+/** A short read or probe (git rev-parse/status/remote, `--version`). */
+export const INSTALL_READ_TIMEOUT_MS = 60_000;
+/** A git transfer the install runs (clone, fetch, checkout). */
+export const INSTALL_GIT_TIMEOUT_MS = 15 * 60_000;
+/** A long step with inherited output (a dependency install, an image build,
+ *  the `instance setup` child): bounded too, at a size no healthy run reaches. */
+export const INSTALL_STEP_TIMEOUT_MS = 60 * 60_000;
+
+function boundedOptions(options, timeoutMs) {
+  return { ...options, timeout: timeoutMs, killSignal: "SIGKILL" };
+}
+
+function describeBound(timeoutMs) {
+  return timeoutMs >= 60_000 && timeoutMs % 60_000 === 0 ? `${timeoutMs / 60_000} min` : `${timeoutMs / 1000} s`;
+}
+
+/** True when spawnSync stopped the child because its bound expired. */
+function childTimedOut(result) {
+  return result?.error?.code === "ETIMEDOUT";
+}
+
+/** The word that names a child in a timeout message: the first argument that
+ *  is neither a flag nor the value of git's `-C` / `-c` option, so
+ *  `git -C <dir> status` is named `git status` and `docker ps -a` `docker ps`. */
+function childSubcommand(args) {
+  const list = Array.isArray(args) ? args : [];
+  for (let i = 0; i < list.length; i += 1) {
+    const a = list[i];
+    if (typeof a !== "string") continue;
+    if (a === "-C" || a === "-c") {
+      i += 1;
+      continue;
+    }
+    if (a.startsWith("-")) continue;
+    return a;
+  }
+  return null;
+}
+
+/** The named failure of an expired bound. */
+function childTimeoutError(command, args, timeoutMs) {
+  const word = childSubcommand(args);
+  const sub = word ? ` ${word}` : "";
+  const err = new Error(
+    `\`${path.basename(String(command))}${sub}\` did not finish within ${describeBound(timeoutMs)}; it was stopped.`,
+  );
+  err.code = "CHILD_TIMEOUT";
+  return err;
+}
+
+/** An advisory read: one whose answer only shapes a message or an optional
+ *  note and whose existing contract already degrades a failed read to "no
+ *  answer". An expired bound degrades it the same way, and `onTimeout`
+ *  receives the named failure so a caller with a log can say so. Every other
+ *  throw propagates. A read whose answer decides an action is never advisory. */
+function advisoryRead(read, onTimeout) {
+  try {
+    return read();
+  } catch (err) {
+    if (err?.code !== "CHILD_TIMEOUT") throw err;
+    if (typeof onTimeout === "function") onTimeout(err);
+    return null;
+  }
+}
+
+/** Run a command inheriting stdio; throw `message` on non-zero exit, and a
+ *  named timeout when it outlives its bound. */
+function runOrThrow(command, args, message, { cwd, env, timeoutMs = INSTALL_STEP_TIMEOUT_MS } = {}) {
+  const result = spawnSync(
+    command,
+    args,
+    boundedOptions({ stdio: "inherit", env: env ?? process.env, ...(cwd ? { cwd } : {}) }, timeoutMs),
+  );
+  if (childTimedOut(result)) {
+    const err = new Error(`${message} (${childTimeoutError(command, args, timeoutMs).message})`);
+    err.code = "CHILD_TIMEOUT";
+    throw err;
+  }
   if (result.error) throw new Error(`${message} (${result.error.message})`);
-  if (result.status !== 0) throw new Error(message);
+  if (result.status !== 0) throw new Error(result.signal ? `${message} (killed by ${result.signal})` : message);
+}
+
+/** One bounded, status-checked read: `{ status, stdout }` after the child
+ *  exits, a named throw when its bound expires. `status` is null (and stdout
+ *  empty) when the child could not be spawned or was killed by a signal. */
+function readChild(command, args, { cwd, env, timeoutMs = INSTALL_READ_TIMEOUT_MS } = {}) {
+  let r;
+  try {
+    r = spawnSync(
+      command,
+      args,
+      boundedOptions({ encoding: "utf8", env: env ?? process.env, ...(cwd ? { cwd } : {}) }, timeoutMs),
+    );
+  } catch {
+    return { status: null, stdout: "" };
+  }
+  if (childTimedOut(r)) throw childTimeoutError(command, args, timeoutMs);
+  if (r.error || typeof r.status !== "number") return { status: null, stdout: "" };
+  return { status: r.status, stdout: r.stdout ?? "" };
 }
 
 /** As `capture`, but WITHOUT trimming — for output whose leading/trailing bytes
  *  are significant. `git status --porcelain` is exactly that: the first two
  *  columns are the status code, so " M path" trimmed becomes "M path" and every
- *  subsequent offset is wrong by one (cinatra-cli#198). */
-function captureRaw(command, args, { cwd, env } = {}) {
-  try {
-    const r = spawnSync(command, args, {
-      encoding: "utf8",
-      env: env ?? process.env,
-      ...(cwd ? { cwd } : {}),
-    });
-    if (r.status !== 0) return null;
-    return r.stdout ?? "";
-  } catch {
-    return null;
-  }
+ *  subsequent offset is wrong by one (cinatra-cli#198). Null on a non-zero exit;
+ *  a named throw when the bound expires. */
+function captureRaw(command, args, { cwd, env, timeoutMs } = {}) {
+  const r = readChild(command, args, { cwd, env, timeoutMs });
+  return r.status === 0 ? r.stdout : null;
 }
 
-/** True iff `command <probeArgs>` exits 0 (used for the preflight). */
-function commandExists(command, probeArgs = ["--version"]) {
+/** True iff `command <probeArgs>` exits 0 (used for the preflight); a probe
+ *  that outlives its bound is a named throw, never "not installed". */
+function commandExists(command, probeArgs = ["--version"], { timeoutMs = INSTALL_READ_TIMEOUT_MS } = {}) {
+  let r;
   try {
-    const r = spawnSync(command, probeArgs, { stdio: "ignore", env: process.env });
-    return r.status === 0;
+    r = spawnSync(command, probeArgs, boundedOptions({ stdio: "ignore", env: process.env }, timeoutMs));
   } catch {
     return false;
   }
+  if (childTimedOut(r)) throw childTimeoutError(command, probeArgs, timeoutMs);
+  return r.status === 0;
 }
 
-/** Capture trimmed stdout of a command, or null on any failure. */
-function capture(command, args, { cwd, env } = {}) {
-  try {
-    const r = spawnSync(command, args, {
-      encoding: "utf8",
-      env: env ?? process.env,
-      ...(cwd ? { cwd } : {}),
-    });
-    if (r.status !== 0) return null;
-    return (r.stdout ?? "").trim();
-  } catch {
-    return null;
-  }
+/** Capture trimmed stdout of a command, or null on a non-zero exit; a named
+ *  throw when the bound expires. */
+function capture(command, args, { cwd, env, timeoutMs } = {}) {
+  const r = readChild(command, args, { cwd, env, timeoutMs });
+  return r.status === 0 ? r.stdout.trim() : null;
 }
 
 /** The env passed to every git child: pin the protocol allowlist + disable
@@ -347,13 +432,26 @@ function gitEnv() {
   };
 }
 
-function git(args, { cwd } = {}) {
-  return spawnSync("git", args, {
-    encoding: "utf8",
-    env: gitEnv(),
-    ...(cwd ? { cwd } : {}),
-  });
+/** A git child for the clone and checkout steps: bounded from its spawn; an
+ *  expired bound is a named throw. The caller reads the exit status. */
+function git(args, { cwd, timeoutMs = INSTALL_GIT_TIMEOUT_MS } = {}) {
+  const r = spawnSync(
+    "git",
+    args,
+    boundedOptions({ encoding: "utf8", env: gitEnv(), ...(cwd ? { cwd } : {}) }, timeoutMs),
+  );
+  if (childTimedOut(r)) throw childTimeoutError("git", args, timeoutMs);
+  return r;
 }
+
+// The bounded, status-checked child helpers, exported for their own tests.
+export {
+  runOrThrow as runInstallChildOrThrow,
+  captureRaw as captureInstallChildRaw,
+  commandExists as installCommandExists,
+  capture as captureInstallChild,
+  git as runInstallGit,
+};
 
 // ---------------------------------------------------------------------------
 // Flag parsing.
@@ -1184,13 +1282,10 @@ export function runPreflight({ mode = "dev", targetDir = null, noInfra = false, 
   };
 }
 
-function composeAvailable() {
-  try {
-    const r = spawnSync("docker", ["compose", "version"], { stdio: "ignore", env: process.env });
-    return r.status === 0;
-  } catch {
-    return false;
-  }
+/** True iff `docker compose version` exits 0: the same bounded, status-only
+ *  probe as `commandExists`. */
+export function composeAvailable({ timeoutMs = INSTALL_READ_TIMEOUT_MS } = {}) {
+  return commandExists("docker", ["compose", "version"], { timeoutMs });
 }
 
 // ── cinatra#2654 D1 — Compose feature probe for `config --no-env-resolution` ──
@@ -1259,7 +1354,10 @@ export function composeSupportsNoEnvResolution({ captureImpl = capture, tmpRoot 
     const svc = doc?.services?.["cinatra-env-resolution-probe"];
     const kept = Array.isArray(svc?.env_file) ? svc.env_file.length > 0 : Boolean(svc?.env_file);
     composeNoEnvResolutionSupport = Boolean(kept);
-  } catch {
+  } catch (err) {
+    // A probe that outlived its bound answered nothing: it is its own named
+    // failure, and no answer is cached for it.
+    if (err?.code === "CHILD_TIMEOUT") throw err;
     composeNoEnvResolutionSupport = false;
   } finally {
     if (probeDir) {
@@ -1278,9 +1376,10 @@ export function __resetComposeFeatureProbe() {
 }
 
 /** The version string this box's Compose reports, for the fallback warning.
- *  Best-effort — the message degrades to "version unknown" when unavailable. */
-function composeVersionString(captureImpl = capture) {
-  const raw = captureImpl("docker", ["compose", "version", "--short"]);
+ *  Best-effort — the message degrades to "version unknown" when unavailable,
+ *  and an advisory read that outlives its bound degrades the same way. */
+export function composeVersionString(captureImpl = capture) {
+  const raw = advisoryRead(() => captureImpl("docker", ["compose", "version", "--short"]));
   return typeof raw === "string" && raw.trim() ? raw.trim() : null;
 }
 
@@ -1399,8 +1498,9 @@ export function identifyComposeHolder(port, inspectRows, host) {
 }
 
 /** Run `docker inspect` over every RUNNING container and return the parsed
- *  array, or null when docker isn't usable / the JSON is unparseable. Injectable
- *  via `deps.capture` for tests. */
+ *  array, or null when docker isn't usable / the JSON is unparseable. A docker
+ *  read that outlives its bound throws its named failure (code CHILD_TIMEOUT).
+ *  Injectable via `deps.capture` for tests. */
 function runningContainersInspect(deps = {}) {
   const cap = deps.capture ?? capture;
   const ids = cap("docker", ["ps", "-q"]);
@@ -1546,7 +1646,8 @@ export function ownershipFromInspect(inspectRows, expectDir) {
  *  Lists the project's container ids (cwd-scoped `compose ps -q`), inspects
  *  them, and keeps only containers rooted at `targetDir`. Empty sets on any
  *  error (fail-safe: a missed exemption only re-surfaces the real bind error,
- *  it never wrongly suppresses a stranger's conflict). */
+ *  it never wrongly suppresses a stranger's conflict). A docker read that
+ *  outlives its bound throws its named failure (code CHILD_TIMEOUT). */
 function targetComposeOwnership(targetDir, deps = {}) {
   const empty = { ports: new Set(), projects: new Set() };
   const cap = deps.capture ?? capture;
@@ -1778,13 +1879,36 @@ function isEmptyDir(dir) {
 /** cinatra-cli#198 — classify `dir`'s working-tree dirt into the install's own
  *  byproducts vs operator changes. Replaces the pre-#198 boolean
  *  `workingTreeIsDirty`, which could only COUNT dirt and so refused the
- *  installer's own output. A `git status` that cannot be captured is reported
- *  CLEAN, exactly as that predicate already treated it (a git failure is
- *  surfaced by the fetch/move that follows, not invented here). */
+ *  installer's own output. The `git status` read is judged by its exit status:
+ *  a read that fails is no clean tree, so it throws naming the directory
+ *  rather than letting a move run over changes nobody could read. */
 function classifyTargetDirt(dir, deps = {}) {
   const cap = deps.captureRaw ?? captureRaw;
   const out = cap("git", ["-C", dir, "status", "--porcelain", "-z"], { env: gitEnv() });
-  return classifyWorkingTreeDirt(out ?? "");
+  if (out === null || out === undefined) {
+    throw new Error(
+      `Could not read the working tree state of ${dir}: \`git status\` did not exit 0. ` +
+        "Nothing was moved; check that it is a readable git checkout, then re-run.",
+    );
+  }
+  return classifyWorkingTreeDirt(out);
+}
+
+/** cinatra-cli#198 — the drift report at the end of a completed install: one
+ *  line per change that is no install byproduct. The install has completed by
+ *  then, so a working-tree read that fails (a non-zero `git status`, or one
+ *  that outlived its bound) is reported as ONE named warning line and the
+ *  report is skipped; it is never read as a clean tree, and it never turns the
+ *  completed install into a failed one. `deps.captureRaw` is for tests. */
+export function reportInstallDrift(targetDir, { log = console.log, deps = {} } = {}) {
+  let dirt;
+  try {
+    dirt = classifyTargetDirt(targetDir, deps);
+  } catch (err) {
+    log(`  ⚠ ${err?.message ?? err}`);
+    return;
+  }
+  for (const line of installByproductDriftLines(dirt)) log(line);
 }
 
 /** Normalize a git remote for equality comparison: lowercase, drop a trailing
@@ -2665,6 +2789,8 @@ export function setupChildArgs({
   return args;
 }
 
+export { ensureMarkerIgnored, inspectProjectLiveness };
+
 export function runSetupInTarget({
   targetDir,
   mode,
@@ -2673,6 +2799,7 @@ export function runSetupInTarget({
   frozenLockfile = false,
   log = console.log,
   spawn = spawnSync,
+  timeoutMs = INSTALL_STEP_TIMEOUT_MS,
 }) {
   const setupMode = mode === "demo" ? "dev" : mode;
   const profile = installProfileForMode(mode);
@@ -2686,11 +2813,16 @@ export function runSetupInTarget({
   // that is a named, non-fatal verdict rather than a failure (see
   // classifySetupChildExit). Everything else still throws the same message.
   const message = `cinatra instance setup ${label} failed inside the target.`;
-  const result = spawn(process.execPath, setupArgs, {
-    stdio: "inherit",
-    cwd: targetDir,
-    env: buildSetupChildEnv({ mode, targetDir }),
-  });
+  const result = spawn(
+    process.execPath,
+    setupArgs,
+    boundedOptions({ stdio: "inherit", cwd: targetDir, env: buildSetupChildEnv({ mode, targetDir }) }, timeoutMs),
+  );
+  if (childTimedOut(result)) {
+    const err = new Error(`${message} (it did not finish within ${describeBound(timeoutMs)}; it was stopped.)`);
+    err.code = "CHILD_TIMEOUT";
+    throw err;
+  }
   if (result.error) throw new Error(`${message} (${result.error.message})`);
   // Only the DEV setup path runs the local-registry seed, so only it can mint
   // the typed skew status (`demo` maps onto `setupMode === "dev"` above).
@@ -2897,7 +3029,9 @@ function resolveIsolatedComposeConfig({ targetDir, deps = {}, log = console.log 
 
 /** Inspect the live containers of the compose project rooted at `targetDir`
  *  (default base pair, cwd-scoped). Returns the parsed `docker inspect` array
- *  for the classifier (working_dir-label ownership). Empty array on any error. */
+ *  for the classifier (working_dir-label ownership). Empty array on any error;
+ *  a docker read that outlives its bound throws its named failure (code
+ *  CHILD_TIMEOUT). */
 function liveComposeInspect(targetDir, deps = {}) {
   const cap = deps.capture ?? capture;
   const ids = cap(
@@ -2933,12 +3067,27 @@ function liveComposeInspect(targetDir, deps = {}) {
  *  marker file (and the generated isolated compose) never make the working tree
  *  DIRTY — which would otherwise break the idempotent-update re-run and surprise
  *  the operator with an untracked file. Uses `.git/info/exclude` (a LOCAL,
- *  non-committed ignore) so it needs NO change to the cinatra repo. Best-effort:
- *  a non-git dir or a write failure is silently tolerated. */
-function ensureMarkerIgnored(targetDir) {
+ *  non-committed ignore) so it needs NO change to the cinatra repo. A dir with
+ *  no `.git` entry is no checkout and is left alone; for a checkout the git-dir
+ *  read is judged by its exit status, and one that fails throws naming the dir
+ *  (an unreadable checkout is never taken for a non-git dir). Only the ignore
+ *  file's own write stays best-effort. */
+function ensureMarkerIgnored(targetDir, { read = readChild } = {}) {
   try {
-    const gitDir = capture("git", ["-C", targetDir, "rev-parse", "--git-dir"], { env: gitEnv() });
-    if (!gitDir) return;
+    lstatSync(path.join(targetDir, ".git"));
+  } catch (err) {
+    if (err?.code === "ENOENT") return;
+    throw new Error(`Could not read whether ${targetDir} is a git checkout: ${err?.code ?? err}.`);
+  }
+  const r = read("git", ["-C", targetDir, "rev-parse", "--git-dir"], { env: gitEnv() });
+  const gitDir = r.status === 0 ? r.stdout.trim() : "";
+  if (!gitDir) {
+    throw new Error(
+      `Could not read the git directory of ${targetDir}: \`git rev-parse --git-dir\` ` +
+        `${r.status === null ? "did not run" : `exited ${r.status}`}.`,
+    );
+  }
+  try {
     const excludePath = path.isAbsolute(gitDir)
       ? path.join(gitDir, "info", "exclude")
       : path.join(targetDir, gitDir, "info", "exclude");
@@ -5062,7 +5211,9 @@ export async function teardownInstance({
         }
       }
 
-      if (inspectError && !force) {
+      // A read that outlived its bound answered nothing, so --force does not
+      // override it: the row and its reservation are kept.
+      if (inspectError && (!force || inspectError.code === "CHILD_TIMEOUT")) {
         outcome = {
           released: false,
           reason: "inspect-failed",
@@ -5317,7 +5468,10 @@ async function runInstallDown({ opts, log = console.log, deps = {} }) {
       `the checkout ${row.installDir} is gone, so the row can only be released after PROVING no container of ` +
       `${inspectTarget} still exists — and that check itself FAILED, so NOTHING was released. ` +
       `An inspection error is not an "all clear": containers may well be live and holding those ports. ` +
-      `Fix the Docker error and re-run \`cinatra install --down\`, or pass --force to release the row without the proof.` +
+      `Fix the Docker error and re-run \`cinatra install --down\`` +
+      (result.error?.code === "CHILD_TIMEOUT"
+        ? ` (--force does not override a read that outlived its bound).`
+        : `, or pass --force to release the row without the proof.`) +
       (result.error ? `\n  ${result.error.message}` : ""),
     "co-use-needs-force":
       `"${row.slug}" is a co-use instance: it owns a separate database (${(row.createdResources ?? []).join(", ") || "unknown"}) ` +
@@ -5562,7 +5716,8 @@ export function decideDefaultProjectOwnership({
  *  and its named volumes (cinatra-cli#35(d)). Returns
  *  `{ containerRows, volumeRows }` for `decideDefaultProjectOwnership`. Injectable
  *  via `deps.inspectProjectOwnership` for tests; the real path shells `docker`.
- *  Best-effort: any docker error yields empty sets (never throws). */
+ *  Best-effort: any docker error yields empty sets; only a docker read that
+ *  outlives its bound throws, with its named failure (code CHILD_TIMEOUT). */
 function inspectProjectOwnership(projectNames, deps = {}) {
   if (typeof deps.inspectProjectOwnership === "function") {
     return deps.inspectProjectOwnership(projectNames, deps);
@@ -5639,7 +5794,9 @@ function inspectProjectOwnership(projectNames, deps = {}) {
  *
  * `capture()` returns null on any non-zero exit or spawn throw, and "" (exit 0,
  * no matches) for a genuinely empty project — that is exactly the distinction
- * this function promotes into a throw.
+ * this function promotes into a throw. A container read that outlives its bound
+ * throws its named failure (code CHILD_TIMEOUT); the advisory volume reads
+ * below degrade on it, as on any other volume-side failure.
  *
  * @throws {Error} when Docker cannot be asked, or answers unusably.
  * @returns {{containerRows: object[], volumeRows: object[]}}
@@ -5692,11 +5849,13 @@ function inspectProjectLiveness(projectNames, deps = {}) {
   const volumeRows = [];
   const volSeen = new Set();
   for (const name of names) {
-    const vols = cap("docker", ["volume", "ls", "--filter", `label=com.docker.compose.project=${name}`, "-q"]);
+    const vols = advisoryRead(() =>
+      cap("docker", ["volume", "ls", "--filter", `label=com.docker.compose.project=${name}`, "-q"]),
+    );
     if (vols == null) continue;
     const volList = vols.split("\n").map((s) => s.trim()).filter(Boolean);
     if (volList.length === 0) continue;
-    const raw = cap("docker", ["volume", "inspect", ...volList]);
+    const raw = advisoryRead(() => cap("docker", ["volume", "inspect", ...volList]));
     if (raw == null) continue;
     let parsed;
     try {
@@ -9151,7 +9310,14 @@ function resolveInstanceOrigin(targetDir) {
   return String(raw).trim().replace(/\/+$/, "");
 }
 
-async function provisionExecutionPlane({ targetDir, opts, log = console.log }) {
+/** The optional execution step of an install. Every failure inside it,
+ *  a child that outlived its bound included, is ONE named warning line and the
+ *  install continues: the step is optional by its contract, and the line names
+ *  what stopped. `deps` (`commandExists`, `runOrThrow`, `capture`) is for tests. */
+export async function provisionExecutionPlane({ targetDir, opts, log = console.log, deps = {} }) {
+  const probe = deps.commandExists ?? commandExists;
+  const runStep = deps.runOrThrow ?? runOrThrow;
+  const read = deps.capture ?? capture;
   try {
     const flags = opts.execution ?? {};
     // Install-preflight execution-mode CHOICE. An explicit --execution-mode wins;
@@ -9185,7 +9351,7 @@ async function provisionExecutionPlane({ targetDir, opts, log = console.log }) {
           `- Execution plane: the L0 Dockerfile (${L0_DOCKERFILE_REL}) is not in this checkout — recording the ` +
             "placement and skipping the image build (run `cinatra instance execution pull` once it is present).",
         );
-      } else if (!commandExists("docker", ["--version"])) {
+      } else if (!probe("docker", ["--version"])) {
         log(
           "- Execution plane: Docker is not available — recording the placement and skipping the image build " +
             "(run `cinatra instance execution pull` when Docker is up).",
@@ -9193,7 +9359,7 @@ async function provisionExecutionPlane({ targetDir, opts, log = console.log }) {
       } else {
         const plan = planImageAcquisition({ executionMode: "local-dev", imageRef: flags.imageRef, dockerfileExists: true });
         log(`- Execution plane: building the L0 sandbox image ${plan.imageRef}…`);
-        runOrThrow(
+        runStep(
           "docker",
           l0BuildArgs({
             imageRef: plan.imageRef,
@@ -9203,7 +9369,7 @@ async function provisionExecutionPlane({ targetDir, opts, log = console.log }) {
           "Failed to build the sandbox L0 image",
           { cwd: targetDir },
         );
-        const digest = parseInspectedDigest(capture("docker", l0DigestInspectArgs(plan.imageRef), { cwd: targetDir }));
+        const digest = parseInspectedDigest(read("docker", l0DigestInspectArgs(plan.imageRef), { cwd: targetDir }));
         acquired = { imageRef: plan.imageRef, digest };
         log(`- Execution plane: L0 image built${digest ? ` (digest ${digest.slice(0, 19)}… recorded)` : ""}.`);
       }
@@ -9404,12 +9570,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
     // Resolve the ref → sha WITHOUT cloning: `git ls-remote <repo> <ref>` is a
     // read-only network query (no checkout, no disk write). Best-effort: if it
     // can't resolve (offline / bad ref), report it as "<resolved at clone>".
-    let resolvedSha = "<resolved at clone>";
-    const lsRemote = cap("git", ["ls-remote", opts.repoUrl, opts.ref], { env: gitEnv() });
-    if (lsRemote) {
-      const sha = lsRemote.split(/\s+/)[0];
-      if (/^[0-9a-f]{7,40}$/.test(sha)) resolvedSha = sha;
-    }
+    const resolvedSha = dryRunResolvedSha({ cap, repoUrl: opts.repoUrl, ref: opts.ref, log });
 
     // The computed default project / instance name (mirrors recordDefaultInstance).
     const defaultSlug = opts.instance ?? deriveInstanceSlug(targetDir);
@@ -10276,7 +10437,7 @@ export async function runInstall(argv = [], { log = console.log, deps = {} } = {
   //     relevant. A completed install leaves its own byproducts behind; the next
   //     reconcile exempts exactly those and refuses everything else, so say so
   //     when there IS something else (drift signal + operator warning).
-  for (const line of installByproductDriftLines(classifyTargetDirt(targetDir))) log(line);
+  reportInstallDrift(targetDir, { log });
 
   // 8c. cinatra-cli#200 — the deferred skew verdict. The install DID complete
   //     (including the preview composition above), so this is stated as the
@@ -10422,10 +10583,59 @@ async function bootstrapPreviewFrontDoor({
   });
 }
 
+/** True when a repository or ref would reach git as an option instead of the
+ *  value it names: not a string, empty, or "-"-led (`--upload-pack=<command>`
+ *  is such a value, and git runs the command it names). Every helper that
+ *  hands a caller's repository or ref to git refuses such a value first. */
+function isFlagShapedGitValue(value) {
+  return typeof value !== "string" || value === "" || value.startsWith("-");
+}
+
+/** Throw a named refusal for a repository or ref that `isFlagShapedGitValue`
+ *  marks, before any git child starts. `what` is "ref" or "repository". */
+function refuseFlagShapedGitValue(what, value) {
+  if (!isFlagShapedGitValue(value)) return;
+  throw Object.assign(
+    new Error(
+      `Refusing the ${what} "${value}": it is empty or starts with "-", so it is not passed to git. ` +
+        `Name a ${what === "ref" ? "branch, tag or commit" : "repository URL or path"} instead.`,
+    ),
+    { code: "GIT_VALUE_FLAG_SHAPED" },
+  );
+}
+
+/** The dry run's read-only `git ls-remote <repo> <ref>`: the sha it names, or
+ *  "<resolved at clone>" when it cannot resolve (offline, a bad ref) or its
+ *  advisory read outlives its bound, which it names in one warning line. A
+ *  dry run never throws for it. Neither value reaches git as an option: an
+ *  empty or "-"-led repository or ref is named and not read, and "--" ends
+ *  git's options before the two. */
+export function dryRunResolvedSha({ cap = capture, repoUrl, ref, log = console.log }) {
+  if (isFlagShapedGitValue(repoUrl)) {
+    log(`  ⚠ The repository "${repoUrl}" is empty or starts with "-", so it is not passed to \`git ls-remote\`. The ref is resolved at clone.`);
+    return "<resolved at clone>";
+  }
+  if (isFlagShapedGitValue(ref)) {
+    log(`  ⚠ The ref "${ref}" is empty or starts with "-", so it is not passed to \`git ls-remote\`. The ref is resolved at clone.`);
+    return "<resolved at clone>";
+  }
+  const lsRemote = advisoryRead(
+    () => cap("git", ["ls-remote", "--", repoUrl, ref], { env: gitEnv() }),
+    (err) => log(`  ⚠ ${err.message} The ref is resolved at clone.`),
+  );
+  if (lsRemote) {
+    const sha = lsRemote.split(/\s+/)[0];
+    if (/^[0-9a-f]{7,40}$/.test(sha)) return sha;
+  }
+  return "<resolved at clone>";
+}
+
 /** Clone a fresh host repo or update an existing checkout to `ref`; return the
  *  resolved commit SHA. Refuses a dirty checkout unless --force (stash-then-
- *  reset), and refuses to update a checkout whose origin is a different repo. */
-async function cloneOrUpdateHost({
+ *  reset), and refuses to update a checkout whose origin is a different repo.
+ *  An empty or "-"-led ref (and, for a clone, repository) is refused by name
+ *  before any git child starts, so it never reaches git as an option. */
+export async function cloneOrUpdateHost({
   targetDir,
   repoUrl,
   ref,
@@ -10434,16 +10644,34 @@ async function cloneOrUpdateHost({
   yes,
   noFetch = false,
   log,
+  deps = {},
 }) {
+  refuseFlagShapedGitValue("ref", ref);
   if (alreadyCheckout) {
     log(`- Existing cinatra checkout at ${targetDir} — updating to ref "${ref}"…`);
-    const currentRef = capture("git", ["-C", targetDir, "rev-parse", "--short", "HEAD"], { env: gitEnv() });
+    // A log line only: an expired bound is named and the update goes on to the
+    // origin and move reads, which decide.
+    const currentRef = advisoryRead(
+      () => (deps.capture ?? capture)("git", ["-C", targetDir, "rev-parse", "--short", "HEAD"], { env: gitEnv() }),
+      (err) => log(`  ⚠ The current commit was not read: ${err.message}`),
+    );
     if (currentRef) log(`  Current commit: ${currentRef}`);
 
     // Verify the existing checkout's origin matches --repo-url. On a re-run an
     // operator may have passed a different (or default) --repo-url; updating a
     // checkout from a DIFFERENT remote would be a silent surprise. Fail loud.
-    const existingOrigin = capture("git", ["-C", targetDir, "remote", "get-url", "origin"], { env: gitEnv() });
+    // Judged by the read's exit status: 0 is the origin; 2 is git's status for
+    // "no such remote", which only a run that fetches nothing (--no-fetch, a
+    // local resolve) can go past; any other status refuses.
+    const originRead = readChild("git", ["-C", targetDir, "remote", "get-url", "origin"], { env: gitEnv() });
+    if (originRead.status !== 0 && !(originRead.status === 2 && noFetch)) {
+      throw new Error(
+        `Refusing to update ${targetDir}: its origin remote could not be read (\`git remote get-url origin\` ` +
+          `${originRead.status === null ? "did not run" : `exited ${originRead.status}`}). ` +
+          `Add the origin it was cloned from, or choose a fresh --dir.`,
+      );
+    }
+    const existingOrigin = originRead.status === 0 ? originRead.stdout.trim() : "";
     if (existingOrigin && normalizeRemote(existingOrigin) !== normalizeRemote(repoUrl)) {
       throw new Error(
         `Refusing to update ${targetDir}: its origin is "${existingOrigin}" but --repo-url is "${repoUrl}". ` +
@@ -10472,6 +10700,7 @@ async function cloneOrUpdateHost({
         `commit you want), or drop --no-fetch.`,
     );
   }
+  refuseFlagShapedGitValue("repository", repoUrl);
 
   if (existsSync(targetDir) && !isEmptyDir(targetDir)) {
     // Non-empty + --force was confirmed above; clone into it is unsafe, so
@@ -10492,12 +10721,13 @@ async function cloneOrUpdateHost({
 
   // Fresh clone: check out the requested ref (the clone default is the remote
   // HEAD branch). Resolve `ref` to a commit and check it out detached-then-by-
-  // name so both a branch and a raw sha work.
+  // name so both a branch and a raw sha work. The ref was refused above when
+  // "-"-led; `checkout` takes no "--" here, as "--" would make it a path.
   const checkout = git(["-C", targetDir, "checkout", ref]);
   if (checkout.status !== 0) {
     // Fetch the ref explicitly (covers a tag/sha not in the default clone) then
     // check out the fetched commit.
-    const fetched = git(["-C", targetDir, "fetch", "origin", ref, "--tags"]);
+    const fetched = git(["-C", targetDir, "fetch", "--tags", "origin", "--", ref]);
     const fh = fetched.status === 0 ? git(["-C", targetDir, "checkout", "FETCH_HEAD"]) : fetched;
     if (fh.status !== 0) {
       throw new Error(
@@ -10636,6 +10866,9 @@ export async function resolveLatestReleaseTag({ targetDir, log = console.log, de
  *                 resolved commit. Used by `install`/`cloneOrUpdateHost` so
  *                 `--ref main` keeps tracking `main`.
  *
+ *  An empty or "-"-led `ref` is refused by name before any git child starts,
+ *  and "--" ends `git fetch`'s options before the ref it fetches.
+ *
  *  `fetch: false` skips the fetch step (the caller already fetched the ref).
  *  `deps` injects `runGit(args)` + `workingTreeIsDirty` + `capture` for tests. */
 export function moveExistingCheckoutToRef({
@@ -10647,6 +10880,9 @@ export function moveExistingCheckoutToRef({
   log = console.log,
   deps = {},
 } = {}) {
+  // 0. A "-"-led or empty ref would reach `git fetch` / `git checkout` as an
+  //    option; refuse it by name before any git child (the dirt read included).
+  refuseFlagShapedGitValue("ref", ref);
   const runGit = deps.runGit ?? ((args) => git(["-C", targetDir, ...args]));
   const cap = deps.capture ?? capture;
   // cinatra-cli#198: the guard now classifies the dirt instead of only counting
@@ -10716,8 +10952,8 @@ export function moveExistingCheckoutToRef({
   const isTag = kind === "tag";
   if (fetch) {
     const fetchArgs = isTag
-      ? ["fetch", "origin", "--force", `refs/tags/${ref}:refs/tags/${ref}`]
-      : ["fetch", "origin", ref, "--tags", "--force"];
+      ? ["fetch", "--force", "origin", "--", `refs/tags/${ref}:refs/tags/${ref}`]
+      : ["fetch", "--tags", "--force", "origin", "--", ref];
     const fetched = runGit(fetchArgs);
     if (fetched.status !== 0) {
       throw new Error(`git fetch origin ${ref} failed: ${(fetched.stderr ?? "").trim()}`);
