@@ -2457,12 +2457,12 @@ export function validateArtifact(packageRoot) {
 // skill gate — mirror of the kind-at-end naming-conformance rule for skills:
 // the package follows @<scope>/<slug>-skill (first-party-plus-vendored scope
 // policy). The suffix is SINGULAR: one kind:"skill" extension ships exactly one
-// Anthropic-schema bundle (cinatra#2089, epic #2086 S2), so the plural
+// skills-schema bundle (cinatra#2089, epic #2086 S2), so the plural
 // `-skills` name is retired. It stays ACCEPTED here while the S3 migration
 // (cinatra#2090) renames the four packages that still carry it — the host-side
 // packaging verdict is the authority that refuses a plural name, and it waives
 // exactly those four by name in its expiring ledger. A vendored skill bundle
-// (e.g. @anthropics/skills) may use a no-suffix VendoredPackageName, allowlisted
+// (e.g. an upstream skills collection) may use a no-suffix VendoredPackageName, allowlisted
 // host-side; standalone we accept either suffix OR a declared
 // cinatra.vendoredFrom.
 // ===========================================================================
