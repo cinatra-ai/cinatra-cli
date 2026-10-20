@@ -589,6 +589,82 @@ describe("advisory reads degrade on an expired bound, named, instead of aborting
     expect(lines).toEqual(["  ⚠ `git ls-remote` did not finish within 60 s; it was stopped. The ref is resolved at clone."]);
   });
 
+  it("the dry run's remote lookup: a repository that starts with '-' never reaches git as an option", () => {
+    const marker = path.join(sandbox, "ls-remote-upload-pack-ran");
+    const lines = [];
+    // The real git child: as an option, this value would make git run the command it names.
+    const resolved = install.dryRunResolvedSha({
+      repoUrl: `--upload-pack=touch ${marker}; :`,
+      ref: "main",
+      log: (l) => lines.push(l),
+    });
+    expect(existsSync(marker)).toBe(false);
+    expect(resolved).toBe("<resolved at clone>");
+    expect(lines).toEqual([
+      `  ⚠ The repository "--upload-pack=touch ${marker}; :" is empty or starts with "-", so it is not passed to \`git ls-remote\`. The ref is resolved at clone.`,
+    ]);
+  });
+
+  it("the dry run's remote lookup: an empty or flag-shaped repository or ref runs no git child", () => {
+    for (const [repoUrl, ref, name, value] of [
+      ["", "main", "repository", ""],
+      ["-x", "main", "repository", "-x"],
+      ["https://github.com/example/example.git", "--upload-pack=touch x", "ref", "--upload-pack=touch x"],
+      ["https://github.com/example/example.git", "-h", "ref", "-h"],
+      ["https://github.com/example/example.git", "", "ref", ""],
+    ]) {
+      const calls = [];
+      const lines = [];
+      const resolved = install.dryRunResolvedSha({
+        cap: (...args) => {
+          calls.push(args);
+          return "0123456789abcdef0123456789abcdef01234567\trefs/heads/main";
+        },
+        repoUrl,
+        ref,
+        log: (l) => lines.push(l),
+      });
+      expect(calls).toEqual([]);
+      expect(resolved).toBe("<resolved at clone>");
+      expect(lines).toEqual([
+        `  ⚠ The ${name} "${value}" is empty or starts with "-", so it is not passed to \`git ls-remote\`. The ref is resolved at clone.`,
+      ]);
+    }
+  });
+
+  it("the dry run's remote lookup: '--' ends git's options before the repository and the ref, and a real git resolves through it", () => {
+    const calls = [];
+    install.dryRunResolvedSha({
+      cap: (...args) => {
+        calls.push(args);
+        return null;
+      },
+      repoUrl: "https://github.com/example/example.git",
+      ref: "main",
+      log: () => {},
+    });
+    expect(calls.map(([command, args]) => [command, args])).toEqual([
+      ["git", ["ls-remote", "--", "https://github.com/example/example.git", "main"]],
+    ]);
+
+    const dir = path.join(sandbox, "ls-remote-source");
+    mkdirSync(dir, { recursive: true });
+    const G = (args) =>
+      execFileSync("git", args, {
+        cwd: dir,
+        env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" },
+        encoding: "utf8",
+      }).trim();
+    G(["init", "-q", "-b", "main"]);
+    writeFileSync(path.join(dir, "a.txt"), "a\n");
+    G(["add", "-A"]);
+    G(["commit", "-q", "-m", "one"]);
+    const head = G(["rev-parse", "HEAD"]);
+    const lines = [];
+    expect(install.dryRunResolvedSha({ repoUrl: dir, ref: "main", log: (l) => lines.push(l) })).toBe(head);
+    expect(lines).toEqual([]);
+  });
+
   it("the existing checkout's current-commit log line: an expired bound is named and the update goes on", async () => {
     const dir = path.join(sandbox, "headlog-timeout");
     mkdirSync(dir, { recursive: true });

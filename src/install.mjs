@@ -10586,10 +10586,20 @@ async function bootstrapPreviewFrontDoor({
 /** The dry run's read-only `git ls-remote <repo> <ref>`: the sha it names, or
  *  "<resolved at clone>" when it cannot resolve (offline, a bad ref) or its
  *  advisory read outlives its bound, which it names in one warning line. A
- *  dry run never throws for it. */
+ *  dry run never throws for it. Neither value reaches git as an option: an
+ *  empty or "-"-led repository or ref is named and not read, and "--" ends
+ *  git's options before the two. */
 export function dryRunResolvedSha({ cap = capture, repoUrl, ref, log = console.log }) {
+  if (typeof repoUrl !== "string" || repoUrl === "" || repoUrl.startsWith("-")) {
+    log(`  ⚠ The repository "${repoUrl}" is empty or starts with "-", so it is not passed to \`git ls-remote\`. The ref is resolved at clone.`);
+    return "<resolved at clone>";
+  }
+  if (typeof ref !== "string" || ref === "" || ref.startsWith("-")) {
+    log(`  ⚠ The ref "${ref}" is empty or starts with "-", so it is not passed to \`git ls-remote\`. The ref is resolved at clone.`);
+    return "<resolved at clone>";
+  }
   const lsRemote = advisoryRead(
-    () => cap("git", ["ls-remote", repoUrl, ref], { env: gitEnv() }),
+    () => cap("git", ["ls-remote", "--", repoUrl, ref], { env: gitEnv() }),
     (err) => log(`  ⚠ ${err.message} The ref is resolved at clone.`),
   );
   if (lsRemote) {
