@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
+import { boundedOptions } from "./child-bound.mjs";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import net from "node:net";
@@ -2172,10 +2173,9 @@ function waitForRedis(repoRoot) {
 function waitForNango(repoRoot, maxAttempts = 60) {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
-      const response = spawnSync("curl", ["-sf", "http://127.0.0.1:3003/health"], {
+      const response = spawnSync("curl", ["-sf", "http://127.0.0.1:3003/health"], boundedOptions({
         stdio: ["ignore", "pipe", "ignore"],
-        timeout: 3000,
-      });
+      }, 3000));
       if (response.status === 0) {
         return;
       }
@@ -2460,12 +2460,11 @@ function mintExecutionSecret() {
 
 // Read-only docker capture (never inherits stdio into the terminal).
 function executionDockerCapture(args, { cwd } = {}) {
-  const r = spawnSync("docker", args, {
+  const r = spawnSync("docker", args, boundedOptions({
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-    timeout: EXECUTION_PROBE_TIMEOUT_MS,
     ...(cwd ? { cwd } : {}),
-  });
+  }, EXECUTION_PROBE_TIMEOUT_MS));
   return {
     status: r.status,
     stdout: (r.stdout ?? "").trim(),
@@ -5887,11 +5886,10 @@ async function gatherDoctorReport({
 
 // Default read-only docker runner (spawnSync). Overridable in tests.
 function defaultDoctorDockerImpl(args) {
-  return spawnSync("docker", args, {
+  return spawnSync("docker", args, boundedOptions({
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-    timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
-  });
+  }, DOCKER_CLI_PROBE_TIMEOUT_MS));
 }
 
 // Pretty-print one assertion line. Statuses/booleans only — never a secret.
@@ -7645,14 +7643,13 @@ async function runDbUpgradePreflight(rest) {
 
   // Best-effort read-only docker capture; ANY failure yields null so the
   // preflight fails closed rather than proceeding on a guess.
-  const dockerCapture = (args, opts = {}) => {
+  const dockerCapture = (args, { timeoutMs = DOCKER_CLI_PROBE_TIMEOUT_MS, ...opts } = {}) => {
     try {
-      const r = spawnSync("docker", args, {
+      const r = spawnSync("docker", args, boundedOptions({
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
         ...opts,
-      });
+      }, timeoutMs));
       if (r.status !== 0) return null;
       return (r.stdout ?? "").trim();
     } catch {
@@ -7716,11 +7713,10 @@ async function runDbUpgradePreflight(rest) {
   // the transport treats it fail-closed, never as an empty/fresh volume).
   const inspectVolumeThreeWay = (name) => {
     try {
-      const r = spawnSync("docker", ["volume", "inspect", name], {
+      const r = spawnSync("docker", ["volume", "inspect", name], boundedOptions({
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
-      });
+      }, DOCKER_CLI_PROBE_TIMEOUT_MS));
       if (r.status === 0) {
         try {
           const parsed = JSON.parse((r.stdout ?? "").trim());
@@ -7759,7 +7755,7 @@ async function runDbUpgradePreflight(rest) {
   const dockerReadVolume = (volumeName, image, program) =>
     dockerCapture(
       ["run", "--rm", "--pull=never", "--entrypoint", "/bin/sh", "-v", `${volumeName}:${PG_MARKER_READ_MOUNT}:ro`, image, "-c", program],
-      { timeout: 60_000 },
+      { timeoutMs: 60_000 },
     );
 
   const transport = {
@@ -7780,7 +7776,7 @@ async function runDbUpgradePreflight(rest) {
       if (!image) return "present";
       const listing = dockerCapture(
         ["run", "--rm", "--pull=never", "--entrypoint", "/bin/sh", "-v", `${name}:/__preflight_probe:ro`, image, "-c", "ls -A /__preflight_probe"],
-        { timeout: 60_000 },
+        { timeoutMs: 60_000 },
       );
       if (listing === null) return "present";
       return listing.length === 0 ? "empty" : "present";
@@ -7866,9 +7862,9 @@ async function runDbUpgradeMajor(rest) {
     return;
   }
 
-  const dockerCapture = (args, opts = {}) => {
+  const dockerCapture = (args, { timeoutMs = DOCKER_CLI_PROBE_TIMEOUT_MS, ...opts } = {}) => {
     try {
-      const r = spawnSync("docker", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: DOCKER_CLI_PROBE_TIMEOUT_MS, ...opts });
+      const r = spawnSync("docker", args, boundedOptions({ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...opts }, timeoutMs));
       if (r.status !== 0) return null;
       return (r.stdout ?? "").trim();
     } catch {
@@ -7933,7 +7929,7 @@ async function runDbUpgradeMajor(rest) {
   };
   const dockerExec = (container, argv) => dockerCapture(["exec", container, ...argv]);
   const dockerReadVolume = (volumeName, image, program) =>
-    dockerCapture(["run", "--rm", "--pull=never", "--entrypoint", "/bin/sh", "-v", `${volumeName}:${PG_MARKER_READ_MOUNT}:ro`, image, "-c", program], { timeout: 60_000 });
+    dockerCapture(["run", "--rm", "--pull=never", "--entrypoint", "/bin/sh", "-v", `${volumeName}:${PG_MARKER_READ_MOUNT}:ro`, image, "-c", program], { timeoutMs: 60_000 });
 
   const transport = {
     inspectVolume: (name) => (name ? inspectVolumeRow(name) : null),
@@ -10718,15 +10714,14 @@ async function pingCloneDb(connString) {
 
 function isComposeAvailable() {
   try {
-    const out = spawnSync("docker", ["compose", "version"], {
+    const out = spawnSync("docker", ["compose", "version"], boundedOptions({
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       // Bounded (cinatra#260 Step 3): this metadata probe is now on the
       // `cinatra instance setup dev` auto-bring-up path — a hung docker CLI must not
       // block setup. On timeout spawnSync returns non-zero/`error` → treated as
       // "not available" by the `status === 0` check.
-      timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
-    });
+    }, DOCKER_CLI_PROBE_TIMEOUT_MS));
     return out.status === 0;
   } catch {
     return false;
@@ -10765,7 +10760,7 @@ function isComposeProjectUp(projectName) {
     ["compose", "-p", projectName, "ps", "--status=running", "--format", "{{.Name}}"],
     // Bounded (cinatra#260 Step 3): now on the setup auto-bring-up path. On
     // timeout, non-zero/`error` status → treated as "not up".
-    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: DOCKER_CLI_PROBE_TIMEOUT_MS },
+    boundedOptions({ encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }, DOCKER_CLI_PROBE_TIMEOUT_MS),
   );
   if (result.error || result.status !== 0) return false;
   const lines = (result.stdout ?? "").trim().split("\n").filter((l) => l.length > 0);
@@ -10812,7 +10807,7 @@ function ensureWayflowImage({
     ["image", "inspect", "cinatra-wayflow:local"],
     // Bounded (cinatra#260 Step 3): now on the setup auto-bring-up path. On
     // timeout, non-zero/`error` → falls through to the (bounded) build.
-    { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", timeout: DOCKER_CLI_PROBE_TIMEOUT_MS },
+    boundedOptions({ stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" }, DOCKER_CLI_PROBE_TIMEOUT_MS),
   );
   if (inspect.status === 0 && !forceRebuild) return;
   log(
@@ -10838,7 +10833,7 @@ function ensureWayflowImage({
     // calls this path, and setup must never hang. Generous (10m) so a normal
     // cold build is unaffected; on timeout spawnSync kills the child and
     // returns a non-zero/`error` result → the throw below surfaces it.
-    { stdio: ["ignore", "inherit", "inherit"], timeout: WAYFLOW_BUILD_TIMEOUT_MS },
+    boundedOptions({ stdio: ["ignore", "inherit", "inherit"] }, WAYFLOW_BUILD_TIMEOUT_MS),
   );
   if (build.error || build.status !== 0) {
     throw new Error(
@@ -13235,11 +13230,10 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
   /** What the machine says about THIS instance's container right now. */
   const readState = () =>
     parseRuntimeContainerState(
-      spawn("docker", dockerRuntimeInspectArgs(plan), {
+      spawn("docker", dockerRuntimeInspectArgs(plan), boundedOptions({
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
-      }),
+      }, DOCKER_CLI_PROBE_TIMEOUT_MS)),
     );
 
   /** Take that one container down: gracefully when it runs, then remove it.
@@ -13248,15 +13242,13 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
    *  by a launch that will collide with what is still there. */
   const removeContainer = (state) => {
     if (state.running) {
-      spawn("docker", dockerRuntimeStopArgs(plan), {
+      spawn("docker", dockerRuntimeStopArgs(plan), boundedOptions({
         stdio: ["ignore", "ignore", "inherit"],
-        timeout: stopTimeoutMs,
-      });
+      }, stopTimeoutMs));
     }
-    const removed = spawn("docker", dockerRuntimeRemoveArgs(plan), {
+    const removed = spawn("docker", dockerRuntimeRemoveArgs(plan), boundedOptions({
       stdio: ["ignore", "ignore", "inherit"],
-      timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
-    });
+    }, DOCKER_CLI_PROBE_TIMEOUT_MS));
     return !removed?.error && (removed?.status ?? 1) === 0;
   };
 
@@ -13266,11 +13258,10 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
    *  The derived name is this instance's by construction and is not asked. */
   const assertOwnContainer = () => {
     if (!containerNameIsChosen(plan)) return;
-    const labels = spawn("docker", dockerContainerProjectArgs(plan), {
+    const labels = spawn("docker", dockerContainerProjectArgs(plan), boundedOptions({
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
-    });
+    }, DOCKER_CLI_PROBE_TIMEOUT_MS));
     if (!containerBelongsToInstance(plan, labels)) throw new Error(foreignContainerMessage(plan));
   };
 
@@ -13422,11 +13413,10 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
   // fresh one. Either way this happens before the container found above is
   // replaced, so a refusal or a failed build leaves it running.
   if (plan.imageNamed) {
-    const present = spawn("docker", dockerImageInspectArgs(plan.image), {
+    const present = spawn("docker", dockerImageInspectArgs(plan.image), boundedOptions({
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
-    });
+    }, DOCKER_CLI_PROBE_TIMEOUT_MS));
     if (present?.error || (present?.status ?? 1) !== 0) {
       throw new Error(missingNamedImageMessage(plan));
     }
@@ -13459,7 +13449,7 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
   // The two keys are handed over HERE and nowhere else — the same hand-over
   // the per-clone road makes, and for the same reason: an operator's shell may
   // carry ANOTHER instance's values, and the instance's own file must win.
-  const up = spawn("docker", upArgs, {
+  const up = spawn("docker", upArgs, boundedOptions({
     cwd: repoRoot,
     env: {
       ...process.env,
@@ -13470,8 +13460,7 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
     // The image is already ensured above, so this is a create+start; the bound
     // is the same one a cold image build is given, and it exists so a wedged
     // daemon fails the command instead of holding it open for ever.
-    timeout: WAYFLOW_BUILD_TIMEOUT_MS,
-  });
+  }, WAYFLOW_BUILD_TIMEOUT_MS));
   const upStatus = up.error ? 1 : (up.status ?? 1);
   if (upStatus !== 0) {
     throw new Error(
@@ -13493,11 +13482,10 @@ async function runInstanceWayflow(verb, argv = [], deps = {}) {
   // Asked with `node`, and with `python3` when the image has no node — the
   // runtime image carries python only (cinatra-cli#281).
   const reach = probeCallbackInsideContainer(plan, (args) =>
-    spawn("docker", args, {
+    spawn("docker", args, boundedOptions({
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: probeTimeoutMs,
-    }),
+    }, probeTimeoutMs)),
   );
   // "Unreachable" is a VERDICT, not every non-zero exit: an image with neither
   // interpreter answers 126/127 and a docker CLI that never ran answers with an
@@ -13882,7 +13870,7 @@ function tearDownDevTunnelSidecar({ projectName, composePath }) {
   const downResult = spawnSync(
     "docker",
     ["compose", "-p", projectName, "-f", composePath, "down"],
-    { stdio: ["ignore", "inherit", "inherit"], timeout: COMPOSE_DOWN_TIMEOUT_MS },
+    boundedOptions({ stdio: ["ignore", "inherit", "inherit"] }, COMPOSE_DOWN_TIMEOUT_MS),
   );
   if (downResult.error || downResult.status !== 0) {
     const why =
@@ -14682,12 +14670,11 @@ async function runVerificationExposure(argv) {
             const upResult = spawnSync(
               "docker",
               ["compose", "-p", projectName, "-f", composePath, "up", "-d", "tailscale"],
-              {
+              boundedOptions({
                 env: composeEnv,
                 encoding: "utf8",
                 stdio: ["ignore", "pipe", "pipe"],
-                timeout: COMPOSE_UP_TIMEOUT_MS,
-              },
+              }, COMPOSE_UP_TIMEOUT_MS),
             );
             const upStdout = scrubTailscaleAuthkey(upResult.stdout ?? "", tsAuthkey);
             const upStderr = scrubTailscaleAuthkey(upResult.stderr ?? "", tsAuthkey);
@@ -15237,7 +15224,7 @@ async function runDevTunnel(argv) {
         "-d",
         "tailscale",
       ];
-      const upResult = spawnSync("docker", upArgs, {
+      const upResult = spawnSync("docker", upArgs, boundedOptions({
         env: composeEnv,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
@@ -15245,8 +15232,7 @@ async function runDevTunnel(argv) {
         // setup dev` calls this — a hung `compose up` must not block setup forever.
         // On timeout spawnSync kills the child; the throw below surfaces it (soft-
         // failed by the setup caller).
-        timeout: COMPOSE_UP_TIMEOUT_MS,
-      });
+      }, COMPOSE_UP_TIMEOUT_MS));
       const upStdout = scrubTailscaleAuthkey(upResult.stdout ?? "", tsAuthkey);
       const upStderr = scrubTailscaleAuthkey(upResult.stderr ?? "", tsAuthkey);
       if (upStdout) process.stdout.write(upStdout);
@@ -15452,6 +15438,7 @@ async function waitForTailscaleFunnelUrl({ projectName, composePath, composeEnv,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
         timeout: TAILSCALE_STATUS_SPAWN_TIMEOUT_MS,
+        killSignal: "SIGKILL",
       },
     );
     if (result.status === 0 && result.stdout) {

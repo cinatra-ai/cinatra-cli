@@ -100,7 +100,7 @@ const REMOVAL_SITES = {
     "--rm\t[\"run\", \"--rm\", \"--pull=never\", \"--entrypoint\", \"/bin/sh\", \"-v\", `${name}:/__preflight_probe:ro`, image, \"-c\", \"ls -A /__preflight_probe\"],",
     "--rm\t[\"run\", \"--rm\", \"--pull=never\", \"--entrypoint\", \"/bin/sh\", \"-v\", `${volumeName}:${PG_MARKER_READ_MOUNT}:ro`, image, \"-c\", program],",
     "--rm\tconst dockerArgs = [\"run\", \"--rm\"];",
-    "--rm\tdockerCapture([\"run\", \"--rm\", \"--pull=never\", \"--entrypoint\", \"/bin/sh\", \"-v\", `${volumeName}:${PG_MARKER_READ_MOUNT}:ro`, image, \"-c\", program], { timeout: 60_000 });",
+    "--rm\tdockerCapture([\"run\", \"--rm\", \"--pull=never\", \"--entrypoint\", \"/bin/sh\", \"-v\", `${volumeName}:${PG_MARKER_READ_MOUNT}:ro`, image, \"-c\", program], { timeoutMs: 60_000 });",
     "Remove it by hand with `docker rm -f \t`Remove it by hand with \\`docker rm -f ${plan.container}\\`, then re-run this command.`,",
     "docker compose down exited \tconsole.warn(`docker compose down exited ${downResult.status}.`);",
     "docker compose down failed\tconsole.warn(`docker compose down failed${why}.`);",

@@ -339,6 +339,13 @@ describe("ensureDevPublicMcpUrl — one-shot read, NO reintroduced poller", () =
 // "start") calls `docker build` (ensureWayflowImage) and `docker compose up`.
 // Both must carry a finite `timeout` so a hung docker can never block setup.
 
+/** True when `text` passes `bound` to a spawn through `boundedOptions`, which
+ *  sets the bound together with SIGKILL (a bare `timeout` sends SIGTERM, which
+ *  a hung child can ignore). */
+function boundedWith(text, bound) {
+  return new RegExp(`boundedOptions\\([\\s\\S]*?\\},\\s*${bound}\\)`).test(text);
+}
+
 describe("auto-bring-up Docker spawns carry a finite timeout (Step 3 must-fix)", () => {
   it("defines finite bound constants for the build + compose-up", () => {
     expect(INDEX_SRC.includes("const WAYFLOW_BUILD_TIMEOUT_MS = 600_000;")).toBe(true);
@@ -351,14 +358,14 @@ describe("auto-bring-up Docker spawns carry a finite timeout (Step 3 must-fix)",
     // Window covers the spawnSync options block (a comment sits between the
     // args array and the options, so reach past it).
     const window = INDEX_SRC.slice(i, i + 900);
-    expect(window.includes("timeout: WAYFLOW_BUILD_TIMEOUT_MS")).toBe(true);
+    expect(boundedWith(window, "WAYFLOW_BUILD_TIMEOUT_MS")).toBe(true);
   });
 
   it("bounds the dev-tunnel `compose up -d tailscale` spawn", () => {
     const start = INDEX_SRC.indexOf("async function runDevTunnel(");
     const nextFn = INDEX_SRC.indexOf("\nfunction readPidFromFile(", start);
     const devBody = INDEX_SRC.slice(start, nextFn);
-    expect(devBody.includes("timeout: COMPOSE_UP_TIMEOUT_MS")).toBe(true);
+    expect(boundedWith(devBody, "COMPOSE_UP_TIMEOUT_MS")).toBe(true);
     // The bring-up throw recognizes the timeout case so it surfaces as a
     // soft-failed bring-up, not a silent success.
     expect(devBody.includes('upResult.error?.code === "ETIMEDOUT"')).toBe(true);
@@ -373,6 +380,7 @@ describe("auto-bring-up Docker spawns carry a finite timeout (Step 3 must-fix)",
     expect(i).toBeGreaterThan(-1);
     const window = INDEX_SRC.slice(i, i + 1200);
     expect(window.includes("timeout: TAILSCALE_STATUS_SPAWN_TIMEOUT_MS")).toBe(true);
+    expect(/timeout: \w+_STATUS_SPAWN_TIMEOUT_MS,\s*killSignal: "SIGKILL",/.test(window)).toBe(true);
   });
 
   it("bounds the fast docker-CLI metadata probes reached by setup auto-bring-up", () => {
@@ -389,7 +397,7 @@ describe("auto-bring-up Docker spawns carry a finite timeout (Step 3 must-fix)",
       const i = INDEX_SRC.indexOf(anchor);
       expect(i).toBeGreaterThan(-1);
       const window = INDEX_SRC.slice(i, i + 600);
-      expect(window.includes("timeout: DOCKER_CLI_PROBE_TIMEOUT_MS")).toBe(true);
+      expect(boundedWith(window, "DOCKER_CLI_PROBE_TIMEOUT_MS")).toBe(true);
     }
   });
 });
@@ -468,7 +476,7 @@ describe("dev tunnel — post-sidecar failures tear the sidecar down (cinatra-cl
       .join("\n");
     // A hung teardown would hang the very command that is already failing.
     expect(INDEX_SRC.includes("const COMPOSE_DOWN_TIMEOUT_MS = 120_000;")).toBe(true);
-    expect(helper.includes("timeout: COMPOSE_DOWN_TIMEOUT_MS")).toBe(true);
+    expect(boundedWith(helper, "COMPOSE_DOWN_TIMEOUT_MS")).toBe(true);
     // codex round-2 must-fix: `isComposeAvailable()` is false for BOTH "docker
     // absent" and "the probe hung", so it must NOT short-circuit the teardown
     // into a claimed success — the `down` is always attempted once a compose

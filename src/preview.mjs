@@ -77,6 +77,7 @@ import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { boundedOptions } from "./child-bound.mjs";
 
 // cinatra-cli#219 — the endpoint-ownership proof. Node-builtins-only and
 // dependency-free in the other direction (it never imports this module), so
@@ -1433,11 +1434,10 @@ function readAgainStep(slug, recordsNoId) {
 }
 
 function runSpawn(cmd, args, { timeoutMs, stdio } = {}) {
-  const res = spawnSync(cmd, args, {
+  const res = spawnSync(cmd, args, boundedOptions({
     encoding: "utf8",
     stdio: stdio ?? ["ignore", "pipe", "pipe"],
-    timeout: timeoutMs ?? DOCKER_CLI_PROBE_TIMEOUT_MS,
-  });
+  }, timeoutMs ?? DOCKER_CLI_PROBE_TIMEOUT_MS));
   return {
     status: res.status,
     stdout: outputText(res, "stdout"),
