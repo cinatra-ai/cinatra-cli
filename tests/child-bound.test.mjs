@@ -414,6 +414,115 @@ console.log(JSON.stringify({ status: r.status, signal: r.signal, error: r.error 
     expectGone(pidFile);
   }, 30_000);
 
+  /** Start `code` (an ES module body) as a caller process of its own, which a
+   *  case can kill; `exited` settles when it is gone. */
+  function startCaller(code, env = process.env) {
+    const proc = spawnAsync(NODE, ["--input-type=module", "-e", code], { stdio: ["ignore", "pipe", "pipe"], env });
+    let out = "";
+    proc.stdout.on("data", (d) => (out += d));
+    const exited = new Promise((resolve) => proc.on("exit", resolve));
+    return { proc, exited, out: () => out };
+  }
+
+  async function waitForFile(file, ms = 10_000) {
+    const t0 = Date.now();
+    while (!existsSync(file) && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 20));
+    expect(existsSync(file), `${path.basename(file)} was written`).toBe(true);
+  }
+
+  it("a child that traps the forwarded SIGTERM and exits 0 still loses its SIGTERM-ignoring descendant at the grace", async () => {
+    const [desc, self] = [pidPath("trap0-desc"), pidPath("trap0-self")];
+    const child = script(
+      "trap0.cjs",
+      `const { spawn } = require("child_process");
+const fs = require("fs");
+const [descPid, selfPid] = process.argv.slice(2);
+spawn(process.execPath, ["-e", ${JSON.stringify(NEVER_EXITS)}, descPid], { stdio: "ignore" });
+const t0 = Date.now();
+while (!fs.existsSync(descPid) && Date.now() - t0 < 5000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+process.on("SIGTERM", () => process.exit(0));
+fs.writeFileSync(selfPid, process.pid + " " + process.ppid);
+setInterval(() => {}, 1000);
+`,
+    );
+    const caller = startCaller(`const cb = await import(${JSON.stringify(LEAF_URL)});
+const r = cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(child)}, ${JSON.stringify(desc)}, ${JSON.stringify(self)}], { timeoutMs: 20000, graceMs: 1500, stdio: "ignore" });
+console.log(JSON.stringify({ status: r.status, signal: r.signal, error: r.error ? r.error.code : null }));`);
+    await waitForFile(self);
+    const [, supervisorPid] = readFileSync(self, "utf8").trim().split(" ").map(Number);
+    expect(supervisorPid).not.toBe(caller.proc.pid);
+    process.kill(supervisorPid, "SIGTERM");
+    await caller.exited;
+    expect(JSON.parse(caller.out().trim().split("\n").pop())).toEqual({ status: 0, signal: null, error: null });
+    expectGone(self);
+    expectGone(desc);
+  }, 30_000);
+
+  it("a caller killed while the child runs takes the whole group with it, even when the child then exits 0", async () => {
+    const [desc, self, sup] = [pidPath("callerdeath-desc"), pidPath("callerdeath-self"), pidPath("callerdeath-sup")];
+    const go = path.join(sandbox, `callerdeath-go-${process.hrtime.bigint()}`);
+    const child = script(
+      "exit0-on-go.cjs",
+      `const { spawn } = require("child_process");
+const fs = require("fs");
+const [descPid, selfPid, goFile] = process.argv.slice(2);
+spawn(process.execPath, ["-e", ${JSON.stringify(NEVER_EXITS)}, descPid], { stdio: "ignore" });
+const t0 = Date.now();
+while (!fs.existsSync(descPid) && Date.now() - t0 < 5000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+fs.writeFileSync(selfPid, process.pid + " " + process.ppid);
+setInterval(() => { if (fs.existsSync(goFile)) process.exit(0); }, 5);
+`,
+    );
+    const caller = startCaller(`const cb = await import(${JSON.stringify(LEAF_URL)});
+cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(child)}, ${JSON.stringify(desc)}, ${JSON.stringify(self)}, ${JSON.stringify(go)}], { timeoutMs: 20000, stdio: "ignore" });`);
+    await waitForFile(self);
+    const [, supervisorPid] = readFileSync(self, "utf8").trim().split(" ").map(Number);
+    expect(supervisorPid).not.toBe(caller.proc.pid);
+    writeFileSync(sup, String(supervisorPid));
+    process.kill(caller.proc.pid, "SIGKILL");
+    await caller.exited;
+    // The child exits 0 at once, well before any once-a-second check.
+    writeFileSync(go, "go");
+    expectGone(desc);
+    expectGone(self);
+    expectGone(sup);
+  }, 30_000);
+
+  it("a caller that dies before the supervisor is up is still noticed: nothing the supervisor would start survives", async () => {
+    const [sup, gc, blocker, self] = [pidPath("early-sup"), pidPath("early-gc"), pidPath("early-blocker"), pidPath("early-self")];
+    const go = path.join(sandbox, `early-go-${process.hrtime.bigint()}`);
+    // Preloaded into every node process of the run, it acts only in the
+    // supervisor: it holds the supervisor before its own code runs until the
+    // case has killed the caller.
+    const preload = script(
+      "hold-supervisor.mjs",
+      `import { existsSync, writeFileSync } from "node:fs";
+if (String(process.argv[1] ?? "").endsWith("/child-group-supervisor.mjs")) {
+  writeFileSync(${JSON.stringify(sup)}, process.pid + " " + process.ppid);
+  const t0 = Date.now();
+  while (!existsSync(${JSON.stringify(go)}) && Date.now() - t0 < 10000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+}
+`,
+    );
+    const tree = treeScript();
+    const env = { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ? `${process.env.NODE_OPTIONS} ` : ""}--import=${pathToFileURL(preload).href}` };
+    delete env.CINATRA_GROUP_SUPERVISED;
+    const caller = startCaller(
+      `const cb = await import(${JSON.stringify(LEAF_URL)});
+cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(tree)}, ${JSON.stringify(gc)}, ${JSON.stringify(blocker)}, ${JSON.stringify(self)}, "block"], { timeoutMs: 20000, stdio: "ignore" });`,
+      env,
+    );
+    await waitForFile(sup);
+    const [, supervisorParent] = readFileSync(sup, "utf8").trim().split(" ").map(Number);
+    expect(supervisorParent).toBe(caller.proc.pid);
+    process.kill(caller.proc.pid, "SIGKILL");
+    await caller.exited;
+    writeFileSync(go, "go");
+    expectGone(sup, 5000);
+    pause(1500);
+    for (const f of [self, gc, blocker]) expect(isAlive(readPid(f)), `${path.basename(f)} is not running`).toBe(false);
+  }, 30_000);
+
   it("nested inside a supervised run it is plain bounded spawnSync (the outer group already holds it)", async () => {
     const code = `const cb = await import(${JSON.stringify(LEAF_URL)});
 const r = cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, ["-e", "console.log(process.ppid)"], { timeoutMs: 15000, encoding: "utf8" });

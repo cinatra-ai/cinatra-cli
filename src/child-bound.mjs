@@ -239,8 +239,13 @@ function killGroupQuietly(pid) {
  *  - on a non-zero exit or a signal death, SIGKILLs what is left of the group;
  *  - on a zero exit, leaves the group as it is (a long-lived service this
  *    starts is detached into a session of its own anyway);
- *  - forwards SIGINT, SIGTERM and SIGHUP to the group, and SIGKILLs it when
- *    the child outlives `graceMs` after that, or when its own parent is gone.
+ *  - forwards SIGINT, SIGTERM and SIGHUP to the group; from then on the
+ *    group is stopped whatever the child's exit status: the supervisor ends
+ *    when the group is empty, or SIGKILLs it `graceMs` after the signal;
+ *  - SIGKILLs the group at once when this process (the caller) is gone: the
+ *    report pipe's end, which the kernel closes when the caller dies, is read
+ *    as that signal, and the caller's pid is checked before the child starts
+ *    and at its exit.
  *
  *  The bound is `timeoutMs`, else spawnSync's own `timeout` option, else the
  *  step class. Inside a supervised run (GROUP_SUPERVISED_ENV is set) this is
@@ -261,7 +266,7 @@ export function spawnGroupBoundedSync(command, args, options = {}) {
     return spawnSync(command, argv, boundedOptions(rest, ms));
   }
   const env = { ...(rest.env ?? process.env), [GROUP_SUPERVISED_ENV]: "1" };
-  const payload = JSON.stringify({ cmd: String(command), args: argv, timeoutMs: ms, graceMs });
+  const payload = JSON.stringify({ cmd: String(command), args: argv, timeoutMs: ms, graceMs, callerPid: process.pid });
   const r = spawnSync(
     process.execPath,
     [SUPERVISOR, payload],
