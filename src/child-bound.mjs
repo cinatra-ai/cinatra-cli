@@ -231,14 +231,17 @@ function killGroupQuietly(pid) {
  *
  *  spawnSync alone stops only the direct child: when that child is itself
  *  blocked in a synchronous wait, its grandchild outlives it. The supervisor
- *  starts the child with `detached` (its own process group) and:
+ *  starts a small anchor (`child-group-anchor.mjs`) `detached` (a process
+ *  group of its own, whose id is the anchor's pid), and the anchor starts the
+ *  child in that group. The supervisor reports the group's id before the
+ *  child exists, and:
  *  - at the bound, SIGKILLs the group and reports a timeout, which maps to
  *    spawnSync's own ETIMEDOUT error, so `childTimedOut` fires unchanged;
  *  - on any exit, a zero exit too, SIGKILLs what is left of the group (a
  *    long-lived service this starts is detached into a session of its own,
  *    so it is not in the group);
- *  - forwards SIGINT, SIGTERM and SIGHUP to the group, also one that arrives
- *    while the child is being started; from then on the
+ *  - forwards SIGINT, SIGTERM and SIGHUP to the group, each time, also one
+ *    that arrives while the child is being started; from then on the
  *    group is stopped whatever the child's exit status: the supervisor ends
  *    when the group is empty, or SIGKILLs it `graceMs` after the signal;
  *  - SIGKILLs the group at once when this process (the caller) is gone: the
@@ -246,18 +249,28 @@ function killGroupQuietly(pid) {
  *    as that signal, and the caller's pid is checked before the child starts
  *    and at its exit.
  *
+ *  The supervisor runs in this process's own process group, so a signal sent
+ *  to the caller's group (a Ctrl-C at a terminal, a kill of the group)
+ *  reaches the supervisor and, through it, the child, also while this process
+ *  is blocked here. The anchor SIGKILLs the group when the supervisor is
+ *  gone, so a supervisor killed at any moment, also before it reported
+ *  anything, leaves nothing running; a supervisor that ended without a result
+ *  after it reported the group's id has the group killed from here too.
+ *
  *  The bound is `timeoutMs`, else spawnSync's own `timeout` option, else the
- *  step class. Every call supervises, a nested call too. The supervisor is
- *  started in a process group of its own, so a group kill aimed at the
- *  caller's group leaves it standing; it stops its child's group as soon as
- *  its caller is gone, so a nested call stays inside the outer bound with no
- *  process-table read.
+ *  step class. Every call supervises, a nested call too: an outer bound that
+ *  kills the nested caller's group kills the nested supervisor with it, and
+ *  its anchor then stops the nested child's group, with no process-table
+ *  read.
  *
  *  Residuals: the supervisor itself is bounded at the child's bound plus
  *  `graceMs`, and an idle supervisor misses its own deadline only under host
- *  starvation (the group is then killed from here when its pid is known). The
- *  child has no controlling terminal, so it must not prompt; the paths that
- *  use this run with prompts disabled. */
+ *  starvation. A SIGKILL that ends the supervisor and the anchor together,
+ *  before the group's id was reported, is the one case left: nothing then
+ *  knows the group. The group kills are POSIX process-group kills; on Windows
+ *  they do not apply. The child has
+ *  no controlling terminal, so it must not prompt; the paths that use this
+ *  run with prompts disabled. */
 export function spawnGroupBoundedSync(command, args, options = {}) {
   const { timeoutMs, timeout, killSignal: _killSignal, graceMs = GROUP_SUPERVISOR_GRACE_MS, ...rest } = options ?? {};
   const ms = timeoutMs ?? timeout ?? boundFor("step");
@@ -266,7 +279,7 @@ export function spawnGroupBoundedSync(command, args, options = {}) {
   const r = spawnSync(
     process.execPath,
     [SUPERVISOR, payload],
-    boundedOptions({ ...rest, detached: process.platform !== "win32", stdio: [...stdioTriple(rest.stdio), "pipe"] }, ms + graceMs),
+    boundedOptions({ ...rest, detached: false, stdio: [...stdioTriple(rest.stdio), "pipe"] }, ms + graceMs),
   );
   const report = supervisorReport(r.output?.[3]);
   const output = [r.output?.[0] ?? null, r.output?.[1] ?? null, r.output?.[2] ?? null];
@@ -289,8 +302,9 @@ export function spawnGroupBoundedSync(command, args, options = {}) {
     return { ...result, status: report.status ?? null, signal: report.signal ?? null };
   }
   // The supervisor ended without a result: its own bound expired, it could not
-  // be started, or it was killed. Stop the group from here when it is known.
-  killGroupQuietly(report.pid);
+  // be started, it lost its anchor, or it was killed. Stop the group from here
+  // when its id was reported (the anchor stops it when the supervisor dies).
+  killGroupQuietly(report.group);
   if (r.error) return { ...result, status: null, signal: r.signal ?? null, error: r.error };
   const how = r.signal ? `killed by ${r.signal}` : `exit ${r.status}`;
   const error = Object.assign(new Error(`could not supervise ${path.basename(String(command))}: the supervisor ended without a result (${how})`), {

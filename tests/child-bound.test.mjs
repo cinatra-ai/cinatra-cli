@@ -11,7 +11,7 @@
 // failure on a tree that does not have it yet.
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { spawn as spawnAsync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -127,6 +127,44 @@ function harness(code, { env = process.env, timeout = 30_000 } = {}) {
     value = null;
   }
   return { status: r.status, value, stderr: r.stderr };
+}
+
+/** `base` with `preload` added to NODE_OPTIONS, so every node process of the
+ *  run loads it first. */
+function withPreload(preload, base = process.env) {
+  return { ...base, NODE_OPTIONS: `${base.NODE_OPTIONS ? `${base.NODE_OPTIONS} ` : ""}--import=${pathToFileURL(preload).href}` };
+}
+
+/** An environment whose supervisor writes its own pid to `file` before its
+ *  code runs (a preload that acts only in the supervisor). */
+function supervisorPidEnv(file, base = process.env) {
+  const preload = script(
+    `supervisor-pid-${process.hrtime.bigint()}.mjs`,
+    `import { writeFileSync } from "node:fs";
+if (String(process.argv[1] ?? "").endsWith("/child-group-supervisor.mjs")) writeFileSync(${JSON.stringify(file)}, String(process.pid));
+`,
+  );
+  return withPreload(preload, base);
+}
+
+/** An environment in which every node process of the run appends its pid to
+ *  `file` before its code runs. */
+function pidLogEnv(file, base = process.env) {
+  const preload = script(
+    `pid-log-${process.hrtime.bigint()}.mjs`,
+    `import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(file)}, process.pid + "\\n");
+`,
+  );
+  return withPreload(preload, base);
+}
+
+function fileLines(file) {
+  try {
+    return readFileSync(file, "utf8").split("\n").filter(Boolean);
+  } catch {
+    return [];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +453,7 @@ process.exit(0);
 
   it("SIGTERM sent to the supervisor reaches the child", async () => {
     const pidFile = pidPath("forward-child");
+    const sup = pidPath("forward-sup");
     const mark = path.join(sandbox, `forward-mark-${process.hrtime.bigint()}`);
     const child = script(
       "forward.cjs",
@@ -427,13 +466,14 @@ setInterval(() => {}, 1000);
     const code = `const cb = await import(${JSON.stringify(LEAF_URL)});
 const r = cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(child)}, ${JSON.stringify(pidFile)}, ${JSON.stringify(mark)}], { timeoutMs: 20000, stdio: "ignore" });
 console.log(JSON.stringify({ status: r.status, signal: r.signal, error: r.error ? r.error.code : null }));`;
-    const proc = spawnAsync(NODE, ["--input-type=module", "-e", code], { stdio: ["ignore", "pipe", "pipe"] });
+    const proc = spawnAsync(NODE, ["--input-type=module", "-e", code], { stdio: ["ignore", "pipe", "pipe"], env: supervisorPidEnv(sup) });
     let out = "";
     proc.stdout.on("data", (d) => (out += d));
     const exited = new Promise((resolve) => proc.on("exit", resolve));
     const t0 = Date.now();
     while (!existsSync(pidFile) && Date.now() - t0 < 10_000) await new Promise((r) => setTimeout(r, 50));
-    const [, supervisorPid] = readFileSync(pidFile, "utf8").trim().split(" ").map(Number);
+    const supervisorPid = readPid(sup);
+    expect(supervisorPid).toBeGreaterThan(0);
     expect(supervisorPid).not.toBe(proc.pid);
     process.kill(supervisorPid, "SIGTERM");
     await exited;
@@ -490,8 +530,8 @@ console.log(JSON.stringify({ status: r.status, signal: r.signal, error: r.error 
 
   /** Start `code` (an ES module body) as a caller process of its own, which a
    *  case can kill; `exited` settles when it is gone. */
-  function startCaller(code, env = process.env) {
-    const proc = spawnAsync(NODE, ["--input-type=module", "-e", code], { stdio: ["ignore", "pipe", "pipe"], env });
+  function startCaller(code, env = process.env, { detached = false } = {}) {
+    const proc = spawnAsync(NODE, ["--input-type=module", "-e", code], { stdio: ["ignore", "pipe", "pipe"], env, detached });
     let out = "";
     proc.stdout.on("data", (d) => (out += d));
     const exited = new Promise((resolve) => proc.on("exit", resolve));
@@ -505,7 +545,7 @@ console.log(JSON.stringify({ status: r.status, signal: r.signal, error: r.error 
   }
 
   it("a child that traps the forwarded SIGTERM and exits 0 still loses its SIGTERM-ignoring descendant at the grace", async () => {
-    const [desc, self] = [pidPath("trap0-desc"), pidPath("trap0-self")];
+    const [desc, self, sup] = [pidPath("trap0-desc"), pidPath("trap0-self"), pidPath("trap0-sup")];
     const child = script(
       "trap0.cjs",
       `const { spawn } = require("child_process");
@@ -521,9 +561,10 @@ setInterval(() => {}, 1000);
     );
     const caller = startCaller(`const cb = await import(${JSON.stringify(LEAF_URL)});
 const r = cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(child)}, ${JSON.stringify(desc)}, ${JSON.stringify(self)}], { timeoutMs: 20000, graceMs: 1500, stdio: "ignore" });
-console.log(JSON.stringify({ status: r.status, signal: r.signal, error: r.error ? r.error.code : null }));`);
+console.log(JSON.stringify({ status: r.status, signal: r.signal, error: r.error ? r.error.code : null }));`, supervisorPidEnv(sup));
     await waitForFile(self);
-    const [, supervisorPid] = readFileSync(self, "utf8").trim().split(" ").map(Number);
+    const supervisorPid = readPid(sup);
+    expect(supervisorPid).toBeGreaterThan(0);
     expect(supervisorPid).not.toBe(caller.proc.pid);
     process.kill(supervisorPid, "SIGTERM");
     await caller.exited;
@@ -532,8 +573,166 @@ console.log(JSON.stringify({ status: r.status, signal: r.signal, error: r.error 
     expectGone(desc);
   }, 30_000);
 
+  it("a child that traps the forwarded SIGTERM and exits 0 with nothing left in its group ends the run at once, before the grace", async () => {
+    const [self, sup] = [pidPath("trapclean-self"), pidPath("trapclean-sup")];
+    const child = script(
+      "trap-clean.cjs",
+      `const fs = require("fs");
+process.on("SIGTERM", () => process.exit(0));
+fs.writeFileSync(process.argv[2], String(process.pid));
+setInterval(() => {}, 1000);
+`,
+    );
+    const caller = startCaller(`const cb = await import(${JSON.stringify(LEAF_URL)});
+const r = cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(child)}, ${JSON.stringify(self)}], { timeoutMs: 30000, graceMs: 20000, stdio: "ignore" });
+console.log(JSON.stringify({ status: r.status, signal: r.signal, error: r.error ? r.error.code : null }));`, supervisorPidEnv(sup));
+    await waitForFile(self);
+    const t0 = Date.now();
+    process.kill(readPid(sup), "SIGTERM");
+    await caller.exited;
+    expect(Date.now() - t0, "ended well before the 20 s grace").toBeLessThan(5_000);
+    expect(JSON.parse(caller.out().trim().split("\n").pop())).toEqual({ status: 0, signal: null, error: null });
+    expectGone(self);
+  }, 40_000);
+
+  // The group-signal probe: the caller runs as a process group of its own and
+  // traps the signal (as a CLI with its own cleanup does), so only a
+  // supervisor that shares the caller's group can pass the signal on while the
+  // caller is blocked in its synchronous wait.
+  for (const [sig, times] of [
+    ["SIGTERM", 1],
+    ["SIGINT", 1],
+    ["SIGHUP", 1],
+    ["SIGTERM", 2],
+  ]) {
+    it(`${sig}${times > 1 ? `, sent ${times} times,` : ""} sent to the caller's process group reaches the child each time, also while the caller traps it`, async () => {
+      const self = pidPath(`group-${sig}-${times}-self`);
+      const mark = path.join(sandbox, `group-${sig}-${times}-mark-${process.hrtime.bigint()}`);
+      const child = script(
+        "group-signal.cjs",
+        `const fs = require("fs");
+const [selfPid, markFile, sig, times] = process.argv.slice(2);
+let n = 0;
+process.on(sig, () => {
+  n += 1;
+  fs.appendFileSync(markFile, sig + " " + n + "\\n");
+  if (n >= Number(times)) process.exit(7);
+});
+fs.writeFileSync(selfPid, String(process.pid));
+setInterval(() => {}, 1000);
+`,
+      );
+      const caller = startCaller(
+        `process.on(${JSON.stringify(sig)}, () => {});
+const cb = await import(${JSON.stringify(LEAF_URL)});
+const t0 = Date.now();
+const r = cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(child)}, ${JSON.stringify(self)}, ${JSON.stringify(mark)}, ${JSON.stringify(sig)}, "${times}"], { timeoutMs: 10000, graceMs: 5000, stdio: "ignore" });
+console.log(JSON.stringify({ status: r.status, signal: r.signal, error: r.error ? r.error.code : null, ms: Date.now() - t0 }));
+process.exit(0);`,
+        process.env,
+        { detached: true },
+      );
+      try {
+        await waitForFile(self);
+        for (let i = 1; i <= times; i += 1) {
+          process.kill(-caller.proc.pid, sig);
+          const t0 = Date.now();
+          while (fileLines(mark).length < i && Date.now() - t0 < 4_000) await new Promise((r) => setTimeout(r, 20));
+          expect(fileLines(mark), `the child saw ${sig} number ${i}`).toEqual(Array.from({ length: i }, (_, k) => `${sig} ${k + 1}`));
+        }
+        await caller.exited;
+        const out = JSON.parse(caller.out().trim().split("\n").pop());
+        expect({ status: out.status, signal: out.signal, error: out.error }).toEqual({ status: 7, signal: null, error: null });
+        expect(out.ms, "ended by the signal, not by the bound").toBeLessThan(8_000);
+        expectGone(self);
+      } finally {
+        killIfAlive(self);
+        try {
+          process.kill(-caller.proc.pid, "SIGKILL");
+        } catch {
+          // the caller's group is gone
+        }
+      }
+    }, 30_000);
+  }
+
+  // The kill window: a deterministic SIGKILL right after a spawn, before the
+  // spawning process can report what it started. "supervisor" kills the
+  // supervisor right after its own spawn; "starter" kills whichever process
+  // starts the real child, right after that spawn. Every node process of the
+  // run logs its pid, so the case sees anything left running.
+  for (const [where, label] of [
+    ["supervisor", "the supervisor right after its spawn, before it reports"],
+    ["starter", "the starter right after its spawn, before it reports"],
+    ["reported", "the supervisor right after it reported the group"],
+  ]) {
+    it(`a SIGKILL of ${label}, leaves no process of the run behind`, async () => {
+      const tree = treeScript();
+      const [gc, blocker, self] = [pidPath(`kill-${where}-gc`), pidPath(`kill-${where}-blocker`), pidPath(`kill-${where}-self`)];
+      const log = path.join(sandbox, `kill-${where}-pids-${process.hrtime.bigint()}`);
+      const preload = script(
+        `kill-after-spawn-${where}.mjs`,
+        `import { createRequire, syncBuiltinESMExports } from "node:module";
+import { existsSync } from "node:fs";
+const where = ${JSON.stringify(where)};
+const inSupervisor = String(process.argv[1] ?? "").endsWith("/child-group-supervisor.mjs");
+const waitThenDie = () => {
+  const t0 = Date.now();
+  while (!existsSync(${JSON.stringify(self)}) && Date.now() - t0 < 5000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  process.kill(process.pid, "SIGKILL");
+};
+if (where === "reported" && inSupervisor) {
+  const fs = createRequire(import.meta.url)("node:fs");
+  const realWrite = fs.writeSync;
+  fs.writeSync = function (...a) {
+    const r = realWrite.apply(this, a);
+    if (a[0] === 3 && String(a[1]).includes('"group"')) waitThenDie();
+    return r;
+  };
+  syncBuiltinESMExports();
+} else if (where === "starter" || inSupervisor) {
+  const cp = createRequire(import.meta.url)("node:child_process");
+  const real = cp.spawn;
+  let first = true;
+  cp.spawn = function (...a) {
+    const c = real.apply(this, a);
+    const startsTree = Array.isArray(a[1]) && a[1][0] === ${JSON.stringify(tree)};
+    const act = where === "supervisor" ? first : startsTree;
+    first = false;
+    if (act) waitThenDie();
+    return c;
+  };
+  syncBuiltinESMExports();
+}
+`,
+      );
+      const env = pidLogEnv(log, withPreload(preload));
+      try {
+        const r = harness(
+          `const cb = await import(${JSON.stringify(LEAF_URL)});
+const r = cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(tree)}, ${JSON.stringify(gc)}, ${JSON.stringify(blocker)}, ${JSON.stringify(self)}, "block"], { timeoutMs: 20000, stdio: "ignore" });
+console.log(JSON.stringify({ status: r.status, error: r.error ? r.error.code : null }));`,
+          { env, timeout: 40_000 },
+        );
+        expect(r.status, r.stderr).toBe(0);
+        expect(r.value).toEqual({ status: null, error: "CHILD_SUPERVISOR_FAILED" });
+        expectGone(self, 5000);
+        expectGone(gc, 5000);
+        pause(500);
+        expect(isAlive(readPid(blocker)), "the child it blocks on is not running").toBe(false);
+        const left = fileLines(log).map(Number).filter((pid) => isAlive(pid));
+        expect(left, "no node process of the run is left").toEqual([]);
+      } finally {
+        for (const f of [self, gc, blocker]) killIfAlive(f);
+        for (const pid of fileLines(log).map(Number)) {
+          if (isAlive(pid)) process.kill(pid, "SIGKILL");
+        }
+      }
+    }, 60_000);
+  }
+
   it("a caller killed while the child runs takes the whole group with it, even when the child then exits 0", async () => {
-    const [desc, self, sup] = [pidPath("callerdeath-desc"), pidPath("callerdeath-self"), pidPath("callerdeath-sup")];
+    const [desc, self, sup, parent] = [pidPath("callerdeath-desc"), pidPath("callerdeath-self"), pidPath("callerdeath-sup"), pidPath("callerdeath-parent")];
     const go = path.join(sandbox, `callerdeath-go-${process.hrtime.bigint()}`);
     const child = script(
       "exit0-on-go.cjs",
@@ -548,11 +747,14 @@ setInterval(() => { if (fs.existsSync(goFile)) process.exit(0); }, 5);
 `,
     );
     const caller = startCaller(`const cb = await import(${JSON.stringify(LEAF_URL)});
-cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(child)}, ${JSON.stringify(desc)}, ${JSON.stringify(self)}, ${JSON.stringify(go)}], { timeoutMs: 20000, stdio: "ignore" });`);
+cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(child)}, ${JSON.stringify(desc)}, ${JSON.stringify(self)}, ${JSON.stringify(go)}], { timeoutMs: 20000, stdio: "ignore" });`, supervisorPidEnv(sup));
     await waitForFile(self);
-    const [, supervisorPid] = readFileSync(self, "utf8").trim().split(" ").map(Number);
+    const supervisorPid = readPid(sup);
+    expect(supervisorPid).toBeGreaterThan(0);
     expect(supervisorPid).not.toBe(caller.proc.pid);
-    writeFileSync(sup, String(supervisorPid));
+    // The child's own parent (the supervisor, or a process it started).
+    const [, childParent] = readFileSync(self, "utf8").trim().split(" ").map(Number);
+    writeFileSync(parent, String(childParent));
     process.kill(caller.proc.pid, "SIGKILL");
     await caller.exited;
     // The child exits 0 at once, well before any once-a-second check.
@@ -560,6 +762,7 @@ cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(child)}, ${J
     expectGone(desc);
     expectGone(self);
     expectGone(sup);
+    expectGone(parent);
   }, 30_000);
 
   it("a caller that dies before the supervisor is up is still noticed: nothing the supervisor would start survives", async () => {
@@ -777,8 +980,8 @@ cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(tree)}, ${JS
     }, 30_000);
   }
 
-  it("the supervisor leads a process group of its own, outside its caller's group", async () => {
-    const [self] = [pidPath("own-group-self")];
+  it("the supervisor stays in its caller's process group, and the child runs in a group that another process leads", async () => {
+    const [self, sup] = [pidPath("own-group-self"), pidPath("own-group-sup")];
     const go = path.join(sandbox, `own-group-go-${process.hrtime.bigint()}`);
     const child = script(
       "own-group.cjs",
@@ -788,34 +991,185 @@ fs.writeFileSync(selfPid, process.pid + " " + process.ppid);
 setInterval(() => { if (fs.existsSync(goFile)) process.exit(0); }, 5);
 `,
     );
-    const caller = startCaller(`const cb = await import(${JSON.stringify(LEAF_URL)});
+    const leadsGroup = (pid) => {
+      try {
+        process.kill(-pid, 0);
+        return true;
+      } catch (err) {
+        return err.code === "EPERM";
+      }
+    };
+    const caller = startCaller(
+      `const cb = await import(${JSON.stringify(LEAF_URL)});
 const r = cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(child)}, ${JSON.stringify(self)}, ${JSON.stringify(go)}], { timeoutMs: 20000, stdio: "ignore" });
-console.log(JSON.stringify({ status: r.status }));`);
+console.log(JSON.stringify({ status: r.status }));`,
+      supervisorPidEnv(sup),
+      { detached: true },
+    );
     await waitForFile(self);
-    const [, supervisorPid] = readFileSync(self, "utf8").trim().split(" ").map(Number);
-    let leadsGroup;
-    try {
-      process.kill(-supervisorPid, 0);
-      leadsGroup = true;
-    } catch (err) {
-      leadsGroup = err.code === "EPERM";
-    }
+    const supervisorPid = readPid(sup);
+    const [childPid, childParent] = readFileSync(self, "utf8").trim().split(" ").map(Number);
+    const seen = { supervisor: leadsGroup(supervisorPid), parent: leadsGroup(childParent), child: leadsGroup(childPid), caller: leadsGroup(caller.proc.pid) };
     writeFileSync(go, "go");
     await caller.exited;
     expect(supervisorPid).toBeGreaterThan(0);
     expect(supervisorPid).not.toBe(caller.proc.pid);
-    expect(leadsGroup, "a process group with the supervisor's id exists").toBe(true);
+    expect(seen.caller, "the caller leads its own group here").toBe(true);
+    expect(seen.supervisor, "no process group has the supervisor's id").toBe(false);
+    expect(childParent, "the child's parent is not the supervisor").not.toBe(supervisorPid);
+    expect(seen.parent, "the child's parent leads a process group").toBe(true);
+    expect(seen.child, "the child leads no process group of its own").toBe(false);
     expect(JSON.parse(caller.out().trim().split("\n").pop())).toEqual({ status: 0 });
     expectGone(self);
   }, 30_000);
 
+  /** A stand-in parent: it starts `entry` (the supervisor or the anchor) with
+   *  a payload naming itself as the parent and a plain file on fd 3, writes
+   *  its pid and waits. */
+  function standInParent() {
+    return script(
+      "stand-in-parent.cjs",
+      `const { spawn } = require("child_process");
+const fs = require("fs");
+const [entry, payloadJson, parentKey, reportFile, selfPid, detached] = process.argv.slice(2);
+const payload = JSON.parse(payloadJson);
+payload[parentKey] = process.pid;
+const fd = fs.openSync(reportFile, "a");
+spawn(process.execPath, [entry, JSON.stringify(payload)], { stdio: ["ignore", "ignore", "ignore", fd], detached: detached === "1" });
+fs.writeFileSync(selfPid, String(process.pid));
+setInterval(() => {}, 1000);
+`,
+    );
+  }
+
+  it("the supervisor reports on fd 3 when it is not a socket: a plain file gets each event and the exit status", () => {
+    const reportFile = path.join(sandbox, `plain-report-${process.hrtime.bigint()}`);
+    const fd = openSync(reportFile, "w");
+    let r;
+    try {
+      const payload = JSON.stringify({ cmd: NODE, args: ["-e", "process.exit(5)"], timeoutMs: 15000, graceMs: 2000, callerPid: process.pid });
+      r = spawnSync(NODE, [path.join(SRC_DIR, "child-group-supervisor.mjs"), payload], { stdio: ["ignore", "ignore", "pipe", fd], encoding: "utf8", timeout: 30_000, killSignal: "SIGKILL" });
+    } finally {
+      closeSync(fd);
+    }
+    expect(r.status, r.stderr).toBe(0);
+    const events = fileLines(reportFile).map((line) => JSON.parse(line));
+    expect(events.some((e) => Number(e.pid) > 0), "the child's pid was reported").toBe(true);
+    expect(events[events.length - 1]).toEqual({ status: 5, signal: null });
+  });
+
+  for (const [label, entry, parentKey, detached, extra] of [
+    ["the supervisor", "child-group-supervisor.mjs", "callerPid", "0", { timeoutMs: 20000, graceMs: 2000 }],
+    ["the group anchor", "child-group-anchor.mjs", "supervisorPid", "1", {}],
+  ]) {
+    it(`${label} with a plain file on fd 3 still notices its parent's death once a second and stops the whole group`, async () => {
+      const tree = treeScript();
+      const [gc, blocker, self, parent] = [pidPath(`plainfd-${parentKey}-gc`), pidPath(`plainfd-${parentKey}-blocker`), pidPath(`plainfd-${parentKey}-self`), pidPath(`plainfd-${parentKey}-parent`)];
+      const reportFile = path.join(sandbox, `plainfd-${parentKey}-report-${process.hrtime.bigint()}`);
+      const payload = JSON.stringify({ cmd: NODE, args: [tree, gc, blocker, self, "block"], ...extra });
+      const proc = spawnAsync(NODE, [standInParent(), path.join(SRC_DIR, entry), payload, parentKey, reportFile, parent, detached], { stdio: "ignore" });
+      const exited = new Promise((resolve) => proc.on("exit", resolve));
+      try {
+        await waitForFile(self);
+        await waitForFile(gc);
+        expect(isAlive(readPid(gc)), "the grandchild runs").toBe(true);
+        process.kill(readPid(parent), "SIGKILL");
+        await exited;
+        expectGone(self, 5000);
+        expectGone(gc, 5000);
+        pause(500);
+        expect(isAlive(readPid(blocker)), "the child it blocks on is not running").toBe(false);
+      } finally {
+        for (const f of [self, gc, blocker, parent]) killIfAlive(f);
+      }
+    }, 30_000);
+  }
+
+  it("the group anchor started by a process other than the supervisor it names starts nothing", () => {
+    const pidFile = pidPath("anchor-wrong-parent");
+    const reportFile = path.join(sandbox, `anchor-wrong-parent-report-${process.hrtime.bigint()}`);
+    const fd = openSync(reportFile, "w");
+    let r;
+    try {
+      // It names this test's own parent, not this test, as its supervisor.
+      const payload = JSON.stringify({ cmd: NODE, args: ["-e", NEVER_EXITS, pidFile], supervisorPid: process.ppid });
+      r = spawnSync(NODE, [path.join(SRC_DIR, "child-group-anchor.mjs"), payload], { stdio: ["ignore", "ignore", "pipe", fd], detached: true, encoding: "utf8", timeout: 15_000, killSignal: "SIGKILL" });
+    } finally {
+      closeSync(fd);
+    }
+    pause(500);
+    expect(r.error, "it ended on its own, well before the bound").toBeFalsy();
+    expect(r.status === 0, "it did not end as a success").toBe(false);
+    expect(existsSync(pidFile), "no child was started").toBe(false);
+    expect(fileLines(reportFile)).toEqual([]);
+  });
+
+  it("the group anchor reports a child it cannot start, also from a payload without a command, as a spawn error", () => {
+    const reportFile = path.join(sandbox, `anchor-no-cmd-report-${process.hrtime.bigint()}`);
+    const fd = openSync(reportFile, "w");
+    let r;
+    try {
+      r = spawnSync(NODE, [path.join(SRC_DIR, "child-group-anchor.mjs"), JSON.stringify({ args: ["x"] })], { stdio: ["ignore", "ignore", "pipe", fd], encoding: "utf8", timeout: 15_000, killSignal: "SIGKILL" });
+    } finally {
+      closeSync(fd);
+    }
+    expect(r.status, r.stderr).toBe(0);
+    const events = fileLines(reportFile).map((line) => JSON.parse(line));
+    expect(events.length).toBe(1);
+    expect(events[0].spawnError?.code).toBe("ERR_INVALID_ARG_TYPE");
+  });
+
+  it("a forwarded signal that ends the group anchor before its handlers are in place ends the run as killed by that signal, and no child is started", () => {
+    const pidFile = pidPath("anchor-early-signal-child");
+    // Preloaded into every node process of the run, it acts only in the
+    // anchor, before the anchor's own code: it sends the supervisor SIGTERM
+    // and waits, so the forwarded SIGTERM meets an anchor without handlers.
+    const preload = script(
+      "anchor-early-signal.mjs",
+      `if (String(process.argv[1] ?? "").endsWith("/child-group-anchor.mjs")) {
+  process.kill(process.ppid, "SIGTERM");
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);
+}
+`,
+    );
+    const t0 = Date.now();
+    const r = harness(
+      `const cb = await import(${JSON.stringify(LEAF_URL)});
+const r = cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, ["-e", ${JSON.stringify(NEVER_EXITS)}, ${JSON.stringify(pidFile)}], { timeoutMs: 20000, graceMs: 15000, stdio: "ignore" });
+console.log(JSON.stringify({ status: r.status, signal: r.signal, error: r.error ? r.error.code : null }));`,
+      { env: withPreload(preload) },
+    );
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.value).toEqual({ status: null, signal: "SIGTERM", error: null });
+    expect(Date.now() - t0, "ended before the grace").toBeLessThan(10_000);
+    pause(300);
+    expect(existsSync(pidFile), "no child was started").toBe(false);
+  }, 30_000);
+
+  it("the child cannot forge a report: a result line written to every socket it holds beyond its stdio changes nothing", async () => {
+    const cb = await loadLeaf();
+    const forger = `const fs = require("fs");
+for (let fd = 3; fd < 64; fd += 1) {
+  try {
+    if (fs.fstatSync(fd).isSocket()) fs.writeSync(fd, '{"status":0,"signal":null}\\n{"timedOut":true}\\n');
+  } catch {}
+}
+process.exit(9);`;
+    const r = cb.spawnGroupBoundedSync(NODE, ["-e", forger], { timeoutMs: 15_000, stdio: "ignore" });
+    expect(r.error).toBeFalsy();
+    expect(r.status).toBe(9);
+    expect(r.signal).toBeNull();
+  });
+
   it("source scan: no process-table read and no supervision variable is left", () => {
     const leaf = readFileSync(path.join(SRC_DIR, "child-bound.mjs"), "utf8");
     const supervisor = readFileSync(path.join(SRC_DIR, "child-group-supervisor.mjs"), "utf8");
+    const anchor = readFileSync(path.join(SRC_DIR, "child-group-anchor.mjs"), "utf8");
     expect(leaf).not.toMatch(/["'`]ps["'`]/);
     expect(leaf).not.toMatch(/GROUP_SUPERVIS(ED|OR_PID)/);
     expect(leaf).not.toMatch(/CINATRA_GROUP_/);
     expect(supervisor).not.toMatch(/CINATRA_GROUP_/);
+    expect(anchor).not.toMatch(/CINATRA_GROUP_/);
   });
 });
 
