@@ -4,21 +4,25 @@
 // <json> is `{ cmd, args, timeoutMs, graceMs, callerPid }`.
 //
 // It starts the real child `detached` (setsid: a process group of its own,
-// which every non-detached descendant joins) on the inherited stdio, and
-// reports one JSON line per event on fd 3:
+// which every non-detached descendant joins) on the inherited stdio, with its
+// own pid in CINATRA_GROUP_SUPERVISOR_PID (how a nested call proves it runs
+// inside this group, `child-bound.mjs`), and reports one JSON line per event
+// on fd 3:
 //   {"pid":N}                       the child was started
 //   {"timedOut":true}               the bound expired; the group was SIGKILLed
 //   {"status":N,"signal":S}         the child exited
 //   {"spawnError":{message,code}}   the child could not be started
 //
 // - At `timeoutMs` the whole group is SIGKILLed.
-// - A non-zero exit or a signal death SIGKILLs what is left of the group.
-// - A zero exit leaves the group as it is, unless a signal was forwarded or
-//   the caller is gone (below).
-// - SIGINT, SIGTERM and SIGHUP are forwarded to the group. From then on the
-//   group's kill road completes whatever the child's exit status: the
-//   supervisor exits only when the group is empty, or after it SIGKILLed the
-//   group `graceMs` after the first forwarded signal.
+// - Any exit SIGKILLs what is left of the group, a zero exit too: a service
+//   meant to outlive the child is started detached, in a session of its own,
+//   so it is not in this group.
+// - SIGINT, SIGTERM and SIGHUP are forwarded to the group. Their handlers are
+//   installed before the child is started, so a signal that arrives while it
+//   starts is forwarded too, and never ends this supervisor with the child
+//   left running. From then on the group's kill road completes whatever the
+//   child's exit status: the supervisor exits only when the group is empty, or
+//   after it SIGKILLed the group `graceMs` after the first forwarded signal.
 // - A dead caller is noticed at once: the report pipe is one end of a socket
 //   pair whose other end only the caller holds, so the kernel closes it when
 //   the caller dies and a read here sees its end. The caller's pid (`callerPid`)
@@ -82,11 +86,31 @@ function onCallerGone() {
   finish({ parentGone: true }, 1);
 }
 
+// The signal handlers come first: a signal that reaches this process before
+// they are installed ends it by default, and once the child is started that
+// would leave it running with nobody to stop it. A handler runs only after
+// the synchronous start below, so it always finds the child.
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(sig, () => {
+    killGroup(sig);
+    if (forwarded) return;
+    forwarded = true;
+    setTimeout(() => {
+      killGroup("SIGKILL");
+      if (exitEvent) finish(exitEvent);
+    }, Math.max(0, Number(graceMs) || 0)).unref();
+  });
+}
+
 // The caller died before this ran: start nothing.
 if (parentGone()) onCallerGone();
 
 try {
-  child = spawn(cmd, Array.isArray(args) ? args : [], { detached: true, stdio: "inherit" });
+  child = spawn(cmd, Array.isArray(args) ? args : [], {
+    detached: true,
+    stdio: "inherit",
+    env: { ...process.env, CINATRA_GROUP_SUPERVISOR_PID: String(process.pid) },
+  });
 } catch (err) {
   finish({ spawnError: { message: String(err?.message ?? err), code: err?.code ?? null, errno: err?.errno ?? null } });
 }
@@ -125,8 +149,10 @@ child.on("exit", (status, signal) => {
     finish(event);
     return;
   }
-  // A zero exit with no forwarded signal leaves the group as it is.
+  // A zero exit with no forwarded signal: what the child left in its group
+  // goes with it.
   if (!forwarded || !groupAlive()) {
+    killGroup("SIGKILL");
     clearTimeout(deadline);
     finish(event);
     return;
@@ -138,18 +164,6 @@ child.on("exit", (status, signal) => {
     if (!groupAlive()) finish(event);
   }, 50);
 });
-
-for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-  process.on(sig, () => {
-    killGroup(sig);
-    if (forwarded) return;
-    forwarded = true;
-    setTimeout(() => {
-      killGroup("SIGKILL");
-      if (exitEvent) finish(exitEvent);
-    }, Math.max(0, Number(graceMs) || 0)).unref();
-  });
-}
 
 setInterval(() => {
   if (process.ppid !== caller) onCallerGone();

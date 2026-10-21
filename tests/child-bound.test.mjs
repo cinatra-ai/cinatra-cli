@@ -355,7 +355,7 @@ describe("spawnGroupBoundedSync: an expired bound stops the whole tree", () => {
     expectGone(gc);
   });
 
-  it("a status-0 exit passes its status and output through and leaves the group as it is", async () => {
+  it("a status-0 exit passes its status and output through and takes the members it left behind with it", async () => {
     const cb = await loadLeaf();
     const ok = cb.spawnGroupBoundedSync(NODE, ["-e", "console.log('hello'); console.error('note')"], { timeoutMs: 15_000, encoding: "utf8" });
     expect(ok.error).toBeFalsy();
@@ -365,9 +365,37 @@ describe("spawnGroupBoundedSync: an expired bound stops the whole tree", () => {
     const tree = treeScript();
     const [gc, blocker, self] = [pidPath("exit0-gc"), pidPath("exit0-blocker"), pidPath("exit0-self")];
     const r = cb.spawnGroupBoundedSync(NODE, [tree, gc, blocker, self, "exit0"], { timeoutMs: 15_000, stdio: "ignore" });
+    expect(r.error).toBeFalsy();
     expect(r.status).toBe(0);
-    expect(isAlive(readPid(gc))).toBe(true);
-    killIfAlive(gc);
+    expect(r.signal).toBeNull();
+    expectGone(self);
+    expectGone(gc);
+  });
+
+  it("a status-0 exit leaves a child started detached, in a session of its own, running", async () => {
+    const cb = await loadLeaf();
+    const [own, member, self] = [pidPath("exit0-own-session"), pidPath("exit0-member"), pidPath("exit0-starter")];
+    const starter = script(
+      "exit0-detached.cjs",
+      `const { spawn } = require("child_process");
+const fs = require("fs");
+const [ownPid, memberPid, selfPid] = process.argv.slice(2);
+spawn(process.execPath, ["-e", ${JSON.stringify(NEVER_EXITS)}, ownPid], { detached: true, stdio: "ignore" }).unref();
+spawn(process.execPath, ["-e", ${JSON.stringify(NEVER_EXITS)}, memberPid], { stdio: "ignore" });
+const t0 = Date.now();
+while (!(fs.existsSync(ownPid) && fs.existsSync(memberPid)) && Date.now() - t0 < 5000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+fs.writeFileSync(selfPid, String(process.pid));
+process.exit(0);
+`,
+    );
+    const r = cb.spawnGroupBoundedSync(NODE, [starter, own, member, self], { timeoutMs: 15_000, stdio: "ignore" });
+    expect(r.error).toBeFalsy();
+    expect(r.status).toBe(0);
+    expectGone(self);
+    expectGone(member);
+    pause(300);
+    expect(isAlive(readPid(own)), "the own-session child is still running").toBe(true);
+    killIfAlive(own);
   });
 
   it("a child that cannot be spawned is a spawn error, not a status", async () => {
@@ -412,6 +440,52 @@ console.log(JSON.stringify({ status: r.status, signal: r.signal, error: r.error 
     expect(readFileSync(mark, "utf8")).toBe("term");
     expect(JSON.parse(out.trim().split("\n").pop())).toEqual({ status: 7, signal: null, error: null });
     expectGone(pidFile);
+  }, 30_000);
+
+  it("a SIGTERM that reaches the supervisor while it starts the child still stops the group after the grace: no orphan", async () => {
+    const [spawned, gc, blocker, self] = [pidPath("window-child"), pidPath("window-gc"), pidPath("window-blocker"), pidPath("window-self")];
+    // Preloaded into every node process of the run, it acts only in the
+    // supervisor: inside the supervisor's own start of the child, once the
+    // child is up (it ignores SIGTERM and has started its grandchild), it
+    // sends the supervisor SIGTERM, before the supervisor's start returns.
+    const preload = script(
+      "signal-in-start.mjs",
+      `import { createRequire, syncBuiltinESMExports } from "node:module";
+import { existsSync, writeFileSync } from "node:fs";
+if (String(process.argv[1] ?? "").endsWith("/child-group-supervisor.mjs")) {
+  const cp = createRequire(import.meta.url)("node:child_process");
+  const real = cp.spawn;
+  cp.spawn = function (...a) {
+    const c = real.apply(this, a);
+    writeFileSync(${JSON.stringify(spawned)}, String(c.pid));
+    const t0 = Date.now();
+    while (!existsSync(${JSON.stringify(self)}) && Date.now() - t0 < 5000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    process.kill(process.pid, "SIGTERM");
+    return c;
+  };
+  syncBuiltinESMExports();
+}
+`,
+    );
+    const tree = treeScript();
+    const env = { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ? `${process.env.NODE_OPTIONS} ` : ""}--import=${pathToFileURL(preload).href}` };
+    delete env.CINATRA_GROUP_SUPERVISED;
+    delete env.CINATRA_GROUP_SUPERVISOR_PID;
+    const t0 = Date.now();
+    const r = harness(
+      `const cb = await import(${JSON.stringify(LEAF_URL)});
+const r = cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(tree)}, ${JSON.stringify(gc)}, ${JSON.stringify(blocker)}, ${JSON.stringify(self)}, "block"], { timeoutMs: 20000, graceMs: 2000, stdio: "ignore" });
+console.log(JSON.stringify({ status: r.status, signal: r.signal, error: r.error ? r.error.code : null }));`,
+      { env },
+    );
+    expect(r.status, r.stderr).toBe(0);
+    expectGone(spawned);
+    expectGone(gc);
+    // The child it blocks on may die of the forwarded SIGTERM before it is up;
+    // either way it is not running.
+    expect(isAlive(readPid(blocker)), "the child it blocks on is not running").toBe(false);
+    expect(Date.now() - t0).toBeLessThan(15_000);
+    expect(r.value).toEqual({ status: null, signal: "SIGKILL", error: null });
   }, 30_000);
 
   /** Start `code` (an ES module body) as a caller process of its own, which a
@@ -523,21 +597,108 @@ cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(tree)}, ${JS
     for (const f of [self, gc, blocker]) expect(isAlive(readPid(f)), `${path.basename(f)} is not running`).toBe(false);
   }, 30_000);
 
-  it("nested inside a supervised run it is plain bounded spawnSync (the outer group already holds it)", async () => {
-    const code = `const cb = await import(${JSON.stringify(LEAF_URL)});
+  /** The inner call: `prefix` runs first, then a spawnGroupBoundedSync of a
+   *  child that prints its parent pid. Plain (nested) mode gives the child
+   *  this process as its parent; supervision gives it a supervisor. */
+  function nestedProbe(prefix = "") {
+    return `const cb = await import(${JSON.stringify(LEAF_URL)});
+${prefix}
+const t0 = Date.now();
 const r = cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, ["-e", "console.log(process.ppid)"], { timeoutMs: 15000, encoding: "utf8" });
-console.log(JSON.stringify({ self: process.pid, parentOfChild: Number(r.stdout.trim()), status: r.status }));`;
-    const nested = harness(code, { env: { ...process.env, CINATRA_GROUP_SUPERVISED: "1" } });
-    expect(nested.status, nested.stderr).toBe(0);
-    expect(nested.value.status).toBe(0);
-    expect(nested.value.parentOfChild).toBe(nested.value.self);
+console.log(JSON.stringify({ self: process.pid, parentOfChild: Number(r.stdout.trim()), status: r.status, ms: Date.now() - t0 }));`;
+  }
+
+  /** A directory holding one stand-in `ps` with the given shell body. */
+  function psStandIn(name, body) {
+    const dir = mkdtempSync(path.join(sandbox, `${name}-`));
+    writeFileSync(path.join(dir, "ps"), `#!/bin/sh\n${body}\n`);
+    chmodSync(path.join(dir, "ps"), 0o755);
+    return dir;
+  }
+
+  /** Run `code` as the child of a real supervisor (a real outer supervised
+   *  run) and return its last stdout line, parsed. */
+  async function underRealSupervisor(code, envChanges = {}) {
+    const cb = await loadLeaf();
+    const env = { ...process.env, ...envChanges };
+    delete env.CINATRA_GROUP_SUPERVISED;
+    delete env.CINATRA_GROUP_SUPERVISOR_PID;
+    const r = cb.spawnGroupBoundedSync(NODE, ["--input-type=module", "-e", code], { timeoutMs: 25_000, encoding: "utf8", env });
+    expect(r.status, r.stderr).toBe(0);
+    return JSON.parse(r.stdout.trim().split("\n").pop());
+  }
+
+  it("nested inside a real supervised run it is plain bounded spawnSync (the outer group already holds it)", async () => {
+    // One level down: the supervised child itself.
+    const inner = await underRealSupervisor(nestedProbe());
+    expect(inner.status).toBe(0);
+    expect(inner.parentOfChild).toBe(inner.self);
+    // Two levels down: a child of the supervised child, still in its group.
+    const viaChild = `const r = (await import("node:child_process")).spawnSync(${JSON.stringify(NODE)}, ["--input-type=module", "-e", ${JSON.stringify(nestedProbe())}], { encoding: "utf8" });
+process.stdout.write(r.stdout); process.exit(r.status ?? 1);`;
+    const innermost = await underRealSupervisor(viaChild);
+    expect(innermost.parentOfChild).toBe(innermost.self);
+    // Not supervised at all: a supervisor of its own.
     const env = { ...process.env };
     delete env.CINATRA_GROUP_SUPERVISED;
-    const outer = harness(code, { env });
+    delete env.CINATRA_GROUP_SUPERVISOR_PID;
+    const outer = harness(nestedProbe(), { env });
     expect(outer.status, outer.stderr).toBe(0);
     expect(outer.value.status).toBe(0);
     expect(outer.value.parentOfChild).not.toBe(outer.value.self);
-  });
+  }, 60_000);
+
+  it("inside a real supervised run, every proof it cannot read or that does not hold makes it supervise (fail closed)", async () => {
+    const cases = [
+      // the flag is not exactly "1"
+      ["flag not 1", nestedProbe(`process.env.CINATRA_GROUP_SUPERVISED = "yes";`)],
+      // the supervisor pid is not a number, is this process, or is no supervisor
+      ["pid not a number", nestedProbe(`process.env.CINATRA_GROUP_SUPERVISOR_PID = "abc";`)],
+      ["pid is this process", nestedProbe(`process.env.CINATRA_GROUP_SUPERVISOR_PID = String(process.pid);`)],
+      // (this test process: a live ancestor, but no supervisor)
+      ["pid is no supervisor", nestedProbe(`process.env.CINATRA_GROUP_SUPERVISOR_PID = ${JSON.stringify(String(process.pid))};`)],
+      // ps exits non-zero, answers unreadable output, is missing, never ends
+      ["ps exits 1", nestedProbe(`process.env.PATH = ${JSON.stringify(psStandIn("ps-exit1", "exit 1"))};`)],
+      ["ps unreadable", nestedProbe(`process.env.PATH = ${JSON.stringify(psStandIn("ps-garbage", "echo '<<not a table>>'"))};`)],
+      ["ps missing", nestedProbe(`process.env.PATH = ${JSON.stringify(mkdtempSync(path.join(sandbox, "no-ps-")))};`)],
+      ["ps never ends", nestedProbe(`cb.__setChildBoundsForTest(1500); process.env.PATH = ${JSON.stringify(psStandIn("ps-hang", `exec "${NODE}" -e "setInterval(() => {}, 1000)"`))};`)],
+    ];
+    for (const [label, code] of cases) {
+      const v = await underRealSupervisor(code);
+      expect(v.status, label).toBe(0);
+      expect(v.parentOfChild, `${label}: supervised`).not.toBe(v.self);
+      expect(v.ms, `${label}: within the bound`).toBeLessThan(10_000);
+    }
+    // A child of the supervised child that left its group (a session of its
+    // own) is out of the outer group's reach: no proof, so it supervises.
+    const ownGroup = `const { spawn } = await import("node:child_process");
+const c = spawn(${JSON.stringify(NODE)}, ["--input-type=module", "-e", ${JSON.stringify(nestedProbe())}], { detached: true, stdio: ["ignore", "pipe", "inherit"] });
+let out = ""; c.stdout.on("data", (d) => (out += d));
+c.on("exit", (code) => { process.stdout.write(out); process.exit(code ?? 1); });`;
+    const own = await underRealSupervisor(ownGroup);
+    expect(own.parentOfChild, "own group: supervised").not.toBe(own.self);
+  }, 120_000);
+
+  for (const [label, extra] of [
+    ["the flag alone", () => ({})],
+    ["the flag and a supervisor pid that is a live ancestor but no supervisor", () => ({ CINATRA_GROUP_SUPERVISOR_PID: String(process.pid) })],
+  ]) {
+    it(`${label}, set by hand with no outer supervisor, is no proof: it supervises, and a timeout leaves no grandchild`, async () => {
+      const tree = treeScript();
+      const [gc, blocker, self] = [pidPath("spoof-gc"), pidPath("spoof-blocker"), pidPath("spoof-self")];
+      const code = `const cb = await import(${JSON.stringify(LEAF_URL)});
+const r = cb.spawnGroupBoundedSync(${JSON.stringify(NODE)}, [${JSON.stringify(tree)}, ${JSON.stringify(gc)}, ${JSON.stringify(blocker)}, ${JSON.stringify(self)}, "block"], { timeoutMs: 1500, stdio: "ignore" });
+console.log(JSON.stringify({ timedOut: cb.childTimedOut(r), status: r.status }));`;
+      const env = { ...process.env, CINATRA_GROUP_SUPERVISED: "1" };
+      delete env.CINATRA_GROUP_SUPERVISOR_PID;
+      const spoofed = harness(code, { env: { ...env, ...extra() } });
+      expect(spoofed.status, spoofed.stderr).toBe(0);
+      expect(spoofed.value).toEqual({ timedOut: true, status: null });
+      expectGone(self);
+      expectGone(gc);
+      expectGone(blocker);
+    }, 30_000);
+  }
 });
 
 describe("runSetupInTarget: the setup child runs under group supervision by default", () => {
