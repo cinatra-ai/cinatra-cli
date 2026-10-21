@@ -190,11 +190,6 @@ export function sleepSync(ms) {
 // Process-group supervision
 // ---------------------------------------------------------------------------
 
-/** The environment flag a supervised child (and everything it starts) carries. */
-export const GROUP_SUPERVISED_ENV = "CINATRA_GROUP_SUPERVISED";
-/** The supervisor's pid, which it gives the child it starts (and so everything
- *  that child starts). The flag alone is no proof: anyone can set it. */
-export const GROUP_SUPERVISOR_PID_ENV = "CINATRA_GROUP_SUPERVISOR_PID";
 /** How long past the child's bound the supervisor itself may take. */
 export const GROUP_SUPERVISOR_GRACE_MS = 10_000;
 
@@ -218,42 +213,6 @@ function supervisorReport(output) {
     }
   }
   return report;
-}
-
-/** Whether this process provably runs inside a supervised group: the flag is
- *  set, the pid in GROUP_SUPERVISOR_PID_ENV is a live supervisor
- *  (`child-group-supervisor.mjs` on its command line) and an ancestor of this
- *  process, and this process is in the process group of the supervisor's
- *  direct child, which is the group the supervisor stops. One bounded `ps`
- *  read gives the process table; a read that fails, or a table without one of
- *  these facts, is no proof, and the caller then supervises (fail closed). */
-function insideProvenSupervisedGroup() {
-  if (process.env[GROUP_SUPERVISED_ENV] !== "1") return false;
-  const supervisor = Number(process.env[GROUP_SUPERVISOR_PID_ENV]);
-  if (!Number.isInteger(supervisor) || supervisor <= 1 || supervisor === process.pid) return false;
-  const r = spawnSync(
-    "ps",
-    ["-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "command="],
-    boundedOptions({ encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }, boundFor("probe")),
-  );
-  if (r.error || r.status !== 0) return false;
-  const table = new Map();
-  for (const line of String(r.stdout ?? "").split("\n")) {
-    const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/.exec(line);
-    if (m) table.set(Number(m[1]), { ppid: Number(m[2]), pgid: Number(m[3]), command: m[4] });
-  }
-  const self = table.get(process.pid);
-  if (!self || !table.get(supervisor)?.command.includes("child-group-supervisor.mjs")) return false;
-  // Walk up to the supervisor's direct child: the leader of its group.
-  let pid = process.pid;
-  for (let depth = 0; depth < 64; depth += 1) {
-    const row = table.get(pid);
-    if (!row) return false;
-    if (row.ppid === supervisor) return row.pgid === pid && self.pgid === pid;
-    if (row.ppid <= 1) return false;
-    pid = row.ppid;
-  }
-  return false;
 }
 
 function killGroupQuietly(pid) {
@@ -288,12 +247,11 @@ function killGroupQuietly(pid) {
  *    and at its exit.
  *
  *  The bound is `timeoutMs`, else spawnSync's own `timeout` option, else the
- *  step class. Inside a supervised run this is plain bounded spawnSync: the
- *  child stays in the outer group, where the outer bound's group kill reaches
- *  it; a group of its own would put it out of that reach. A supervised run
- *  counts only when it is proven (`insideProvenSupervisedGroup`): the flag
- *  GROUP_SUPERVISED_ENV alone can be set by hand, and trusting it would leave
- *  the child's grandchildren unbounded. Without that proof this supervises.
+ *  step class. Every call supervises, a nested call too. The supervisor is
+ *  started in a process group of its own, so a group kill aimed at the
+ *  caller's group leaves it standing; it stops its child's group as soon as
+ *  its caller is gone, so a nested call stays inside the outer bound with no
+ *  process-table read.
  *
  *  Residuals: the supervisor itself is bounded at the child's bound plus
  *  `graceMs`, and an idle supervisor misses its own deadline only under host
@@ -304,15 +262,11 @@ export function spawnGroupBoundedSync(command, args, options = {}) {
   const { timeoutMs, timeout, killSignal: _killSignal, graceMs = GROUP_SUPERVISOR_GRACE_MS, ...rest } = options ?? {};
   const ms = timeoutMs ?? timeout ?? boundFor("step");
   const argv = Array.isArray(args) ? args : [];
-  if (insideProvenSupervisedGroup()) {
-    return spawnSync(command, argv, boundedOptions(rest, ms));
-  }
-  const env = { ...(rest.env ?? process.env), [GROUP_SUPERVISED_ENV]: "1" };
   const payload = JSON.stringify({ cmd: String(command), args: argv, timeoutMs: ms, graceMs, callerPid: process.pid });
   const r = spawnSync(
     process.execPath,
     [SUPERVISOR, payload],
-    boundedOptions({ ...rest, env, stdio: [...stdioTriple(rest.stdio), "pipe"] }, ms + graceMs),
+    boundedOptions({ ...rest, detached: process.platform !== "win32", stdio: [...stdioTriple(rest.stdio), "pipe"] }, ms + graceMs),
   );
   const report = supervisorReport(r.output?.[3]);
   const output = [r.output?.[0] ?? null, r.output?.[1] ?? null, r.output?.[2] ?? null];

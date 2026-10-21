@@ -3,11 +3,13 @@
 // <json>` with the caller's stdio on fds 0-2 and a report pipe on fd 3, where
 // <json> is `{ cmd, args, timeoutMs, graceMs, callerPid }`.
 //
+// It runs in a process group of its own (its caller starts it detached), so a
+// kill of the caller's group does not reach it; it then sees the caller's end
+// and SIGKILLs the child's group.
+//
 // It starts the real child `detached` (setsid: a process group of its own,
-// which every non-detached descendant joins) on the inherited stdio, with its
-// own pid in CINATRA_GROUP_SUPERVISOR_PID (how a nested call proves it runs
-// inside this group, `child-bound.mjs`), and reports one JSON line per event
-// on fd 3:
+// which every non-detached descendant joins) on the inherited stdio, and
+// reports one JSON line per event on fd 3:
 //   {"pid":N}                       the child was started
 //   {"timedOut":true}               the bound expired; the group was SIGKILLed
 //   {"status":N,"signal":S}         the child exited
@@ -109,7 +111,7 @@ try {
   child = spawn(cmd, Array.isArray(args) ? args : [], {
     detached: true,
     stdio: "inherit",
-    env: { ...process.env, CINATRA_GROUP_SUPERVISOR_PID: String(process.pid) },
+    env: process.env,
   });
 } catch (err) {
   finish({ spawnError: { message: String(err?.message ?? err), code: err?.code ?? null, errno: err?.errno ?? null } });
