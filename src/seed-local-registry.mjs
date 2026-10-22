@@ -71,6 +71,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { boundedOptions } from "./child-bound.mjs";
 import { createHash } from "node:crypto";
 
 import { Parser as TarParser } from "tar";
@@ -329,12 +330,11 @@ function packTarball(dir, outDir, registryUrl, userconfigPath) {
       // and ignoring scripts keeps a malicious/accidental prepack out of setup.
       "--ignore-scripts",
     ],
-    {
+    boundedOptions({
       cwd: dir,
       encoding: "utf8",
       env: { ...process.env, NPM_CONFIG_USERCONFIG: userconfigPath },
-      timeout: PUBLISH_TIMEOUT_MS,
-    },
+    }, PUBLISH_TIMEOUT_MS),
   );
   if (result.status !== 0) return null;
   // npm pack prints the produced filename on the last non-empty stdout line.
@@ -778,11 +778,10 @@ export async function seedLocalRegistryExtensions({
           // needed; ignoring scripts keeps a prepublish hook out of setup.
           "--ignore-scripts",
         ],
-        {
+        boundedOptions({
           encoding: "utf8",
           env: { ...process.env, NPM_CONFIG_USERCONFIG: userconfigPath },
-          timeout: PUBLISH_TIMEOUT_MS,
-        },
+        }, PUBLISH_TIMEOUT_MS),
       );
       if (result.status === 0) {
         summary.published.push(id);

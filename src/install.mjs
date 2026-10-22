@@ -51,6 +51,7 @@ import process from "node:process";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { spawnGroupBoundedSync } from "./child-bound.mjs";
 import { syncCinatraDevExtensions } from "./cinatra-dev-extensions.mjs";
 import { ensureDevTwentyCrm } from "./dev-twenty.mjs";
 import {
@@ -2531,10 +2532,7 @@ function waitForCompose(targetDir, service, readyCmd, label, log, maxAttempts = 
 function waitForNango(log, maxAttempts = 60, healthUrl = null) {
   const url = healthUrl ?? "http://127.0.0.1:3003/health";
   for (let i = 0; i < maxAttempts; i += 1) {
-    const r = spawnSync("curl", ["-sf", url], {
-      stdio: "ignore",
-      timeout: 3000,
-    });
+    const r = spawnSync("curl", ["-sf", url], boundedOptions({ stdio: "ignore" }, 3000));
     if (r.status === 0) {
       log("  Nango is ready.");
       return;
@@ -2798,7 +2796,10 @@ export function runSetupInTarget({
   pinnedExtensions = false,
   frozenLockfile = false,
   log = console.log,
-  spawn = spawnSync,
+  // The setup child starts children of its own (package installs, generators,
+  // compose); under group supervision its bound stops all of them, not only
+  // the setup process itself.
+  spawn = spawnGroupBoundedSync,
   timeoutMs = INSTALL_STEP_TIMEOUT_MS,
 }) {
   const setupMode = mode === "demo" ? "dev" : mode;
