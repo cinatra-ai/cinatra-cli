@@ -193,7 +193,8 @@ function makeInspectVolumeThreeWay(spawn) {
           return { status: "error", row: null };
         }
       }
-      if (/no such volume/i.test(`${r.stderr ?? ""}${r.stdout ?? ""}`)) return { status: "absent", row: null };
+      // Absent only from docker's own answer: exit 1 with "no such volume".
+      if (r.status === 1 && /no such volume/i.test(`${r.stderr ?? ""}${r.stdout ?? ""}`)) return { status: "absent", row: null };
       return { status: "error", row: null };
     } catch {
       return { status: "error", row: null };

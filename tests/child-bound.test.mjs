@@ -966,3 +966,112 @@ return { status: r.status, timedOut: r.timedOut, error: r.error ? String(r.error
     }
   }, 30_000);
 });
+
+// ---------------------------------------------------------------------------
+// Only a whole exit status is read; the command's result and its terminal
+// signals are its own
+// ---------------------------------------------------------------------------
+
+describe("child-bound: class exit-status only a whole, non-negative exit status is read", () => {
+  const result = (status) => ({ status, signal: null, error: null, stdout: "", stderr: "" });
+
+  it("childResultRefused refuses NaN, a fraction, an infinity and a negative status, and reads a whole one", async () => {
+    const { childResultRefused } = await loadLeaf();
+    for (const status of [Number.NaN, 1.5, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, "0", null, undefined]) {
+      expect(childResultRefused(result(status)), `status ${String(status)} is refused`).toBe(true);
+    }
+    for (const status of [0, 1, 255]) {
+      expect(childResultRefused(result(status)), `status ${status} is read`).toBe(false);
+    }
+  });
+
+  it("src/recreate-preflight.mjs makeInspectVolumeThreeWay: 'no such volume' is absent only from docker's own exit 1", async () => {
+    const m = await import(new URL("../src/recreate-preflight.mjs", import.meta.url).href);
+    const inspect = (status) =>
+      m
+        .buildDeploymentPreflight({
+          slug: null,
+          targetDir: sandbox,
+          spawn: () => ({ ...result(status), stderr: "Error: No such volume: cinatra_pgdata\n" }),
+        })
+        .transport.inspectVolumeStatus("cinatra_pgdata");
+    for (const status of [Number.NaN, 1.5, 23, 0]) {
+      expect(inspect(status), `status ${String(status)} with "no such volume"`).toEqual({ status: "error", row: null });
+    }
+    expect(inspect(1)).toEqual({ status: "absent", row: null });
+  });
+});
+
+describe("child-bound: class own-result the result is the command's own, whatever Node startup options reach the call", () => {
+  it("readChild of a command that exits 3 reads exit 3 when NODE_OPTIONS preloads a module that exits 0", () => {
+    const preload = script(`preload-exits-0-${process.hrtime.bigint()}.cjs`, "process.exit(0);\n");
+    const r = harness(`const cb = await import(${JSON.stringify(LEAF_URL)});
+const r = cb.readChild("/bin/sh", ["-c", "exit 3"], { env: { ...process.env, NODE_OPTIONS: "--require " + ${JSON.stringify(preload)} } });
+console.log(JSON.stringify({ ok: r.ok, status: r.status, reason: r.reason }));`);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.value).toEqual({ ok: false, status: 3, reason: "sh exited 3" });
+  }, 20_000);
+});
+
+describe("child-bound: class job-control a Ctrl-C or a Ctrl-Z of the caller's process group reaches the bounded command itself", () => {
+  /** A bin dir holding a stand-in `docker` that writes its pid and appends the
+   *  name of each SIGINT or SIGTSTP it receives to `markFile`; at a SIGINT it
+   *  then exits 130, as a command that cancels its work does. */
+  function signalStandInBin(pidFile, markFile) {
+    const dir = mkdtempSync(path.join(sandbox, "sbin-"));
+    const body = `#!${NODE}
+if (process.argv[2] === "--warm") process.exit(0);
+const fs = require("fs");
+const mark = (signal) => fs.appendFileSync(${JSON.stringify(markFile)}, signal + "\\n");
+process.on("SIGINT", () => { mark("SIGINT"); process.exit(130); });
+process.on("SIGTSTP", () => mark("SIGTSTP"));
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+setInterval(() => {}, 1000);
+`;
+    const p = path.join(dir, "docker");
+    writeFileSync(p, body);
+    chmodSync(p, 0o755);
+    warm(p);
+    return dir;
+  }
+
+  for (const [signal, what] of [
+    ["SIGINT", "Ctrl-C: the command's own SIGINT handler runs, so a long build can cancel its work"],
+    ["SIGTSTP", "Ctrl-Z: the command receives the stop signal of the job, as the caller does"],
+  ]) {
+    it(`${signal} to the caller's process group reaches the bounded command (${what})`, async () => {
+      const pidFile = pidPath(`job-${signal}`);
+      const markFile = path.join(sandbox, `job-${signal}-${process.hrtime.bigint()}.mark`);
+      const bin = signalStandInBin(pidFile, markFile);
+      const moduleUrl = new URL("../src/version-ledger-capture.mjs", import.meta.url).href;
+      const code = `const cb = await import(${JSON.stringify(LEAF_URL)});
+const m = await import(${JSON.stringify(moduleUrl)});
+cb.__setChildBoundsForTest(20000);
+m.defaultCapture("docker", ["compose", "ps", "--format", "json"], { cwd: ${JSON.stringify(sandbox)} });
+process.exit(0);`;
+      // detached: the caller leads a process group of its own, as a terminal job does.
+      const caller = spawn(NODE, ["--input-type=module", "-e", code], {
+        env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}` },
+        stdio: "ignore",
+        detached: true,
+      });
+      try {
+        const t0 = Date.now();
+        while (!(readPid(pidFile) > 0) && Date.now() - t0 < 15_000) await new Promise((r) => setTimeout(r, 50));
+        expect(readPid(pidFile), "the command started").toBeGreaterThan(0);
+        process.kill(-caller.pid, signal);
+        const t1 = Date.now();
+        while (!fileLines(markFile).includes(signal) && Date.now() - t1 < 3_000) await new Promise((r) => setTimeout(r, 50));
+        expect(fileLines(markFile), `the command received ${signal}`).toContain(signal);
+        if (signal === "SIGINT") expectGone(pidFile);
+      } finally {
+        killIfAlive(pidFile);
+        try {
+          process.kill(-caller.pid, "SIGKILL");
+        } catch {
+          // the caller's group is gone
+        }
+      }
+    }, 30_000);
+  }
+});

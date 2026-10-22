@@ -23,7 +23,7 @@
 //   wait ends even when a descendant still holds them; the descendant itself
 //   is not stopped here (the caller's wait is what is bounded).
 // - `childResultRefused` is the first question of every status reader: a
-//   result with a spawn error, a timeout, a signal or no numeric status is
+//   result with a spawn error, a timeout, a signal or no whole exit status is
 //   refused before its status or output is read.
 // - `sleepSync` waits in-process; nothing is spawned.
 //
@@ -169,14 +169,15 @@ export function spawnBounded(spawn, command, args, options, timeoutMs) {
 
 /** True when a spawnSync result must not be read as an exit status: no
  *  result, a spawn error (an expired bound is one), a signal death, or a
- *  status that is not a number. A child whose descendant holds the pipes
- *  after it exits 0 comes back as status 0 WITH a timeout error; this refuses
- *  it. Every status reader asks this first. */
+ *  status that is not a whole number of at least 0 (NaN, a fraction, an
+ *  infinity, a negative number, a string, null). A child whose descendant
+ *  holds the pipes after it exits 0 comes back as status 0 WITH a timeout
+ *  error; this refuses it. Every status reader asks this first. */
 export function childResultRefused(r) {
   if (r === null || typeof r !== "object") return true;
   if (r.error != null || childTimedOut(r)) return true;
   if (r.signal != null) return true;
-  return typeof r.status !== "number";
+  return !(Number.isInteger(r.status) && r.status >= 0);
 }
 
 // ---------------------------------------------------------------------------
