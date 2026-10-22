@@ -20,7 +20,8 @@
 //   goes through `checkedBound`, then `boundedOptions`. With Node's spawnSync
 //   on a POSIX platform the command runs below `child-bound-watchdog.mjs`,
 //   which SIGKILLs the command's whole process group at the bound, at a
-//   SIGINT, SIGTERM or SIGHUP, and when the waiting caller is gone. A
+//   SIGTERM or SIGHUP, and when the waiting caller is gone; a Ctrl-C or a
+//   Ctrl-Z of the caller's job reaches the command. A
 //   descendant that leaves that group (setsid, a detached spawn) is not
 //   reached. On win32, or with any other spawn, the call is the plain
 //   bounded spawn: spawnSync SIGKILLs the child and closes its pipes.
@@ -172,7 +173,8 @@ const NODE_SPAWN_SYNC = process.getBuiltinModule("node:child_process").spawnSync
  *  spawnSync off win32 the command runs below the watchdog, in a group of its
  *  own; spawnSync stops the watchdog by SIGTERM at `timeoutMs`, and the
  *  watchdog SIGKILLs the group. Its fd-3 note gives back the command's pid
- *  and start error, so the result reads as the command's own. Any other
+ *  and start error, so the result reads as the command's own; a result with
+ *  no note is the error ENOWATCHDOGNOTE, never a status. Any other
  *  `spawn` (a stand-in or a module mock), and win32, get the command itself
  *  under `boundedOptions`. */
 export function spawnBounded(spawn, command, args, options, timeoutMs) {
@@ -180,8 +182,18 @@ export function spawnBounded(spawn, command, args, options, timeoutMs) {
   if (spawn !== NODE_SPAWN_SYNC || process.platform === "win32") return spawn(command, [...args], boundedOptions(options, bound));
   const io = options?.stdio ?? "pipe";
   const stdio = Array.isArray(io) ? [io[0] ?? "pipe", io[1] ?? "pipe", io[2] ?? "pipe", "pipe"] : [io, io, io, "pipe"];
+  // Node's own startup variables (NODE_*) of a given env reach the command,
+  // not the watchdog: a NODE_OPTIONS preload must not run (or end) the
+  // watchdog in the command's place. An inherited env is the caller's own.
   const watched = { ...boundedOptions(options, bound), killSignal: "SIGTERM", stdio };
-  const r = spawn(process.execPath, [WATCHDOG, String(process.pid), String(command), ...args], watched);
+  if (options?.env != null) {
+    const nodeVars = {};
+    watched.env = {};
+    for (const [k, v] of Object.entries(options.env)) (k.startsWith("NODE_") ? nodeVars : watched.env)[k] = v;
+    watched.env.NODE_CHILD_BOUND_ENV = JSON.stringify(nodeVars);
+  }
+  const envArg = options?.env != null ? "moved" : "own";
+  const r = spawn(process.execPath, [WATCHDOG, String(process.pid), String(bound), envArg, String(command), ...args], watched);
   let note = null;
   try {
     note = JSON.parse(String(r.output?.[3] ?? ""));
@@ -190,8 +202,11 @@ export function spawnBounded(spawn, command, args, options, timeoutMs) {
   }
   if (Array.isArray(r.output)) r.output = r.output.slice(0, 3);
   if (Number.isInteger(note?.pid)) r.pid = note.pid;
-  if (note?.error && r.error == null) {
-    r.error = Object.assign(new Error(`spawnSync ${command} ${note.error.code}`), note.error, { syscall: `spawnSync ${command}`, spawnargs: [...args] });
+  if (r.error == null && !Number.isInteger(note?.pid)) {
+    // No pid: the note's own error, or, with no readable note, the watchdog
+    // ended before it said anything (its status is not the command's).
+    const code = typeof note?.error?.code === "string" ? note.error.code : "ENOWATCHDOGNOTE";
+    r.error = Object.assign(new Error(`spawnSync ${command} ${code}`), note?.error, { code, syscall: `spawnSync ${command}`, spawnargs: [...args] });
     r.status = null;
   }
   return r;
