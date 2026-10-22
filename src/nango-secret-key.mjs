@@ -95,6 +95,7 @@
 
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { childResultRefused, siteBound, spawnBounded } from "./child-bound.mjs";
 import { chmodSync, existsSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 
 /** The env var the app reads, and the only key this module ever writes. */
@@ -230,20 +231,22 @@ export function createComposeNangoDbTransport({
 } = {}) {
   return {
     query: (sql) => {
-      const result = spawn(
+      const result = spawnBounded(
+        spawn,
         "docker",
         [...composeArgs, "exec", "-T", service, "psql", "-U", NANGO_DB_USER, "-d", NANGO_DB_NAME, "-tAc", sql],
+        // Bounded (SIGKILL at the bound): a hung daemon/container must not stall the bring-up.
         {
           cwd,
           encoding: "utf8",
           env: process.env,
           stdio: ["ignore", "pipe", "pipe"],
-          // Bounded: a hung daemon/container must not stall the bring-up.
-          timeout: NANGO_DB_QUERY_TIMEOUT_MS,
         },
+        siteBound(NANGO_DB_QUERY_TIMEOUT_MS),
       );
       return {
-        status: result?.error ? null : (result?.status ?? null),
+        // A spawn error, a timeout or a signal is no exit status.
+        status: childResultRefused(result) ? null : result.status,
         stdout: result?.stdout ?? "",
         stderr: result?.stderr ?? "",
       };
