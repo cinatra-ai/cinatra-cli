@@ -1,5 +1,5 @@
 // The watchdog of `spawnBounded` (child-bound.mjs):
-//   node <this> <caller pid> <bound ms> <own|moved> <command> [args...]
+//   node <this> <caller pid> <bound ms> moved <command> [args...]
 // spawnSync blocks its caller, so the caller cannot answer a signal while it
 // waits. spawnSync starts this process in the caller's process group; this
 // process starts the command detached (a process group of its own) and
@@ -20,9 +20,10 @@
 // a terminal, the command stays in this process group instead, so a terminal
 // read or mode change does not stop it as a background job, the terminal's
 // signals reach it directly, and only the command's own pid is killed.
-// "moved": the NODE_* variables of the env spawnBounded was given reach the
-// command, not this process: spawnBounded moved them into NODE_CHILD_BOUND_ENV.
-// "own": the command gets this process's env, the caller's own, as it is.
+// "moved": the NODE_* variables of the command's env (given or inherited)
+// reach the command, not this process: spawnBounded moved them into
+// NODE_CHILD_BOUND_ENV, a JSON object of NODE_* names and string values. Any
+// other mode, or a moved env that is not such an object, is refused.
 import { spawn } from "node:child_process";
 import { fstatSync, writeSync } from "node:fs";
 import { isatty } from "node:tty";
@@ -71,7 +72,16 @@ if (!onTerminal) {
   });
   process.on("SIGCONT", () => (clearTimeout(stopping), toGroup("SIGCONT")));
 }
-if (!(Number.isInteger(caller) && caller > 1 && Number.isInteger(bound) && bound >= 1 && ["own", "moved"].includes(envArg))) refuse("EWATCHDOGARGS");
+const { NODE_CHILD_BOUND_ENV: movedText, ...ownEnv } = process.env;
+let moved = null;
+try {
+  moved = JSON.parse(movedText ?? "");
+} catch {
+  // Not JSON: refused below.
+}
+const movedOk =
+  moved !== null && typeof moved === "object" && !Array.isArray(moved) && Object.entries(moved).every(([k, v]) => k.startsWith("NODE_") && typeof v === "string");
+if (!(Number.isInteger(caller) && caller > 1 && Number.isInteger(bound) && bound >= 1 && envArg === "moved" && movedOk)) refuse("EWATCHDOGARGS");
 if (callerGone()) refuse("ECALLERGONE");
 const deadline = performance.now() + bound + 1000;
 // A gone caller ends the group one turn later, so that a SIGINT which ended
@@ -90,8 +100,7 @@ const piped = (fd) => {
   }
 };
 const relayed = [1, 2].filter(piped);
-const { NODE_CHILD_BOUND_ENV: moved, ...ownEnv } = process.env;
-const env = envArg === "moved" ? { ...ownEnv, ...JSON.parse(moved) } : process.env;
+const env = { ...ownEnv, ...moved };
 const child = spawn(command, args, {
   stdio: [0, relayed.includes(1) ? "pipe" : 1, relayed.includes(2) ? "pipe" : 2, "ignore"],
   detached: !onTerminal,

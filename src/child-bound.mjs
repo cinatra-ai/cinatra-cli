@@ -182,18 +182,19 @@ export function spawnBounded(spawn, command, args, options, timeoutMs) {
   if (spawn !== NODE_SPAWN_SYNC || process.platform === "win32") return spawn(command, [...args], boundedOptions(options, bound));
   const io = options?.stdio ?? "pipe";
   const stdio = Array.isArray(io) ? [io[0] ?? "pipe", io[1] ?? "pipe", io[2] ?? "pipe", "pipe"] : [io, io, io, "pipe"];
-  // Node's own startup variables (NODE_*) of a given env reach the command,
-  // not the watchdog: a NODE_OPTIONS preload must not run (or end) the
-  // watchdog in the command's place. An inherited env is the caller's own.
-  const watched = { ...boundedOptions(options, bound), killSignal: "SIGTERM", stdio };
-  if (options?.env != null) {
-    const nodeVars = {};
-    watched.env = {};
-    for (const [k, v] of Object.entries(options.env)) (k.startsWith("NODE_") ? nodeVars : watched.env)[k] = v;
-    watched.env.NODE_CHILD_BOUND_ENV = JSON.stringify(nodeVars);
+  // Node's own startup variables (NODE_*) of the command's env, given or
+  // inherited, reach the command, not the watchdog: a NODE_OPTIONS preload
+  // must not run (or end) the watchdog in the command's place, and a
+  // NODE_DEBUG must not make it print the env it passes on.
+  const watched = { ...boundedOptions(options, bound), killSignal: "SIGTERM", stdio, env: {} };
+  const nodeVars = {};
+  for (const [k, v] of Object.entries(options?.env ?? process.env)) {
+    if (k.startsWith("NODE_")) {
+      if (v !== undefined) nodeVars[k] = String(v);
+    } else watched.env[k] = v;
   }
-  const envArg = options?.env != null ? "moved" : "own";
-  const r = spawn(process.execPath, [WATCHDOG, String(process.pid), String(bound), envArg, String(command), ...args], watched);
+  watched.env.NODE_CHILD_BOUND_ENV = JSON.stringify(nodeVars);
+  const r = spawn(process.execPath, [WATCHDOG, String(process.pid), String(bound), "moved", String(command), ...args], watched);
   let note = null;
   try {
     note = JSON.parse(String(r.output?.[3] ?? ""));

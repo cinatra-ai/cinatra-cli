@@ -478,7 +478,13 @@ console.log(JSON.stringify({ site: cb.siteBound(15000), read: cb.boundFor("read"
       expect(text, `child-bound.mjs defines ${name}`).not.toBeNull();
       expect(text, `${name} reads no environment`).not.toMatch(/process\s*\.\s*(env|argv)|process\s*\[/);
     }
-    expect(leaf).not.toMatch(/process\s*\.\s*env/);
+    // The one read of process.env is spawnBounded's: the command's inherited
+    // env, whose NODE_* variables it moves off the watchdog. No bound is read
+    // from it (the bound is checkedBound(timeoutMs)).
+    const spawnText = functionText(leaf, "spawnBounded");
+    expect(spawnText.match(/process\s*\.\s*env/g), "spawnBounded reads process.env once").toEqual(["process.env"]);
+    expect(spawnText).toMatch(/const bound = checkedBound\(timeoutMs\);/);
+    expect(leaf.replace(spawnText, ""), "no other read of process.env").not.toMatch(/process\s*\.\s*env/);
   });
 
   it("sleepSync waits in-process: no child, and it works with an empty PATH", async () => {
@@ -1096,6 +1102,16 @@ function noteOf(r) {
   }
 }
 
+/** The env of a watchdog started directly, as spawnBounded gives it: this
+ *  process's env without its NODE_* variables, which go into
+ *  NODE_CHILD_BOUND_ENV (`moved`, a JSON object; "{}" by default; null
+ *  leaves it out). */
+function watchdogEnv(moved = "{}") {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("NODE_")));
+  if (moved !== null) env.NODE_CHILD_BOUND_ENV = moved;
+  return env;
+}
+
 describe("child-bound: class tree-ends the command's whole process group ends at the bound", () => {
   for (const row of SITE_ROWS) {
     it(`${row.site}: a grandchild on the pipes is gone with the child when the bound ends the call`, () => {
@@ -1152,13 +1168,13 @@ process.exit(0);`;
     const refusedFile = pidPath("watchdog-refused");
     const startedFile = pidPath("watchdog-started");
     const writePid = "require('fs').writeFileSync(process.argv[1], String(process.pid))";
-    const opts = { encoding: "utf8", stdio: ["ignore", "pipe", "pipe", "pipe"], timeout: 15_000, killSignal: "SIGKILL" };
-    const refused = spawnSync(NODE, [WATCHDOG, String(process.ppid), "15000", "own", NODE, "-e", writePid, refusedFile], opts);
+    const opts = { encoding: "utf8", stdio: ["ignore", "pipe", "pipe", "pipe"], timeout: 15_000, killSignal: "SIGKILL", env: watchdogEnv() };
+    const refused = spawnSync(NODE, [WATCHDOG, String(process.ppid), "15000", "moved", NODE, "-e", writePid, refusedFile], opts);
     expect(noteOf(refused), refused.stderr).toEqual({ error: { code: "ECALLERGONE" } });
     expect(refused.status).toBe(1);
     pause(300);
     expect(readPid(refusedFile), "the command was never started").toBe(0);
-    const ran = spawnSync(NODE, [WATCHDOG, String(process.pid), "15000", "own", NODE, "-e", writePid, startedFile], opts);
+    const ran = spawnSync(NODE, [WATCHDOG, String(process.pid), "15000", "moved", NODE, "-e", writePid, startedFile], opts);
     expect(ran.status, ran.stderr).toBe(0);
     expect(noteOf(ran)).toEqual({ pid: readPid(startedFile) });
   }, 30_000);
@@ -1219,13 +1235,15 @@ function killGroupIfAlive(pgid) {
 }
 
 /** A caller (ES module code) that runs `spawnBounded(spawnSync, NODE, args,
- *  options, bound)` and exits 0; it writes its own pid to `callerPidFile`. */
-function boundedCaller(args, { stdin = "pipe", bound = 20_000, callerPidFile = null } = {}) {
+ *  options, bound)` and exits 0; it writes its own pid to `callerPidFile`, and
+ *  the result's status, signal, error code and refusal to `resultFile`. */
+function boundedCaller(args, { stdin = "pipe", bound = 20_000, callerPidFile = null, resultFile = null } = {}) {
   return `import { spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 const cb = await import(${JSON.stringify(LEAF_URL)});
 ${callerPidFile ? `writeFileSync(${JSON.stringify(callerPidFile)}, String(process.pid));` : ""}
-cb.spawnBounded(spawnSync, ${JSON.stringify(NODE)}, ${JSON.stringify(args)}, { encoding: "utf8", stdio: [${JSON.stringify(stdin)}, "pipe", "pipe"] }, ${bound});
+const r = cb.spawnBounded(spawnSync, ${JSON.stringify(NODE)}, ${JSON.stringify(args)}, { encoding: "utf8", stdio: [${JSON.stringify(stdin)}, "pipe", "pipe"] }, ${bound});
+${resultFile ? `writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify({ status: r.status, signal: r.signal, code: r.error?.code ?? null, refused: cb.childResultRefused(r) }));` : ""}
 process.exit(0);`;
 }
 
@@ -1233,12 +1251,13 @@ process.exit(0);`;
  *  `markFile`. `mode` "cancel": at SIGINT it marks SIGINT, writes to stdout
  *  200 ms later (the caller is gone by then), and marks CLEANED and exits 130
  *  after 500 ms, as a build that cancels its work does. "ignore": it marks
- *  SIGINT and runs on. "tick": it marks "tick" every 50 ms. */
+ *  SIGINT and runs on. "tick": it marks "tick" every 50 ms. With a fourth
+ *  argument `lifeMs`, it marks END and exits 0 after that many ms. */
 function jobCommand(name) {
   return script(
     `job-command-${name}-${process.hrtime.bigint()}.cjs`,
     `const fs = require("fs");
-const [pidFile, markFile, mode] = process.argv.slice(2);
+const [pidFile, markFile, mode, lifeMs] = process.argv.slice(2);
 const mark = (line) => fs.appendFileSync(markFile, line + "\\n");
 process.stdout.on("error", () => {});
 process.on("SIGINT", () => {
@@ -1248,6 +1267,7 @@ process.on("SIGINT", () => {
   setTimeout(() => (mark("CLEANED"), process.exit(130)), 500);
 });
 if (mode === "tick") setInterval(() => mark("tick"), 50);
+if (Number(lifeMs) > 0) setTimeout(() => (mark("END"), process.exit(0)), Number(lifeMs));
 fs.writeFileSync(pidFile, String(process.pid));
 setInterval(() => {}, 1000);
 `,
@@ -1293,10 +1313,10 @@ describe("child-bound: class watchdog-note a result is the command's only when t
 
   it("the watchdog refuses a caller pid that is not a whole number above 1, a bound below 1 or not whole, and an env mode it does not know, and starts nothing", () => {
     const writePid = "require('fs').writeFileSync(process.argv[1], String(process.pid))";
-    const opts = { encoding: "utf8", stdio: ["ignore", "pipe", "pipe", "pipe"], timeout: 15_000, killSignal: "SIGKILL" };
+    const opts = { encoding: "utf8", stdio: ["ignore", "pipe", "pipe", "pipe"], timeout: 15_000, killSignal: "SIGKILL", env: watchdogEnv() };
     const files = [];
     const me = String(process.pid);
-    for (const [callerArg, boundArg, envArg] of [["x", "15000", "own"], ["1", "15000", "own"], [me, "x", "own"], [me, "0", "own"], [me, "1.5", "own"], [me, "15000", "Own"], [me, "15000", ""]]) {
+    for (const [callerArg, boundArg, envArg] of [["x", "15000", "moved"], ["1", "15000", "moved"], [me, "x", "moved"], [me, "0", "moved"], [me, "1.5", "moved"], [me, "15000", "Moved"], [me, "15000", ""]]) {
       const file = pidPath("watchdog-args");
       files.push(file);
       const r = spawnSync(NODE, [WATCHDOG, callerArg, boundArg, envArg, NODE, "-e", writePid, file], opts);
@@ -1321,6 +1341,53 @@ describe("child-bound: class watchdog-note a result is the command's only when t
     }
   }, 30_000);
 });
+
+/** A python3 script (its `pty` module) that runs argv[1:] as the foreground
+ *  job of a new terminal: the session's leader stays, as a shell does, and
+ *  runs the job as the terminal's foreground process group. Bytes written to
+ *  the script's stdin are typed on the terminal (Ctrl-Z is "\x1a"). */
+function ptyRunScript() {
+  return script(
+    `pty-run-${process.hrtime.bigint()}.py`,
+    `import os, pty, select, signal, sys
+pid, fd = pty.fork()
+if pid == 0:
+    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    job = os.fork()
+    if job == 0:
+        os.setpgid(0, 0)
+        os.tcsetpgrp(0, os.getpid())
+        signal.signal(signal.SIGTTOU, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.execv(sys.argv[1], sys.argv[1:])
+    try:
+        os.setpgid(job, job)
+    except OSError:
+        pass
+    while True:
+        signal.pause()
+inputs = [fd, 0]
+while True:
+    try:
+        ready = select.select(inputs, [], [])[0]
+    except InterruptedError:
+        continue
+    if 0 in ready:
+        data = os.read(0, 1024)
+        if data:
+            os.write(fd, data)
+        else:
+            inputs.remove(0)
+    if fd in ready:
+        try:
+            if not os.read(fd, 4096):
+                break
+        except OSError:
+            break
+`,
+  );
+}
 
 describe("child-bound: class job-control-fold the command handles the job's Ctrl-C to its end, and a Ctrl-Z stops it", () => {
   /** Start a caller as a job of its own (a process group, as a shell starts one). */
@@ -1387,36 +1454,7 @@ describe("child-bound: class job-control-fold the command handles the job's Ctrl
   }, 30_000);
 
   it("on a terminal (a pty; the caller is its foreground job): Ctrl-C reaches the command once and its handler runs to its end", async () => {
-    // python3's pty module: the session's leader stays, as a shell does, and
-    // runs the caller as the terminal's foreground process group.
-    const ptyRun = script(
-      `pty-run-${process.hrtime.bigint()}.py`,
-      `import os, pty, signal, sys
-pid, fd = pty.fork()
-if pid == 0:
-    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    job = os.fork()
-    if job == 0:
-        os.setpgid(0, 0)
-        os.tcsetpgrp(0, os.getpid())
-        signal.signal(signal.SIGTTOU, signal.SIG_DFL)
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        os.execv(sys.argv[1], sys.argv[1:])
-    try:
-        os.setpgid(job, job)
-    except OSError:
-        pass
-    while True:
-        signal.pause()
-while True:
-    try:
-        if not os.read(fd, 4096):
-            break
-    except OSError:
-        break
-`,
-    );
+    const ptyRun = ptyRunScript();
     const pidFile = pidPath("jobfold-tty");
     const callerPidFile = pidPath("jobfold-tty-caller");
     const markFile = path.join(sandbox, `jobfold-tty-${process.hrtime.bigint()}.mark`);
@@ -1429,6 +1467,208 @@ while True:
       process.kill(-readPid(callerPidFile), "SIGINT");
       await waitFor(() => fileLines(markFile).includes("CLEANED"), 5_000);
       expect(fileLines(markFile), "SIGINT reached the command once, and its handler ended").toEqual(["SIGINT", "CLEANED"]);
+      expectGone(pidFile);
+    } finally {
+      killIfAlive(pidFile);
+      if (readPid(callerPidFile) > 0) killGroupIfAlive(readPid(callerPidFile));
+      killGroupIfAlive(outer.pid);
+    }
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// An inherited env: Node's startup variables (NODE_*) do not reach the watchdog
+// ---------------------------------------------------------------------------
+
+describe("child-bound: class inherited-node-env the caller's own NODE_* variables reach the command, never the watchdog", () => {
+  /** Run spawnBounded with no `env` in a fresh caller that first sets `vars`
+   *  in its own process.env, so the command's env is the inherited one. */
+  function inheritedRun(vars, command, args) {
+    const code = `import { spawnSync } from "node:child_process";
+const cb = await import(${JSON.stringify(LEAF_URL)});
+Object.assign(process.env, ${JSON.stringify(vars)});
+const r = cb.spawnBounded(spawnSync, ${JSON.stringify(command)}, ${JSON.stringify(args)}, { encoding: "utf8" }, 15000);
+process.stdout.write("\\n" + JSON.stringify({ status: r.status, code: r.error?.code ?? null, stdout: r.stdout, stderr: r.stderr }));`;
+    const h = harness(code);
+    expect(h.status, h.stderr).toBe(0);
+    return h.value;
+  }
+
+  it("an inherited NODE_DEBUG=child_process: the result's stderr carries no line of the watchdog and no env value; the command still gets NODE_DEBUG", () => {
+    const mark = `private-mark-${process.hrtime.bigint()}`;
+    const v = inheritedRun({ NODE_DEBUG: "child_process", CB_PRIVATE_MARK: mark }, "/bin/sh", ["-c", 'printf %s "$NODE_DEBUG"']);
+    expect(v.stderr.includes(mark), "no env value in stderr").toBe(false);
+    expect(v).toEqual({ status: 0, code: null, stdout: "child_process", stderr: "" });
+  }, 30_000);
+
+  it("an inherited NODE_OPTIONS preload that exits 0 does not run in the watchdog: the result is the command's own status 3", () => {
+    const preload = script(`exit-preload-${process.hrtime.bigint()}.cjs`, "process.exit(0);\n");
+    const v = inheritedRun({ NODE_OPTIONS: `--require=${preload}` }, "/bin/sh", ["-c", 'printf %s "$NODE_OPTIONS"; exit 3']);
+    expect(v).toEqual({ status: 3, code: null, stdout: `--require=${preload}`, stderr: "" });
+  }, 30_000);
+
+  it("the watchdog refuses the mode own, and a moved env that is missing, not JSON, not an object, names a variable other than NODE_*, or holds a value that is not a string; it starts nothing", () => {
+    const writePid = "require('fs').writeFileSync(process.argv[1], String(process.pid))";
+    const me = String(process.pid);
+    const files = [];
+    const rows = [
+      ["own", "{}"],
+      ["moved", null],
+      ["moved", "x"],
+      ["moved", "[]"],
+      ["moved", "null"],
+      ["moved", '"NODE_OPTIONS"'],
+      ["moved", '{"PATH":"/x"}'],
+      ["moved", '{"NODE_OPTIONS":1}'],
+    ];
+    for (const [envArg, moved] of rows) {
+      const file = pidPath("watchdog-env");
+      files.push(file);
+      const opts = { encoding: "utf8", stdio: ["ignore", "pipe", "pipe", "pipe"], timeout: 15_000, killSignal: "SIGKILL", env: watchdogEnv(moved) };
+      const r = spawnSync(NODE, [WATCHDOG, me, "15000", envArg, NODE, "-e", writePid, file], opts);
+      expect({ note: noteOf(r), status: r.status, stderr: r.stderr }, `mode ${envArg}, moved env ${moved}`).toEqual({ note: { error: { code: "EWATCHDOGARGS" } }, status: 1, stderr: "" });
+    }
+    pause(300);
+    for (const file of files) expect(readPid(file), "the command was never started").toBe(0);
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// Job control at its edges: a quick resume, SIGHUP to the watchdog, a closed
+// relay, and Ctrl-Z typed on a terminal
+// ---------------------------------------------------------------------------
+
+/** `ps` columns of one process (`ppid`, `stat`), or null when it is gone. */
+function psOf(pid) {
+  const r = spawnSync("ps", ["-o", "ppid=,stat=", "-p", String(pid)], { encoding: "utf8", timeout: 10_000, killSignal: "SIGKILL" });
+  const m = /^\s*(\d+)\s+(\S+)/.exec(r.stdout ?? "");
+  return m ? { ppid: Number(m[1]), stat: m[2] } : null;
+}
+
+function readJson(file) {
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+describe("child-bound: class job-control-edges a resume, SIGHUP, a closed relay and a terminal's Ctrl-Z end as they should", () => {
+  it("Ctrl-Z, then a resume 50 ms later (inside the 500 ms before the stop): the command ticks on, the watchdog is not stopped, and the job ends with the command's status", async () => {
+    const pidFile = pidPath("edges-resume");
+    const markFile = path.join(sandbox, `edges-resume-${process.hrtime.bigint()}.mark`);
+    const resultFile = path.join(sandbox, `edges-resume-${process.hrtime.bigint()}.json`);
+    const code = boundedCaller([jobCommand("resume"), pidFile, markFile, "tick", "2500"], { resultFile });
+    const caller = spawn(NODE, ["--input-type=module", "-e", code], { stdio: "ignore", detached: true });
+    const ticks = () => fileLines(markFile).filter((l) => l === "tick").length;
+    try {
+      await waitFor(() => readPid(pidFile) > 0 && ticks() > 1, 15_000);
+      expect(ticks(), "the command ticks").toBeGreaterThan(1);
+      const watchdog = psOf(readPid(pidFile))?.ppid ?? 0;
+      expect(psOf(watchdog)?.ppid, "the command's parent is the watchdog, the caller's child").toBe(caller.pid);
+      process.kill(-caller.pid, "SIGTSTP");
+      pause(50);
+      process.kill(-caller.pid, "SIGCONT");
+      const before = ticks();
+      pause(900);
+      expect(psOf(watchdog)?.stat ?? "", "the watchdog is not stopped").not.toMatch(/T/);
+      expect(ticks(), "the command ticked on").toBeGreaterThan(before + 5);
+      await waitFor(() => readJson(resultFile) !== null, 6_000);
+      expect(readJson(resultFile), "the job ended with the command's own status").toEqual({ status: 0, signal: null, code: null, refused: false });
+      expect(fileLines(markFile).at(-1)).toBe("END");
+      expectGone(pidFile);
+    } finally {
+      killIfAlive(pidFile);
+      killGroupIfAlive(caller.pid);
+    }
+  }, 30_000);
+
+  it("SIGHUP to the watchdog's pid alone: the command and the worker it left in its group are gone, and the result is a signal, refused", async () => {
+    const pidFile = pidPath("edges-hup");
+    const wpidFile = pidPath("edges-hup-worker");
+    const resultFile = path.join(sandbox, `edges-hup-${process.hrtime.bigint()}.json`);
+    const worker = `require('fs').writeFileSync(${JSON.stringify(wpidFile)}, String(process.pid)); setInterval(() => {}, 1000)`;
+    const body = `require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(worker)}], { stdio: 'ignore' }).unref();
+require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+setInterval(() => {}, 1000);`;
+    const caller = spawn(NODE, ["--input-type=module", "-e", boundedCaller(["-e", body], { resultFile })], { stdio: "ignore", detached: true });
+    try {
+      await waitFor(() => readPid(pidFile) > 0 && readPid(wpidFile) > 0, 15_000);
+      expect(readPid(wpidFile), "the command and its worker started").toBeGreaterThan(0);
+      const watchdog = psOf(readPid(pidFile))?.ppid ?? 0;
+      expect(psOf(watchdog)?.ppid, "the command's parent is the watchdog, the caller's child").toBe(caller.pid);
+      process.kill(watchdog, "SIGHUP");
+      expectGone(pidFile);
+      expectGone(wpidFile);
+      await waitFor(() => readJson(resultFile) !== null, 5_000);
+      expect(readJson(resultFile)).toEqual({ status: null, signal: "SIGKILL", code: null, refused: true });
+    } finally {
+      killIfAlive(pidFile);
+      killIfAlive(wpidFile);
+      killGroupIfAlive(caller.pid);
+    }
+  }, 30_000);
+
+  it("a failed relay write (the caller's read end is closed, then the command writes): the command writes on and ends, and the watchdog ends with the command's status, without a hang", async () => {
+    const pidFile = pidPath("edges-relay");
+    const markFile = path.join(sandbox, `edges-relay-${process.hrtime.bigint()}.mark`);
+    const body = `const fs = require('fs');
+process.stdout.on('error', () => fs.appendFileSync(${JSON.stringify(markFile)}, 'EPIPE\\n'));
+process.on('SIGUSR2', () => {
+  let n = 0;
+  const t = setInterval(() => {
+    process.stdout.write('x'.repeat(4096) + '\\n');
+    if (++n < 20) return;
+    clearInterval(t);
+    fs.appendFileSync(${JSON.stringify(markFile)}, 'END\\n');
+    process.exit(4);
+  }, 10);
+});
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+setInterval(() => {}, 1000);`;
+    const wd = spawn(NODE, [WATCHDOG, String(process.pid), "15000", "moved", NODE, "-e", body], { stdio: ["ignore", "pipe", "pipe", "pipe"], env: watchdogEnv() });
+    const ended = new Promise((resolve) => wd.on("exit", (code, signal) => resolve({ code, signal })));
+    wd.stderr.resume();
+    wd.stdio[3].resume();
+    try {
+      await waitFor(() => readPid(pidFile) > 0, 15_000);
+      expect(readPid(pidFile), "the command started").toBeGreaterThan(0);
+      wd.stdout.destroy();
+      await new Promise((r) => setTimeout(r, 100));
+      process.kill(readPid(pidFile), "SIGUSR2");
+      const outcome = await Promise.race([ended, new Promise((r) => setTimeout(() => r("hang"), 8_000))]);
+      expect(outcome, "the watchdog ended with the command's status").toEqual({ code: 4, signal: null });
+      expect(fileLines(markFile).at(-1), "the command wrote to its end and finished").toBe("END");
+      expectGone(pidFile);
+    } finally {
+      killIfAlive(pidFile);
+      if (wd.exitCode === null && wd.signalCode === null) wd.kill("SIGKILL");
+    }
+  }, 30_000);
+
+  it("on a terminal (a pty; the caller is its foreground job): Ctrl-Z typed on it stops the whole job, a resume continues it, and the job ends with the command's status", async () => {
+    const pidFile = pidPath("edges-tty");
+    const callerPidFile = pidPath("edges-tty-caller");
+    const markFile = path.join(sandbox, `edges-tty-${process.hrtime.bigint()}.mark`);
+    const resultFile = path.join(sandbox, `edges-tty-${process.hrtime.bigint()}.json`);
+    const code = boundedCaller([jobCommand("tty-stop"), pidFile, markFile, "tick", "3000"], { stdin: "inherit", callerPidFile, resultFile });
+    const outer = spawn("python3", [ptyRunScript(), NODE, "--input-type=module", "-e", code], { stdio: ["pipe", "ignore", "ignore"], detached: true });
+    const spawnError = new Promise((resolve) => outer.on("error", resolve));
+    const ticks = () => fileLines(markFile).filter((l) => l === "tick").length;
+    try {
+      await Promise.race([waitFor(() => readPid(pidFile) > 0 && ticks() > 1, 15_000), spawnError]);
+      expect(ticks(), "python3 ran the caller on a pty, and the command ticks").toBeGreaterThan(1);
+      outer.stdin.write("\x1a");
+      await waitFor(() => /T/.test(psOf(readPid(pidFile))?.stat ?? ""), 3_000);
+      expect(psOf(readPid(pidFile))?.stat ?? "", "the command is stopped").toMatch(/T/);
+      expect(psOf(readPid(callerPidFile))?.stat ?? "", "the caller is stopped with it").toMatch(/T/);
+      const stoppedAt = ticks();
+      pause(600);
+      expect(ticks(), "no tick while the job is stopped").toBe(stoppedAt);
+      process.kill(-readPid(callerPidFile), "SIGCONT");
+      await waitFor(() => readJson(resultFile) !== null, 8_000);
+      expect(ticks(), "the command ticked again after the resume").toBeGreaterThan(stoppedAt);
+      expect(readJson(resultFile), "the job ended with the command's own status").toEqual({ status: 0, signal: null, code: null, refused: false });
       expectGone(pidFile);
     } finally {
       killIfAlive(pidFile);
