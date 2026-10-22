@@ -51,6 +51,7 @@
 // ---------------------------------------------------------------------------
 
 import { spawnSync } from "node:child_process";
+import { boundedOptions, checkedBound, siteBound } from "./child-bound.mjs";
 
 import { makeMarkerReader, makeProbeVersion, PG_MARKER_READ_MOUNT } from "./pg-adapters.mjs";
 import { DEFAULT_UPGRADE_MATRIX, imageParts, serviceRunbookUrl } from "./upgrade-matrix.mjs";
@@ -155,14 +156,13 @@ export function assertRecreateSafe({
 /** Best-effort docker capture: trimmed stdout on exit 0, else null (so callers
  *  distinguish "empty output" from "failed"). Never throws. */
 function makeDockerCapture(spawn) {
-  return (args, opts = {}) => {
+  return (args, { timeoutMs = siteBound(DOCKER_CLI_PROBE_TIMEOUT_MS), ...opts } = {}) => {
     try {
-      const r = spawn("docker", args, {
+      const r = spawn("docker", [...args], boundedOptions({
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
         ...opts,
-      });
+      }, checkedBound(timeoutMs)));
       if (r.status !== 0) return null;
       return (r.stdout ?? "").trim();
     } catch {
@@ -177,11 +177,10 @@ function makeDockerCapture(spawn) {
 function makeInspectVolumeThreeWay(spawn) {
   return (name) => {
     try {
-      const r = spawn("docker", ["volume", "inspect", name], {
+      const r = spawn("docker", ["volume", "inspect", name], boundedOptions({
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
-      });
+      }, siteBound(DOCKER_CLI_PROBE_TIMEOUT_MS)));
       if (r.status === 0) {
         try {
           const parsed = JSON.parse((r.stdout ?? "").trim());
@@ -348,7 +347,7 @@ export function buildDeploymentPreflight({
     if (before.status !== "ok") return null;
     const out = capture(
       ["run", "--rm", "--pull=never", "--entrypoint", "/bin/sh", "-v", `${volumeName}:${PG_MARKER_READ_MOUNT}:ro`, image, "-c", program],
-      { timeout: DOCKER_VOLUME_READ_TIMEOUT_MS },
+      { timeoutMs: siteBound(DOCKER_VOLUME_READ_TIMEOUT_MS) },
     );
     const after = inspectVolumeThreeWay(volumeName);
     const beforeId = volumeIdentityFromInspect(before.row);
@@ -383,7 +382,7 @@ export function buildDeploymentPreflight({
       // trusting a possibly-recreated volume's "empty".
       const listing = capture(
         ["run", "--rm", "--pull=never", "--entrypoint", "/bin/sh", "-v", `${name}:/__preflight_probe:ro`, image, "-c", "ls -A /__preflight_probe"],
-        { timeout: DOCKER_VOLUME_READ_TIMEOUT_MS },
+        { timeoutMs: siteBound(DOCKER_VOLUME_READ_TIMEOUT_MS) },
       );
       const after = inspectVolumeThreeWay(name);
       const beforeId = volumeIdentityFromInspect(res.row);

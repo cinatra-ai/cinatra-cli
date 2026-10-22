@@ -35,6 +35,7 @@
 // ---------------------------------------------------------------------------
 
 import { spawnSync } from "node:child_process";
+import { boundedOptions, siteBound } from "./child-bound.mjs";
 
 import {
   DEFAULT_UPGRADE_MATRIX,
@@ -58,12 +59,11 @@ const DOCKER_CAPTURE_TIMEOUT_MS = 30_000;
  *  Never throws. */
 export function defaultCapture(cmd, args, { cwd } = {}) {
   try {
-    const r = spawnSync(cmd, args, {
+    const r = spawnSync(cmd, [...args], boundedOptions({
       cwd,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: DOCKER_CAPTURE_TIMEOUT_MS,
-    });
+    }, siteBound(DOCKER_CAPTURE_TIMEOUT_MS)));
     if (r.status !== 0) return null;
     return (r.stdout ?? "").trim();
   } catch {
