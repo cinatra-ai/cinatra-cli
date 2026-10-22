@@ -1088,7 +1088,8 @@ process.exit(0);`;
 //
 // Off win32, spawnBounded runs the command below src/child-bound-watchdog.mjs,
 // in a process group of its own. The watchdog SIGKILLs that group at the bound,
-// at SIGINT, SIGTERM or SIGHUP, and when the caller it was given is no longer
+// at SIGTERM or SIGHUP (the "end" rows of src/child-bound-signals.mjs), and
+// passes SIGINT, SIGQUIT and SIGUSR2 on to it; it ends it when the caller it was given is no longer
 // its parent. It refuses to start the command when that is so from the start.
 
 const WATCHDOG = fileURLToPath(new URL("../src/child-bound-watchdog.mjs", import.meta.url));
@@ -1676,4 +1677,111 @@ setInterval(() => {}, 1000);`;
       killGroupIfAlive(outer.pid);
     }
   }, 30_000);
+});
+
+// The watchdog's signal table (src/child-bound-signals.mjs)
+// ---------------------------------------------------------------------------
+// Off a terminal the command is in a process group of its own, so a signal of
+// the caller's job reaches the caller and the watchdog only. Each signal of
+// the table, sent to the watchdog's pid alone and to the caller's process
+// group (the job), with piped stdio, must end the command and the worker it
+// left in its group. "end": the group is SIGKILLed and the result is SIGKILL;
+// "pass": the signal is passed on, so a command and a worker that do not
+// handle it end by it, and the result is that signal. These rows are the
+// table's rows: the closure test below checks that.
+
+const SIGNAL_ROWS = [
+  ["SIGTERM", "end"],
+  ["SIGHUP", "end"],
+  ["SIGINT", "pass"],
+  ["SIGQUIT", "pass"],
+  ["SIGUSR2", "pass"],
+];
+
+/** The POSIX default action of each signal that Node names on a platform:
+ *  "T" ends the process, "A" ends it with a core, "I" ignores it, "S" stops
+ *  it and "C" continues it. Where two platforms differ (SIGIO ends a process
+ *  on Linux and is ignored on macOS), the row takes the action that ends. */
+const POSIX_DEFAULT_ACTION = {
+  SIGHUP: "T", SIGINT: "T", SIGQUIT: "A", SIGILL: "A", SIGTRAP: "A", SIGABRT: "A", SIGIOT: "A",
+  SIGBUS: "A", SIGFPE: "A", SIGKILL: "T", SIGUSR1: "T", SIGSEGV: "A", SIGUSR2: "T", SIGPIPE: "T",
+  SIGALRM: "T", SIGTERM: "T", SIGSTKFLT: "T", SIGCHLD: "I", SIGCONT: "C", SIGSTOP: "S", SIGTSTP: "S",
+  SIGTTIN: "S", SIGTTOU: "S", SIGURG: "I", SIGXCPU: "A", SIGXFSZ: "A", SIGVTALRM: "T", SIGPROF: "T",
+  SIGWINCH: "I", SIGIO: "T", SIGPOLL: "T", SIGPWR: "T", SIGSYS: "A", SIGUNUSED: "A", SIGINFO: "I",
+  SIGEMT: "A", SIGLOST: "T", SIGBREAK: "T",
+};
+
+describe("child-bound: class signal-table each signal of the watchdog's table ends the command's group, with piped stdio", () => {
+  for (const [signal, kind] of SIGNAL_ROWS) {
+    for (const to of ["watchdog", "job"]) {
+      const target = to === "watchdog" ? "the watchdog's pid alone" : "the caller's process group (the job)";
+      it(`${signal} (${kind}) to ${target}: the command and the worker it left in its group are gone, and the ${to === "watchdog" ? "result is refused as a signal" : "caller ended by the signal"}`, async () => {
+        const tag = `table-${signal}-${to}`;
+        const pidFile = pidPath(tag);
+        const wpidFile = pidPath(`${tag}-worker`);
+        const resultFile = path.join(sandbox, `${tag}-${process.hrtime.bigint()}.json`);
+        const worker = `require('fs').writeFileSync(${JSON.stringify(wpidFile)}, String(process.pid)); setInterval(() => {}, 1000)`;
+        const body = `require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(worker)}], { stdio: 'ignore' }).unref();
+require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+setInterval(() => {}, 1000);`;
+        const caller = spawn(NODE, ["--input-type=module", "-e", boundedCaller(["-e", body], { resultFile })], { stdio: "ignore", detached: true });
+        const exited = new Promise((resolve) => caller.on("exit", (c, sig) => resolve(sig ?? c)));
+        try {
+          await waitFor(() => readPid(pidFile) > 0 && readPid(wpidFile) > 0, 15_000);
+          expect(readPid(wpidFile), "the command and its worker started").toBeGreaterThan(0);
+          const watchdog = psOf(readPid(pidFile))?.ppid ?? 0;
+          expect(psOf(watchdog)?.ppid, "the command's parent is the watchdog, the caller's child").toBe(caller.pid);
+          process.kill(to === "watchdog" ? watchdog : -caller.pid, signal);
+          expectGone(pidFile);
+          expectGone(wpidFile);
+          if (to === "watchdog") {
+            await waitFor(() => readJson(resultFile) !== null, 5_000);
+            expect(readJson(resultFile), "the result is the signal that ended the watchdog").toEqual({ status: null, signal: kind === "end" ? "SIGKILL" : signal, code: null, refused: true });
+          } else {
+            expect(await exited, "the caller ended by the signal").toBe(signal);
+          }
+        } finally {
+          killIfAlive(pidFile);
+          killIfAlive(wpidFile);
+          killGroupIfAlive(caller.pid);
+        }
+      }, 30_000);
+    }
+  }
+
+  it("every catchable signal whose default action ends a process is in the table or excluded with a reason; the watchdog handles the table only", async () => {
+    const { WATCHDOG_SIGNALS, WATCHDOG_SIGNAL_EXCLUSIONS } = await import(new URL("../src/child-bound-signals.mjs", import.meta.url).href);
+    expect(Object.entries(WATCHDOG_SIGNALS), "the rows of this test are the table's").toEqual(SIGNAL_ROWS);
+    const names = Object.keys(os.constants.signals);
+    // Which of them Node lets a listener catch, read in a fresh process.
+    const probe = spawnSync(
+      NODE,
+      ["-e", `const out = {}; for (const s of ${JSON.stringify(names)}) { try { const f = () => {}; process.on(s, f); process.removeListener(s, f); out[s] = true; } catch { out[s] = false; } } console.log(JSON.stringify(out));`],
+      { encoding: "utf8", timeout: 15_000, killSignal: "SIGKILL" },
+    );
+    expect(probe.status, probe.stderr).toBe(0);
+    const catchable = JSON.parse(probe.stdout);
+    expect(catchable.SIGKILL, "SIGKILL cannot be caught").toBe(false);
+    expect(catchable.SIGSTOP, "SIGSTOP cannot be caught").toBe(false);
+    for (const name of names) {
+      expect(POSIX_DEFAULT_ACTION[name], `the POSIX table of this test names the default action of ${name}`).toMatch(/^[TAISC]$/);
+      if (!catchable[name] || !"TA".includes(POSIX_DEFAULT_ACTION[name])) continue;
+      const reason = WATCHDOG_SIGNAL_EXCLUSIONS[name];
+      expect(name in WATCHDOG_SIGNALS || (typeof reason === "string" && reason.length > 0), `${name} ends a process: it is in the table, or excluded with a reason`).toBe(true);
+    }
+    for (const [name, kind] of Object.entries(WATCHDOG_SIGNALS)) {
+      expect(["end", "pass"], `${name}: a kind the watchdog knows`).toContain(kind);
+      expect(name in WATCHDOG_SIGNAL_EXCLUSIONS, `${name} is not both in the table and excluded`).toBe(false);
+    }
+    for (const [name, reason] of Object.entries(WATCHDOG_SIGNAL_EXCLUSIONS)) {
+      expect(typeof reason === "string" && reason.length > 0, `${name}: a written reason`).toBe(true);
+    }
+    // The watchdog's own per-signal handlers are the stop-and-continue pair;
+    // every other signal it handles comes from the table.
+    const src = readFileSync(path.join(SRC_DIR, "child-bound-watchdog.mjs"), "utf8");
+    const own = [...src.matchAll(/process\.on\(\s*"(SIG[A-Z0-9]+)"/g)].map((m) => m[1]);
+    expect(own.sort(), "the watchdog's own signal handlers").toEqual(["SIGCONT", "SIGTSTP"]);
+    expect(src, "no list of signal names in the watchdog besides the table").not.toMatch(/\[\s*"SIG[A-Z0-9]+"/);
+    expect(src).toMatch(/^import \{ WATCHDOG_SIGNALS \} from "\.\/child-bound-signals\.mjs";$/m);
+  });
 });

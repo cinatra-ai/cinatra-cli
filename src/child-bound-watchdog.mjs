@@ -2,14 +2,17 @@
 //   node <this> <caller pid> <bound ms> moved <command> [args...]
 // spawnSync blocks its caller, so the caller cannot answer a signal while it
 // waits. spawnSync starts this process in the caller's process group; this
-// process starts the command detached (a process group of its own) and
-// SIGKILLs that whole group at SIGTERM (spawnSync sends it at the bound) or
-// SIGHUP, and when the caller is gone: its parent is not the caller pid it was
-// given, checked before the command starts, every 100 ms after, and at the
-// command's exit. A Ctrl-C or Ctrl-Z of the caller's job is passed on to the
-// group as it is: SIGINT (after it, a caller that is gone ends nothing, and the
-// command has the bound plus 1 s to end), and SIGTSTP, then SIGSTOP of the
-// group and of this process 500 ms later; a SIGCONT is passed on too.
+// process starts the command detached (a process group of its own). The
+// signals of the caller's job that it handles are the one table of
+// child-bound-signals.mjs: it SIGKILLs that whole group at an "end" signal
+// (SIGTERM, which spawnSync sends at the bound, and SIGHUP), and passes a
+// "pass" signal on to the group as it is (SIGINT, SIGQUIT, SIGUSR2: after it,
+// a caller that is gone ends nothing, and the command has the bound plus 1 s
+// to end). It SIGKILLs the group too when the caller is gone: its parent is
+// not the caller pid it was given, checked before the command starts, every
+// 100 ms after, and at the command's exit. A Ctrl-Z of the caller's job is
+// passed on as SIGTSTP, then SIGSTOP of the group and of this process 500 ms
+// later; a SIGCONT is passed on too.
 // A stdout or stderr that is a pipe is relayed through this process, so it
 // leaves when the command has exited and those pipes are closed, as spawnSync
 // waits: a descendant that holds them keeps it here, guarding the group, and
@@ -27,6 +30,7 @@
 import { spawn } from "node:child_process";
 import { fstatSync, writeSync } from "node:fs";
 import { isatty } from "node:tty";
+import { WATCHDOG_SIGNALS } from "./child-bound-signals.mjs";
 
 const [callerArg, boundArg, envArg, command, ...args] = process.argv.slice(2);
 const caller = Number(callerArg);
@@ -60,10 +64,11 @@ const leaveBy = (signal) => {
 const endAll = () => (killGroup(), leaveBy("SIGKILL"));
 const callerGone = () => process.ppid !== caller;
 
-for (const signal of ["SIGTERM", "SIGHUP"]) process.on(signal, endAll);
-// On a terminal the command is in this group and gets the terminal's signals
-// itself; this process only stops treating a gone caller as the end.
-process.on("SIGINT", () => ((interrupted = true), onTerminal || toGroup("SIGINT")));
+// On a terminal the command is in this group and gets the job's "pass"
+// signals itself; this process only stops treating a gone caller as the end.
+// A kind other than "pass" ends the group.
+const passOn = (signal) => () => ((interrupted = true), onTerminal || toGroup(signal));
+for (const [signal, kind] of Object.entries(WATCHDOG_SIGNALS)) process.on(signal, kind === "pass" ? passOn(signal) : endAll);
 if (!onTerminal) {
   process.on("SIGTSTP", () => {
     toGroup("SIGTSTP");
