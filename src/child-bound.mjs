@@ -17,11 +17,13 @@
 //   test can shorten it through an import of `__setChildBoundsForTest`;
 //   production keeps the constant.
 // - `spawnBounded` is the one bounded spawn of every swept site: the bound
-//   goes through `checkedBound`, then `boundedOptions`. The child stays in the
-//   caller's process group, so a Ctrl-C of the terminal reaches it as before.
-//   At the bound spawnSync SIGKILLs the child and closes its pipes, so the
-//   wait ends even when a descendant still holds them; the descendant itself
-//   is not stopped here (the caller's wait is what is bounded).
+//   goes through `checkedBound`, then `boundedOptions`. With Node's spawnSync
+//   on a POSIX platform the command runs below `child-bound-watchdog.mjs`,
+//   which SIGKILLs the command's whole process group at the bound, at a
+//   SIGINT, SIGTERM or SIGHUP, and when the waiting caller is gone. A
+//   descendant that leaves that group (setsid, a detached spawn) is not
+//   reached. On win32, or with any other spawn, the call is the plain
+//   bounded spawn: spawnSync SIGKILLs the child and closes its pipes.
 // - `childResultRefused` is the first question of every status reader: a
 //   result with a spawn error, a timeout, a signal or no whole exit status is
 //   refused before its status or output is read.
@@ -34,6 +36,7 @@
 // without an import cycle.
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 export function boundedOptions(options, timeoutMs) {
   return { ...options, timeout: timeoutMs, killSignal: "SIGKILL" };
@@ -160,11 +163,38 @@ export function __setChildBoundsForTest(ms) {
 // The bounded spawn, and the refusal of an unreadable result
 // ---------------------------------------------------------------------------
 
+const WATCHDOG = fileURLToPath(new URL("./child-bound-watchdog.mjs", import.meta.url));
+// Node's own spawnSync, read past any module mock: only that one is watched.
+const NODE_SPAWN_SYNC = process.getBuiltinModule("node:child_process").spawnSync;
+
 /** One bounded `spawn(command, args, options)`: `timeoutMs` goes through
- *  `checkedBound` (CHILD_BOUND_INVALID before anything starts), and the call
- *  gets it with `killSignal: "SIGKILL"`. Nothing else in `options` changes. */
+ *  `checkedBound` (CHILD_BOUND_INVALID before anything starts). With Node's
+ *  spawnSync off win32 the command runs below the watchdog, in a group of its
+ *  own; spawnSync stops the watchdog by SIGTERM at `timeoutMs`, and the
+ *  watchdog SIGKILLs the group. Its fd-3 note gives back the command's pid
+ *  and start error, so the result reads as the command's own. Any other
+ *  `spawn` (a stand-in or a module mock), and win32, get the command itself
+ *  under `boundedOptions`. */
 export function spawnBounded(spawn, command, args, options, timeoutMs) {
-  return spawn(command, [...args], boundedOptions(options, checkedBound(timeoutMs)));
+  const bound = checkedBound(timeoutMs);
+  if (spawn !== NODE_SPAWN_SYNC || process.platform === "win32") return spawn(command, [...args], boundedOptions(options, bound));
+  const io = options?.stdio ?? "pipe";
+  const stdio = Array.isArray(io) ? [io[0] ?? "pipe", io[1] ?? "pipe", io[2] ?? "pipe", "pipe"] : [io, io, io, "pipe"];
+  const watched = { ...boundedOptions(options, bound), killSignal: "SIGTERM", stdio };
+  const r = spawn(process.execPath, [WATCHDOG, String(process.pid), String(command), ...args], watched);
+  let note = null;
+  try {
+    note = JSON.parse(String(r.output?.[3] ?? ""));
+  } catch {
+    // No note: the watchdog itself did not start (r.error says why).
+  }
+  if (Array.isArray(r.output)) r.output = r.output.slice(0, 3);
+  if (Number.isInteger(note?.pid)) r.pid = note.pid;
+  if (note?.error && r.error == null) {
+    r.error = Object.assign(new Error(`spawnSync ${command} ${note.error.code}`), note.error, { syscall: `spawnSync ${command}`, spawnargs: [...args] });
+    r.status = null;
+  }
+  return r;
 }
 
 /** True when a spawnSync result must not be read as an exit status: no

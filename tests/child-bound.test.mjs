@@ -180,7 +180,7 @@ describe("child-bound: the helpers are the install road's own text", () => {
     await loadLeaf();
     const leaf = readFileSync(path.join(SRC_DIR, "child-bound.mjs"), "utf8");
     const specifiers = [...leaf.matchAll(/^import\s[^;]*?from\s+"([^"]+)"/gm)].map((m) => m[1]);
-    expect(specifiers.slice().sort()).toEqual(["node:child_process", "node:path"]);
+    expect(specifiers.slice().sort()).toEqual(["node:child_process", "node:path", "node:url"]);
     expect(leaf.match(/^\s*import\b/gm) ?? []).toHaveLength(specifiers.length);
     expect(leaf).not.toMatch(/\bimport\s*\(/);
   });
@@ -1074,4 +1074,127 @@ process.exit(0);`;
       }
     }, 30_000);
   }
+});
+
+// ---------------------------------------------------------------------------
+// The command's whole process group ends with the wait (POSIX, Node's spawnSync)
+// ---------------------------------------------------------------------------
+//
+// Off win32, spawnBounded runs the command below src/child-bound-watchdog.mjs,
+// in a process group of its own. The watchdog SIGKILLs that group at the bound,
+// at SIGINT, SIGTERM or SIGHUP, and when the caller it was given is no longer
+// its parent. It refuses to start the command when that is so from the start.
+
+const WATCHDOG = fileURLToPath(new URL("../src/child-bound-watchdog.mjs", import.meta.url));
+
+/** The watchdog's fd-3 note in a spawnSync result, or null. */
+function noteOf(r) {
+  try {
+    return JSON.parse(String(r.output?.[3] ?? ""));
+  } catch {
+    return null;
+  }
+}
+
+describe("child-bound: class tree-ends the command's whole process group ends at the bound", () => {
+  for (const row of SITE_ROWS) {
+    it(`${row.site}: a grandchild on the pipes is gone with the child when the bound ends the call`, () => {
+      const pidFile = pidPath("tree-ends");
+      const gpidFile = pidPath("tree-ends-grandchild");
+      const callLog = path.join(sandbox, `tcalls-${process.hrtime.bigint()}.log`);
+      const bin = groupStandInBin({ answers: row.answers, target: { re: row.hang, mode: "hang" } }, { pidFile, gpidFile, callLog });
+      const r = runEntry(row.module, row.entry, bin);
+      expect(r.value?.ms ?? Infinity, `the call ends within the bound plus 3 s (harness ${r.signal ?? r.status}): ${r.stderr}`).toBeLessThan(GROUP_BOUND_MS + 3_000);
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.value.v).toEqual(row.expected);
+      expectGone(pidFile);
+      expectGone(gpidFile);
+    }, 30_000);
+  }
+});
+
+describe("child-bound: class caller-gone the command's group ends when the waiting caller dies", () => {
+  for (const signal of ["SIGKILL", "SIGTERM"]) {
+    it(`${signal} to the caller's pid alone ends the bounded child and its grandchild`, async () => {
+      const pidFile = pidPath(`gone-${signal}`);
+      const gpidFile = pidPath(`gone-${signal}-grandchild`);
+      const callLog = path.join(sandbox, `gone-calls-${process.hrtime.bigint()}.log`);
+      const bin = groupStandInBin({ target: { re: "^compose ps ", mode: "hang" } }, { pidFile, gpidFile, callLog });
+      const moduleUrl = new URL("../src/version-ledger-capture.mjs", import.meta.url).href;
+      const code = `const cb = await import(${JSON.stringify(LEAF_URL)});
+const m = await import(${JSON.stringify(moduleUrl)});
+cb.__setChildBoundsForTest(20000);
+m.defaultCapture("docker", ["compose", "ps", "--format", "json"], { cwd: ${JSON.stringify(sandbox)} });
+process.exit(0);`;
+      const caller = spawn(NODE, ["--input-type=module", "-e", code], {
+        env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}` },
+        stdio: "ignore",
+        detached: true,
+      });
+      const exited = new Promise((resolve) => caller.on("exit", (c, sig) => resolve(sig ?? c)));
+      try {
+        const t0 = Date.now();
+        while (!(readPid(pidFile) > 0 && readPid(gpidFile) > 0) && Date.now() - t0 < 15_000) await new Promise((r) => setTimeout(r, 50));
+        expect(readPid(gpidFile), "the child and grandchild started").toBeGreaterThan(0);
+        process.kill(caller.pid, signal);
+        expect(await exited, "the caller ended by the signal").toBe(signal);
+        expectGone(pidFile);
+        expectGone(gpidFile);
+      } finally {
+        killIfAlive(pidFile);
+        killIfAlive(gpidFile);
+        if (caller.exitCode === null && caller.signalCode === null) process.kill(caller.pid, "SIGKILL");
+      }
+    }, 30_000);
+  }
+
+  it("the watchdog starts nothing when its parent is not the caller it was given, and starts the command when it is", () => {
+    const refusedFile = pidPath("watchdog-refused");
+    const startedFile = pidPath("watchdog-started");
+    const writePid = "require('fs').writeFileSync(process.argv[1], String(process.pid))";
+    const opts = { encoding: "utf8", stdio: ["ignore", "pipe", "pipe", "pipe"], timeout: 15_000, killSignal: "SIGKILL" };
+    const refused = spawnSync(NODE, [WATCHDOG, String(process.ppid), NODE, "-e", writePid, refusedFile], opts);
+    expect(noteOf(refused), refused.stderr).toEqual({ error: { code: "ECALLERGONE" } });
+    expect(refused.status).toBe(1);
+    pause(300);
+    expect(readPid(refusedFile), "the command was never started").toBe(0);
+    const ran = spawnSync(NODE, [WATCHDOG, String(process.pid), NODE, "-e", writePid, startedFile], opts);
+    expect(ran.status, ran.stderr).toBe(0);
+    expect(noteOf(ran)).toEqual({ pid: readPid(startedFile) });
+  }, 30_000);
+});
+
+describe("child-bound: class result-is-the-command's the result under the watchdog reads as the command's own", () => {
+  it("stdout, stderr, the exit status and the pid are the command's", async () => {
+    const cb = await loadLeaf();
+    const body = "process.stdout.write(process.pid + '\\n' + 'x'.repeat(300000)); process.stderr.write('e'); process.exitCode = 3";
+    const r = cb.spawnBounded(spawnSync, NODE, ["-e", body], { encoding: "utf8" }, 15_000);
+    const [pidLine, rest] = r.stdout.split("\n");
+    expect({ status: r.status, signal: r.signal, error: r.error ?? null, stderr: r.stderr, rest: rest.length, outputs: r.output.length }).toEqual({
+      status: 3,
+      signal: null,
+      error: null,
+      stderr: "e",
+      rest: 300000,
+      outputs: 3,
+    });
+    expect(r.pid).toBe(Number(pidLine));
+  }, 30_000);
+
+  it("output a grandchild writes to the pipes after the command's exit is in the result, as spawnSync waits for them", async () => {
+    const cb = await loadLeaf();
+    const late = "setTimeout(() => process.stdout.write('late\\n'), 300)";
+    // unref: the command exits right after "first", while the grandchild still
+    // holds the pipes it inherited; only a wait for those pipes keeps "late".
+    const body = `require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(late)}], { stdio: ['ignore', 'inherit', 'inherit'] }).unref(); process.stdout.write('first\\n')`;
+    const r = cb.spawnBounded(spawnSync, NODE, ["-e", body], { encoding: "utf8" }, 15_000);
+    expect({ status: r.status, error: r.error ?? null, stdout: r.stdout }).toEqual({ status: 0, error: null, stdout: "first\nlate\n" });
+  }, 30_000);
+
+  it("a command that cannot be started is a spawn error with its code and no status", async () => {
+    const cb = await loadLeaf();
+    const missing = path.join(sandbox, "no-such-command");
+    const r = cb.spawnBounded(spawnSync, missing, ["x"], { encoding: "utf8" }, 15_000);
+    expect({ status: r.status, code: r.error?.code ?? null, path: r.error?.path ?? null }).toEqual({ status: null, code: "ENOENT", path: missing });
+  }, 30_000);
 });
