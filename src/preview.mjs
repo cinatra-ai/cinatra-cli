@@ -77,6 +77,7 @@ import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { siteBound, spawnBounded } from "./child-bound.mjs";
 
 // cinatra-cli#219 — the endpoint-ownership proof. Node-builtins-only and
 // dependency-free in the other direction (it never imports this module), so
@@ -1432,12 +1433,14 @@ function readAgainStep(slug, recordsNoId) {
   return `\`cinatra instance preview start --slug ${slug}${recordsNoId ? " --recreate" : ""}\``;
 }
 
+// Only an omitted `timeoutMs` takes the probe bound; any other value goes
+// through `siteBound`, which throws CHILD_BOUND_INVALID before the spawn
+// when it is not a usable bound (`0`, `null`, `NaN`).
 function runSpawn(cmd, args, { timeoutMs, stdio } = {}) {
-  const res = spawnSync(cmd, args, {
+  const res = spawnBounded(spawnSync, cmd, args, {
     encoding: "utf8",
     stdio: stdio ?? ["ignore", "pipe", "pipe"],
-    timeout: timeoutMs ?? DOCKER_CLI_PROBE_TIMEOUT_MS,
-  });
+  }, siteBound(timeoutMs === undefined ? DOCKER_CLI_PROBE_TIMEOUT_MS : timeoutMs));
   return {
     status: res.status,
     stdout: outputText(res, "stdout"),

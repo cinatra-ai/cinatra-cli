@@ -34,6 +34,7 @@
 
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { childResultRefused, siteBound, spawnBounded } from "./child-bound.mjs";
 
 import {
   beginMigration,
@@ -61,8 +62,8 @@ export function dockerVolumeIdentity(volumeName, run = defaultDockerRun) {
 
 function defaultDockerRun(args) {
   try {
-    const r = spawnSync("docker", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 15_000 });
-    if (r.status !== 0) return null;
+    const r = spawnBounded(spawnSync, "docker", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }, siteBound(15_000));
+    if (childResultRefused(r) || r.status !== 0) return null;
     return (r.stdout ?? "").trim();
   } catch {
     return null;
