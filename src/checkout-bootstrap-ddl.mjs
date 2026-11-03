@@ -56,12 +56,30 @@
 //     chain a half-bootstrapped schema.
 
 import { createRequire } from "node:module";
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { childResultRefused, childTimedOut, childTimeoutError, siteBound, spawnBounded } from "./child-bound.mjs";
+
 const ENTRY_BASENAME = "checkout-bootstrap-ddl-entry.mjs";
+
+/** The bound of the DDL run, counted from its spawn. */
+export const CHECKOUT_DDL_TIMEOUT_MS = 15 * 60_000;
+
+/** The default DDL run: bounded from its spawn, and judged by its exit status.
+ *  Throws the named failure (code CHILD_TIMEOUT) when the bound expires, and a
+ *  reason for a spawn error, a signal or a non-zero exit. */
+export function runCheckoutDdlChild(cmd, args, options) {
+  const timeoutMs = siteBound(CHECKOUT_DDL_TIMEOUT_MS);
+  const r = spawnBounded(spawnSync, cmd, args, options, timeoutMs);
+  if (childTimedOut(r)) throw childTimeoutError(cmd, args, timeoutMs);
+  if (r.error) throw r.error;
+  const name = path.basename(String(cmd));
+  if (childResultRefused(r)) throw new Error(`${name} was killed by ${r.signal ?? "a signal"}`);
+  if (r.status !== 0) throw new Error(`${name} exited ${r.status}`);
+}
 
 /** `<repoRoot>/src/lib/drizzle-store.ts`, or null when the checkout does not
  *  carry the TS source (baked standalone runtime image). */
@@ -113,11 +131,7 @@ export function applyCheckoutBootstrapDdl({
   warn = console.warn,
   deps = {},
 }) {
-  const run =
-    deps.run ??
-    ((cmd, args, options) => {
-      execFileSync(cmd, args, options);
-    });
+  const run = deps.run ?? runCheckoutDdlChild;
   const ddlEnv = {
     ...process.env,
     SUPABASE_DB_URL: connectionString,

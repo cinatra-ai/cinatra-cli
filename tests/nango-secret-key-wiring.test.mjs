@@ -36,6 +36,8 @@ vi.mock("node:child_process", () => ({
 }));
 
 const { bringUpInfra } = await import("../src/install.mjs");
+const { ensureNangoSecretKey } = await import("../src/nango-secret-key.mjs");
+const { waitForWayflowHealth } = await import("../src/wayflow-runtime.mjs");
 
 /** What each recorded call was, as a coarse step name, in order. */
 function steps() {
@@ -55,7 +57,15 @@ describe("bringUpInfra reconciles NANGO_SECRET_KEY after Nango is healthy", () =
   let envPath;
   let logged;
   const log = (line) => logged.push(String(line));
-  const deps = { assertRecreateSafe: () => {} };
+  // The reconcile's backoff and the Wayflow health wait pause in-process
+  // (cinatra-cli#306), which the child_process mock cannot shorten: the real
+  // functions run here with their sleep seams empty, so their attempts take no
+  // wall time (the Wayflow wait alone is 60 attempts with 3 s pauses).
+  const deps = {
+    assertRecreateSafe: () => {},
+    ensureNangoSecretKey: (args) => ensureNangoSecretKey({ ...args, sleep: () => {} }),
+    waitForWayflowHealth: (args) => waitForWayflowHealth({ ...args, sleepImpl: () => {} }),
+  };
 
   beforeEach(() => {
     procControl.calls = [];

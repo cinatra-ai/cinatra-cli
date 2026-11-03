@@ -483,6 +483,57 @@ describe("T2 ensureDevTwentyCrm — reuse-first by name", () => {
     expect(lines2.join("\n")).toMatch(/WARNING.*did not answer/);
   });
 
+  it("cinatra-cli#306 T2: an `up` with no exit status is a named failure, whatever compose printed", async () => {
+    const { ensureDevTwentyCrm } = await twenty();
+    const unread = [
+      // A timed-out `up` that printed compose's unhealthy-dependency text first.
+      {
+        status: null,
+        stderr: "dependency failed to start: container cinatra-twenty-1 is unhealthy",
+        reason: "`docker compose` did not finish within 60 min; it was stopped.",
+      },
+      // A signalled `up` (no reason given by the seam).
+      { status: null, stderr: "dependency failed to start: container cinatra-twenty-1 is unhealthy" },
+    ];
+    for (const result of unread) {
+      const dir = makeTwentyCheckout(path.join(sandbox, `t2-unread-${Math.random().toString(36).slice(2)}`));
+      const { docker, calls } = fakeDocker({ upResults: [result, { status: 0, stderr: "" }] });
+      const { deps } = ensureDeps({ docker });
+      const lines = [];
+      await expect(ensureDevTwentyCrm({ targetDir: dir, mode: "dev", log: (l) => lines.push(String(l)), deps })).rejects.toThrow(
+        result.reason
+          ? "Twenty CRM: docker compose -p cinatra-dev-twenty up -d did not finish with an exit status (`docker compose` did not finish within 60 min; it was stopped.)."
+          : "Twenty CRM: docker compose -p cinatra-dev-twenty up -d did not finish with an exit status.",
+      );
+      // Never the health road: no warning, no second `up`.
+      expect(calls.filter((c) => c[0] === "compose")).toHaveLength(1);
+      expect(lines.join("\n")).not.toMatch(/did not report healthy/);
+    }
+  });
+
+  it("cinatra-cli#306 T2: a failed second `up` after the server answered is a named failure, never a healthy result", async () => {
+    const { ensureDevTwentyCrm } = await twenty();
+    const unhealthy = { status: 1, stderr: "dependency failed to start: container cinatra-twenty-1 is unhealthy" };
+    const retries = [
+      [{ status: 1, stderr: "worker failed to start" }, "Twenty CRM: docker compose -p cinatra-dev-twenty up -d failed after the server answered (exit 1).\nworker failed to start"],
+      [
+        { status: null, stderr: "", reason: "`docker compose` did not finish within 60 min; it was stopped." },
+        "Twenty CRM: docker compose -p cinatra-dev-twenty up -d after the server answered did not finish with an exit status (`docker compose` did not finish within 60 min; it was stopped.).",
+      ],
+      [{ status: null, stderr: "" }, "Twenty CRM: docker compose -p cinatra-dev-twenty up -d after the server answered did not finish with an exit status."],
+    ];
+    for (const [retry, message] of retries) {
+      const dir = makeTwentyCheckout(path.join(sandbox, `t2-retry-${Math.random().toString(36).slice(2)}`));
+      const { docker, calls } = fakeDocker({ viewNames: presence, upResults: [unhealthy, retry] });
+      const { deps } = ensureDeps({ docker });
+      const lines = [];
+      await expect(ensureDevTwentyCrm({ targetDir: dir, mode: "dev", log: (l) => lines.push(String(l)), deps })).rejects.toThrow(message);
+      // Both `up` calls ran; the failure is thrown before the endpoint line.
+      expect(calls.filter((c) => c[0] === "compose")).toHaveLength(2);
+      expect(lines.join("\n")).not.toMatch(/shared by every instance on this machine/);
+    }
+  });
+
   it("T2: a checkout whose compose file does not name the Twenty stack -> the named skip line and not one docker call", async () => {
     const { ensureDevTwentyCrm } = await twenty();
     const dir = path.join(sandbox, "t2-older-checkout");

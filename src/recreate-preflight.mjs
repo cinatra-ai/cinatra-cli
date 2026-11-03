@@ -51,6 +51,7 @@
 // ---------------------------------------------------------------------------
 
 import { spawnSync } from "node:child_process";
+import { checkedBound, childResultRefused, siteBound, spawnBounded } from "./child-bound.mjs";
 
 import { makeMarkerReader, makeProbeVersion, PG_MARKER_READ_MOUNT } from "./pg-adapters.mjs";
 import { DEFAULT_UPGRADE_MATRIX, imageParts, serviceRunbookUrl } from "./upgrade-matrix.mjs";
@@ -153,17 +154,18 @@ export function assertRecreateSafe({
 // --- docker-backed default (production seams) ------------------------------
 
 /** Best-effort docker capture: trimmed stdout on exit 0, else null (so callers
- *  distinguish "empty output" from "failed"). Never throws. */
-function makeDockerCapture(spawn) {
-  return (args, opts = {}) => {
+ *  distinguish "empty output" from "failed"). Never throws. Exported for the
+ *  `upgrade-preflight` command in index.mjs, which reads its deployment with
+ *  this same capture. */
+export function makeDockerCapture(spawn) {
+  return (args, { timeoutMs = siteBound(DOCKER_CLI_PROBE_TIMEOUT_MS), ...opts } = {}) => {
     try {
-      const r = spawn("docker", args, {
+      const r = spawnBounded(spawn, "docker", args, {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
         ...opts,
-      });
-      if (r.status !== 0) return null;
+      }, checkedBound(timeoutMs));
+      if (childResultRefused(r) || r.status !== 0) return null;
       return (r.stdout ?? "").trim();
     } catch {
       return null;
@@ -171,17 +173,39 @@ function makeDockerCapture(spawn) {
   };
 }
 
+/** The two volume-inspect seams of a preflight transport over one three-way
+ *  reader: `inspectVolume` (the row, or null) and `inspectVolumeStatus` (the
+ *  three-way answer). `recheckVolumeStability` (upgrade-preflight.mjs) prefers
+ *  the second, so a failed final inspect is never read as "absent". Exported
+ *  for the `upgrade-preflight` command in index.mjs, whose transport takes
+ *  both, as this module's own does. */
+export function makeVolumeInspectSeams(inspectVolumeThreeWay) {
+  return {
+    inspectVolume: (name) => {
+      if (!name) return null;
+      const res = inspectVolumeThreeWay(name);
+      return res.status === "ok" ? res.row : null;
+    },
+    inspectVolumeStatus: (name) => (name ? inspectVolumeThreeWay(name) : { status: "absent", row: null }),
+  };
+}
+
 /** `docker volume inspect` with an explicit three-way outcome: only docker's own
  *  "no such volume" is ABSENT; any other failure is an ERROR (treated fail-closed
- *  as "present", never as an empty/fresh volume). Mirrors index.mjs's reader. */
-function makeInspectVolumeThreeWay(spawn) {
+ *  as "present", never as an empty/fresh volume). Exported for the
+ *  `upgrade-preflight` command in index.mjs, which reads volumes with this same
+ *  reader, so `upgrade-preflight.mjs` passes an "absent" volume only on
+ *  docker's own exit 1. */
+export function makeInspectVolumeThreeWay(spawn) {
   return (name) => {
     try {
-      const r = spawn("docker", ["volume", "inspect", name], {
+      const r = spawnBounded(spawn, "docker", ["volume", "inspect", name], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
-      });
+      }, siteBound(DOCKER_CLI_PROBE_TIMEOUT_MS));
+      // A timed-out, signalled or failed spawn says nothing: neither its
+      // status nor its text is read, so it is never "absent".
+      if (childResultRefused(r)) return { status: "error", row: null };
       if (r.status === 0) {
         try {
           const parsed = JSON.parse((r.stdout ?? "").trim());
@@ -191,7 +215,8 @@ function makeInspectVolumeThreeWay(spawn) {
           return { status: "error", row: null };
         }
       }
-      if (/no such volume/i.test(`${r.stderr ?? ""}${r.stdout ?? ""}`)) return { status: "absent", row: null };
+      // Absent only from docker's own answer: exit 1 with "no such volume".
+      if (r.status === 1 && /no such volume/i.test(`${r.stderr ?? ""}${r.stdout ?? ""}`)) return { status: "absent", row: null };
       return { status: "error", row: null };
     } catch {
       return { status: "error", row: null };
@@ -348,7 +373,7 @@ export function buildDeploymentPreflight({
     if (before.status !== "ok") return null;
     const out = capture(
       ["run", "--rm", "--pull=never", "--entrypoint", "/bin/sh", "-v", `${volumeName}:${PG_MARKER_READ_MOUNT}:ro`, image, "-c", program],
-      { timeout: DOCKER_VOLUME_READ_TIMEOUT_MS },
+      { timeoutMs: siteBound(DOCKER_VOLUME_READ_TIMEOUT_MS) },
     );
     const after = inspectVolumeThreeWay(volumeName);
     const beforeId = volumeIdentityFromInspect(before.row);
@@ -358,15 +383,11 @@ export function buildDeploymentPreflight({
   };
 
   const transport = {
-    inspectVolume: (name) => {
-      if (!name) return null;
-      const res = inspectVolumeThreeWay(name);
-      return res.status === "ok" ? res.row : null;
-    },
-    // Three-way status seam (cinatra-cli#140): the preflight's post-probe recheck
-    // uses this so an inspect ERROR is never collapsed to "absent" (a failed
-    // recheck cannot confirm the volume stayed absent → fail closed).
-    inspectVolumeStatus: (name) => (name ? inspectVolumeThreeWay(name) : { status: "absent", row: null }),
+    // `inspectVolume`, and the three-way status seam (cinatra-cli#140): the
+    // preflight's post-probe recheck uses `inspectVolumeStatus` so an inspect
+    // ERROR is never collapsed to "absent" (a failed recheck cannot confirm the
+    // volume stayed absent → fail closed).
+    ...makeVolumeInspectSeams(inspectVolumeThreeWay),
     volumeState: (name) => {
       if (!name) return "absent";
       const res = inspectVolumeThreeWay(name);
@@ -383,7 +404,7 @@ export function buildDeploymentPreflight({
       // trusting a possibly-recreated volume's "empty".
       const listing = capture(
         ["run", "--rm", "--pull=never", "--entrypoint", "/bin/sh", "-v", `${name}:/__preflight_probe:ro`, image, "-c", "ls -A /__preflight_probe"],
-        { timeout: DOCKER_VOLUME_READ_TIMEOUT_MS },
+        { timeoutMs: siteBound(DOCKER_VOLUME_READ_TIMEOUT_MS) },
       );
       const after = inspectVolumeThreeWay(name);
       const beforeId = volumeIdentityFromInspect(res.row);

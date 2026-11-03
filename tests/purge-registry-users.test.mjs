@@ -623,6 +623,29 @@ describe("createComposeRegistryTransport", () => {
     expect(recorder.seen[0].options.cwd).toBe("/repo");
   });
 
+  it("cinatra-cli#306: every call is bounded from its spawn and stopped by SIGKILL", () => {
+    const recorder = recordingSpawn();
+    const transport = createComposeRegistryTransport("/repo", { spawn: recorder.spawn });
+    transport.exec({ command: "printf ready" });
+    transport.restart();
+    expect(recorder.seen.map((c) => [c.options.timeout, c.options.killSignal])).toEqual([
+      [120_000, "SIGKILL"],
+      [120_000, "SIGKILL"],
+    ]);
+  });
+
+  it("cinatra-cli#306: a signal or an expired bound is no exit status, whatever status the spawn reports", () => {
+    const unread = [
+      { status: 0, signal: "SIGKILL", stdout: "out", stderr: "" },
+      { status: 0, error: Object.assign(new Error("spawnSync docker ETIMEDOUT"), { code: "ETIMEDOUT" }), stdout: "out", stderr: "" },
+    ];
+    for (const result of unread) {
+      const transport = createComposeRegistryTransport("/repo", { spawn: () => result });
+      expect(transport.exec({ command: "printf ready" }).status).toBeNull();
+      expect(transport.restart().status).toBeNull();
+    }
+  });
+
   it("reports a spawn error as a null status rather than throwing", () => {
     const transport = createComposeRegistryTransport("/repo", {
       spawn: () => ({ error: new Error("ENOENT"), status: null }),

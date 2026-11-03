@@ -100,6 +100,7 @@
 
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { boundFor, childResultRefused, spawnBounded } from "./child-bound.mjs";
 
 /** Compose service that runs the bundled local registry. */
 export const VERDACCIO_COMPOSE_SERVICE = "verdaccio";
@@ -295,15 +296,19 @@ export function filterHtpasswdEntries(contents, namespaces) {
  * itself whether a non-zero status is fatal (none of them are).
  */
 export function createComposeRegistryTransport(repoRoot, { spawn = spawnSync } = {}) {
+  // Each call is bounded from its spawn (the compose class, 2 min). A timeout,
+  // a signal or a spawn error is no exit status: `status` is null, which every
+  // caller already reads as a failed call.
   const call = (args, input) => {
-    const result = spawn("docker", args, {
-      cwd: repoRoot,
-      input: input ?? "",
-      encoding: "utf8",
-      env: process.env,
-    });
+    const result = spawnBounded(
+      spawn,
+      "docker",
+      args,
+      { cwd: repoRoot, input: input ?? "", encoding: "utf8", env: process.env },
+      boundFor("compose"),
+    );
     return {
-      status: result?.error ? null : (result?.status ?? null),
+      status: childResultRefused(result) ? null : result.status,
       stdout: result?.stdout ?? "",
       stderr: result?.stderr ?? "",
     };

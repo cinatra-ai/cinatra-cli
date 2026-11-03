@@ -21,6 +21,7 @@
 
 import path from "node:path";
 import { spawnSync as nodeSpawnSync } from "node:child_process";
+import { boundFor, childResultRefused, childTimedOut, childTimeoutError, pauseSync, siteBound, spawnBounded } from "./child-bound.mjs";
 import { existsSync as nodeExistsSync, readFileSync as nodeReadFileSync } from "node:fs";
 
 /** The compose service name AND the compose profile that gates it. */
@@ -29,8 +30,9 @@ export const WAYFLOW_PROFILE = "wayflow";
 
 /** WayFlow's DEFAULT published host port — where an install that allocated no
  *  band (the default plan) reaches its runtime. Mirrors instance-alloc.mjs
- *  DEFAULT_WAYFLOW_PORT; this module stays import-light (node builtins only) by
- *  design, so the value is restated rather than imported. */
+ *  DEFAULT_WAYFLOW_PORT; this module stays import-light (node builtins, plus
+ *  the builtins-only child-bound.mjs) by design, so the value is restated
+ *  rather than imported. */
 export const DEFAULT_WAYFLOW_PORT = 3010;
 
 /** The `.env.local` key that records what THIS install decided about the
@@ -241,6 +243,9 @@ export function wayflowEndpointForPorts(ports) {
  *
  * @returns {{ ok: boolean, skipped: boolean, reason: string|null }}
  */
+/** The bound of the bridge-token env generator, counted from its spawn. */
+export const WAYFLOW_ENV_GENERATE_TIMEOUT_MS = 2 * 60_000;
+
 export function generateWayflowEnv({
   targetDir,
   log = console.log,
@@ -286,16 +291,24 @@ export function generateWayflowEnv({
     return { ok: true, skipped: true, reason: "generator-absent" };
   }
   log("  Provisioning the WayFlow bridge-token env (docker/wayflow/.wayflow.env)…");
-  const result = spawnImpl(execPath, [generator, "--require-bridge-token"], {
-    cwd: targetDir,
-    stdio: ["ignore", "inherit", "inherit"],
-  });
-  const status = result?.error ? 1 : (result?.status ?? 1);
+  const generatorArgs = [generator, "--require-bridge-token"];
+  const timeoutMs = siteBound(WAYFLOW_ENV_GENERATE_TIMEOUT_MS);
+  const result = spawnBounded(spawnImpl, execPath, generatorArgs, { cwd: targetDir, stdio: ["ignore", "inherit", "inherit"] }, timeoutMs);
+  if (childTimedOut(result)) {
+    return {
+      ok: false,
+      skipped: false,
+      reason: `gen-wayflow-env.mjs failed (${childTimeoutError(execPath, generatorArgs, timeoutMs).message})`,
+    };
+  }
+  const status = childResultRefused(result) ? 1 : result.status;
   if (status !== 0) {
     return {
       ok: false,
       skipped: false,
-      reason: `gen-wayflow-env.mjs failed (exit ${status})${result?.error ? `: ${result.error.message}` : ""}`,
+      reason:
+        `gen-wayflow-env.mjs failed (exit ${status})${result?.error ? `: ${result.error.message}` : ""}` +
+        `${result?.signal ? ` (killed by ${result.signal})` : ""}`,
     };
   }
   const bad = judge("gen-wayflow-env.mjs exited 0");
@@ -334,14 +347,21 @@ export function buildWayflowImage({
 } = {}) {
   const args = [...composeArgs, "build", WAYFLOW_SERVICE];
   log("  Building the WayFlow agent-runtime image (first build is slow; later runs hit the layer cache)…");
-  const result = spawnImpl("docker", args, {
-    cwd: targetDir,
-    env: process.env,
-    encoding: "utf8",
-    stdio: ["ignore", "inherit", "pipe"],
-  });
-  const stderr = String(result?.stderr ?? "").trim();
-  const status = result?.error ? 1 : (result?.status ?? 1);
+  // Bounded from its spawn by the step class (60 min, as every long install
+  // step with inherited output); an expired bound is named in `stderr`.
+  const timeoutMs = boundFor("step");
+  const result = spawnBounded(
+    spawnImpl,
+    "docker",
+    args,
+    { cwd: targetDir, env: process.env, encoding: "utf8", stdio: ["ignore", "inherit", "pipe"] },
+    timeoutMs,
+  );
+  const timedOut = childTimedOut(result);
+  const stderr = [String(result?.stderr ?? "").trim(), timedOut ? childTimeoutError("docker", args, timeoutMs).message : ""]
+    .filter(Boolean)
+    .join("\n");
+  const status = childResultRefused(result) ? 1 : result.status;
   if (status !== 0 && stderr) process.stderr.write(`${stderr}\n`);
   return { ok: status === 0, stderr, status };
 }
@@ -378,10 +398,16 @@ export function waitForWayflowHealth({
   sleepImpl = null,
 } = {}) {
   if (!project) return { healthy: false, state: null };
-  const sleep = sleepImpl ?? ((ms) => spawnImpl("sleep", [String(Math.max(1, Math.round(ms / 1000)))]));
+  // The pause between probes is `pauseSync` (child-bound.mjs), in whole
+  // seconds, kept in this thread with no child: it never ends early.
+  const sleep = sleepImpl ?? ((ms) => pauseSync(Math.max(1, Math.round(ms / 1000))));
   let state = null;
   for (let i = 0; i < attempts; i += 1) {
-    const result = spawnImpl(
+    // Each probe is bounded from its spawn (the probe class, 15 s), and its
+    // line is read only after `docker ps` exits 0: a failed, timed-out or
+    // signalled probe is no state, and the next attempt asks again.
+    const result = spawnBounded(
+      spawnImpl,
       "docker",
       [
         "ps",
@@ -393,8 +419,13 @@ export function waitForWayflowHealth({
         "{{.Status}}",
       ],
       { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+      boundFor("probe"),
     );
-    const status = String(result?.stdout ?? "").trim().split("\n")[0]?.trim() ?? "";
+    if (childResultRefused(result) || result.status !== 0) {
+      sleep(intervalMs);
+      continue;
+    }
+    const status = String(result.stdout ?? "").trim().split("\n")[0]?.trim() ?? "";
     if (status) state = status;
     if (/\(healthy\)/i.test(status)) return { healthy: true, state: status };
     sleep(intervalMs);

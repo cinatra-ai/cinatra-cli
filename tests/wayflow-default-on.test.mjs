@@ -422,7 +422,7 @@ describe("waitForWayflowHealth", () => {
       sleepImpl: () => {},
       spawnImpl: () => {
         n += 1;
-        return { stdout: n < 3 ? "Up 2 seconds (health: starting)" : "Up 30 seconds (healthy)" };
+        return { status: 0, stdout: n < 3 ? "Up 2 seconds (health: starting)" : "Up 30 seconds (healthy)" };
       },
     });
     expect(res.healthy).toBe(true);
@@ -434,10 +434,37 @@ describe("waitForWayflowHealth", () => {
       project: "cinatra_demo",
       attempts: 2,
       sleepImpl: () => {},
-      spawnImpl: () => ({ stdout: "Up 5 seconds (health: starting)" }),
+      spawnImpl: () => ({ status: 0, stdout: "Up 5 seconds (health: starting)" }),
     });
     expect(res.healthy).toBe(false);
     expect(res.state).toContain("health: starting");
+  });
+
+  it("cinatra-cli#306: a `docker ps` line is read only after exit 0; a failed, signalled or unbounded probe is no state", () => {
+    const answers = [
+      { status: 1, stdout: "Up 30 seconds (healthy)" },
+      { status: null, signal: "SIGKILL", stdout: "Up 30 seconds (healthy)" },
+      { status: 0, error: Object.assign(new Error("spawnSync docker ETIMEDOUT"), { code: "ETIMEDOUT" }), stdout: "Up 30 seconds (healthy)" },
+      { stdout: "Up 30 seconds (healthy)" },
+    ];
+    for (const answer of answers) {
+      const seen = [];
+      const res = waitForWayflowHealth({
+        project: "cinatra_probe",
+        attempts: 2,
+        sleepImpl: () => {},
+        spawnImpl: (cmd, args, opts) => {
+          seen.push(opts);
+          return answer;
+        },
+      });
+      expect(res, JSON.stringify(answer)).toEqual({ healthy: false, state: null });
+      // Each probe carries its bound and is stopped by SIGKILL.
+      expect(seen.map((o) => [o.timeout, o.killSignal])).toEqual([
+        [15_000, "SIGKILL"],
+        [15_000, "SIGKILL"],
+      ]);
+    }
   });
 
   it("without a known project there is nothing to wait on", () => {

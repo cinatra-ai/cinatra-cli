@@ -39,7 +39,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { boundFor, readChild } from "./child-bound.mjs";
 
 import {
   CLONE_NEXTJS_PORT_BASE,
@@ -194,18 +194,20 @@ const CLONE_DEV_PROC_RE =
 export function processCommandLineMatches(pid, { cwdMustEqual } = {}) {
   if (!isPidAlive(pid)) return { alive: false };
 
-  let cmd = "";
-  try {
-    cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-  } catch {
+  // Each lookup is bounded from its spawn (the read class) and read only after
+  // exit 0; a lookup that outlives its bound is indeterminate, named by it.
+  const ps = readChild("ps", ["-p", String(pid), "-o", "command="], {
+    timeoutMs: boundFor("read"),
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (!ps.ok) {
     // Could not VERIFY (vs. a positive mismatch) — caller must decide
     // whether to fail closed (e.g. destructive prune) on an unverified
     // live pid.
-    return { alive: true, ours: false, indeterminate: true, why: "ps failed (likely permission)" };
+    const why = ps.code === "CHILD_TIMEOUT" ? `ps failed (${ps.reason})` : "ps failed (likely permission)";
+    return { alive: true, ours: false, indeterminate: true, why };
   }
+  const cmd = ps.stdout.trim();
 
   // The process is "ours" by command line ONLY if it is the spawned
   // dev-runner wrapper / Next.js process per the narrow CLONE_DEV_PROC_RE.
@@ -230,10 +232,15 @@ export function processCommandLineMatches(pid, { cwdMustEqual } = {}) {
         // grabbed the first system process's path (typically `/`), so the
         // cwd guard silently never matched on macOS. With `-a -p <pid>` the
         // output is a single `p<pid>` / `fcwd` / `n<path>` block.
-        const out = execFileSync("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
-          encoding: "utf8",
+        const lsof = readChild("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
+          timeoutMs: boundFor("read"),
           stdio: ["ignore", "pipe", "ignore"],
         });
+        if (!lsof.ok) {
+          const why = lsof.code === "CHILD_TIMEOUT" ? `cwd lookup failed (${lsof.reason})` : "cwd lookup failed";
+          return { alive: true, ours: false, indeterminate: true, why };
+        }
+        const out = lsof.stdout;
         // lsof -Fn emits the cwd as an "n<path>" line. Anchor to the n line
         // that follows this pid's record so a multi-line dump can't mislead.
         const match = out.split("\n").find((line) => line.startsWith("n"));

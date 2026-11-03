@@ -1,5 +1,6 @@
 import path from "node:path";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { boundFor, childResultRefused, childTimedOut, childTimeoutError, spawnBounded } from "./child-bound.mjs";
 
 // ---------------------------------------------------------------------------
 // cinatra-cli#233 — mount the agent sources the WayFlow runtime was started
@@ -195,12 +196,16 @@ export function publishedWayflowEndpoint({ targetDir, composeArgs = null, deps =
   if (typeof spawn !== "function") return null;
   if (!Array.isArray(composeArgs) || composeArgs.length === 0) return null;
   try {
-    const result = spawn("docker", [...composeArgs, "port", WAYFLOW_SERVICE_NAME, String(WAYFLOW_CONTAINER_PORT)], {
-      cwd: targetDir,
-      stdio: ["ignore", "pipe", "pipe"],
-      encoding: "utf8",
-    });
-    if (result?.status !== 0) return null;
+    // Bounded from its spawn (the probe class); the address is read only after
+    // exit 0, and a timeout, a signal or a spawn error is no answer.
+    const result = spawnBounded(
+      spawn,
+      "docker",
+      [...composeArgs, "port", WAYFLOW_SERVICE_NAME, String(WAYFLOW_CONTAINER_PORT)],
+      { cwd: targetDir, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" },
+      boundFor("probe"),
+    );
+    if (childResultRefused(result) || result.status !== 0) return null;
     return endpointFromPublishedAddress(result.stdout);
   } catch {
     return null;
@@ -405,13 +410,13 @@ export function restartWayflowService({ targetDir, composeArgs = null, deps = {}
   if (typeof spawn !== "function") return { ok: false, reason: "no-spawn" };
   if (!Array.isArray(composeArgs) || composeArgs.length === 0) return { ok: false, reason: "no-compose-context" };
   try {
-    const result = spawn("docker", [...composeArgs, "restart", WAYFLOW_SERVICE_NAME], {
-      cwd: targetDir,
-      stdio: ["ignore", "pipe", "pipe"],
-      encoding: "utf8",
-    });
-    if (result?.status === 0) return { ok: true, reason: null };
-    return { ok: false, reason: `restart-exit-${result?.status ?? "null"}` };
+    // Bounded from its spawn (the compose class); an expired bound is named.
+    const restartArgs = [...composeArgs, "restart", WAYFLOW_SERVICE_NAME];
+    const timeoutMs = boundFor("compose");
+    const result = spawnBounded(spawn, "docker", restartArgs, { cwd: targetDir, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" }, timeoutMs);
+    if (childTimedOut(result)) return { ok: false, reason: `restart-timeout (${childTimeoutError("docker", restartArgs, timeoutMs).message})` };
+    if (!childResultRefused(result) && result.status === 0) return { ok: true, reason: null };
+    return { ok: false, reason: `restart-exit-${childResultRefused(result) ? "null" : result.status}` };
   } catch (err) {
     return { ok: false, reason: `restart-failed (${err?.message ?? err})` };
   }
