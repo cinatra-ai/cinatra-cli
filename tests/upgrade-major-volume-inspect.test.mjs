@@ -45,6 +45,7 @@ const FAILED = {
   "an exit 0 with text that is not JSON": answer({ stdout: "not json" }),
   "an exit 0 with JSON null": answer({ stdout: "null" }),
   "an exit 0 whose row is not an object": answer({ stdout: "[5]" }),
+  "an exit 0 whose row is an array": answer({ stdout: JSON.stringify([[ROW]]) }),
   "no answer object from spawn": undefined,
 };
 
@@ -92,6 +93,16 @@ describe("cinatra-cli#324: the upgrade-major volume reader is three-way", () => 
   it("cinatra-cli#324 reads docker's own exit 1 with no such volume as absent", () => {
     const { spawn } = spawnOf([ABSENT]);
     expect(makeUpgradeMajorInspectVolume(spawn, 15_000)(VOL)).toEqual({ status: "absent", row: null });
+  });
+
+  it("cinatra-cli#324 reads docker's exit 1 as absent in either case and on either stream", () => {
+    for (const r of [
+      answer({ status: 1, stderr: `Error: No such volume: ${VOL}\n` }),
+      answer({ status: 1, stdout: `Error response from daemon: get ${VOL}: no such volume\n` }),
+    ]) {
+      const { spawn } = spawnOf([r]);
+      expect(makeUpgradeMajorInspectVolume(spawn, 15_000)(VOL)).toEqual({ status: "absent", row: null });
+    }
   });
 
   for (const [what, r] of Object.entries(FAILED)) {
@@ -206,6 +217,15 @@ describe("cinatra-cli#324: the detection step upgrade-major runs refuses a faile
     });
   }
 
+  for (const what of ["a timeout", "a signal", "a non-zero exit with other text"]) {
+    it(`cinatra-cli#324 detection: a probed version on a volume first inspected whose final inspect gives ${what} fails closed`, () => {
+      const { transport, calls } = transportOf([OK, OK, FAILED[what]], "15");
+      const rep = detectProbed(transport);
+      expect(calls).toHaveLength(3);
+      expect(rep.results[0].verdict).toBe(VERDICTS.FAIL_CLOSED);
+    });
+  }
+
   it("cinatra-cli#324 control: a probed version on an inspected volume is the supported STOP", () => {
     const { transport, calls } = transportOf([OK, OK, OK], "15");
     const rep = detectProbed(transport);
@@ -242,5 +262,7 @@ describe("cinatra-cli#324: `instance db upgrade-major` builds its transport from
     expect(transportText, "the transport is found").not.toBe("");
     expect(transportText).toMatch(/\n    \.\.\.makeUpgradeMajorVolumeSeams\(inspectVolumeThreeWay, /);
     expect(transportText).not.toMatch(/\n    (inspectVolume|inspectVolumeStatus|volumeState):/);
+    // The listing: the volume's own image, read only, or null (a present volume) when no image is known.
+    expect(transportText).toMatch(/const image = volumeImages\.get\(name\);\n      return image \? dockerReadVolume\(name, image, "ls -A \/__cinatra_pgver 2>\/dev\/null"\) : null;/);
   });
 });
