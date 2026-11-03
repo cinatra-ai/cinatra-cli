@@ -95,7 +95,7 @@
 
 import process from "node:process";
 import { spawnSync } from "node:child_process";
-import { childResultRefused, pauseBounded, siteBound, spawnBounded } from "./child-bound.mjs";
+import { childResultRefused, pauseSync, siteBound, spawnBounded } from "./child-bound.mjs";
 import { chmodSync, existsSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 
 /** The env var the app reads, and the only key this module ever writes. */
@@ -209,10 +209,10 @@ export function nangoSecretKeyQueries(environmentName) {
 }
 
 /** Bounded sync backoff, matching how the sibling bring-up waits do it:
- *  `pauseBounded` (child-bound.mjs), which never ends early, whatever its
- *  `sleep` child answers. */
+ *  `pauseSync` (child-bound.mjs), kept in this thread with no child, so it
+ *  never ends early. */
 function sleepSeconds(seconds) {
-  pauseBounded(spawnSync, seconds);
+  pauseSync(seconds);
 }
 
 /**

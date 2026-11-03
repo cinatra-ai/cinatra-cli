@@ -17,7 +17,7 @@ import net from "node:net";
 import { resolveTeardownNames } from "./teardown-config.mjs";
 // The bounded child waits (cinatra-cli#306): node built-ins only, so the static
 // import keeps the lean startup.
-import { boundFor, childResultRefused, childTimedOut, childTimeoutError, pauseBounded, readChild, siteBound, spawnBounded } from "./child-bound.mjs";
+import { boundFor, childResultRefused, childTimedOut, childTimeoutError, pauseSync, readChild, siteBound, spawnBounded } from "./child-bound.mjs";
 // What `--version` answers beside the SemVer: the commit this build came from,
 // whenever the installed package can prove one (cinatra-cli#271). Builtins-only
 // file reads — it stays inside the lean-startup contract.
@@ -2160,8 +2160,8 @@ function removePathIfExists(targetPath) {
 /** Poll a compose service's own readiness command until it exits 0. Each
  *  probe is bounded from its spawn (the probe class, 15 s): a probe that
  *  hangs, times out or dies by a signal is a failed attempt, never ready.
- *  The 1 s pause between attempts is `pauseBounded` (child-bound.mjs): it
- *  never ends early, whatever its `sleep` child answers. */
+ *  The 1 s pause between attempts is `pauseSync` (child-bound.mjs): kept in
+ *  this thread with no child, so it never ends early. */
 function waitForService(repoRoot, service, readyCommand, readyArgs, label, maxAttempts = 30) {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const result = spawnBounded(
@@ -2174,7 +2174,7 @@ function waitForService(repoRoot, service, readyCommand, readyArgs, label, maxAt
     if (!childResultRefused(result) && result.status === 0) {
       return;
     }
-    pauseBounded(spawnSync, 1);
+    pauseSync(1);
   }
   throw new Error(`${label} did not become ready within ${maxAttempts} seconds.`);
 }
@@ -2188,8 +2188,8 @@ function waitForRedis(repoRoot) {
 }
 
 /** Poll nango's health endpoint until curl exits 0. The 2 s pause between
- *  attempts is `pauseBounded` (child-bound.mjs): it never ends early, whatever
- *  its `sleep` child answers (cinatra-cli#306). */
+ *  attempts is `pauseSync` (child-bound.mjs): kept in this thread with no
+ *  child, so it never ends early (cinatra-cli#306). */
 function waitForNango(repoRoot, maxAttempts = 60) {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
@@ -2203,7 +2203,7 @@ function waitForNango(repoRoot, maxAttempts = 60) {
     } catch {
       // ignore
     }
-    pauseBounded(spawnSync, 2);
+    pauseSync(2);
   }
   throw new Error(`Nango server did not become ready within ${maxAttempts * 2} seconds.`);
 }

@@ -28,7 +28,9 @@
 // - `childResultRefused` is the first question of every status reader: a
 //   result with a spawn error, a timeout, a signal or no whole exit status is
 //   refused before its status or output is read.
-// - `sleepSync` waits in-process; nothing is spawned.
+// - `sleepSync` waits in-process; nothing is spawned. `pauseSync` is the pause
+//   between the attempts of a wait: whole seconds, kept on the monotonic clock
+//   in this thread, with no child.
 //
 // Each of the first six helpers is the install road's own declaration in
 // `install.mjs` with `export ` put before it; a test compares the two texts.
@@ -310,18 +312,21 @@ export function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, n);
 }
 
-/** One pause of `seconds` (rounded, at least 1) through a `sleep` child that
- *  `spawn` starts, bounded to its length plus 1 s. A pause is no read: nothing
- *  the child prints is taken. Only a clean exit 0 ends the pause there (`sleep`
- *  exits 0 only once its time is up); any other answer (a spawn error, a
- *  signal, a non-zero exit, an expired bound) is kept in this thread
- *  (`sleepSync`) for the time that is left. So a pause never ends early, and a
- *  `sleep` that hangs ends it at its bound, 1 s late. */
-export function pauseBounded(spawn, seconds) {
-  const s = Math.max(1, Math.round(Number(seconds) || 0));
-  const ms = s * 1_000;
-  const t0 = performance.now();
-  const r = spawnBounded(spawn, "sleep", [String(s)], { stdio: "ignore" }, siteBound(ms + 1_000));
-  if (!childResultRefused(r) && r.status === 0) return;
-  sleepSync(ms - (performance.now() - t0));
+/** The length of a pause in ms: `seconds` rounded to whole seconds, at least
+ *  1 (0, NaN or none is 1 s). A length of Infinity or -Infinity throws
+ *  CHILD_BOUND_INVALID. */
+export function pauseMs(seconds) {
+  const n = Number(seconds);
+  if (n === Number.POSITIVE_INFINITY || n === Number.NEGATIVE_INFINITY) return checkedBound(n);
+  return checkedBound(Math.max(1, Math.round(n || 0)) * 1_000);
+}
+
+/** One pause of `seconds` (see `pauseMs`) between the attempts of a wait. It
+ *  is kept in this thread (`sleepSync`) until the monotonic clock has passed
+ *  its whole length: no child is spawned, so no `sleep` found on PATH can end
+ *  it early, and no bound can expire. */
+export function pauseSync(seconds) {
+  const ms = pauseMs(seconds);
+  const end = performance.now() + ms;
+  for (let left = ms; left > 0; left = end - performance.now()) sleepSync(left);
 }

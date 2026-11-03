@@ -21,7 +21,7 @@
 
 import path from "node:path";
 import { spawnSync as nodeSpawnSync } from "node:child_process";
-import { boundFor, childResultRefused, childTimedOut, childTimeoutError, pauseBounded, siteBound, spawnBounded } from "./child-bound.mjs";
+import { boundFor, childResultRefused, childTimedOut, childTimeoutError, pauseSync, siteBound, spawnBounded } from "./child-bound.mjs";
 import { existsSync as nodeExistsSync, readFileSync as nodeReadFileSync } from "node:fs";
 
 /** The compose service name AND the compose profile that gates it. */
@@ -398,9 +398,9 @@ export function waitForWayflowHealth({
   sleepImpl = null,
 } = {}) {
   if (!project) return { healthy: false, state: null };
-  // The pause between probes is `pauseBounded` (child-bound.mjs), in whole
-  // seconds: it never ends early, whatever its `sleep` child answers.
-  const sleep = sleepImpl ?? ((ms) => pauseBounded(spawnImpl, Math.max(1, Math.round(ms / 1000))));
+  // The pause between probes is `pauseSync` (child-bound.mjs), in whole
+  // seconds, kept in this thread with no child: it never ends early.
+  const sleep = sleepImpl ?? ((ms) => pauseSync(Math.max(1, Math.round(ms / 1000))));
   let state = null;
   for (let i = 0; i < attempts; i += 1) {
     // Each probe is bounded from its spawn (the probe class, 15 s), and its
