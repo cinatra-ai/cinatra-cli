@@ -18,11 +18,12 @@
 // the pause control is in a describe of its own, also without it.
 //
 // The pauses (pauseBounded in src/child-bound.mjs, used by waitForService,
-// waitForWayflowHealth and the nango backoff): a `sleep` child that does not
+// waitForWayflowHealth, the nango backoff and waitForNango): a `sleep` child that does not
 // exit 0 cleanly (a signal, a non-zero exit, a spawn error, an expired bound)
 // ends no pause early; the time left is kept in-process. Each row measures the
 // pause against its length; a clean exit 0 ends it at once (`sleep` exits 0
-// only once its time is up).
+// only once its time is up). A describe of its own pins the bound (the length
+// plus 1 s) and the length (whole seconds, at least 1).
 import { describe, it, expect, vi, afterAll } from "vitest";
 
 const probe = vi.hoisted(() => ({ answer: null, sleepAnswer: null, calls: [] }));
@@ -188,6 +189,28 @@ describe("cinatra-cli#306 pauses: a `sleep` child that does not exit 0 cleanly e
     expect(performance.now() - t0).toBeGreaterThanOrEqual(ONE_PAUSE_MS);
   });
 
+  it("waitForNango: a pause whose sleep child dies by a signal still takes its 2 s", async () => {
+    const { waitForNango } = await import("../src/index.mjs");
+    probe.calls = [];
+    probe.answer = RESULT.exit1; // curl: nango does not answer
+    probe.sleepAnswer = RESULT.signalDeath;
+    const t0 = performance.now();
+    try {
+      expect(() => waitForNango("/nonexistent-checkout", 1)).toThrow("Nango server did not become ready within 2 seconds.");
+      expect(performance.now() - t0).toBeGreaterThanOrEqual(2 * ONE_PAUSE_MS);
+      const sleep = probe.calls.find((c) => c.command === "sleep");
+      expect(probe.calls.map((c) => c.command)).toEqual(["curl", "sleep"]);
+      expect({ args: sleep?.args, timeout: sleep?.options.timeout, killSignal: sleep?.options.killSignal }).toEqual({
+        args: ["2"],
+        timeout: 3_000,
+        killSignal: "SIGKILL",
+      });
+    } finally {
+      probe.answer = null;
+      probe.sleepAnswer = null;
+    }
+  });
+
   it("the nango backoff: a pause whose sleep child gives a spawn error still takes its 1 s", async () => {
     const { readSeededNangoSecretKey } = await import("../src/nango-secret-key.mjs");
     probe.calls = [];
@@ -206,6 +229,38 @@ describe("cinatra-cli#306 pauses: a `sleep` child that does not exit 0 cleanly e
       probe.answer = null;
       probe.sleepAnswer = null;
     }
+  });
+});
+
+// The bound and the length of a pause: pauseBounded is new here, so these rows
+// pin its own arithmetic (a clean exit 0 keeps them fast).
+describe("cinatra-cli#306 pause bound: the length is whole seconds of at least 1, and the bound is the length plus 1 s", () => {
+  const spawnOf = (calls) => (command, args, options) => (calls.push({ command, args: [...args], options }), RESULT.clean());
+  it("pauseBounded: a 2 s pause spawns `sleep 2` with a 3 s bound and SIGKILL", async () => {
+    const { pauseBounded } = await import("../src/child-bound.mjs");
+    const calls = [];
+    pauseBounded(spawnOf(calls), 2);
+    expect(calls.map((c) => [c.command, c.args, c.options.timeout, c.options.killSignal])).toEqual([["sleep", ["2"], 3_000, "SIGKILL"]]);
+  });
+  for (const [given, seconds] of [[0, "1"], [0.4, "1"], [1.6, "2"], ["2", "2"], [Number.NaN, "1"], [-3, "1"], [undefined, "1"]]) {
+    it(`pauseBounded: a length of ${String(given)} is a pause of ${seconds} s`, async () => {
+      const { pauseBounded } = await import("../src/child-bound.mjs");
+      const calls = [];
+      pauseBounded(spawnOf(calls), given);
+      expect(calls.map((c) => [c.args, c.options.timeout])).toEqual([[[seconds], Number(seconds) * 1_000 + 1_000]]);
+    });
+  }
+  it("pauseBounded: an infinite length throws CHILD_BOUND_INVALID before any child starts", async () => {
+    const { pauseBounded } = await import("../src/child-bound.mjs");
+    const calls = [];
+    let err = null;
+    try {
+      pauseBounded(spawnOf(calls), Number.POSITIVE_INFINITY);
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("CHILD_BOUND_INVALID");
+    expect(calls).toEqual([]);
   });
 });
 

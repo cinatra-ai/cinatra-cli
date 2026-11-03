@@ -612,4 +612,15 @@ describe("cinatra-cli#306: `instance db upgrade-preflight` reads volumes with th
     expect(seams.inspectVolume("v")).toBeNull();
     expect(u.recheckVolumeStability(seams, "v", null)).toBe("stable");
   });
+
+  it("the shared seams answer an empty volume name without a docker call: no row, and absent", async () => {
+    const m = await import("../src/recreate-preflight.mjs");
+    let reads = 0;
+    const seams = m.makeVolumeInspectSeams(() => (reads += 1, { status: "ok", row: { Name: "v" } }));
+    for (const name of ["", null, undefined]) {
+      expect(seams.inspectVolume(name)).toBeNull();
+      expect(seams.inspectVolumeStatus(name)).toEqual({ status: "absent", row: null });
+    }
+    expect(reads).toBe(0);
+  });
 });

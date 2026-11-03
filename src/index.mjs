@@ -2187,6 +2187,9 @@ function waitForRedis(repoRoot) {
   waitForService(repoRoot, "redis", ["redis-cli", "ping"], [], "Redis");
 }
 
+/** Poll nango's health endpoint until curl exits 0. The 2 s pause between
+ *  attempts is `pauseBounded` (child-bound.mjs): it never ends early, whatever
+ *  its `sleep` child answers (cinatra-cli#306). */
 function waitForNango(repoRoot, maxAttempts = 60) {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
@@ -2200,7 +2203,7 @@ function waitForNango(repoRoot, maxAttempts = 60) {
     } catch {
       // ignore
     }
-    spawnSync("sleep", ["2"]);
+    pauseBounded(spawnSync, 2);
   }
   throw new Error(`Nango server did not become ready within ${maxAttempts * 2} seconds.`);
 }
@@ -17132,6 +17135,7 @@ export {
   commandExists,
   waitForService,
   readInstalledCliVersion,
+  waitForNango,
   // cinatra-cli#208 — the reset entrypoint, exported so the wiring itself is
   // testable: that the registry namespaces are read BEFORE the schema drop, and
   // that the reconcile runs only for --purge-app-data. Both are invisible at the
