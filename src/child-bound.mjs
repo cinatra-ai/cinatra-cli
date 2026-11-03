@@ -309,3 +309,19 @@ export function sleepSync(ms) {
   if (!(n > 0)) return;
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, n);
 }
+
+/** One pause of `seconds` (rounded, at least 1) through a `sleep` child that
+ *  `spawn` starts, bounded to its length plus 1 s. A pause is no read: nothing
+ *  the child prints is taken. Only a clean exit 0 ends the pause there (`sleep`
+ *  exits 0 only once its time is up); any other answer (a spawn error, a
+ *  signal, a non-zero exit, an expired bound) is kept in this thread
+ *  (`sleepSync`) for the time that is left. So a pause never ends early, and a
+ *  `sleep` that hangs ends it at its bound, 1 s late. */
+export function pauseBounded(spawn, seconds) {
+  const s = Math.max(1, Math.round(Number(seconds) || 0));
+  const ms = s * 1_000;
+  const t0 = performance.now();
+  const r = spawnBounded(spawn, "sleep", [String(s)], { stdio: "ignore" }, siteBound(ms + 1_000));
+  if (!childResultRefused(r) && r.status === 0) return;
+  sleepSync(ms - (performance.now() - t0));
+}

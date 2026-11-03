@@ -421,8 +421,19 @@ export async function ensureDevTwentyCrm({ targetDir, mode = "dev", noTwenty = f
   if (healthy && upPending) {
     // The server answers now: start what compose held back, once.
     const again = s.docker(upPending, { inherit: true, cwd: path.dirname(upPending[4]) });
+    // The held-back services did not start: a named failure, as for the
+    // first `up`, never a healthy result.
+    if (!Number.isInteger(again.status)) {
+      throw new Error(
+        `Twenty CRM: docker compose -p ${DEV_TWENTY_PROJECT} up -d after the server answered did not finish with an exit status` +
+          `${again.reason ? ` (${again.reason})` : ""}.`,
+      );
+    }
     if (again.status !== 0) {
-      log(`  ⚠ Twenty CRM WARNING: docker compose -p ${DEV_TWENTY_PROJECT} up -d exited ${again.status} after the server answered.`);
+      const detail = String(again.stderr ?? "").trim();
+      throw new Error(
+        `Twenty CRM: docker compose -p ${DEV_TWENTY_PROJECT} up -d failed after the server answered (exit ${again.status}).${detail ? `\n${detail}` : ""}`,
+      );
     }
   }
   if (!healthy) {

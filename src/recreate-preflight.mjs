@@ -173,6 +173,23 @@ export function makeDockerCapture(spawn) {
   };
 }
 
+/** The two volume-inspect seams of a preflight transport over one three-way
+ *  reader: `inspectVolume` (the row, or null) and `inspectVolumeStatus` (the
+ *  three-way answer). `recheckVolumeStability` (upgrade-preflight.mjs) prefers
+ *  the second, so a failed final inspect is never read as "absent". Exported
+ *  for the `upgrade-preflight` command in index.mjs, whose transport takes
+ *  both, as this module's own does. */
+export function makeVolumeInspectSeams(inspectVolumeThreeWay) {
+  return {
+    inspectVolume: (name) => {
+      if (!name) return null;
+      const res = inspectVolumeThreeWay(name);
+      return res.status === "ok" ? res.row : null;
+    },
+    inspectVolumeStatus: (name) => (name ? inspectVolumeThreeWay(name) : { status: "absent", row: null }),
+  };
+}
+
 /** `docker volume inspect` with an explicit three-way outcome: only docker's own
  *  "no such volume" is ABSENT; any other failure is an ERROR (treated fail-closed
  *  as "present", never as an empty/fresh volume). Exported for the
@@ -366,15 +383,11 @@ export function buildDeploymentPreflight({
   };
 
   const transport = {
-    inspectVolume: (name) => {
-      if (!name) return null;
-      const res = inspectVolumeThreeWay(name);
-      return res.status === "ok" ? res.row : null;
-    },
-    // Three-way status seam (cinatra-cli#140): the preflight's post-probe recheck
-    // uses this so an inspect ERROR is never collapsed to "absent" (a failed
-    // recheck cannot confirm the volume stayed absent → fail closed).
-    inspectVolumeStatus: (name) => (name ? inspectVolumeThreeWay(name) : { status: "absent", row: null }),
+    // `inspectVolume`, and the three-way status seam (cinatra-cli#140): the
+    // preflight's post-probe recheck uses `inspectVolumeStatus` so an inspect
+    // ERROR is never collapsed to "absent" (a failed recheck cannot confirm the
+    // volume stayed absent → fail closed).
+    ...makeVolumeInspectSeams(inspectVolumeThreeWay),
     volumeState: (name) => {
       if (!name) return "absent";
       const res = inspectVolumeThreeWay(name);

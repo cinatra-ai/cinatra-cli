@@ -223,7 +223,7 @@ return await m.ensureDevTwentyCrm({ targetDir: dir, mode: "dev", log: () => {}, 
     expected: { code: "CHILD_TIMEOUT", message: "`docker` did not finish within 2 s; it was stopped." },
   },
   {
-    site: "src/index.mjs waitForService (one attempt, then the in-process pause)",
+    site: "src/index.mjs waitForService (one attempt, then the pause)",
     module: "index.mjs",
     command: "docker",
     entry: CAUGHT(`m.waitForService(dir, "postgres", ["pg_isready", "-U", "postgres"], [], "Postgres", 1)`),
@@ -560,7 +560,7 @@ describe("cinatra-cli#306: `instance db upgrade-preflight` reads volumes with th
 
   it("the command builds its capture and its three-way volume reader from recreate-preflight.mjs, with no copy of its own", () => {
     expect(body, "runDbUpgradePreflight is found").not.toBe("");
-    expect(body).toMatch(/const \{ makeDockerCapture, makeInspectVolumeThreeWay \} = await import\("\.\/recreate-preflight\.mjs"\);/);
+    expect(body).toMatch(/const \{ makeDockerCapture, makeInspectVolumeThreeWay, makeVolumeInspectSeams \} = await import\("\.\/recreate-preflight\.mjs"\);/);
     expect(body).toMatch(/const dockerCapture = makeDockerCapture\(spawnSync\);/);
     expect(body).toMatch(/const inspectVolumeThreeWay = makeInspectVolumeThreeWay\(spawnSync\);/);
     // No reading of docker's text of its own: "no such volume" is decided only
@@ -578,5 +578,38 @@ describe("cinatra-cli#306: `instance db upgrade-preflight` reads volumes with th
     const timedOut = { status: 0, signal: null, stdout: "out\n", stderr: "", error: Object.assign(new Error("spawnSync docker ETIMEDOUT"), { code: "ETIMEDOUT" }) };
     expect(m.makeDockerCapture(() => timedOut)(["ps"])).toBeNull();
     expect(m.makeDockerCapture(() => ({ status: 0, signal: null, error: null, stdout: "out\n", stderr: "" }))(["ps"])).toBe("out");
+  });
+
+  it("the command's transport takes the recreate preflight's two inspect seams, the three-way status seam among them", () => {
+    const at = body.indexOf("const transport = {");
+    const transportText = at >= 0 ? body.slice(at, body.indexOf("\n  };", at)) : "";
+    expect(transportText, "the transport is found").not.toBe("");
+    expect(transportText).toMatch(/\n    \.\.\.makeVolumeInspectSeams\(inspectVolumeThreeWay\),\n/);
+    // No inspect seam of its own: a lossy `inspectVolume` alone reads a failed
+    // final inspect as "still absent".
+    expect(transportText).not.toMatch(/\n    inspectVolume(Status)?:/);
+  });
+
+  it("with those seams, a failed final inspect of a volume first found absent is uncertain, never stable", async () => {
+    const m = await import(new URL("../src/recreate-preflight.mjs", import.meta.url).href);
+    const u = await import(new URL("../src/upgrade-preflight.mjs", import.meta.url).href);
+    const absent = { status: 1, signal: null, error: null, stdout: "", stderr: "Error: No such volume: v\n" };
+    const failed = [
+      { status: null, signal: "SIGKILL", error: null, stdout: "", stderr: "" },
+      { status: 0, signal: null, stdout: "", stderr: "", error: Object.assign(new Error("spawnSync docker ETIMEDOUT"), { code: "ETIMEDOUT" }) },
+      { status: 2, signal: null, error: null, stdout: "", stderr: "Cannot connect to the Docker daemon\n" },
+    ];
+    for (const final of failed) {
+      const answers = [absent, final];
+      const seams = m.makeVolumeInspectSeams(m.makeInspectVolumeThreeWay(() => answers.shift()));
+      // The first inspect finds the volume absent; the recheck after the probes fails.
+      expect(seams.inspectVolume("v")).toBeNull();
+      expect(u.recheckVolumeStability(seams, "v", null), JSON.stringify(final)).toBe("uncertain");
+    }
+    // With a clean "no such volume" again, absent stays absent.
+    const again = [absent, absent];
+    const seams = m.makeVolumeInspectSeams(m.makeInspectVolumeThreeWay(() => again.shift()));
+    expect(seams.inspectVolume("v")).toBeNull();
+    expect(u.recheckVolumeStability(seams, "v", null)).toBe("stable");
   });
 });

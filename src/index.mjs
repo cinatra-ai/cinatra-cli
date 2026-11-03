@@ -17,7 +17,7 @@ import net from "node:net";
 import { resolveTeardownNames } from "./teardown-config.mjs";
 // The bounded child waits (cinatra-cli#306): node built-ins only, so the static
 // import keeps the lean startup.
-import { boundFor, childResultRefused, childTimedOut, childTimeoutError, readChild, siteBound, spawnBounded } from "./child-bound.mjs";
+import { boundFor, childResultRefused, childTimedOut, childTimeoutError, pauseBounded, readChild, siteBound, spawnBounded } from "./child-bound.mjs";
 // What `--version` answers beside the SemVer: the commit this build came from,
 // whenever the installed package can prove one (cinatra-cli#271). Builtins-only
 // file reads — it stays inside the lean-startup contract.
@@ -2034,8 +2034,9 @@ async function createClient(connectionString) {
 }
 
 /** Run a user-facing step with inherited output: bounded from its spawn by
- *  `timeoutMs` (the step class, 60 min, as install.mjs's `runOrThrow`), with
- *  the command's process group ended at the bound. Success is exit status 0
+ *  `timeoutMs` (the step class, 60 min, as install.mjs's `runOrThrow`). At the
+ *  bound the command's process group is ended, or, when a stdio is a
+ *  terminal, only the command itself (child-bound-watchdog.mjs). Success is exit status 0
  *  only; a timeout throws `fallbackError` with the named failure (code
  *  CHILD_TIMEOUT), and a spawn error or a signal throws `fallbackError` with
  *  its reason. */
@@ -2159,7 +2160,8 @@ function removePathIfExists(targetPath) {
 /** Poll a compose service's own readiness command until it exits 0. Each
  *  probe is bounded from its spawn (the probe class, 15 s): a probe that
  *  hangs, times out or dies by a signal is a failed attempt, never ready.
- *  The 1 s pause between attempts is a `sleep` child bounded to 6 s. */
+ *  The 1 s pause between attempts is `pauseBounded` (child-bound.mjs): it
+ *  never ends early, whatever its `sleep` child answers. */
 function waitForService(repoRoot, service, readyCommand, readyArgs, label, maxAttempts = 30) {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const result = spawnBounded(
@@ -2172,7 +2174,7 @@ function waitForService(repoRoot, service, readyCommand, readyArgs, label, maxAt
     if (!childResultRefused(result) && result.status === 0) {
       return;
     }
-    spawnBounded(spawnSync, "sleep", ["1"], { stdio: "ignore" }, siteBound(6_000));
+    pauseBounded(spawnSync, 1);
   }
   throw new Error(`${label} did not become ready within ${maxAttempts} seconds.`);
 }
@@ -7628,7 +7630,7 @@ async function runDbUpgradePreflight(rest) {
   const { resolveComposeConfig, statefulServicesFromComposeConfig } = await import("./version-ledger-capture.mjs");
   const { imageParts } = await import("./upgrade-matrix.mjs");
   const { makeProbeVersion, makeMarkerReader, PG_MARKER_READ_MOUNT } = await import("./pg-adapters.mjs");
-  const { makeDockerCapture, makeInspectVolumeThreeWay } = await import("./recreate-preflight.mjs");
+  const { makeDockerCapture, makeInspectVolumeThreeWay, makeVolumeInspectSeams } = await import("./recreate-preflight.mjs");
   const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, getInstance } =
     await import("./instance-registry.mjs");
 
@@ -7752,11 +7754,11 @@ async function runDbUpgradePreflight(rest) {
     );
 
   const transport = {
-    inspectVolume: (name) => {
-      if (!name) return null;
-      const res = inspectVolumeThreeWay(name);
-      return res.status === "ok" ? res.row : null;
-    },
+    // The recreate preflight's own two inspect seams: `inspectVolumeStatus`
+    // keeps the three-way answer, so the recheck after the probes
+    // (`recheckVolumeStability`) reads a failed final inspect as uncertain,
+    // never as "still absent".
+    ...makeVolumeInspectSeams(inspectVolumeThreeWay),
     volumeState: (name) => {
       if (!name) return "absent";
       const res = inspectVolumeThreeWay(name);

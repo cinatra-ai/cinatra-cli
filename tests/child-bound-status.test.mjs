@@ -14,10 +14,18 @@
 // no status; a status 0 with an error or a signal comes from the plain bounded
 // spawn (an injected or mocked spawn, and win32), so it is given here.
 // The rows that main's code passes too (an exit 1, a signal death with no
-// status, a clean exit 0) are in the last describe, without the issue's name.
+// status, a clean exit 0) are in the last describe, without the issue's name;
+// the pause control is in a describe of its own, also without it.
+//
+// The pauses (pauseBounded in src/child-bound.mjs, used by waitForService,
+// waitForWayflowHealth and the nango backoff): a `sleep` child that does not
+// exit 0 cleanly (a signal, a non-zero exit, a spawn error, an expired bound)
+// ends no pause early; the time left is kept in-process. Each row measures the
+// pause against its length; a clean exit 0 ends it at once (`sleep` exits 0
+// only once its time is up).
 import { describe, it, expect, vi, afterAll } from "vitest";
 
-const probe = vi.hoisted(() => ({ answer: null, calls: [] }));
+const probe = vi.hoisted(() => ({ answer: null, sleepAnswer: null, calls: [] }));
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal();
@@ -26,13 +34,15 @@ vi.mock("node:child_process", async (importOriginal) => {
     spawnSync: (command, args, options) => {
       if (probe.answer === null) return actual.spawnSync(command, args, options);
       probe.calls.push({ command, args: [...(args ?? [])], options: options ?? {} });
-      return command === "sleep" ? { status: 0, signal: null, error: null, stdout: "", stderr: "" } : probe.answer();
+      if (command === "sleep") return probe.sleepAnswer ? probe.sleepAnswer() : { status: 0, signal: null, error: null, stdout: "", stderr: "" };
+      return probe.answer();
     },
   };
 });
 
 afterAll(() => {
   probe.answer = null;
+  probe.sleepAnswer = null;
   vi.doUnmock("node:child_process");
   vi.resetModules();
 });
@@ -46,20 +56,34 @@ const RESULT = {
   signalDeath: () => ({ status: null, signal: "SIGKILL", error: null, stdout: "", stderr: "" }),
   clean: () => ({ status: 0, signal: null, error: null, stdout: "", stderr: "" }),
 };
+/** The answers of a `sleep` child that must not end a pause early. */
+const SLEEP_UNCLEAN = [
+  ["a signal death", RESULT.signalDeath],
+  ["a status 0 that came with a signal", RESULT.zeroWithSignal],
+  ["a non-zero exit", RESULT.exit1],
+  ["a spawn error", () => ({ status: null, signal: null, error: spawnError("ENOENT"), stdout: "", stderr: "" })],
+  ["an expired bound", RESULT.zeroWithTimeout],
+];
+/** A pause of 1 s is kept when it lasts at least this long (sleepSync waits at least its time). */
+const ONE_PAUSE_MS = 950;
 
-/** waitForService with `answer` as every probe's result: the thrown message
- *  (or "ready"), and the calls the mock saw. */
-async function waitWith(answer, attempts) {
+/** waitForService with `answer` as every probe's result (and `sleepAnswer`
+ *  as every pause child's): the thrown message (or "ready"), the calls the
+ *  mock saw, and how long the call took. */
+async function waitWith(answer, attempts, sleepAnswer = null) {
   const { waitForService } = await import("../src/index.mjs");
   probe.calls = [];
   probe.answer = answer;
+  probe.sleepAnswer = sleepAnswer;
+  const t0 = performance.now();
   try {
     waitForService("/nonexistent-checkout", "postgres", ["pg_isready", "-U", "postgres"], [], "Postgres", attempts);
-    return { outcome: "ready", calls: probe.calls };
+    return { outcome: "ready", calls: probe.calls, ms: performance.now() - t0 };
   } catch (err) {
-    return { outcome: err.message, calls: probe.calls };
+    return { outcome: err.message, calls: probe.calls, ms: performance.now() - t0 };
   } finally {
     probe.answer = null;
+    probe.sleepAnswer = null;
   }
 }
 
@@ -88,7 +112,7 @@ describe("cinatra-cli#306 status reading: waitForService reads no status of a re
     });
   }
 
-  it("each probe is spawned with the probe bound (15 s) and SIGKILL, and each pause with its own 6 s bound", async () => {
+  it("each probe is spawned with the probe bound (15 s) and SIGKILL, and each pause with its length plus 1 s", async () => {
     const r = await waitWith(RESULT.exit1, 1);
     expect(r.outcome).toBe("Postgres did not become ready within 1 seconds.");
     const docker = r.calls.find((c) => c.command === "docker");
@@ -100,7 +124,7 @@ describe("cinatra-cli#306 status reading: waitForService reads no status of a re
     });
     expect({ args: sleep?.args, timeout: sleep?.options.timeout, killSignal: sleep?.options.killSignal }).toEqual({
       args: ["1"],
-      timeout: 6_000,
+      timeout: 2_000,
       killSignal: "SIGKILL",
     });
   });
@@ -131,6 +155,68 @@ describe("cinatra-cli#306 status reading: restartWayflowService reads no status 
       timeout: 120_000,
       killSignal: "SIGKILL",
     });
+  });
+});
+
+describe("cinatra-cli#306 pauses: a `sleep` child that does not exit 0 cleanly ends no pause early", () => {
+  for (const [name, answer] of SLEEP_UNCLEAN) {
+    it(`pauseBounded: ${name} of the sleep child still keeps the whole pause`, async () => {
+      const { pauseBounded } = await import("../src/child-bound.mjs");
+      const calls = [];
+      const t0 = performance.now();
+      pauseBounded((command, args, options) => (calls.push({ command, args: [...args], options }), answer()), 1);
+      expect(performance.now() - t0).toBeGreaterThanOrEqual(ONE_PAUSE_MS);
+      expect(calls.map((c) => [c.command, c.args, c.options.timeout, c.options.killSignal])).toEqual([["sleep", ["1"], 2_000, "SIGKILL"]]);
+    });
+  }
+
+  it("waitForService: a pause whose sleep child dies by a signal still takes its 1 s", async () => {
+    const r = await waitWith(RESULT.exit1, 1, RESULT.signalDeath);
+    expect(r.outcome).toBe("Postgres did not become ready within 1 seconds.");
+    expect(r.calls.map((c) => c.command)).toEqual(["docker", "sleep"]);
+    expect(r.ms).toBeGreaterThanOrEqual(ONE_PAUSE_MS);
+  });
+
+  it("waitForWayflowHealth: a pause whose sleep child exits non-zero still takes its 1 s", async () => {
+    const { waitForWayflowHealth } = await import("../src/wayflow-runtime.mjs");
+    const seen = [];
+    const spawnImpl = (command) => (seen.push(command), command === "sleep" ? RESULT.exit1() : RESULT.exit1());
+    const t0 = performance.now();
+    const res = waitForWayflowHealth({ project: "cinatra_probe", attempts: 1, intervalMs: 1_000, spawnImpl });
+    expect(res).toEqual({ healthy: false, state: null });
+    expect(seen).toEqual(["docker", "sleep"]);
+    expect(performance.now() - t0).toBeGreaterThanOrEqual(ONE_PAUSE_MS);
+  });
+
+  it("the nango backoff: a pause whose sleep child gives a spawn error still takes its 1 s", async () => {
+    const { readSeededNangoSecretKey } = await import("../src/nango-secret-key.mjs");
+    probe.calls = [];
+    probe.answer = RESULT.clean; // no docker call is expected; the transport is the test's own
+    probe.sleepAnswer = () => ({ status: null, signal: null, error: spawnError("ENOENT"), stdout: "", stderr: "" });
+    const queries = [];
+    const transport = { query: (sql) => (queries.push(sql), { status: 1, stdout: "", stderr: "" }) };
+    const t0 = performance.now();
+    try {
+      const res = readSeededNangoSecretKey({ transport, environmentName: "dev", attempts: 2, intervalSeconds: 1, deadlineMs: 60_000 });
+      expect(res).toEqual({ ok: false, secretKey: null });
+      expect(performance.now() - t0).toBeGreaterThanOrEqual(ONE_PAUSE_MS);
+      expect(probe.calls.map((c) => c.command)).toEqual(["sleep"]);
+      expect(queries.length).toBeGreaterThan(2);
+    } finally {
+      probe.answer = null;
+      probe.sleepAnswer = null;
+    }
+  });
+});
+
+// The control of the pause rows above: pauseBounded is new here, so main has
+// no such row; it is outside the issue's name because it shows no defect.
+describe("the pause control: a clean exit 0 of the sleep child", () => {
+  it("pauseBounded: a clean exit 0 of the sleep child ends the pause there (sleep exits 0 only once its time is up)", async () => {
+    const { pauseBounded } = await import("../src/child-bound.mjs");
+    const t0 = performance.now();
+    pauseBounded(() => RESULT.clean(), 1);
+    expect(performance.now() - t0).toBeLessThan(ONE_PAUSE_MS);
   });
 });
 

@@ -864,6 +864,7 @@ describe("child-bound: result-refused every status reader refuses an error, a ti
       if (gpidFile) expect(readPid(gpidFile), "the grandchild that held the pipes was started").toBeGreaterThan(0);
       expect(r.value.v).toEqual(row.expected);
       expectGone(pidFile);
+      if (gpidFile) expectGone(gpidFile);
     }, 30_000);
   }
 
