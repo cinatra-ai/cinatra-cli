@@ -15,6 +15,9 @@ import net from "node:net";
 // behind the single `createClient` chokepoint via `getPgClientCtor()` below, so
 // only a command that actually opens a DB connection pulls it.
 import { resolveTeardownNames } from "./teardown-config.mjs";
+// The bounded child waits (cinatra-cli#306): node built-ins only, so the static
+// import keeps the lean startup.
+import { boundFor, childResultRefused, childTimedOut, childTimeoutError, readChild, siteBound, spawnBounded } from "./child-bound.mjs";
 // What `--version` answers beside the SemVer: the commit this build came from,
 // whenever the installed package can prove one (cinatra-cli#271). Builtins-only
 // file reads — it stays inside the lean-startup contract.
@@ -2030,25 +2033,31 @@ async function createClient(connectionString) {
   });
 }
 
-function runCommandOrThrow(command, args, fallbackError, options = {}) {
-  const result = spawnSync(command, args, {
-    stdio: "inherit",
-    env: process.env,
-    ...options,
-  });
-
-  if (result.status !== 0) {
-    throw new Error(fallbackError);
+/** Run a user-facing step with inherited output: bounded from its spawn by
+ *  `timeoutMs` (the step class, 60 min, as install.mjs's `runOrThrow`), with
+ *  the command's process group ended at the bound. Success is exit status 0
+ *  only; a timeout throws `fallbackError` with the named failure (code
+ *  CHILD_TIMEOUT), and a spawn error or a signal throws `fallbackError` with
+ *  its reason. */
+function runCommandOrThrow(command, args, fallbackError, { timeoutMs = boundFor("step"), ...options } = {}) {
+  const result = spawnBounded(spawnSync, command, args, { stdio: "inherit", env: process.env, ...options }, timeoutMs);
+  if (childTimedOut(result)) {
+    const err = new Error(`${fallbackError} (${childTimeoutError(command, args, timeoutMs).message})`);
+    err.code = "CHILD_TIMEOUT";
+    throw err;
   }
+  if (result.error) throw new Error(`${fallbackError} (${result.error.message})`);
+  if (childResultRefused(result)) throw new Error(`${fallbackError} (killed by ${result.signal ?? "a signal"})`);
+  if (result.status !== 0) throw new Error(fallbackError);
 }
 
-function commandExists(command, args = ["--version"]) {
-  const result = spawnSync(command, args, {
-    stdio: "ignore",
-    env: process.env,
-  });
-
-  return result.status === 0;
+/** True iff `command <args>` exits 0. The probe is bounded from its spawn
+ *  (the read class, 60 s); a probe that outlives its bound is a named throw
+ *  (code CHILD_TIMEOUT), never "not installed". */
+function commandExists(command, args = ["--version"], { timeoutMs = boundFor("read") } = {}) {
+  const result = spawnBounded(spawnSync, command, args, { stdio: "ignore", env: process.env }, timeoutMs);
+  if (childTimedOut(result)) throw childTimeoutError(command, args, timeoutMs);
+  return !childResultRefused(result) && result.status === 0;
 }
 
 // An EXACT pnpm version pin, per the semver grammar (numeric identifiers carry
@@ -2147,16 +2156,23 @@ function removePathIfExists(targetPath) {
   rmSync(targetPath, { recursive: true, force: true });
 }
 
+/** Poll a compose service's own readiness command until it exits 0. Each
+ *  probe is bounded from its spawn (the probe class, 15 s): a probe that
+ *  hangs, times out or dies by a signal is a failed attempt, never ready.
+ *  The 1 s pause between attempts is a `sleep` child bounded to 6 s. */
 function waitForService(repoRoot, service, readyCommand, readyArgs, label, maxAttempts = 30) {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const result = spawnSync("docker", ["compose", "exec", "-T", service, ...readyCommand, ...readyArgs], {
-      stdio: "ignore",
-      cwd: repoRoot,
-    });
-    if (result.status === 0) {
+    const result = spawnBounded(
+      spawnSync,
+      "docker",
+      ["compose", "exec", "-T", service, ...readyCommand, ...readyArgs],
+      { stdio: "ignore", cwd: repoRoot },
+      boundFor("probe"),
+    );
+    if (!childResultRefused(result) && result.status === 0) {
       return;
     }
-    spawnSync("sleep", ["1"]);
+    spawnBounded(spawnSync, "sleep", ["1"], { stdio: "ignore" }, siteBound(6_000));
   }
   throw new Error(`${label} did not become ready within ${maxAttempts} seconds.`);
 }
@@ -7612,6 +7628,7 @@ async function runDbUpgradePreflight(rest) {
   const { resolveComposeConfig, statefulServicesFromComposeConfig } = await import("./version-ledger-capture.mjs");
   const { imageParts } = await import("./upgrade-matrix.mjs");
   const { makeProbeVersion, makeMarkerReader, PG_MARKER_READ_MOUNT } = await import("./pg-adapters.mjs");
+  const { makeDockerCapture, makeInspectVolumeThreeWay } = await import("./recreate-preflight.mjs");
   const { requireUsableInstanceRegistry, defaultInstanceRegistryPath, getInstance } =
     await import("./instance-registry.mjs");
 
@@ -7644,21 +7661,11 @@ async function runDbUpgradePreflight(rest) {
   }
 
   // Best-effort read-only docker capture; ANY failure yields null so the
-  // preflight fails closed rather than proceeding on a guess.
-  const dockerCapture = (args, opts = {}) => {
-    try {
-      const r = spawnSync("docker", args, {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
-        ...opts,
-      });
-      if (r.status !== 0) return null;
-      return (r.stdout ?? "").trim();
-    } catch {
-      return null;
-    }
-  };
+  // preflight fails closed rather than proceeding on a guess. The recreate
+  // preflight's own capture: bounded from its spawn (SIGKILL of the command's
+  // group at the bound), and a timeout, a signal or a spawn error is refused
+  // before the status is read.
+  const dockerCapture = makeDockerCapture(spawnSync);
 
   // Discover services: ledger entries first (integrity-only), then the
   // checkout's compose-config intent (adds/overrides the volume the deployment
@@ -7712,30 +7719,12 @@ async function runDbUpgradePreflight(rest) {
   };
 
   // `docker volume inspect` with an explicit three-way outcome: only docker's
-  // own "no such volume" counts as ABSENT; any other failure is an ERROR (and
-  // the transport treats it fail-closed, never as an empty/fresh volume).
-  const inspectVolumeThreeWay = (name) => {
-    try {
-      const r = spawnSync("docker", ["volume", "inspect", name], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: DOCKER_CLI_PROBE_TIMEOUT_MS,
-      });
-      if (r.status === 0) {
-        try {
-          const parsed = JSON.parse((r.stdout ?? "").trim());
-          const inspectRow = Array.isArray(parsed) ? parsed[0] ?? null : parsed;
-          return inspectRow ? { status: "ok", row: inspectRow } : { status: "error", row: null };
-        } catch {
-          return { status: "error", row: null };
-        }
-      }
-      if (/no such volume/i.test(`${r.stderr ?? ""}${r.stdout ?? ""}`)) return { status: "absent", row: null };
-      return { status: "error", row: null };
-    } catch {
-      return { status: "error", row: null };
-    }
-  };
+  // own answer (exit 1 with "no such volume") counts as ABSENT; any other
+  // failure, a timeout or a signal included, is an ERROR (and the transport
+  // treats it fail-closed, never as an empty/fresh volume). The recreate
+  // preflight's own reader, so `upgrade-preflight.mjs` passes an absent volume
+  // only on that answer.
+  const inspectVolumeThreeWay = makeInspectVolumeThreeWay(spawnSync);
 
   // The running container for a compose service (compose labels), or null when
   // it is down (→ the probe falls through to the raw marker). Best-effort.
@@ -7759,7 +7748,7 @@ async function runDbUpgradePreflight(rest) {
   const dockerReadVolume = (volumeName, image, program) =>
     dockerCapture(
       ["run", "--rm", "--pull=never", "--entrypoint", "/bin/sh", "-v", `${volumeName}:${PG_MARKER_READ_MOUNT}:ro`, image, "-c", program],
-      { timeout: 60_000 },
+      { timeoutMs: siteBound(60_000) },
     );
 
   const transport = {
@@ -7780,7 +7769,7 @@ async function runDbUpgradePreflight(rest) {
       if (!image) return "present";
       const listing = dockerCapture(
         ["run", "--rm", "--pull=never", "--entrypoint", "/bin/sh", "-v", `${name}:/__preflight_probe:ro`, image, "-c", "ls -A /__preflight_probe"],
-        { timeout: 60_000 },
+        { timeoutMs: siteBound(60_000) },
       );
       if (listing === null) return "present";
       return listing.length === 0 ? "empty" : "present";
@@ -8197,6 +8186,19 @@ async function promptUpdateChoice() {
   }
 }
 
+/** The globally installed CLI version `npm ls -g` names, or null. The listing
+ *  is read only after exit status 0, and the read is bounded from its spawn
+ *  (the read class); a failed, timed-out or signalled read is null. */
+function readInstalledCliVersion() {
+  const r = readChild("npm", ["ls", "-g", CLI_INSTALL_SPEC.split("@latest")[0], "--depth=0"], {
+    timeoutMs: boundFor("read"),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (!r.ok) return null;
+  const m = r.stdout.match(/@cinatra-ai\/cinatra@(\S+)/);
+  return m ? m[1] : null;
+}
+
 /**
  * Option 1 — update the CLI itself: `npm install -g @cinatra-ai/cinatra@latest`.
  * Prints the resolved new version + a "re-run cinatra" notice (the running
@@ -8218,16 +8220,9 @@ async function runCliUpdate({ dryRun }) {
   );
 
   // Read back the freshly-installed global version (best-effort — never fatal).
-  let newVersion = null;
-  try {
-    const out = spawnSync("npm", ["ls", "-g", CLI_INSTALL_SPEC.split("@latest")[0], "--depth=0"], {
-      encoding: "utf8",
-    });
-    const m = (out.stdout || "").match(/@cinatra-ai\/cinatra@(\S+)/);
-    if (m) newVersion = m[1];
-  } catch {
-    /* best-effort */
-  }
+  // The listing is read only after `npm ls` exits 0, inside its bound (the read
+  // class); any other answer leaves the version unnamed.
+  const newVersion = readInstalledCliVersion();
 
   console.log(
     `\n✔ CLI updated${newVersion ? ` to ${newVersion}` : ""}. ` +
@@ -17129,6 +17124,12 @@ async function runAgentImport(argv) {
 // client + mocked token mint — without booting the app or a live DB.
 // ---------------------------------------------------------------------------
 export {
+  // cinatra-cli#306 — the bounded child waits of this module, exported so a
+  // test drives each one against a stand-in child that never exits.
+  runCommandOrThrow,
+  commandExists,
+  waitForService,
+  readInstalledCliVersion,
   // cinatra-cli#208 — the reset entrypoint, exported so the wiring itself is
   // testable: that the registry namespaces are read BEFORE the schema drop, and
   // that the reconcile runs only for --purge-app-data. Both are invisible at the

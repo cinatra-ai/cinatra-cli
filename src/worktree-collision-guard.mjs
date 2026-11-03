@@ -12,7 +12,17 @@
 //   - makeDefaultGitImpl(repoRoot)
 //   - formatResult(result)
 
-import { execFileSync } from "node:child_process";
+import { boundFor, readChild } from "./child-bound.mjs";
+
+/** One git read of the guard: bounded from its spawn (the read class) and
+ *  judged by its exit status. Its stdout after exit 0; null for any other
+ *  answer; an expired bound throws the named failure (code CHILD_TIMEOUT), so
+ *  a hung read is never an empty list. */
+function readGit(args) {
+  const r = readChild("git", args, { timeoutMs: boundFor("read"), stdio: ["ignore", "pipe", "pipe"] });
+  if (r.code === "CHILD_TIMEOUT") throw r.error;
+  return r.ok ? r.stdout : null;
+}
 
 const SLUG_REGEX = /^[a-z0-9][a-z0-9-]{0,29}$/;
 
@@ -80,39 +90,27 @@ export function findCollisions({
 export function makeDefaultGitImpl(repoRoot) {
   return {
     listWorktrees() {
-      try {
-        const out = execFileSync("git", ["-C", repoRoot, "worktree", "list", "--porcelain"], {
-          encoding: "utf8",
-        });
-        const entries = [];
-        let cur = {};
-        for (const line of out.split("\n")) {
-          if (line.startsWith("worktree ")) {
-            if (cur.path) entries.push(cur);
-            cur = { path: line.slice("worktree ".length).trim() };
-          } else if (line.startsWith("branch ")) {
-            cur.branch = line.slice("branch ".length).trim();
-          } else if (line.startsWith("HEAD ")) {
-            cur.head = line.slice("HEAD ".length).trim();
-          }
+      const out = readGit(["-C", repoRoot, "worktree", "list", "--porcelain"]);
+      if (out === null) return [];
+      const entries = [];
+      let cur = {};
+      for (const line of out.split("\n")) {
+        if (line.startsWith("worktree ")) {
+          if (cur.path) entries.push(cur);
+          cur = { path: line.slice("worktree ".length).trim() };
+        } else if (line.startsWith("branch ")) {
+          cur.branch = line.slice("branch ".length).trim();
+        } else if (line.startsWith("HEAD ")) {
+          cur.head = line.slice("HEAD ".length).trim();
         }
-        if (cur.path) entries.push(cur);
-        return entries;
-      } catch {
-        return [];
       }
+      if (cur.path) entries.push(cur);
+      return entries;
     },
     listBranches() {
-      try {
-        const out = execFileSync(
-          "git",
-          ["-C", repoRoot, "for-each-ref", "--format=%(refname:short)", "refs/heads/"],
-          { encoding: "utf8" }
-        );
-        return out.split("\n").map((s) => s.trim()).filter(Boolean);
-      } catch {
-        return [];
-      }
+      const out = readGit(["-C", repoRoot, "for-each-ref", "--format=%(refname:short)", "refs/heads/"]);
+      if (out === null) return [];
+      return out.split("\n").map((s) => s.trim()).filter(Boolean);
     },
   };
 }

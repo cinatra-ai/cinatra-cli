@@ -30,23 +30,21 @@
 // surface downstream.
 // ---------------------------------------------------------------------------
 
-import { spawnSync } from "node:child_process";
+import { boundFor, readChild } from "./child-bound.mjs";
 
 /** Run a command and return trimmed stdout, or null on any failure. Local copy
  *  (this module must not import `install.mjs`, which lazy-imports the preview
- *  composition that imports THIS module). */
+ *  composition that imports THIS module). Bounded from its spawn (the read
+ *  class); a timeout, a signal or a spawn error is a failure, and stdout is
+ *  read only after exit 0. */
 function capture(command, args, { cwd, env } = {}) {
-  try {
-    const r = spawnSync(command, args, {
-      encoding: "utf8",
-      env: env ?? process.env,
-      ...(cwd ? { cwd } : {}),
-    });
-    if (r.status !== 0) return null;
-    return (r.stdout ?? "").trim();
-  } catch {
-    return null;
-  }
+  const r = readChild(command, args, {
+    timeoutMs: boundFor("read"),
+    env: env ?? process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+    ...(cwd ? { cwd } : {}),
+  });
+  return r.ok ? r.stdout.trim() : null;
 }
 
 /** Parse the published host ports out of a `docker compose config --format json`

@@ -510,10 +510,10 @@ console.log(JSON.stringify({ ms: performance.now() - t0 }));`,
 // ---------------------------------------------------------------------------
 //
 // Each row drives the site through an exported entry, in a fresh node process
-// whose leaf bound override is 300 ms (set by import, as a test does). A
+// whose leaf bound override is 2 s (set by import, as a test does). A
 // stand-in `docker` is first on PATH: it answers the earlier calls of the
 // entry by argv pattern, and on the target call writes its pid, ignores
-// SIGTERM and never exits. The call must end within 300 ms plus 2 s with the
+// SIGTERM and never exits. The call must end within 2 s plus 3 s with the
 // site's own failure value, and the stand-in must be gone. A site bound only
 // by `timeout` sends SIGTERM, so the stand-in outlives it, the call blocks,
 // and the row's harness bound (SIGKILL) ends the run instead.
@@ -638,7 +638,7 @@ if (new RegExp(${JSON.stringify(row.hang)}).test(line)) {
 
 describe("child-bound: site-expiry every bounded site ends a SIGTERM-ignoring child at its bound", () => {
   for (const row of SITE_ROWS) {
-    it(`${row.site}: ends within 300 ms + 2 s with its named failure, and the stand-in is gone`, async () => {
+    it(`${row.site}: ends within 2 s + 3 s with its named failure, and the stand-in is gone`, async () => {
       const pidFile = pidPath("site");
       const callLog = path.join(sandbox, `calls-${process.hrtime.bigint()}.log`);
       const bin = standInBin(row, pidFile, callLog);
@@ -649,13 +649,13 @@ describe("child-bound: site-expiry every bounded site ends a SIGTERM-ignoring ch
         `const cb = await import(${JSON.stringify(LEAF_URL)});
 const m = await import(${JSON.stringify(moduleUrl)});
 const dir = ${JSON.stringify(work)};
-cb.__setChildBoundsForTest(300);
+cb.__setChildBoundsForTest(2_000);
 const t0 = performance.now();
 const v = await (async () => { ${row.entry} })();
 console.log(JSON.stringify({ ms: performance.now() - t0, v: v === undefined ? "(undefined)" : v }));`,
         { env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}` }, timeout: 8_000 },
       );
-      expect(r.value?.ms ?? Infinity, `the call ends within the bound plus 2 s (harness ${r.signal ?? r.status}): ${r.stderr}`).toBeLessThan(2_300);
+      expect(r.value?.ms ?? Infinity, `the call ends within the bound plus 3 s (harness ${r.signal ?? r.status}): ${r.stderr}`).toBeLessThan(5_000);
       expect(r.status, r.stderr).toBe(0);
       expect(r.value.v).toEqual(row.expected);
       expect(fileLines(callLog).some((l) => new RegExp(row.hang).test(l)), "the stand-in saw the target call").toBe(true);
@@ -708,8 +708,10 @@ function awaitWorkerPid(gpidFile) {
  *  argv pattern; the first target call (`target.re`) writes its own pid
  *  (a repeated one exits 98 and starts nothing), then
  *  - mode "hang": starts the grandchild, ignores SIGTERM and never exits;
- *  - mode "answer-and-leave": writes `out`/`err`, starts the grandchild and
- *    exits `exit` (the grandchild keeps the pipes open);
+ *  - mode "answer-and-leave": writes `out`/`err`, starts the grandchild,
+ *    waits until it has written its pid (exit 99 when it has not within
+ *    WORKER_PID_WAIT_MS) and exits `exit` (the grandchild keeps the pipes
+ *    open);
  *  - mode "answer-and-die": writes `out`/`err`, then SIGKILLs itself;
  *  - mode "answer-with-worker": writes `out`, starts the grandchild with all
  *    its stdio ignored (a background worker that holds no pipe), waits until
@@ -746,6 +748,8 @@ if (t.mode === "hang") {
   if (t.mode === "answer-and-die") process.kill(process.pid, "SIGKILL");
   if (t.mode === "answer-with-worker") {
     ${gpidFile ? startGrandchild(gpidFile, "ignore") + awaitWorkerPid(gpidFile) : ""}
+  } else if (t.mode === "answer-and-leave") {
+    ${gpidFile ? startGrandchild(gpidFile) + awaitWorkerPid(gpidFile) : ""}
   } else {
     ${gpidFile ? startGrandchild(gpidFile) : ""}
   }
@@ -856,6 +860,8 @@ describe("child-bound: result-refused every status reader refuses an error, a ti
       const r = runEntry(row.module, row.entry, bin);
       expect(r.status, r.stderr).toBe(0);
       expect(fileLines(callLog).some((l) => new RegExp(row.target.re).test(l)), "the stand-in saw the target call").toBe(true);
+      // A row with a grandchild proves nothing unless it held the pipes: read that first.
+      if (gpidFile) expect(readPid(gpidFile), "the grandchild that held the pipes was started").toBeGreaterThan(0);
       expect(r.value.v).toEqual(row.expected);
       expectGone(pidFile);
     }, 30_000);

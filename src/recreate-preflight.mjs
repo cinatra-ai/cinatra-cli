@@ -154,8 +154,10 @@ export function assertRecreateSafe({
 // --- docker-backed default (production seams) ------------------------------
 
 /** Best-effort docker capture: trimmed stdout on exit 0, else null (so callers
- *  distinguish "empty output" from "failed"). Never throws. */
-function makeDockerCapture(spawn) {
+ *  distinguish "empty output" from "failed"). Never throws. Exported for the
+ *  `upgrade-preflight` command in index.mjs, which reads its deployment with
+ *  this same capture. */
+export function makeDockerCapture(spawn) {
   return (args, { timeoutMs = siteBound(DOCKER_CLI_PROBE_TIMEOUT_MS), ...opts } = {}) => {
     try {
       const r = spawnBounded(spawn, "docker", args, {
@@ -173,8 +175,11 @@ function makeDockerCapture(spawn) {
 
 /** `docker volume inspect` with an explicit three-way outcome: only docker's own
  *  "no such volume" is ABSENT; any other failure is an ERROR (treated fail-closed
- *  as "present", never as an empty/fresh volume). Mirrors index.mjs's reader. */
-function makeInspectVolumeThreeWay(spawn) {
+ *  as "present", never as an empty/fresh volume). Exported for the
+ *  `upgrade-preflight` command in index.mjs, which reads volumes with this same
+ *  reader, so `upgrade-preflight.mjs` passes an "absent" volume only on
+ *  docker's own exit 1. */
+export function makeInspectVolumeThreeWay(spawn) {
   return (name) => {
     try {
       const r = spawnBounded(spawn, "docker", ["volume", "inspect", name], {

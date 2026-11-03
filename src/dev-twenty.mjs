@@ -26,6 +26,7 @@
 // suite drives all of it with fakes — no docker, no network, no database.
 
 import { spawnSync } from "node:child_process";
+import { boundFor, childResultRefused, childTimedOut, childTimeoutError, spawnBounded } from "./child-bound.mjs";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -201,14 +202,38 @@ export function renderDevTwentyCompose(resolved) {
 // Default seams.
 // ---------------------------------------------------------------------------
 
+/** The bound of one default docker call, counted from its spawn: the `up` with
+ *  inherited output and a workspace command run by `exec` take the step class
+ *  (an image pull, a seed); every other call (`ps`, `start`) the compose class. */
+function devTwentyDockerBound(args, inherit) {
+  return inherit || args[0] === "exec" ? boundFor("step") : boundFor("compose");
+}
+
+/** One docker call. `status` is the exit status, or null when there is none
+ *  to read (a timeout, a signal or a spawn error); `reason` then names why. */
 function defaultDocker(args, { inherit = false, cwd } = {}) {
-  const r = spawnSync("docker", args, {
-    encoding: "utf8",
-    ...(cwd ? { cwd } : {}),
-    stdio: inherit ? ["ignore", "inherit", "pipe"] : ["ignore", "pipe", "pipe"],
-    maxBuffer: 16 * 1024 * 1024,
-  });
-  return { status: r.error ? null : r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+  const timeoutMs = devTwentyDockerBound(args, inherit);
+  const r = spawnBounded(
+    spawnSync,
+    "docker",
+    args,
+    {
+      encoding: "utf8",
+      ...(cwd ? { cwd } : {}),
+      stdio: inherit ? ["ignore", "inherit", "pipe"] : ["ignore", "pipe", "pipe"],
+      maxBuffer: 16 * 1024 * 1024,
+    },
+    timeoutMs,
+  );
+  const refused = childResultRefused(r);
+  const reason = !refused
+    ? null
+    : childTimedOut(r)
+      ? childTimeoutError("docker", args, timeoutMs).message
+      : r.error
+        ? `docker could not run: ${r.error.message}`
+        : `docker was killed by ${r.signal ?? "a signal"}`;
+  return { status: refused ? null : r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "", reason };
 }
 
 async function defaultResolveComposeConfig(targetDir) {
@@ -366,11 +391,22 @@ export async function ensureDevTwentyCrm({ targetDir, mode = "dev", noTwenty = f
     s.writeFile(file, `${JSON.stringify(doc, null, 2)}\n`, { mode: 0o600 });
     const upArgs = ["compose", "-p", DEV_TWENTY_PROJECT, "-f", file, "up", "-d"];
     const r = s.docker(upArgs, { inherit: true, cwd: path.dirname(file) });
+    if (!Number.isInteger(r.status)) {
+      // No exit status (a timeout, a signal or a spawn error): the `up` did not
+      // answer, and nothing it printed is read.
+      throw new Error(
+        `Twenty CRM: docker compose -p ${DEV_TWENTY_PROJECT} up -d did not finish with an exit status` +
+          `${r.reason ? ` (${r.reason})` : ""}.`,
+      );
+    }
     if (r.status !== 0) {
       const detail = String(r.stderr ?? "").trim();
       // A server slower than its own healthcheck makes compose refuse to start
       // the worker that waits on it: that is the health condition, which the
       // bounded wait below reports as a warning, never an install failure.
+      // This text is no success decision: after a non-zero exit it only picks
+      // the health wait, and success is the server's own /healthz answer
+      // followed by a second `up`.
       if (!UNHEALTHY_DEPENDENCY_RE.test(detail)) {
         throw new Error(`Twenty CRM: docker compose -p ${DEV_TWENTY_PROJECT} up -d failed (exit ${r.status}).${detail ? `\n${detail}` : ""}`);
       }

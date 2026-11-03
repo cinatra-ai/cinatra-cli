@@ -2825,8 +2825,11 @@ export function deriveSlug({ rest, checkoutDir }) {
     }
     return explicit;
   }
+  // The branch is read only after `git rev-parse` exits 0; any other answer
+  // (a non-zero exit, a timeout, a signal, a spawn error) names no branch, and
+  // the slug falls back to "main" as for an empty answer.
   const r = runSpawn("git", ["-C", checkoutDir, "rev-parse", "--abbrev-ref", "HEAD"]);
-  const branch = (outputText(r, "stdout") ?? "").trim();
+  const branch = answerOk(r) ? (outputText(r, "stdout") ?? "").trim() : "";
   const slug = String(branch || "main")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")

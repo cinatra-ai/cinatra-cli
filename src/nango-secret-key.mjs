@@ -208,9 +208,10 @@ export function nangoSecretKeyQueries(environmentName) {
   ];
 }
 
-/** Bounded sync backoff, matching how the sibling bring-up waits do it. */
+/** Bounded sync backoff, matching how the sibling bring-up waits do it. The
+ *  `sleep` child is bounded from its spawn: its own length plus 5 s. */
 function sleepSeconds(seconds) {
-  spawnSync("sleep", [String(seconds)]);
+  spawnBounded(spawnSync, "sleep", [String(seconds)], { stdio: "ignore" }, siteBound(seconds * 1_000 + 5_000));
 }
 
 /**
