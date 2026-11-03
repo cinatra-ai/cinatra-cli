@@ -112,7 +112,8 @@ const NEVER_EXITS =
  *    With `leave` it answers only once the grandchild has written its pid, so
  *    the pipes are held when it exits; a grandchild with no pid within
  *    GRANDCHILD_PID_WAIT_MS is the stand-in's exit 99, and the row fails on
- *    its "was started" check before it reads the site's answer. */
+ *    its "was started" check before it reads the site's answer. With
+ *    `signal` it ends by that signal instead of its exit. */
 function standIn(command, { answers = [], target }, { pidFile, gpidFile, callLog }) {
   const dir = mkdtempSync(path.join(sandbox, "bin-"));
   const body = `#!${NODE}
@@ -142,6 +143,7 @@ if (t.mode === "hang") {
   }
   if (t.out) fs.writeSync(1, t.out);
   if (!t.leave) g.kill("SIGKILL");
+  if (t.signal) process.kill(process.pid, t.signal);
   process.exit(t.exit ?? 0);
 }
 `;
@@ -507,6 +509,37 @@ describe("cinatra-cli#306 status-first: a site reads no text of a non-zero exit 
         if (row.target.leave) expect(readPid(gpidFile), "the grandchild that held the pipes was started").toBeGreaterThan(0);
         expect(r.value.v).toEqual(row.expected);
         if (row.target.leave) expectGone(gpidFile, "the grandchild that held the pipes");
+      } finally {
+        killIfAlive(pidFile);
+        killIfAlive(gpidFile);
+      }
+    }, 30_000);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Through the watchdog, the restart's own failures keep their reasons (main's
+// code gives the same reasons; tests/child-bound-status.test.mjs has the rows
+// with a refused status 0)
+// ---------------------------------------------------------------------------
+
+describe("restartWayflowService through the watchdog: an exit 1 and a signal death keep their reasons", () => {
+  const RESTART = `const cp = await import("node:child_process");
+return m.restartWayflowService({ targetDir: dir, composeArgs: ["compose"], deps: { spawnSync: cp.spawnSync } });`;
+  for (const [name, target, expected] of [
+    ["an exit 1 is restart-exit-1", { re: "^compose restart wayflow$", mode: "answer", exit: 1 }, { ok: false, reason: "restart-exit-1" }],
+    ["a SIGKILL death is restart-exit-null", { re: "^compose restart wayflow$", mode: "answer", signal: "SIGKILL" }, { ok: false, reason: "restart-exit-null" }],
+  ]) {
+    it(name, () => {
+      const pidFile = pidPath("child");
+      const gpidFile = pidPath("grandchild");
+      const callLog = path.join(sandbox, `calls-${process.hrtime.bigint()}.log`);
+      const bin = standIn("docker", { target }, { pidFile, gpidFile, callLog });
+      try {
+        const r = drive("wayflow-agent-mount.mjs", RESTART, bin);
+        expect(r.status, `harness ${r.signal ?? r.status}: ${r.stderr}`).toBe(0);
+        expect(fileLines(callLog).some((l) => new RegExp(target.re).test(l)), "the stand-in saw the target call").toBe(true);
+        expect(r.value.v).toEqual(expected);
       } finally {
         killIfAlive(pidFile);
         killIfAlive(gpidFile);
