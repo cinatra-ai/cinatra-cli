@@ -553,6 +553,78 @@ export function runUpgradeMajorCommand(argv, deps = {}) {
   return typeof code === "number" ? code : UPGRADE_EXIT.INTERRUPTED;
 }
 
+// --- the detection step's volume reads (cinatra-cli#324) ---------------------
+
+/**
+ * `docker volume inspect` with an explicit three-way outcome, for the
+ * detection step `instance db upgrade-major` runs before an upgrade. Only
+ * docker's own answer is ABSENT: exit 1 with "no such volume". A timeout, a
+ * signal, a spawn error, any other exit and an exit 0 without a parseable row
+ * (or one whose row is not an object) are an ERROR; the text of a refused
+ * child is never read. `spawn` is spawnSync (injected, so the rows drive it
+ * with a stand-in). cinatra-cli#306 gives the recreate preflight's reader the
+ * same rule; this reader can share that seam once it is exported.
+ * @param {Function} spawn  spawnSync-shaped
+ * @param {number} timeoutMs  the inspect's bound
+ * @returns {(name: string) => {status: "ok"|"absent"|"error", row: object|null}}
+ */
+export function makeUpgradeMajorInspectVolume(spawn, timeoutMs) {
+  return (name) => {
+    try {
+      const r = spawn("docker", ["volume", "inspect", name], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: timeoutMs,
+      });
+      if (!r || r.error != null || r.signal != null || !Number.isInteger(r.status)) return { status: "error", row: null };
+      if (r.status === 0) {
+        try {
+          const parsed = JSON.parse((r.stdout ?? "").trim());
+          const row = Array.isArray(parsed) ? parsed[0] ?? null : parsed;
+          return row && typeof row === "object" && !Array.isArray(row) ? { status: "ok", row } : { status: "error", row: null };
+        } catch {
+          return { status: "error", row: null };
+        }
+      }
+      if (r.status === 1 && /no such volume/i.test(`${r.stderr ?? ""}${r.stdout ?? ""}`)) return { status: "absent", row: null };
+      return { status: "error", row: null };
+    } catch {
+      return { status: "error", row: null };
+    }
+  };
+}
+
+/**
+ * The volume seams of the upgrade-major preflight transport over one three-way
+ * reader (cinatra-cli#324): `inspectVolume` (the row, or null),
+ * `inspectVolumeStatus` (the three-way answer, which `recheckVolumeStability`
+ * prefers, so a failed final inspect is uncertain, never "still absent") and
+ * `volumeState`, where an inspect error is "present" (fail closed, never a
+ * fresh volume). `listVolume(name)` reads the volume's listing: null when it
+ * cannot be read (→ "present"), "" for an empty volume.
+ * @param {(name: string) => {status: string, row: object|null}} inspectVolumeThreeWay
+ * @param {(name: string) => string|null} listVolume
+ */
+export function makeUpgradeMajorVolumeSeams(inspectVolumeThreeWay, listVolume) {
+  return {
+    inspectVolume: (name) => {
+      if (!name) return null;
+      const res = inspectVolumeThreeWay(name);
+      return res.status === "ok" ? res.row : null;
+    },
+    inspectVolumeStatus: (name) => (name ? inspectVolumeThreeWay(name) : { status: "absent", row: null }),
+    volumeState: (name) => {
+      if (!name) return "absent";
+      const res = inspectVolumeThreeWay(name);
+      if (res.status === "absent") return "absent";
+      if (res.status !== "ok") return "present";
+      const listing = listVolume(name);
+      if (listing === null || listing === undefined) return "present";
+      return listing.length === 0 ? "empty" : "present";
+    },
+  };
+}
+
 export const __test = {
   USAGE,
   UPGRADE_EXIT,
