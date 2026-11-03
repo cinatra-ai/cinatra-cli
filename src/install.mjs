@@ -457,6 +457,7 @@ export {
   waitForCompose as waitForInstallCompose,
   waitForNango as waitForInstallNango,
   pauseInstall,
+  installPauseMs,
 };
 
 // ---------------------------------------------------------------------------
@@ -2543,33 +2544,28 @@ function exitedCleanly(r) {
   return !childTimedOut(r) && !r?.error && !r?.signal && r?.status === 0;
 }
 
-/** One pause of `seconds` (rounded, at least 1) between readiness probes,
- *  through a `sleep` child bounded to its length plus 1 s. A pause is no
- *  read: only a clean exit 0 ends it there (`sleep` exits 0 only once its time
- *  is up); any other answer (a spawn error, a signal, a non-zero exit, an
- *  expired bound) is kept in this thread for the time that is left. So a pause
- *  never ends early, and a `sleep` that hangs ends it at its bound, 1 s late.
- *  A length that is not a finite number throws INSTALL_PAUSE_INVALID.
- *  The same rule as the kept pause of cinatra-cli#306, kept self-contained
- *  here as the helpers above are. */
-function pauseInstall(seconds) {
+/** The length of a pause in ms: `seconds` rounded to whole seconds, at least
+ *  1. A length that is not a finite number throws INSTALL_PAUSE_INVALID. */
+function installPauseMs(seconds) {
   if (typeof seconds !== "number" || !Number.isFinite(seconds)) {
     throw Object.assign(new Error(`install pause: the length must be a finite number of seconds (got ${String(seconds)})`), {
       code: "INSTALL_PAUSE_INVALID",
     });
   }
-  const s = Math.max(1, Math.round(seconds));
-  const ms = s * 1_000;
-  const t0 = performance.now();
-  let r = null;
-  try {
-    r = spawnSync("sleep", [String(s)], boundedOptions({ stdio: "ignore" }, ms + 1_000));
-  } catch {
-    r = null;
+  return Math.max(1, Math.round(seconds)) * 1_000;
+}
+
+/** One pause of `seconds` (see `installPauseMs`) between readiness probes. It
+ *  spawns no child: it is kept in this thread until the monotonic clock has
+ *  passed its whole length, so no `sleep` found on PATH can end it early, and
+ *  no bound can expire. The rule of the pauses of cinatra-cli#306, kept
+ *  self-contained here as the helpers above are. */
+function pauseInstall(seconds) {
+  const ms = installPauseMs(seconds);
+  const end = performance.now() + ms;
+  for (let left = ms; left > 0; left = end - performance.now()) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, left);
   }
-  if (exitedCleanly(r)) return;
-  const left = Math.ceil(ms - (performance.now() - t0));
-  if (left > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, left);
 }
 
 /** Poll a compose service's ready command until it exits 0. Each probe is
