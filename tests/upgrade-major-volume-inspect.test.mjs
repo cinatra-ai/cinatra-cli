@@ -226,6 +226,41 @@ describe("cinatra-cli#324: the detection step upgrade-major runs refuses a faile
     });
   }
 
+  // A volume that changes between the first inspect and the recheck: the
+  // three-way recheck reads "changed", and the step fails closed.
+  for (const [what, answers] of [
+    ["created between the reads (absent, absent, then a row)", [ABSENT, ABSENT, OK]],
+    ["removed between the reads (a row, a row, then absent)", [OK, OK, ABSENT]],
+  ]) {
+    it(`cinatra-cli#324 detection: a probed version on a volume ${what} fails closed`, () => {
+      const { transport, calls } = transportOf(answers, "15");
+      expect(recheckVolumeStability(transportOf([answers[2]]).transport, VOL, answers[0] === OK ? { name: VOL, createdAt: ROW.CreatedAt } : null)).toBe("changed");
+      const rep = detectProbed(transport);
+      expect(calls).toHaveLength(3);
+      expect(rep.results[0].verdict).toBe(VERDICTS.FAIL_CLOSED);
+    });
+
+    it(`cinatra-cli#324 detection: an unprobed volume ${what} fails closed, never an empty/fresh PASS`, () => {
+      const { transport } = transportOf(answers);
+      const rep = detect(transport);
+      expect(rep.results[0].verdict).toBe(VERDICTS.FAIL_CLOSED);
+    });
+  }
+
+  it("cinatra-cli#324 detection: an unprobed volume whose middle (state) inspect fails is read present and fails closed, never an empty/fresh PASS", () => {
+    const { transport, calls } = transportOf([OK, FAILED["a non-zero exit with other text"], OK]);
+    const rep = detect(transport);
+    expect(calls).toHaveLength(3);
+    expect(rep.results[0].verdict).toBe(VERDICTS.FAIL_CLOSED);
+  });
+
+  it("cinatra-cli#324 detection: a probed version on a volume inspected at both ends whose middle (state) inspect fails is the supported STOP (the failed read counts as present)", () => {
+    const { transport, calls } = transportOf([OK, FAILED["a non-zero exit with other text"], OK], "15");
+    const rep = detectProbed(transport);
+    expect(calls).toHaveLength(3);
+    expect(rep.results[0].verdict).toBe(VERDICTS.STOP);
+  });
+
   it("cinatra-cli#324 control: a probed version on an inspected volume is the supported STOP", () => {
     const { transport, calls } = transportOf([OK, OK, OK], "15");
     const rep = detectProbed(transport);
