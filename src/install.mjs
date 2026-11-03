@@ -2526,12 +2526,14 @@ export const INSTALL_PROBE_TIMEOUT_MS = 15_000;
 /** The `curl` probe of the Nango wait keeps its own 3 s bound. */
 export const INSTALL_NANGO_PROBE_TIMEOUT_MS = 3_000;
 
-/** A probe bound must be a positive, finite number of milliseconds: spawnSync
- *  reads a `timeout` of 0 (or none) as no bound at all, so such a value is
- *  refused by name (INSTALL_PROBE_BOUND_INVALID), never passed on. */
+/** A probe bound must be a whole number of milliseconds of at least 1:
+ *  spawnSync reads a `timeout` of 0 (or none) as no bound at all, and throws
+ *  on a fraction, which the probe's catch would turn into a silent failed
+ *  attempt. Any other value is refused by name (INSTALL_PROBE_BOUND_INVALID),
+ *  never passed on. */
 function checkedProbeBound(ms) {
-  if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) {
-    throw Object.assign(new Error(`install readiness probe: the bound must be a positive, finite number of ms (got ${String(ms)})`), {
+  if (typeof ms !== "number" || !Number.isInteger(ms) || ms < 1) {
+    throw Object.assign(new Error(`install readiness probe: the bound must be a whole number of ms of at least 1 (got ${String(ms)})`), {
       code: "INSTALL_PROBE_BOUND_INVALID",
     });
   }

@@ -198,7 +198,7 @@ describe("waitForCompose: the docker compose exec probe is bounded from its spaw
     expect(install.INSTALL_NANGO_PROBE_TIMEOUT_MS).toBe(3_000);
   });
 
-  for (const bound of ["0", "-1", "Infinity", "NaN", '"1500"', "null"]) {
+  for (const bound of ["0", "-1", "Infinity", "NaN", '"1500"', "null", "0.5", "1500.5"]) {
     it(`a probe bound of ${bound} is refused by name before any probe runs (0 would mean no bound)`, { timeout: HARNESS_CASE_MS }, () => {
       const countFile = path.join(mkdtempSync(path.join(sandbox, "count-")), "count");
       const env = standInsEnv({ docker: `echo x >> "${countFile}"; exit 0`, sleep: SLEEP_CLEAN });
@@ -267,7 +267,7 @@ describe("waitForNango: the curl probe is bounded with SIGKILL and the 2 s pause
     expectGone(pidFile);
   });
 
-  for (const bound of ["0", "-1", "Infinity"]) {
+  for (const bound of ["0", "-1", "Infinity", "0.5", "1500.5"]) {
     it(`a curl probe bound of ${bound} is refused by name`, { timeout: HARNESS_CASE_MS }, () => {
       const env = standInsEnv({ curl: "exit 0", sleep: SLEEP_CLEAN });
       const v = valueOf(inHarness(nango(`{ probeTimeoutMs: ${bound} }`), { env }));
