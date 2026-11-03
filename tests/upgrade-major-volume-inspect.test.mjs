@@ -287,6 +287,38 @@ describe("cinatra-cli#324: the detection step upgrade-major runs refuses a faile
     expect(rep.results[0].verdict).toBe(VERDICTS.STOP);
   });
 
+  // A failed FIRST read followed by reads that succeed. The detection step keeps
+  // no memory of the failed first read: the later reads decide.
+  it("cinatra-cli#324 detection: an unprobed volume whose first inspect fails and that is then inspected twice fails closed (the recheck reads it as changed)", () => {
+    const { transport, calls } = transportOf([FAILED["a non-zero exit with other text"], OK, OK]);
+    const rep = detect(transport);
+    expect(calls).toHaveLength(3);
+    expect(rep.results[0].verdict).toBe(VERDICTS.FAIL_CLOSED);
+  });
+
+  it("cinatra-cli#324 detection: an unprobed volume whose first inspect fails and that docker then reports absent twice is the fresh-volume PASS (docker's own answers on the later reads decide)", () => {
+    const { transport, calls } = transportOf([FAILED["a non-zero exit with other text"], ABSENT, ABSENT]);
+    const rep = detect(transport);
+    expect(calls).toHaveLength(3);
+    expect(rep.results[0].verdict).toBe(VERDICTS.PASS);
+  });
+
+  it("cinatra-cli#324 detection: a probed version on a volume whose first two inspects fail and whose recheck docker reports absent is the STOP (the probed version decides, as when docker reports the volume absent at every inspect)", () => {
+    const failed = FAILED["a non-zero exit with other text"];
+    const { transport, calls } = transportOf([failed, failed, ABSENT], "15");
+    const rep = detectProbed(transport);
+    expect(calls).toHaveLength(3);
+    expect(rep.results[0].verdict).toBe(VERDICTS.STOP);
+    expect(detectProbed(transportOf([ABSENT, ABSENT, ABSENT], "15").transport).results[0].verdict).toBe(VERDICTS.STOP);
+  });
+
+  it("cinatra-cli#324 detection: an unprobed volume first inspected whose final inspect gives a signal fails closed", () => {
+    const { transport, calls } = transportOf([OK, OK, FAILED["a signal"]]);
+    const rep = detect(transport);
+    expect(calls).toHaveLength(3);
+    expect(rep.results[0].verdict).toBe(VERDICTS.FAIL_CLOSED);
+  });
+
   it("cinatra-cli#324 control: a probed version on an inspected volume is the supported STOP", () => {
     const { transport, calls } = transportOf([OK, OK, OK], "15");
     const rep = detectProbed(transport);
