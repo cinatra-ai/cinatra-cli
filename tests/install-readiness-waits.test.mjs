@@ -13,16 +13,22 @@
 //
 // The cleanup signals no pid (it only probes one with signal 0, which delivers
 // nothing): a pid read from a file can belong to another process by the time
-// it is read. After its case, a hanging child is
-// asked to stop through a marker file next to its pid file; it reads the
-// marker every 100 ms, and also at its start, so a child that starts only
-// after its cleanup exits at once. It exits by itself after 60 s in any case.
-// The cleanup then waits up to 5 s for the child to be gone and fails the case
-// if it is not.
+// it is read. After its case, a hanging child is asked to stop through a
+// marker file next to its pid file; it reads the marker at its start and every
+// 100 ms. The cleanup then waits up to 5 s for the child to be gone and fails
+// the case if it is not. A child can miss its marker: one that starts after its
+// cleanup and is held before its first read while the marker is removed. So
+// each hanging child also holds a lifeline: at its start it connects to a Unix
+// socket that this file listens on, and it exits when that connection ends or
+// fails. afterAll ends the lifeline and waits up to 5 s for every connection
+// that it has taken to close, then removes the sandbox. A child that tries to
+// connect only after that fails to connect, and exits. A child also exits by
+// itself after 60 s.
 import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -36,13 +42,18 @@ const STOP_WAIT_MS = 5_000;
 // slack covers floating-point rounding only.
 const FLOAT_SLACK_MS = 0.001;
 // The hanging child: argv[2] is its pid file; the marker `stop` next to it asks
-// it to exit, and it notes its own exit in `exited` there.
+// it to exit, and it notes its own exit in `exited` there. argv[3] is the
+// lifeline socket: the child connects to it before anything else and exits
+// when that connection ends, closes or fails.
 const HANGING_CHILD_JS = [
   "const fs = require('fs');",
+  "const net = require('net');",
   "const path = require('path');",
   "const pidFile = process.argv[2];",
   "const dir = path.dirname(pidFile);",
   "const lifetimeEnd = Date.now() + 60000;",
+  "const lifeline = net.connect(process.argv[3]);",
+  "for (const e of ['end', 'close', 'error']) lifeline.on(e, () => process.exit(0));",
   "fs.writeFileSync(pidFile, String(process.pid));",
   "process.on('exit', () => { try { fs.writeFileSync(path.join(dir, 'exited'), String(process.pid)); } catch {} });",
   "process.on('SIGTERM', () => {});",
@@ -52,14 +63,33 @@ const HANGING_CHILD_JS = [
   "setInterval(check, 100);",
   "",
 ].join("\n");
+// Loaded with -r into a hanging child by a control of the cleanup: it holds the
+// child for 1 s right after its first file write (the pid write), before its
+// first read of the stop marker, as a child that is descheduled there.
+const HOLD_AFTER_PID_JS = [
+  "const fs = require('fs');",
+  "const write = fs.writeFileSync;",
+  "fs.writeFileSync = function (...args) {",
+  "  fs.writeFileSync = write;",
+  "  const out = write.apply(this, args);",
+  "  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);",
+  "  return out;",
+  "};",
+  "",
+].join("\n");
 
 let sandbox;
 let hangingChildFile;
+let holdAfterPidFile;
+let lifeline;
 const pidFiles = [];
-beforeAll(() => {
+beforeAll(async () => {
   sandbox = mkdtempSync(path.join(os.tmpdir(), "cinatra-readiness-waits-"));
   hangingChildFile = path.join(sandbox, "hanging-child.cjs");
   writeFileSync(hangingChildFile, HANGING_CHILD_JS);
+  holdAfterPidFile = path.join(sandbox, "hold-after-pid.cjs");
+  writeFileSync(holdAfterPidFile, HOLD_AFTER_PID_JS);
+  lifeline = await openLifeline(sandbox);
 });
 afterEach(() => {
   const left = [];
@@ -72,9 +102,58 @@ afterEach(() => {
   }
   if (left.length) throw new Error(left.join("; "));
 });
-afterAll(() => {
-  rmSync(sandbox, { recursive: true, force: true });
+afterAll(async () => {
+  await endOfFile(lifeline, sandbox);
 });
+
+/** The lifeline in `dir`: a Unix socket server. Each connection to it is one
+ *  hanging child, which exits when its connection ends. */
+function openLifeline(dir) {
+  const file = path.join(dir, "l.sock");
+  if (Buffer.byteLength(file) > 100) {
+    throw new Error(`the lifeline socket path is too long for a Unix socket (${file}); use a shorter TMPDIR`);
+  }
+  const sockets = new Set();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("error", () => {});
+    socket.resume();
+  });
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(file, () => resolve({ file, server, sockets }));
+  });
+}
+
+/** What `promise` resolves to, or false after `ms`. */
+function within(promise, ms) {
+  let timer;
+  const late = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+  });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+}
+
+/** Ends the lifeline: it takes no new connection, ends each one it holds, and
+ *  waits up to `waitMs` for all of them to close (a child closes its own only
+ *  by exiting). Throws if one is still open then. It signals no process. */
+async function endLifeline(life, { waitMs = STOP_WAIT_MS } = {}) {
+  const closed = new Promise((resolve) => life.server.close(() => resolve(true)));
+  for (const socket of life.sockets) socket.end();
+  if (!(await within(closed, waitMs))) {
+    throw new Error(`${life.sockets.size} hanging child(ren) still held the lifeline ${waitMs} ms after it was ended; none was signalled`);
+  }
+}
+
+/** The end of a test file: its lifeline ended, then its sandbox removed. */
+async function endOfFile(life, dir) {
+  try {
+    if (life) await endLifeline(life);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 function readPid(pidFile) {
   try {
@@ -125,9 +204,10 @@ function newPidFile(tag) {
   return file;
 }
 
-/** A shell line that becomes the hanging node child (pid in `pidFile`). */
+/** A shell line that becomes the hanging node child (pid in `pidFile`), on the
+ *  lifeline of this file. */
 function hangs(pidFile) {
-  return `exec "${NODE}" "${hangingChildFile}" "${pidFile}"`;
+  return `exec "${NODE}" "${hangingChildFile}" "${pidFile}" "${lifeline.file}"`;
 }
 
 /** Stand-in scripts (`{ name: shell body }`) in one new directory. With
@@ -525,5 +605,31 @@ describe("this file's cleanup: it signals no pid, and a late child stops by itse
     expect(r.error?.code ?? null, "the late child ran until its guard").toBe(null);
     expect(r.status).toBe(0);
     expect(readPid(pidFile)).toBeGreaterThan(0);
+  });
+
+  it("a late child whose stop marker is removed between its pid write and its first read of it is gone once its file has ended", { timeout: HARNESS_CASE_MS }, async () => {
+    // A test file of its own: a sandbox and a lifeline that this row ends as afterAll ends the file's.
+    const box = mkdtempSync(path.join(sandbox, "lf-"));
+    const life = await openLifeline(box);
+    const pidFile = path.join(mkdtempSync(path.join(box, "pid-")), "child.pid");
+    // The harness guard stopped the harness before its child started: the cleanup finds no pid,
+    // writes the stop marker and returns.
+    stopChild(pidFile);
+    const child = spawn(NODE, ["-r", holdAfterPidFile, hangingChildFile, pidFile, life.file], { stdio: "ignore" });
+    const exited = once(child, "exit").then(() => true, () => false);
+    try {
+      const start = performance.now();
+      while (readPid(pidFile) === 0 && performance.now() - start < STOP_WAIT_MS) await delay(10);
+      expect(readPid(pidFile), "the late child wrote its pid").toBeGreaterThan(0);
+      // The child is held for 1 s after its pid write; its marker goes in that time.
+      rmSync(path.join(path.dirname(pidFile), "stop"), { force: true });
+      await endOfFile(life, box);
+      expect(await within(exited, 3_000), "the late child was still running 3 s after its file ended").toBe(true);
+    } finally {
+      // Ended through its own handle, which sends nothing once the process has exited.
+      child.kill("SIGKILL");
+      for (const socket of life.sockets) socket.destroy();
+      life.server.close();
+    }
   });
 });
