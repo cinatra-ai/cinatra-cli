@@ -5,33 +5,72 @@
 //
 // The children here are real processes: small `docker`, `curl` and `sleep`
 // stand-in scripts placed first on PATH of a harness node process. A stand-in
-// that "hangs" execs a node child that writes its pid, ignores SIGTERM and
-// never exits, so only a bound with SIGKILL ends it. A wait with no bound
-// blocks its whole process (the wait is synchronous), so each case runs the
-// helper in a harness process with its own guard: the guard stops a helper
-// that waited past its bound, and the case fails on its own assertion. Every
-// never-exiting child is killed after its case in either outcome, by the pid
-// it wrote itself.
+// that "hangs" execs a node child that writes its pid and ignores SIGTERM, so
+// only a bound with SIGKILL ends it before its case is over. A wait with no
+// bound blocks its whole process (the wait is synchronous), so each case runs
+// the helper in a harness process with its own guard: the guard stops a helper
+// that waited past its bound, and the case fails on its own assertion.
+//
+// The cleanup signals no pid (it only probes one with signal 0, which delivers
+// nothing): a pid read from a file can belong to another process by the time
+// it is read. After its case, a hanging child is
+// asked to stop through a marker file next to its pid file; it reads the
+// marker every 100 ms, and also at its start, so a child that starts only
+// after its cleanup exits at once. It exits by itself after 60 s in any case.
+// The cleanup then waits up to 5 s for the child to be gone and fails the case
+// if it is not.
 import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 const NODE = process.execPath;
 const INSTALL_URL = new URL("../src/install.mjs", import.meta.url).href;
 const HARNESS_GUARD_MS = 15_000;
 const HARNESS_CASE_MS = 30_000;
-const NEVER_EXITS_JS =
-  "require('fs').writeFileSync(process.argv[1], String(process.pid)); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)";
+const STOP_WAIT_MS = 5_000;
+// The pause rows read the time on the clock that the pause itself reads; the
+// slack covers floating-point rounding only.
+const FLOAT_SLACK_MS = 0.001;
+// The hanging child: argv[2] is its pid file; the marker `stop` next to it asks
+// it to exit, and it notes its own exit in `exited` there.
+const HANGING_CHILD_JS = [
+  "const fs = require('fs');",
+  "const path = require('path');",
+  "const pidFile = process.argv[2];",
+  "const dir = path.dirname(pidFile);",
+  "const lifetimeEnd = Date.now() + 60000;",
+  "fs.writeFileSync(pidFile, String(process.pid));",
+  "process.on('exit', () => { try { fs.writeFileSync(path.join(dir, 'exited'), String(process.pid)); } catch {} });",
+  "process.on('SIGTERM', () => {});",
+  "const stopAsked = () => fs.existsSync(path.join(dir, 'stop'));",
+  "const check = () => { if (stopAsked() || Date.now() >= lifetimeEnd) process.exit(0); };",
+  "check();",
+  "setInterval(check, 100);",
+  "",
+].join("\n");
 
 let sandbox;
+let hangingChildFile;
 const pidFiles = [];
 beforeAll(() => {
   sandbox = mkdtempSync(path.join(os.tmpdir(), "cinatra-readiness-waits-"));
+  hangingChildFile = path.join(sandbox, "hanging-child.cjs");
+  writeFileSync(hangingChildFile, HANGING_CHILD_JS);
 });
 afterEach(() => {
-  while (pidFiles.length) killIfAlive(pidFiles.pop());
+  const left = [];
+  while (pidFiles.length) {
+    try {
+      stopChild(pidFiles.pop());
+    } catch (err) {
+      left.push(err.message);
+    }
+  }
+  if (left.length) throw new Error(left.join("; "));
 });
 afterAll(() => {
   rmSync(sandbox, { recursive: true, force: true });
@@ -61,28 +100,34 @@ function expectGone(pidFile) {
   expect(isAlive(pid), "the hanging child is gone after the wait").toBe(false);
 }
 
-/** Cleanup in every outcome: a child a helper never stopped is killed here. */
-function killIfAlive(pidFile) {
-  const pid = readPid(pidFile);
-  if (isAlive(pid)) {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // already gone
+/** Cleanup in every outcome. It signals no pid: it writes the `stop` marker
+ *  next to `pidFile`, then waits up to `waitMs` for the child to be gone (its
+ *  `exited` note, or no live process with its pid), and throws if it is not.
+ *  A child that has not started yet sees the marker when it starts. */
+function stopChild(pidFile, { waitMs = STOP_WAIT_MS } = {}) {
+  const dir = path.dirname(pidFile);
+  writeFileSync(path.join(dir, "stop"), "");
+  const end = performance.now() + waitMs;
+  for (;;) {
+    const pid = readPid(pidFile);
+    if (existsSync(path.join(dir, "exited")) || !isAlive(pid)) return;
+    if (performance.now() >= end) {
+      throw new Error(`a stand-in child (pid ${pid}) did not stop within ${waitMs} ms after its stop marker; it was not signalled`);
     }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
   }
 }
 
-/** A new pid file path in the sandbox, killed after the case. */
+/** A new pid file path in the sandbox, its child stopped after the case. */
 function newPidFile(tag) {
   const file = path.join(mkdtempSync(path.join(sandbox, `pid-${tag}-`)), "child.pid");
   pidFiles.push(file);
   return file;
 }
 
-/** A shell line that becomes a node child which never exits (pid in `pidFile`). */
+/** A shell line that becomes the hanging node child (pid in `pidFile`). */
 function hangs(pidFile) {
-  return `exec "${NODE}" -e "${NEVER_EXITS_JS}" "${pidFile}"`;
+  return `exec "${NODE}" "${hangingChildFile}" "${pidFile}"`;
 }
 
 /** Stand-in scripts (`{ name: shell body }`) in one new directory. With
@@ -131,9 +176,9 @@ function inHarness(body, { env = process.env } = {}) {
 function timed(call) {
   return (
     "const lines = []; const log = (l) => lines.push(l); let threw = null; let code = null;\n" +
-    "const t0 = Date.now();\n" +
+    "const t0 = performance.now();\n" +
     `try { ${call}; } catch (err) { threw = String(err?.message ?? err); code = err?.code ?? null; }\n` +
-    "return { ms: Date.now() - t0, lines, threw, code };"
+    "return { ms: performance.now() - t0, lines, threw, code };"
   );
 }
 
@@ -165,7 +210,7 @@ function expectNoSleepChild(marker) {
 }
 
 describe("waitForCompose: the docker compose exec probe is bounded from its spawn (cinatra-cli#325)", () => {
-  it("a probe that never exits is stopped at its bound and is a failed attempt, not a hang", { timeout: HARNESS_CASE_MS }, () => {
+  it("a probe that hangs is stopped at its bound and is a failed attempt, not a hang", { timeout: HARNESS_CASE_MS }, () => {
     const pidFile = newPidFile("docker");
     const env = standInsEnv({ docker: hangs(pidFile), sleep: SLEEP_CLEAN });
     const v = valueOf(inHarness(compose(), { env }));
@@ -198,7 +243,7 @@ describe("waitForCompose: the docker compose exec probe is bounded from its spaw
     expect(install.INSTALL_NANGO_PROBE_TIMEOUT_MS).toBe(3_000);
   });
 
-  for (const bound of ["0", "-1", "Infinity", "NaN", '"1500"', "null", "0.5", "1500.5"]) {
+  for (const bound of ["0", "-1", "Infinity", "NaN", '"1500"', "null", "0.5", "1500.5", "Object.create(null)"]) {
     it(`a probe bound of ${bound} is refused by name before any probe runs (0 would mean no bound)`, { timeout: HARNESS_CASE_MS }, () => {
       const countFile = path.join(mkdtempSync(path.join(sandbox, "count-")), "count");
       const env = standInsEnv({ docker: `echo x >> "${countFile}"; exit 0`, sleep: SLEEP_CLEAN });
@@ -207,6 +252,23 @@ describe("waitForCompose: the docker compose exec probe is bounded from its spaw
       expect(() => readFileSync(countFile, "utf8")).toThrow();
     });
   }
+
+  for (const [bound, shown] of [["Object.create(null)", "an object"], ["() => 1500", "a function"], ["Symbol(\"x\")", "Symbol(x)"], ["null", "null"]]) {
+    it(`a refused probe bound of ${bound} is named in the message as ${shown}`, { timeout: HARNESS_CASE_MS }, () => {
+      const env = standInsEnv({ docker: "exit 0", sleep: SLEEP_CLEAN });
+      const v = valueOf(inHarness(compose(`{ probeTimeoutMs: ${bound} }`), { env }));
+      expect(v.code).toBe("INSTALL_PROBE_BOUND_INVALID");
+      expect(v.threw).toContain(`(got ${shown})`);
+    });
+  }
+
+  it("a probe bound of 1 (the smallest whole number of ms) is taken and passed to the probe", { timeout: HARNESS_CASE_MS }, () => {
+    const fake = "(cmd, args, options) => { globalThis.seen = { cmd, timeout: options?.timeout, killSignal: options?.killSignal }; return { status: 0, signal: null, error: undefined }; }";
+    const v = valueOf(inHarness(withFakeSpawn(fake, `m.waitForInstallCompose(".", "db", ["pg_isready"], "Postgres", log, 1, ["compose"], { probeTimeoutMs: 1 }); lines.push(JSON.stringify(globalThis.seen))`)));
+    expect(v.threw).toBe(null);
+    expect(v.code).toBe(null);
+    expect(JSON.parse(v.lines[1])).toEqual({ cmd: "docker", timeout: 1, killSignal: "SIGKILL" });
+  });
 });
 
 describe("waitForCompose: probe readings that main's code reads the same way (controls)", () => {
@@ -233,30 +295,98 @@ describe("waitForCompose: probe readings that main's code reads the same way (co
   });
 });
 
-describe("waitForCompose: the 1 s pause spawns no child and never ends early (cinatra-cli#325)", () => {
-  it("with a `sleep` on PATH that exits 0 at once, the pause still takes its full 1 s and no sleep child runs", { timeout: HARNESS_CASE_MS }, () => {
+/** A harness body that puts `fake` (the source of a function) in place of
+ *  `spawnSync` of `node:child_process` (the binding src/install.mjs imports)
+ *  before `call` runs, and counts its calls. */
+function withFakeSpawn(fake, call) {
+  return (
+    "const cp = (await import('node:child_process')).default;\n" +
+    "let calls = 0; const fake = " + fake + ";\n" +
+    "cp.spawnSync = (...args) => { calls += 1; return fake(...args); };\n" +
+    "(await import('node:module')).syncBuiltinESMExports();\n" +
+    "const timedCall = async () => { " + timed(call) + " };\n" +
+    "return { ...(await timedCall()), calls };"
+  );
+}
+
+// Probe results that no real child gives: status 0 together with a signal, a
+// spawn error or an expired bound; and a spawnSync that throws.
+const FAKE_RESULTS = [
+  ["status 0 with a signal", '() => ({ status: 0, signal: "SIGKILL", error: undefined })'],
+  ["status 0 with a spawn error", '() => ({ status: 0, signal: null, error: new Error("spawn failed") })'],
+  ["status 0 with an expired bound", '() => ({ status: 0, signal: null, error: Object.assign(new Error("timed out"), { code: "ETIMEDOUT" }) })'],
+  ["a spawnSync that throws", '() => { throw new TypeError("bad argument"); }'],
+];
+
+describe("both loops: only a clean exit 0 is ready, and a throw of spawnSync is a failed attempt (cinatra-cli#325)", () => {
+  for (const [what, fake] of FAKE_RESULTS) {
+    it(`waitForCompose: a probe of ${what} is a failed attempt, never ready`, { timeout: HARNESS_CASE_MS }, () => {
+      const env = standInsEnv({ docker: "exit 0", sleep: SLEEP_CLEAN });
+      const v = valueOf(inHarness(withFakeSpawn(fake, `m.waitForInstallCompose(".", "db", ["pg_isready"], "Postgres", log, 1, ["compose"], { probeTimeoutMs: 1500 })`), { env }));
+      expect(v.calls).toBe(1);
+      expect(v.threw).toMatch(/Postgres did not become ready within 1 seconds/);
+      expect(v.lines).toEqual([]);
+    });
+
+    it(`waitForNango: a probe of ${what} is a failed attempt, never ready`, { timeout: HARNESS_CASE_MS }, () => {
+      const env = standInsEnv({ curl: "exit 0", sleep: SLEEP_CLEAN });
+      const v = valueOf(inHarness(withFakeSpawn(fake, `m.waitForInstallNango(log, 1, "http://localhost:9/health", { probeTimeoutMs: 1500 })`), { env }));
+      expect(v.calls).toBe(1);
+      expect(v.threw).toBe(null);
+      expect(v.lines).toHaveLength(1);
+      expect(v.lines[0]).toMatch(/Nango did not report healthy in time/);
+    });
+  }
+
+  it("with no options, the compose probe is spawned with the 15 s default bound and SIGKILL", { timeout: HARNESS_CASE_MS }, () => {
+    const fake = "(cmd, args, options) => { globalThis.seen = { cmd, timeout: options?.timeout, killSignal: options?.killSignal }; return { status: 0, signal: null, error: undefined }; }";
+    const v = valueOf(inHarness(withFakeSpawn(fake, `m.waitForInstallCompose(".", "db", ["pg_isready"], "Postgres", log, 1, ["compose"]); lines.push(JSON.stringify(globalThis.seen))`)));
+    expect(v.threw).toBe(null);
+    expect(v.lines[0]).toBe("  Postgres is ready.");
+    expect(JSON.parse(v.lines[1])).toEqual({ cmd: "docker", timeout: 15_000, killSignal: "SIGKILL" });
+  });
+
+  it("with no options, the curl probe is spawned with the 3 s default bound and SIGKILL", { timeout: HARNESS_CASE_MS }, () => {
+    const fake = "(cmd, args, options) => { globalThis.seen = { cmd, timeout: options?.timeout, killSignal: options?.killSignal }; return { status: 0, signal: null, error: undefined }; }";
+    const v = valueOf(inHarness(withFakeSpawn(fake, `m.waitForInstallNango(log, 1, "http://localhost:9/health"); lines.push(JSON.stringify(globalThis.seen))`)));
+    expect(v.threw).toBe(null);
+    expect(v.lines[0]).toBe("  Nango is ready.");
+    expect(JSON.parse(v.lines[1])).toEqual({ cmd: "curl", timeout: 3_000, killSignal: "SIGKILL" });
+  });
+
+  it("control: a fake probe of a clean exit 0 is ready (the fake is the probe the loop reads)", { timeout: HARNESS_CASE_MS }, () => {
+    const env = standInsEnv({ docker: "exit 1", sleep: SLEEP_CLEAN });
+    const v = valueOf(inHarness(withFakeSpawn("() => ({ status: 0, signal: null, error: undefined })", `m.waitForInstallCompose(".", "db", ["pg_isready"], "Postgres", log, 1, ["compose"], { probeTimeoutMs: 1500 })`), { env }));
+    expect(v.calls).toBe(1);
+    expect(v.threw).toBe(null);
+    expect(v.lines).toEqual(["  Postgres is ready."]);
+  });
+});
+
+describe("waitForCompose: the 1 s pause spawns no child and is not skipped (cinatra-cli#325)", () => {
+  it("with a `sleep` on PATH that exits 0 at once, the wait takes at least its 1 s pause and no sleep child runs", { timeout: HARNESS_CASE_MS }, () => {
     const sleep = markedSleep("exit 0");
     const env = standInsEnv({ docker: "exit 1", sleep: sleep.body });
     const v = valueOf(inHarness(compose(), { env }));
     expect(v.threw).toMatch(/Postgres did not become ready/);
-    expect(v.ms).toBeGreaterThanOrEqual(950);
+    expect(v.ms).toBeGreaterThanOrEqual(1_000 - FLOAT_SLACK_MS);
     expectNoSleepChild(sleep.marker);
   });
 
-  it("with a `sleep` on PATH that never exits, the pause takes its 1 s and no sleep child runs", { timeout: HARNESS_CASE_MS }, () => {
+  it("with a `sleep` on PATH that hangs, the wait takes at least its 1 s pause and no sleep child runs", { timeout: HARNESS_CASE_MS }, () => {
     const pidFile = newPidFile("sleep");
     const sleep = markedSleep(hangs(pidFile));
     const env = standInsEnv({ docker: "exit 1", sleep: sleep.body });
     const v = valueOf(inHarness(compose(), { env }));
     expect(v.threw).toMatch(/Postgres did not become ready/);
-    expect(v.ms).toBeGreaterThanOrEqual(950);
+    expect(v.ms).toBeGreaterThanOrEqual(1_000 - FLOAT_SLACK_MS);
     expect(v.ms).toBeLessThan(8_000);
     expectNoSleepChild(sleep.marker);
   });
 });
 
 describe("waitForNango: the curl probe is bounded with SIGKILL and the 2 s pause spawns no child (cinatra-cli#325)", () => {
-  it("a curl probe that never exits (it ignores SIGTERM) is stopped at its bound; the wait warns and goes on", { timeout: HARNESS_CASE_MS }, () => {
+  it("a curl probe that hangs (it ignores SIGTERM) is stopped at its bound; the wait warns and goes on", { timeout: HARNESS_CASE_MS }, () => {
     const pidFile = newPidFile("curl");
     const env = standInsEnv({ curl: hangs(pidFile), sleep: SLEEP_CLEAN });
     const v = valueOf(inHarness(nango(), { env }));
@@ -267,7 +397,23 @@ describe("waitForNango: the curl probe is bounded with SIGKILL and the 2 s pause
     expectGone(pidFile);
   });
 
-  for (const bound of ["0", "-1", "Infinity", "0.5", "1500.5"]) {
+  it("a timed-out curl probe is never ready: the loop goes on and a later clean probe is ready", { timeout: HARNESS_CASE_MS }, () => {
+    const pidFile = newPidFile("curl");
+    const countFile = path.join(path.dirname(pidFile), "count");
+    const curl = [
+      `n=$(cat "${countFile}" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "${countFile}"`,
+      `if [ "$n" -eq 1 ]; then ${hangs(pidFile)}; fi`,
+      "exit 0",
+    ].join("\n");
+    const env = standInsEnv({ curl, sleep: SLEEP_CLEAN });
+    const v = valueOf(inHarness(nango("{ probeTimeoutMs: 1500 }", 2), { env }));
+    expect(v.threw).toBe(null);
+    expect(v.lines).toEqual(["  Nango is ready."]);
+    expect(readFileSync(countFile, "utf8").trim()).toBe("2");
+    expectGone(pidFile);
+  });
+
+  for (const bound of ["0", "-1", "Infinity", "0.5", "1500.5", "Object.create(null)"]) {
     it(`a curl probe bound of ${bound} is refused by name`, { timeout: HARNESS_CASE_MS }, () => {
       const env = standInsEnv({ curl: "exit 0", sleep: SLEEP_CLEAN });
       const v = valueOf(inHarness(nango(`{ probeTimeoutMs: ${bound} }`), { env }));
@@ -276,22 +422,22 @@ describe("waitForNango: the curl probe is bounded with SIGKILL and the 2 s pause
     });
   }
 
-  it("with a `sleep` on PATH that exits 0 at once, the pause still takes its full 2 s and no sleep child runs", { timeout: HARNESS_CASE_MS }, () => {
+  it("with a `sleep` on PATH that exits 0 at once, the wait takes at least its 2 s pause and no sleep child runs", { timeout: HARNESS_CASE_MS }, () => {
     const sleep = markedSleep("exit 0");
     const env = standInsEnv({ curl: "exit 7", sleep: sleep.body });
     const v = valueOf(inHarness(nango(), { env }));
     expect(v.lines[0]).toMatch(/Nango did not report healthy in time/);
-    expect(v.ms).toBeGreaterThanOrEqual(1_950);
+    expect(v.ms).toBeGreaterThanOrEqual(2_000 - FLOAT_SLACK_MS);
     expectNoSleepChild(sleep.marker);
   });
 
-  it("with a `sleep` on PATH that never exits, the pause takes its 2 s and no sleep child runs", { timeout: HARNESS_CASE_MS }, () => {
+  it("with a `sleep` on PATH that hangs, the wait takes at least its 2 s pause and no sleep child runs", { timeout: HARNESS_CASE_MS }, () => {
     const pidFile = newPidFile("sleep");
     const sleep = markedSleep(hangs(pidFile));
     const env = standInsEnv({ curl: "exit 7", sleep: sleep.body });
     const v = valueOf(inHarness(nango(), { env }));
     expect(v.lines[0]).toMatch(/Nango did not report healthy in time/);
-    expect(v.ms).toBeGreaterThanOrEqual(1_950);
+    expect(v.ms).toBeGreaterThanOrEqual(2_000 - FLOAT_SLACK_MS);
     expect(v.ms).toBeLessThan(9_000);
     expectNoSleepChild(sleep.marker);
   });
@@ -310,14 +456,14 @@ describe("pauseInstall: no child, the whole length, rounding and refused lengths
     const env = standInsEnv({ sleep: sleep.body });
     const v = valueOf(inHarness(pause("1"), { env }));
     expect(v.threw).toBe(null);
-    expect(v.ms).toBeGreaterThanOrEqual(950);
+    expect(v.ms).toBeGreaterThanOrEqual(1_000 - FLOAT_SLACK_MS);
     expectNoSleepChild(sleep.marker);
   });
 
   it("a length of 1.6 s is a pause of 2 s", { timeout: HARNESS_CASE_MS }, () => {
     const v = valueOf(inHarness(pause("1.6")));
     expect(v.threw).toBe(null);
-    expect(v.ms).toBeGreaterThanOrEqual(1_950);
+    expect(v.ms).toBeGreaterThanOrEqual(2_000 - FLOAT_SLACK_MS);
   });
 
   for (const [arg, ms] of [
@@ -326,6 +472,9 @@ describe("pauseInstall: no child, the whole length, rounding and refused lengths
     [0, 1_000],
     [-5, 1_000],
     [2, 2_000],
+    [0.5, 1_000],
+    [1.5, 2_000],
+    [2.5, 3_000],
   ]) {
     it(`installPauseMs: a length of ${arg} s is a pause of ${ms} ms`, async () => {
       const install = await import("../src/install.mjs");
@@ -333,7 +482,15 @@ describe("pauseInstall: no child, the whole length, rounding and refused lengths
     });
   }
 
-  for (const arg of ["Infinity", "-Infinity", "NaN", '"1"', "undefined", "null"]) {
+  for (const [arg, shown] of [["Object.create(null)", "an object"], ["() => 1", "a function"], ["null", "null"]]) {
+    it(`a refused length of ${arg} is named in the message as ${shown}`, { timeout: HARNESS_CASE_MS }, () => {
+      const v = valueOf(inHarness(pause(arg)));
+      expect(v.code).toBe("INSTALL_PAUSE_INVALID");
+      expect(v.threw).toContain(`(got ${shown})`);
+    });
+  }
+
+  for (const arg of ["Infinity", "-Infinity", "NaN", '"1"', "undefined", "null", "Object.create(null)"]) {
     it(`a length of ${arg} is refused by name at once`, { timeout: HARNESS_CASE_MS }, () => {
       const sleep = markedSleep("exit 0");
       const env = standInsEnv({ sleep: sleep.body });
@@ -343,4 +500,30 @@ describe("pauseInstall: no child, the whole length, rounding and refused lengths
       expectNoSleepChild(sleep.marker);
     });
   }
+});
+
+describe("this file's cleanup: it signals no pid, and a late child stops by itself (controls of the test)", () => {
+  it("a pid file that names a process the cleanup did not start leaves that process running, and the cleanup reports it", { timeout: HARNESS_CASE_MS }, async () => {
+    const other = spawn(NODE, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    try {
+      await once(other, "spawn");
+      const pidFile = path.join(mkdtempSync(path.join(sandbox, "pid-other-")), "child.pid");
+      writeFileSync(pidFile, String(other.pid));
+      expect(() => stopChild(pidFile, { waitMs: 300 })).toThrow(/did not stop within 300 ms/);
+      const ended = await Promise.race([once(other, "exit").then(() => true), delay(500).then(() => false)]);
+      expect(ended, "the process named in the pid file was ended by the cleanup").toBe(false);
+    } finally {
+      // Ended through its own handle, which sends nothing once the process has exited.
+      other.kill("SIGKILL");
+    }
+  });
+
+  it("a hanging child that starts only after its cleanup ran exits by itself at once", { timeout: HARNESS_CASE_MS }, () => {
+    const pidFile = newPidFile("late");
+    stopChild(pidFile);
+    const r = spawnSync("sh", ["-c", hangs(pidFile)], { stdio: "ignore", timeout: 10_000, killSignal: "SIGKILL" });
+    expect(r.error?.code ?? null, "the late child ran until its guard").toBe(null);
+    expect(r.status).toBe(0);
+    expect(readPid(pidFile)).toBeGreaterThan(0);
+  });
 });

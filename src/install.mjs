@@ -2526,6 +2526,14 @@ export const INSTALL_PROBE_TIMEOUT_MS = 15_000;
 /** The `curl` probe of the Nango wait keeps its own 3 s bound. */
 export const INSTALL_NANGO_PROBE_TIMEOUT_MS = 3_000;
 
+/** A refused value as its refusal message shows it. `String` throws on an
+ *  object with no conversion to a primitive (`Object.create(null)`), so an
+ *  object or a function is shown by its type, never converted. */
+function shownValue(value) {
+  if (typeof value === "function") return "a function";
+  return value !== null && typeof value === "object" ? "an object" : String(value);
+}
+
 /** A probe bound must be a whole number of milliseconds of at least 1:
  *  spawnSync reads a `timeout` of 0 (or none) as no bound at all, and throws
  *  on a fraction, which the probe's catch would turn into a silent failed
@@ -2533,7 +2541,7 @@ export const INSTALL_NANGO_PROBE_TIMEOUT_MS = 3_000;
  *  never passed on. */
 function checkedProbeBound(ms) {
   if (typeof ms !== "number" || !Number.isInteger(ms) || ms < 1) {
-    throw Object.assign(new Error(`install readiness probe: the bound must be a whole number of ms of at least 1 (got ${String(ms)})`), {
+    throw Object.assign(new Error(`install readiness probe: the bound must be a whole number of ms of at least 1 (got ${shownValue(ms)})`), {
       code: "INSTALL_PROBE_BOUND_INVALID",
     });
   }
@@ -2550,7 +2558,7 @@ function exitedCleanly(r) {
  *  1. A length that is not a finite number throws INSTALL_PAUSE_INVALID. */
 function installPauseMs(seconds) {
   if (typeof seconds !== "number" || !Number.isFinite(seconds)) {
-    throw Object.assign(new Error(`install pause: the length must be a finite number of seconds (got ${String(seconds)})`), {
+    throw Object.assign(new Error(`install pause: the length must be a finite number of seconds (got ${shownValue(seconds)})`), {
       code: "INSTALL_PAUSE_INVALID",
     });
   }
