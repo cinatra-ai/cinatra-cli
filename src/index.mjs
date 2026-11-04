@@ -7831,7 +7831,8 @@ const PG_SERVICE_SUPERUSER = Object.freeze({
 });
 
 async function runDbUpgradeMajor(rest) {
-  const { runUpgradeMajorCommand, UPGRADE_EXIT } = await import("./upgrade-major.mjs");
+  const { runUpgradeMajorCommand, UPGRADE_EXIT, makeUpgradeMajorVolumeSeams } = await import("./upgrade-major.mjs");
+  const { makeInspectVolumeThreeWay } = await import("./recreate-preflight.mjs");
   const { runPreflight, VERDICTS } = await import("./upgrade-preflight.mjs");
   const { readLedger, defaultLedgerDir } = await import("./version-ledger.mjs");
   const { resolveComposeConfig, statefulServicesFromComposeConfig } = await import("./version-ledger-capture.mjs");
@@ -7909,16 +7910,11 @@ async function runDbUpgradeMajor(rest) {
     return [...specs.values()];
   };
 
-  const inspectVolumeRow = (name) => {
-    const out = dockerCapture(["volume", "inspect", name]);
-    if (!out) return null;
-    try {
-      const parsed = JSON.parse(out);
-      return Array.isArray(parsed) ? parsed[0] ?? null : parsed;
-    } catch {
-      return null;
-    }
-  };
+  // cinatra-cli#324: the recreate preflight's three-way volume reader. Only
+  // docker's own exit 1 with "no such volume" is absent; a timeout, a signal
+  // or any other failure is an inspect error, which the detection step
+  // refuses (never a fresh volume).
+  const inspectVolumeThreeWay = makeInspectVolumeThreeWay(spawnSync);
   const runningContainerFor = (service) => {
     const project = row?.composeProject && row.composeProject !== "cinatra" ? row.composeProject : "cinatra";
     const out = dockerCapture(["ps", "--filter", `label=com.docker.compose.service=${service}`, "--filter", `label=com.docker.compose.project=${project}`, "--filter", "status=running", "--format", "{{.Names}}"]);
@@ -7930,17 +7926,12 @@ async function runDbUpgradeMajor(rest) {
     dockerCapture(["run", "--rm", "--pull=never", "--entrypoint", "/bin/sh", "-v", `${volumeName}:${PG_MARKER_READ_MOUNT}:ro`, image, "-c", program], { timeout: 60_000 });
 
   const transport = {
-    inspectVolume: (name) => (name ? inspectVolumeRow(name) : null),
-    volumeState: (name) => {
-      if (!name) return "absent";
-      const row2 = inspectVolumeRow(name);
-      if (!row2) return "absent";
+    // inspectVolume, the three-way inspectVolumeStatus (so the recheck after
+    // the probes reads a failed final inspect as uncertain) and volumeState.
+    ...makeUpgradeMajorVolumeSeams(inspectVolumeThreeWay, (name) => {
       const image = volumeImages.get(name);
-      if (!image) return "present";
-      const listing = dockerReadVolume(name, image, "ls -A /__cinatra_pgver 2>/dev/null");
-      if (listing === null) return "present";
-      return listing.length === 0 ? "empty" : "present";
-    },
+      return image ? dockerReadVolume(name, image, "ls -A /__cinatra_pgver 2>/dev/null") : null;
+    }),
     probeVersion: makeProbeVersion({ runningContainerFor, dockerExec }),
     readMarker: makeMarkerReader({ volumeFor: (svc) => serviceVolume.get(svc) ?? null, imageFor: (svc) => serviceImage.get(svc) ?? null, dockerReadVolume }),
     profileEnabled: () => true,

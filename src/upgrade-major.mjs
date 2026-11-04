@@ -74,6 +74,8 @@ import {
   serviceRunbookUrl,
   supportedTransition,
 } from "./upgrade-matrix.mjs";
+import { makeVolumeInspectSeams } from "./recreate-preflight.mjs";
+import { volumeIdentityFromInspect } from "./upgrade-preflight.mjs";
 
 export const UPGRADE_EXIT = Object.freeze({
   OK: 0,
@@ -551,6 +553,36 @@ export function runUpgradeMajorCommand(argv, deps = {}) {
   }
   const code = deps.execute(ctx);
   return typeof code === "number" ? code : UPGRADE_EXIT.INTERRUPTED;
+}
+
+// --- the detection step's volume seams (cinatra-cli#324) --------------------
+
+/**
+ * The volume seams of the transport `instance db upgrade-major` gives its
+ * detection step, over the recreate preflight's three-way reader
+ * (`makeInspectVolumeThreeWay`, src/recreate-preflight.mjs, where only
+ * docker's own exit 1 with "no such volume" is absent and any other failure
+ * is an error). `inspectVolume` and the three-way `inspectVolumeStatus` are
+ * that module's `makeVolumeInspectSeams`; this adds `volumeState`. An inspect
+ * error, or a row the detection step cannot identify, is a present volume:
+ * it is never read as absent or empty, and its contents are not listed.
+ * @param {(name: string) => {status: "ok"|"absent"|"error", row: any}} inspectVolumeThreeWay
+ * @param {(name: string) => string|null|undefined} listVolume  the volume's
+ *   listing, or null when it cannot be read (a present volume)
+ */
+export function makeUpgradeMajorVolumeSeams(inspectVolumeThreeWay, listVolume) {
+  return {
+    ...makeVolumeInspectSeams(inspectVolumeThreeWay),
+    volumeState: (name) => {
+      if (!name) return "absent";
+      const res = inspectVolumeThreeWay(name);
+      if (res.status === "absent") return "absent";
+      if (res.status !== "ok" || !volumeIdentityFromInspect(res.row)) return "present";
+      const listing = listVolume(name);
+      if (listing === null || listing === undefined) return "present";
+      return listing.length === 0 ? "empty" : "present";
+    },
+  };
 }
 
 export const __test = {
