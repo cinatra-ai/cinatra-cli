@@ -63,16 +63,22 @@ const HANGING_CHILD_JS = [
   "setInterval(check, 100);",
   "",
 ].join("\n");
-// Loaded with -r into a hanging child by a control of the cleanup: it holds the
-// child for 1 s right after its first file write (the pid write), before its
-// first read of the stop marker, as a child that is descheduled there.
+// Loaded with -r into a hanging child by a control of the cleanup: right after
+// its first file write (the pid write), before its first read of the stop
+// marker, it holds the child, as a child that is descheduled there, until the
+// marker next to the pid file is gone (at most 10 s). Then it writes to the
+// file named by HOLD_NOTE whether the marker was gone when it let the child go.
 const HOLD_AFTER_PID_JS = [
   "const fs = require('fs');",
+  "const path = require('path');",
   "const write = fs.writeFileSync;",
-  "fs.writeFileSync = function (...args) {",
+  "fs.writeFileSync = function (file, ...rest) {",
   "  fs.writeFileSync = write;",
-  "  const out = write.apply(this, args);",
-  "  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);",
+  "  const out = write.call(this, file, ...rest);",
+  "  const marker = path.join(path.dirname(String(file)), 'stop');",
+  "  const end = Date.now() + 10000;",
+  "  while (fs.existsSync(marker) && Date.now() < end) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);",
+  "  if (process.env.HOLD_NOTE) write(process.env.HOLD_NOTE, fs.existsSync(marker) ? 'marker still there' : 'marker gone');",
   "  return out;",
   "};",
   "",
@@ -615,16 +621,22 @@ describe("this file's cleanup: it signals no pid, and a late child stops by itse
     // The harness guard stopped the harness before its child started: the cleanup finds no pid,
     // writes the stop marker and returns.
     stopChild(pidFile);
-    const child = spawn(NODE, ["-r", holdAfterPidFile, hangingChildFile, pidFile, life.file], { stdio: "ignore" });
+    // The note is outside the row's own sandbox, so that it is still there after that sandbox is removed.
+    const note = path.join(mkdtempSync(path.join(sandbox, "hold-")), "note");
+    const child = spawn(NODE, ["-r", holdAfterPidFile, hangingChildFile, pidFile, life.file], {
+      stdio: "ignore",
+      env: { ...process.env, HOLD_NOTE: note },
+    });
     const exited = once(child, "exit").then(() => true, () => false);
     try {
       const start = performance.now();
       while (readPid(pidFile) === 0 && performance.now() - start < STOP_WAIT_MS) await delay(10);
       expect(readPid(pidFile), "the late child wrote its pid").toBeGreaterThan(0);
-      // The child is held for 1 s after its pid write; its marker goes in that time.
+      // The child is held after its pid write until its marker is gone, so its first read finds none.
       rmSync(path.join(path.dirname(pidFile), "stop"), { force: true });
       await endOfFile(life, box);
       expect(await within(exited, 3_000), "the late child was still running 3 s after its file ended").toBe(true);
+      expect(readFileSync(note, "utf8"), "the child was held after its pid write until its stop marker was gone").toBe("marker gone");
     } finally {
       // Ended through its own handle, which sends nothing once the process has exited.
       child.kill("SIGKILL");
