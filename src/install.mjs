@@ -285,7 +285,9 @@ const GIT_ALLOW_PROTOCOL = ALLOWED_GIT_PROTOCOLS.join(":");
 // ignores SIGTERM cannot hold the wait open. An expired bound is a named failure
 // (`childTimeoutError`), never "false", "null" or empty. Success is the exit
 // status alone; output is parsed only after a zero status. The other direct
-// child waits of this file (the compose start among them) keep their own handling.
+// child waits of this file (the compose start among them) keep their own handling,
+// except the readiness waits of the stack start (`waitForCompose`, `waitForNango`),
+// whose probes and pauses are bounded too (cinatra-cli#325).
 // ---------------------------------------------------------------------------
 
 /** A short read or probe (git rev-parse/status/remote, `--version`). */
@@ -451,6 +453,11 @@ export {
   commandExists as installCommandExists,
   capture as captureInstallChild,
   git as runInstallGit,
+  // cinatra-cli#325 — the readiness waits of the stack start and their pause.
+  waitForCompose as waitForInstallCompose,
+  waitForNango as waitForInstallNango,
+  pauseInstall,
+  installPauseMs,
 };
 
 // ---------------------------------------------------------------------------
@@ -2513,33 +2520,107 @@ function composeUpOrThrow(targetDir, { composeFiles = null, composeProject = nul
   }
 }
 
-function waitForCompose(targetDir, service, readyCmd, label, log, maxAttempts = 60, composeBase = ["compose"]) {
-  for (let i = 0; i < maxAttempts; i += 1) {
-    const r = spawnSync("docker", [...composeBase, "exec", "-T", service, ...readyCmd], {
-      stdio: "ignore",
-      cwd: targetDir,
+/** One readiness probe of the wait loops below (a `docker compose exec`
+ *  ready command): bounded from its spawn like a short read. */
+export const INSTALL_PROBE_TIMEOUT_MS = 15_000;
+/** The `curl` probe of the Nango wait keeps its own 3 s bound. */
+export const INSTALL_NANGO_PROBE_TIMEOUT_MS = 3_000;
+
+/** A refused value as its refusal message shows it. `String` throws on an
+ *  object with no conversion to a primitive (`Object.create(null)`), so an
+ *  object or a function is shown by its type, never converted. */
+function shownValue(value) {
+  if (typeof value === "function") return "a function";
+  return value !== null && typeof value === "object" ? "an object" : String(value);
+}
+
+/** A probe bound must be a whole number of milliseconds of at least 1:
+ *  spawnSync reads a `timeout` of 0 (or none) as no bound at all, and throws
+ *  on a fraction, which the probe's catch would turn into a silent failed
+ *  attempt. Any other value is refused by name (INSTALL_PROBE_BOUND_INVALID),
+ *  never passed on. */
+function checkedProbeBound(ms) {
+  if (typeof ms !== "number" || !Number.isInteger(ms) || ms < 1) {
+    throw Object.assign(new Error(`install readiness probe: the bound must be a whole number of ms of at least 1 (got ${shownValue(ms)})`), {
+      code: "INSTALL_PROBE_BOUND_INVALID",
     });
-    if (r.status === 0) {
+  }
+  return ms;
+}
+
+/** True only for a child that exited by itself with status 0: no expired
+ *  bound, no spawn error, no signal. Anything else is a failed attempt. */
+function exitedCleanly(r) {
+  return !childTimedOut(r) && !r?.error && !r?.signal && r?.status === 0;
+}
+
+/** The length of a pause in ms: `seconds` rounded to whole seconds, at least
+ *  1. A length that is not a finite number throws INSTALL_PAUSE_INVALID. */
+function installPauseMs(seconds) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) {
+    throw Object.assign(new Error(`install pause: the length must be a finite number of seconds (got ${shownValue(seconds)})`), {
+      code: "INSTALL_PAUSE_INVALID",
+    });
+  }
+  return Math.max(1, Math.round(seconds)) * 1_000;
+}
+
+/** One pause of `seconds` (see `installPauseMs`) between readiness probes. It
+ *  spawns no child: it is kept in this thread until the monotonic clock has
+ *  passed its whole length, so no `sleep` found on PATH can end it early, and
+ *  no bound can expire. The rule of the pauses of cinatra-cli#306, kept
+ *  self-contained here as the helpers above are. */
+function pauseInstall(seconds) {
+  const ms = installPauseMs(seconds);
+  const end = performance.now() + ms;
+  for (let left = ms; left > 0; left = end - performance.now()) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, left);
+  }
+}
+
+/** Poll a compose service's ready command until it exits 0. Each probe is
+ *  bounded from its spawn (`probeTimeoutMs`, 15 s); a probe that times out,
+ *  dies by a signal or cannot be spawned is a failed attempt, never ready.
+ *  The 1 s pause between attempts is `pauseInstall` (cinatra-cli#325). */
+function waitForCompose(targetDir, service, readyCmd, label, log, maxAttempts = 60, composeBase = ["compose"], { probeTimeoutMs = INSTALL_PROBE_TIMEOUT_MS } = {}) {
+  const bound = checkedProbeBound(probeTimeoutMs);
+  for (let i = 0; i < maxAttempts; i += 1) {
+    let r = null;
+    try {
+      r = spawnSync("docker", [...composeBase, "exec", "-T", service, ...readyCmd], boundedOptions({
+        stdio: "ignore",
+        cwd: targetDir,
+      }, bound));
+    } catch {
+      r = null;
+    }
+    if (exitedCleanly(r)) {
       log(`  ${label} is ready.`);
       return;
     }
-    spawnSync("sleep", ["1"]);
+    pauseInstall(1);
   }
   throw new Error(`${label} did not become ready within ${maxAttempts} seconds.`);
 }
 
-function waitForNango(log, maxAttempts = 60, healthUrl = null) {
+/** Poll Nango's health endpoint until `curl` exits 0. The probe keeps its 3 s
+ *  bound (now with SIGKILL) and is read as `waitForCompose` reads its own; the
+ *  2 s pause between attempts is `pauseInstall` (cinatra-cli#325). */
+function waitForNango(log, maxAttempts = 60, healthUrl = null, { probeTimeoutMs = INSTALL_NANGO_PROBE_TIMEOUT_MS } = {}) {
   const url = healthUrl ?? "http://127.0.0.1:3003/health";
+  const bound = checkedProbeBound(probeTimeoutMs);
   for (let i = 0; i < maxAttempts; i += 1) {
-    const r = spawnSync("curl", ["-sf", url], {
-      stdio: "ignore",
-      timeout: 3000,
-    });
-    if (r.status === 0) {
+    let r = null;
+    try {
+      r = spawnSync("curl", ["-sf", url], boundedOptions({ stdio: "ignore" }, bound));
+    } catch {
+      r = null;
+    }
+    if (exitedCleanly(r)) {
       log("  Nango is ready.");
       return;
     }
-    spawnSync("sleep", ["2"]);
+    pauseInstall(2);
   }
   // Non-fatal: Nango can lag; setup re-probes. Warn, don't abort.
   log("  ⚠ Nango did not report healthy in time — continuing; `cinatra instance setup` will re-check.");
