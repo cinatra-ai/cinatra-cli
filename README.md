@@ -1,6 +1,6 @@
 # cinatra
 
-The command-line tool for [Cinatra](https://cinatra.ai) — the open source AI workspace for teams, where people, AI assistants, and autonomous agents work together on durable workflows.
+The command-line tool for [Cinatra](https://cinatra.ai) — the open source agentic teams workspace, where people, AI assistants, and autonomous agents work together on durable workflows.
 
 Use it to stand up your own Cinatra instance and keep it running — from a local dev setup to production.
 
