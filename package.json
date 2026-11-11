@@ -1,6 +1,6 @@
 {
   "name": "@cinatra-ai/cinatra",
-  "description": "Command-line tool to install, run, and maintain a Cinatra instance — the open source AI workspace for teams.",
+  "description": "Command-line tool to install, run, and maintain a Cinatra instance — The Open Source Agentic Teams Workspace.",
   "version": "0.1.8",
   "author": "Cinatra <sandro@cinatra.ai>",
   "type": "module",
