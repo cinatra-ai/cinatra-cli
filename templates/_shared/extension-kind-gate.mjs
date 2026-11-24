@@ -1660,7 +1660,8 @@ function readPassthroughData(node) {
 /** Collect + validate `artifact_materialize` passthrough nodes — static mirror
  * of the host `collectArtifactMaterializeNodesFromOasDocument` subset: literal
  * extension (∈ produces), literal authorable declaredMime, literal node_id equal
- * to the ApiNode's id, present content + title. Returns `{ attempted, errors }`. */
+ * to the ApiNode's id, present content + title (or, in the list mode, both
+ * literal member fields and no title). Returns `{ attempted, errors }`. */
 export function collectArtifactMaterializeNodes(oasDoc, producesSet) {
   const errors = [];
   let attempted = 0;
@@ -1691,7 +1692,28 @@ export function collectArtifactMaterializeNodes(oasDoc, producesSet) {
       errors.push(`${where}.input.node_id: "${input.node_id}" must equal this ApiNode's id ("${nodeId}") — it is the idempotency-ledger identity`);
     }
     if (!isNonEmptyStr(input.content)) errors.push(`${where}.input.content: required non-empty string`);
-    if (!isNonEmptyStr(input.title)) errors.push(`${where}.input.title: required non-empty string`);
+    // The list mode (mirrors the host's list-mode call grammar): memberContentField
+    // and memberTitleField name, as literals, the content and the title field of
+    // each member of the JSON-array `content`. Both or neither; each member has
+    // its own title, so a list call carries no top-level title.
+    const hasMemberContent = input.memberContentField !== undefined;
+    const hasMemberTitle = input.memberTitleField !== undefined;
+    if (hasMemberContent !== hasMemberTitle) {
+      const missing = hasMemberContent ? "memberTitleField" : "memberContentField";
+      errors.push(`${where}.input.${missing}: a list call names both memberContentField and memberTitleField, or neither`);
+    }
+    for (const field of ["memberContentField", "memberTitleField"]) {
+      const value = input[field];
+      if (value === undefined) continue;
+      if (typeof value !== "string" || value.trim().length === 0 || value !== value.trim() || isTemplated(value)) {
+        errors.push(`${where}.input.${field}: must be a literal field name with no surrounding whitespace (got ${JSON.stringify(value)})`);
+      }
+    }
+    if (hasMemberContent || hasMemberTitle) {
+      if (input.title !== undefined) errors.push(`${where}.input.title: cannot be combined with a list call (memberContentField + memberTitleField) — every member has its own title`);
+    } else if (!isNonEmptyStr(input.title)) {
+      errors.push(`${where}.input.title: required non-empty string`);
+    }
   });
   return { attempted, errors };
 }
