@@ -116,6 +116,38 @@ describe("collectArtifactMaterializeNodes", () => {
     expect(collectArtifactMaterializeNodes(materializeFlow({ ...VALID_MAT_INPUT, declaredMime: "image/png" }), null).errors.some((e) => /not text-authorable/.test(e))).toBe(true);
     expect(collectArtifactMaterializeNodes(materializeFlow({ ...VALID_MAT_INPUT, content: "" }), null).errors.some((e) => /content/.test(e))).toBe(true);
   });
+
+  // The list mode (cinatra#3089): `content` is a JSON array and each member
+  // carries its own title, named by memberTitleField; the call has no title.
+  const { title: _omitTitle, ...LIST_BASE } = VALID_MAT_INPUT;
+  const VALID_LIST_INPUT = { ...LIST_BASE, content: "{{ drafts | tojson }}", memberContentField: "body", memberTitleField: "subject" };
+  const listErrors = (input) => collectArtifactMaterializeNodes(materializeFlow(input), new Set([EXT])).errors;
+
+  it("accepts a list-mode node that names both member fields and carries no title", () => {
+    expect(listErrors(VALID_LIST_INPUT)).toEqual([]);
+  });
+
+  it("rejects a list-mode node that names only one member field", () => {
+    const { memberTitleField: _t, ...contentOnly } = VALID_LIST_INPUT;
+    const { memberContentField: _c, ...titleOnly } = VALID_LIST_INPUT;
+    expect(listErrors(contentOnly).some((e) => /memberTitleField/.test(e))).toBe(true);
+    expect(listErrors(titleOnly).some((e) => /memberContentField/.test(e))).toBe(true);
+  });
+
+  it("rejects a member field that is templated, blank, padded or not a string", () => {
+    for (const bad of ["{{ f }}", "", "   ", " body", "body ", 7]) {
+      expect(listErrors({ ...VALID_LIST_INPUT, memberContentField: bad }).some((e) => /memberContentField/.test(e))).toBe(true);
+      expect(listErrors({ ...VALID_LIST_INPUT, memberTitleField: bad }).some((e) => /memberTitleField/.test(e))).toBe(true);
+    }
+  });
+
+  it("rejects a top-level title alongside the member fields", () => {
+    expect(listErrors({ ...VALID_LIST_INPUT, title: "{{ title }}" }).some((e) => /\.input\.title/.test(e))).toBe(true);
+  });
+
+  it("still requires a title on a single-artifact node", () => {
+    expect(listErrors(LIST_BASE).some((e) => /\.input\.title: required/.test(e))).toBe(true);
+  });
 });
 
 describe("findReadonlyWriteToolMislabels (keyed on tool, not name)", () => {
